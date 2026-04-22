@@ -1,0 +1,41 @@
+import {describe, expect, it} from 'vitest';
+import {buildTreeRows} from '../src/tree.js';
+
+describe('buildTreeRows', () => {
+  it('expands changed file paths into a stable directory tree', () => {
+    const rows = buildTreeRows([
+      '.cursor/planning/stream-feeds-v2-to-v3-mobile-migration-execplan.md',
+      'CLAUDE.md',
+      'healthline-cares-core/containers/StreamV3ThreadContainer.js',
+      'healthline-cares-core/lib/stream-v3/StreamV3Api.js',
+    ]);
+
+    expect(rows.map((row) => ({kind: row.kind, label: row.label, depth: row.depth, path: row.path}))).toEqual([
+      {kind: 'file', label: 'CLAUDE.md', depth: 0, path: 'CLAUDE.md'},
+      {kind: 'dir', label: '.cursor', depth: 0, path: '.cursor'},
+      {kind: 'dir', label: 'planning', depth: 1, path: '.cursor/planning'},
+      {
+        kind: 'file',
+        label: 'stream-feeds-v2-to-v3-mobile-migration-execplan.md',
+        depth: 2,
+        path: '.cursor/planning/stream-feeds-v2-to-v3-mobile-migration-execplan.md',
+      },
+      {kind: 'dir', label: 'healthline-cares-core', depth: 0, path: 'healthline-cares-core'},
+      {kind: 'dir', label: 'containers', depth: 1, path: 'healthline-cares-core/containers'},
+      {
+        kind: 'file',
+        label: 'StreamV3ThreadContainer.js',
+        depth: 2,
+        path: 'healthline-cares-core/containers/StreamV3ThreadContainer.js',
+      },
+      {kind: 'dir', label: 'lib', depth: 1, path: 'healthline-cares-core/lib'},
+      {kind: 'dir', label: 'stream-v3', depth: 2, path: 'healthline-cares-core/lib/stream-v3'},
+      {
+        kind: 'file',
+        label: 'StreamV3Api.js',
+        depth: 3,
+        path: 'healthline-cares-core/lib/stream-v3/StreamV3Api.js',
+      },
+    ]);
+  });
+});

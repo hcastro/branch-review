@@ -1,0 +1,81 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {execFileSync} from 'node:child_process';
+import {afterEach, describe, expect, it} from 'vitest';
+import {
+  getBranchMetrics,
+  getChangedFiles,
+  getFileMetricsMap,
+  getRawFileDiff,
+  resolveRefs,
+} from '../src/git.js';
+
+const tempDirs: string[] = [];
+
+function runGit(cwd: string, ...args: string[]) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function createRepo() {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-cli-'));
+  tempDirs.push(cwd);
+
+  runGit(cwd, 'init', '-b', 'development');
+  runGit(cwd, 'config', 'user.name', 'Test User');
+  runGit(cwd, 'config', 'user.email', 'test@example.com');
+
+  fs.mkdirSync(path.join(cwd, 'src'), {recursive: true});
+  fs.writeFileSync(path.join(cwd, 'src', 'app.ts'), 'export const value = 1;\n');
+  runGit(cwd, 'add', '.');
+  runGit(cwd, 'commit', '-m', 'initial');
+
+  runGit(cwd, 'checkout', '-b', 'feature/example');
+  fs.writeFileSync(path.join(cwd, 'src', 'app.ts'), 'export const value = 2;\nexport const next = 3;\n');
+  fs.writeFileSync(path.join(cwd, 'README.md'), '# Example\n');
+  runGit(cwd, 'add', '.');
+  runGit(cwd, 'commit', '-m', 'feature change');
+
+  return cwd;
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+});
+
+describe('git helpers', () => {
+  it('resolves refs and returns changed files relative to the merge base', () => {
+    const cwd = createRepo();
+
+    const refs = resolveRefs(cwd, 'HEAD', 'development');
+    const files = getChangedFiles(cwd, refs.base, refs.branch);
+
+    expect(refs).toEqual({base: 'development', branch: 'HEAD'});
+    expect(files).toEqual(['README.md', 'src/app.ts']);
+  });
+
+  it('returns a file-specific diff instead of the whole branch diff', () => {
+    const cwd = createRepo();
+    const diff = getRawFileDiff(cwd, 'development', 'HEAD', 'README.md');
+
+    expect(diff).toContain('diff --git a/README.md b/README.md');
+    expect(diff).toContain('+# Example');
+    expect(diff).not.toContain('src/app.ts');
+  });
+
+  it('extracts per-file and branch metrics from numstat output', () => {
+    const cwd = createRepo();
+    const metricsMap = getFileMetricsMap(cwd, 'development', 'HEAD');
+    const branchMetrics = getBranchMetrics(cwd, 'development', 'HEAD');
+
+    expect(metricsMap.get('README.md')).toMatchObject({additions: 1, deletions: 0, changedLines: 1});
+    expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 2, deletions: 1, changedLines: 3});
+    expect(branchMetrics).toEqual({filesChanged: 2, additions: 3, deletions: 1, changedLines: 4});
+  });
+});
