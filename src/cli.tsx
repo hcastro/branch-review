@@ -45,7 +45,33 @@ const sections = buildDiffSections(
   })),
 );
 
-render(
+const useAltScreen = Boolean(process.stdout.isTTY);
+let altScreenActive = false;
+const enterAltScreen = () => {
+  if (useAltScreen && !altScreenActive) {
+    process.stdout.write('[?1049h[H');
+    altScreenActive = true;
+  }
+};
+const exitAltScreen = () => {
+  if (altScreenActive) {
+    process.stdout.write('[?1049l');
+    altScreenActive = false;
+  }
+};
+
+enterAltScreen();
+process.on('exit', exitAltScreen);
+process.on('SIGINT', () => {
+  exitAltScreen();
+  process.exit(130);
+});
+process.on('SIGTERM', () => {
+  exitAltScreen();
+  process.exit(143);
+});
+
+const instance = render(
   <App
     base={range.base}
     branch={branchLabel}
@@ -53,3 +79,5 @@ render(
     branchMetrics={branchMetrics}
   />,
 );
+
+instance.waitUntilExit().finally(exitAltScreen);

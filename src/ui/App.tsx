@@ -287,7 +287,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
         return;
       }
 
-      const relativeY = position.y - treeBounds.top - 2;
+      const relativeY = position.y - treeBounds.top - 3;
       if (relativeY < 0 || relativeY >= stateRef.current.visibleTreeRows) {
         setHoveredTreeRow((current) => (current === null ? current : null));
         return;
@@ -312,7 +312,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
       const treeBounds = getBounds(treePanelRef);
       if (!isInside(treeBounds, position.x, position.y) || !treeBounds) return;
 
-      const relativeY = position.y - treeBounds.top - 2;
+      const relativeY = position.y - treeBounds.top - 3;
       if (relativeY < 0 || relativeY >= stateRef.current.visibleTreeRows) return;
 
       const rowIndex = stateRef.current.treeOffset + relativeY;
