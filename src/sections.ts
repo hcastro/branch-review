@@ -116,6 +116,36 @@ export function wrapAnsi(line: string, maxWidth: number): string[] {
   return result;
 }
 
+export function visibleWidth(line: string): number {
+  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').length;
+}
+
+export function padToWidth(line: string, width: number): string {
+  const diff = width - visibleWidth(line);
+  return diff > 0 ? line + ' '.repeat(diff) : line;
+}
+
+export function frameLine(
+  line: string,
+  innerWidth: number,
+  borderAnsi: string,
+): string {
+  const truncated = truncateAnsi(line, innerWidth);
+  const padded = padToWidth(truncated, innerWidth);
+  const vbar = `${borderAnsi}\u2502${RESET}`;
+  return `${vbar} ${padded} ${vbar}`;
+}
+
+export function frameTopBorder(paneWidth: number, borderAnsi: string): string {
+  const inner = paneWidth - 2;
+  return `${borderAnsi}\u256D${'\u2500'.repeat(inner)}\u256E${RESET}`;
+}
+
+export function frameBottomBorder(paneWidth: number, borderAnsi: string): string {
+  const inner = paneWidth - 2;
+  return `${borderAnsi}\u2570${'\u2500'.repeat(inner)}\u256F${RESET}`;
+}
+
 export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {

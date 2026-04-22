@@ -9,8 +9,13 @@ import {buildTreeRows, type TreeRow} from '../tree.js';
 import {
   flattenSectionLines,
   formatMetrics,
+  frameBottomBorder,
+  frameLine,
+  frameTopBorder,
   getSectionForLine,
   getSectionIndexForLine,
+  padToWidth,
+  visibleWidth,
   wrapSections,
   type BranchMetrics,
   type DiffSection,
@@ -176,13 +181,23 @@ function DiffPane({
       width={width}
       height={height}
       flexDirection="column"
-      borderStyle="round"
-      borderColor={hovered ? 'cyan' : 'gray'}
-      paddingX={1}
+      flexShrink={0}
     >
       {children}
     </Box>
   );
+}
+
+const ANSI_CYAN_BRIGHT_BOLD = '[96;1m';
+const ANSI_YELLOW = '[33m';
+const ANSI_GRAY = '[90m';
+const ANSI_CYAN = '[36m';
+const ANSI_RESET = '[0m';
+
+function truncateStart(text: string, maxWidth: number): string {
+  if (text.length <= maxWidth) return text;
+  if (maxWidth <= 1) return '…'.slice(0, maxWidth);
+  return '…' + text.slice(text.length - maxWidth + 1);
 }
 
 function AppContent({base, branch, sections: rawSections, branchMetrics, dimensions}: AppProps) {
@@ -196,8 +211,10 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
   const rightWidth = Math.max(78, columns - leftWidth - 4);
   const diffContentWidth = Math.max(1, rightWidth - 4);
   const contentHeight = Math.max(terminalRows - 9, 10);
-  const visibleTreeRows = Math.max(contentHeight - 2, 4);
-  const visibleDiffRows = Math.max(contentHeight - 2, 6);
+  // Pane overhead: 2 borders + header rows.
+  // Tree has 1 header row; diff has 2 (filename + metrics).
+  const visibleTreeRows = Math.max(contentHeight - 3, 4);
+  const visibleDiffRows = Math.max(contentHeight - 4, 6);
 
   const sections = useMemo(
     () => wrapSections(rawSections, diffContentWidth),
@@ -423,34 +440,33 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
           hovered={diffHovered}
           setHovered={setDiffHovered}
         >
-          <Box width={diffContentWidth} flexShrink={0}>
-            <Text color="cyanBright" bold wrap="truncate-start">
-              {activeFilePath || ' '}
-            </Text>
-          </Box>
-          <Box width={diffContentWidth} flexShrink={0} justifyContent="space-between">
-            {activeSection ? (
-              <Box flexShrink={1}>
-                <Text color="yellow" wrap="truncate-end">
-                  {formatMetrics(activeSection.metrics)}
-                  {'  '}
-                  <Text color="gray">file {activeSectionIndex + 1}/{sections.length}</Text>
-                </Text>
-              </Box>
-            ) : (
-              <Text color="gray">No diff loaded.</Text>
-            )}
-            <Box flexShrink={0} marginLeft={1}>
-              <Text color="gray">
-                ln {visibleLineStart}-{visibleLineEnd}/{allDiffLines.length}
-              </Text>
-            </Box>
-          </Box>
-          {visibleDiffLines.map((line, index) => (
-            <Text key={`${diffOffset}-${index}`}>
-              {line || ' '}
-            </Text>
-          ))}
+          {(() => {
+            const borderAnsi = diffHovered ? ANSI_CYAN : ANSI_GRAY;
+            const inner = Math.max(1, rightWidth - 4);
+
+            const fileLabel = `${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
+
+            const metricsCore = activeSection
+              ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+              : `${ANSI_GRAY}No diff loaded.${ANSI_RESET}`;
+            const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
+            const counterWidth = visibleWidth(counter);
+            const metricsWidth = visibleWidth(metricsCore);
+            const gap = Math.max(1, inner - metricsWidth - counterWidth);
+            const metricsRow = padToWidth(`${metricsCore}${' '.repeat(gap)}${counter}`, inner);
+
+            const rows: string[] = [
+              frameTopBorder(rightWidth, borderAnsi),
+              frameLine(fileLabel, inner, borderAnsi),
+              frameLine(metricsRow, inner, borderAnsi),
+            ];
+            for (const line of visibleDiffLines) {
+              rows.push(frameLine(line || ' ', inner, borderAnsi));
+            }
+            rows.push(frameBottomBorder(rightWidth, borderAnsi));
+
+            return rows.map((row, i) => <Text key={`diff-${i}`}>{row}</Text>);
+          })()}
         </DiffPane>
       </Box>
 
