@@ -8,8 +8,8 @@ describe('wheel helpers', () => {
   it('applies direct deltas at single-line precision', () => {
     expect(applyScrollDelta(10, 40, 3)).toBe(13);
     expect(applyScrollDelta(10, 40, -2)).toBe(8);
-    expect(applyMouseScroll(10, 40, 'scrolldown')).toBe(11);
-    expect(applyMouseScroll(10, 40, 'scrollup')).toBe(9);
+    expect(applyMouseScroll(10, 40, 'scrolldown')).toBe(13);
+    expect(applyMouseScroll(10, 40, 'scrollup')).toBe(7);
     expect(applyMouseScroll(10, 40, undefined)).toBe(10);
   });
 

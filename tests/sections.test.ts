@@ -7,6 +7,8 @@ import {
   getSectionForLine,
   getSectionIndexForLine,
   truncateAnsi,
+  wrapAnsi,
+  wrapSections,
 } from '../src/sections.js';
 
 describe('section helpers', () => {
@@ -45,5 +47,31 @@ describe('section helpers', () => {
     const line = '[31mabc[0m[32mdef[0m';
     expect(stripAnsi(truncateAnsi(line, 100))).toBe('abcdef');
     expect(stripAnsi(truncateAnsi(line, 4))).toBe('abcd');
+  });
+
+  it('wraps long colored lines into multiple width-constrained pieces', () => {
+    const line = '[32m' + 'x'.repeat(25) + '[0m';
+    const wrapped = wrapAnsi(line, 10);
+
+    expect(wrapped).toHaveLength(3);
+    expect(wrapped.map(stripAnsi)).toEqual(['x'.repeat(10), 'x'.repeat(10), 'x'.repeat(5)]);
+    for (const piece of wrapped) {
+      expect(piece.endsWith('[0m')).toBe(true);
+    }
+  });
+
+  it('rewraps sections and recomputes line boundaries across wrapped lines', () => {
+    const base = buildDiffSections([
+      {
+        path: 'a.ts',
+        metrics: {path: 'a.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'x'.repeat(25),
+      },
+    ]);
+
+    const wrapped = wrapSections(base, 10);
+    expect(wrapped[0].lines.length).toBeGreaterThan(base[0].lines.length);
+    expect(wrapped[0].startLine).toBe(0);
+    expect(wrapped[0].endLineExclusive).toBe(wrapped[0].lines.length);
   });
 });
