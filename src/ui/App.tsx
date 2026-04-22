@@ -49,6 +49,10 @@ function ensureVisible(index: number, currentOffset: number, viewportSize: numbe
     return 0;
   }
 
+  if (index < 0) {
+    return currentOffset;
+  }
+
   if (index < currentOffset) {
     return index;
   }
@@ -84,45 +88,13 @@ const TreeFileRow = memo(function TreeFileRow({
   const glyph = row.kind === 'dir' ? '▾' : '•';
 
   return (
-    <Box ref={ref}>
+    <Box ref={ref} flexShrink={0}>
       <Text color={accent} backgroundColor={background} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
         {' '.repeat(row.depth * 2)}{glyph} {row.label}
       </Text>
     </Box>
   );
 });
-
-function DiffPanel({
-  panelRef,
-  width,
-  height,
-  diffHovered,
-  setDiffHovered,
-  children,
-}: {
-  panelRef: React.RefObject<DOMElement>;
-  width: number;
-  height: number;
-  diffHovered: boolean;
-  setDiffHovered: (hovered: boolean) => void;
-  children: React.ReactNode;
-}) {
-  useOnMouseHover(panelRef, setDiffHovered);
-
-  return (
-    <Box
-      ref={panelRef}
-      width={width}
-      height={height}
-      flexDirection="column"
-      borderStyle="round"
-      borderColor={diffHovered ? 'cyan' : 'gray'}
-      paddingX={1}
-    >
-      {children}
-    </Box>
-  );
-}
 
 function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProps) {
   const {exit} = useApp();
@@ -140,33 +112,56 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
   const visibleTreeRows = Math.max(contentHeight - 2, 4);
   const visibleDiffRows = Math.max(contentHeight - 2, 6);
   const maxDiffOffset = Math.max(allDiffLines.length - visibleDiffRows, 0);
+  const maxTreeOffset = Math.max(rows.length - visibleTreeRows, 0);
 
+  const treePanelRef = useRef<DOMElement>(null);
   const diffPanelRef = useRef<DOMElement>(null);
   const [diffOffset, setDiffOffset] = useState(0);
+  const [treeOffset, setTreeOffset] = useState(0);
   const [diffHovered, setDiffHovered] = useState(false);
+  const [treeHovered, setTreeHovered] = useState(false);
   const mouseAction = useMouseAction();
+
+  useOnMouseHover(treePanelRef, setTreeHovered);
+  useOnMouseHover(diffPanelRef, setDiffHovered);
 
   const activeSectionIndex = getSectionIndexForLine(sections, diffOffset);
   const activeSection = getSectionForLine(sections, diffOffset);
   const activeFilePath = activeSection?.path ?? '';
   const activeRowIndex = rows.findIndex((row) => row.path === activeFilePath);
-  const treeOffset = ensureVisible(activeRowIndex, 0, visibleTreeRows);
-  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
-  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const visibleLineStart = diffOffset + 1;
-  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
   }, [maxDiffOffset]);
 
   useEffect(() => {
+    setTreeOffset((current) => {
+      const clamped = clamp(current, 0, maxTreeOffset);
+      return ensureVisible(activeRowIndex, clamped, visibleTreeRows);
+    });
+  }, [activeRowIndex, maxTreeOffset, visibleTreeRows]);
+
+  useEffect(() => {
     if (mouseAction !== 'scrollup' && mouseAction !== 'scrolldown') {
       return;
     }
 
-    setDiffOffset((current) => applyMouseScroll(current, maxDiffOffset, mouseAction));
-  }, [maxDiffOffset, mouseAction]);
+    if (treeHovered) {
+      setTreeOffset((current) => applyMouseScroll(current, maxTreeOffset, mouseAction));
+      return;
+    }
+
+    if (diffHovered) {
+      setDiffOffset((current) => applyMouseScroll(current, maxDiffOffset, mouseAction));
+    }
+  }, [mouseAction, treeHovered, diffHovered, maxTreeOffset, maxDiffOffset]);
+
+  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
+  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
+  const visibleLineStart = diffOffset + 1;
+  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
+  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
+  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
 
   const jumpToFile = useCallback((filePath: string) => {
     const section = sections.find((entry) => entry.path === filePath);
@@ -194,26 +189,22 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
     }
 
     if (input === 'j') {
-      const next = applyScrollDelta(diffOffset, maxDiffOffset, 1);
-      setDiffOffset(next);
+      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, 1));
       return;
     }
 
     if (input === 'k') {
-      const next = applyScrollDelta(diffOffset, maxDiffOffset, -1);
-      setDiffOffset(next);
+      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, -1));
       return;
     }
 
     if (key.pageDown) {
-      const next = applyScrollDelta(diffOffset, maxDiffOffset, visibleDiffRows);
-      setDiffOffset(next);
+      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, visibleDiffRows));
       return;
     }
 
     if (key.pageUp) {
-      const next = applyScrollDelta(diffOffset, maxDiffOffset, -visibleDiffRows);
-      setDiffOffset(next);
+      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, -visibleDiffRows));
       return;
     }
 
@@ -248,10 +239,21 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
       </Box>
 
       <Box>
-        <Box width={leftWidth} height={contentHeight} flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginRight={1}>
-          <Box justifyContent="space-between">
+        <Box
+          ref={treePanelRef}
+          width={leftWidth}
+          height={contentHeight}
+          flexDirection="column"
+          flexShrink={0}
+          overflow="hidden"
+          borderStyle="round"
+          borderColor={treeHovered ? 'cyan' : 'gray'}
+          paddingX={1}
+          marginRight={1}
+        >
+          <Box justifyContent="space-between" flexShrink={0}>
             <Text color="cyan">Changed files</Text>
-            <Text color="gray">{Math.max(activeSectionIndex + 1, 0)}/{sections.length}</Text>
+            <Text color="gray">{treeRowStart}-{treeRowEnd}/{rows.length}</Text>
           </Box>
           {visibleRows.map((row) => (
             <TreeFileRow
@@ -263,14 +265,18 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
           ))}
         </Box>
 
-        <DiffPanel
-          panelRef={diffPanelRef}
+        <Box
+          ref={diffPanelRef}
           width={rightWidth}
           height={contentHeight}
-          diffHovered={diffHovered}
-          setDiffHovered={setDiffHovered}
+          flexDirection="column"
+          flexShrink={0}
+          overflow="hidden"
+          borderStyle="round"
+          borderColor={diffHovered ? 'cyan' : 'gray'}
+          paddingX={1}
         >
-          <Box justifyContent="space-between">
+          <Box justifyContent="space-between" flexShrink={0}>
             <Text color="cyan" bold wrap="truncate-end">{activeFilePath}</Text>
             <Text color="gray">lines {visibleLineStart}-{visibleLineEnd}/{allDiffLines.length}</Text>
           </Box>
@@ -284,11 +290,11 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
               {line || ' '}
             </Text>
           ))}
-        </DiffPanel>
+        </Box>
       </Box>
 
       <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
-        <Text color="gray">trackpad scroll • ↑/↓ jump file • click file jumps diff • PgUp/PgDn page • g/G top-bottom • q quit</Text>
+        <Text color="gray">scroll hovered pane • ↑/↓ jump file • click file jumps diff • PgUp/PgDn page • g/G top-bottom • q quit</Text>
         <Text color="gray">{base}...{branch}</Text>
       </Box>
     </Box>
