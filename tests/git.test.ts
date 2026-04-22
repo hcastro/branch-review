@@ -53,16 +53,22 @@ describe('git helpers', () => {
   it('resolves refs and returns changed files relative to the merge base', () => {
     const cwd = createRepo();
 
-    const refs = resolveRefs(cwd, 'HEAD', 'development');
-    const files = getChangedFiles(cwd, refs.base, refs.branch);
+    const range = resolveRefs(cwd, 'feature/example', 'development');
+    const files = getChangedFiles(cwd, range);
 
-    expect(refs).toEqual({base: 'development', branch: 'HEAD'});
+    expect(range).toMatchObject({
+      base: 'development',
+      branch: 'feature/example',
+      diffArg: 'development...feature/example',
+      includeWorktree: false,
+    });
     expect(files).toEqual(['README.md', 'src/app.ts']);
   });
 
   it('returns a file-specific diff instead of the whole branch diff', () => {
     const cwd = createRepo();
-    const diff = getRawFileDiff(cwd, 'development', 'HEAD', 'README.md');
+    const range = resolveRefs(cwd, 'feature/example', 'development');
+    const diff = getRawFileDiff(cwd, range, 'README.md');
 
     expect(diff).toContain('diff --git a/README.md b/README.md');
     expect(diff).toContain('+# Example');
@@ -71,11 +77,37 @@ describe('git helpers', () => {
 
   it('extracts per-file and branch metrics from numstat output', () => {
     const cwd = createRepo();
-    const metricsMap = getFileMetricsMap(cwd, 'development', 'HEAD');
-    const branchMetrics = getBranchMetrics(cwd, 'development', 'HEAD');
+    const range = resolveRefs(cwd, 'feature/example', 'development');
+    const metricsMap = getFileMetricsMap(cwd, range);
+    const branchMetrics = getBranchMetrics(cwd, range);
 
     expect(metricsMap.get('README.md')).toMatchObject({additions: 1, deletions: 0, changedLines: 1});
     expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 2, deletions: 1, changedLines: 3});
     expect(branchMetrics).toEqual({filesChanged: 2, additions: 3, deletions: 1, changedLines: 4});
+  });
+
+  it('includes unstaged, staged, and untracked changes in worktree mode', () => {
+    const cwd = createRepo();
+
+    fs.writeFileSync(path.join(cwd, 'src', 'app.ts'), 'export const value = 2;\nexport const next = 4;\nexport const extra = 5;\n');
+    fs.writeFileSync(path.join(cwd, 'staged.ts'), 'export const staged = true;\n');
+    runGit(cwd, 'add', 'staged.ts');
+    fs.writeFileSync(path.join(cwd, 'untracked.ts'), 'export const a = 1;\nexport const b = 2;\n');
+
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    expect(range).toMatchObject({base: 'development', branch: 'HEAD', includeWorktree: true});
+
+    const files = getChangedFiles(cwd, range);
+    expect(files).toEqual(['README.md', 'src/app.ts', 'staged.ts', 'untracked.ts']);
+
+    const metricsMap = getFileMetricsMap(cwd, range);
+    expect(metricsMap.get('untracked.ts')).toEqual({
+      path: 'untracked.ts',
+      additions: 2,
+      deletions: 0,
+      changedLines: 2,
+    });
+    expect(metricsMap.get('staged.ts')).toMatchObject({additions: 1, deletions: 0});
+    expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 3, deletions: 1});
   });
 });

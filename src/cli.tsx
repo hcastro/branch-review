@@ -8,6 +8,7 @@ import {
   getChangedFiles,
   getColoredFileDiff,
   getFileMetricsMap,
+  getUntrackedFiles,
   resolveRefs,
 } from './git.js';
 
@@ -16,19 +17,21 @@ EventEmitter.defaultMaxListeners = 100;
 const cwd = process.cwd();
 const requestedBranch = process.argv[2] ?? 'HEAD';
 const requestedBase = process.argv[3] ?? 'development';
-const refs = resolveRefs(cwd, requestedBranch, requestedBase);
-const files = getChangedFiles(cwd, refs.base, refs.branch);
+const range = resolveRefs(cwd, requestedBranch, requestedBase);
+const files = getChangedFiles(cwd, range);
 
 if (files.length === 0) {
-  console.log(`No file changes between ${refs.base} and ${refs.branch}.`);
+  console.log(`No file changes between ${range.base} and ${range.branch}.`);
   process.exit(0);
 }
 
 const terminalWidth = process.stdout.columns ?? 160;
 const leftWidth = Math.max(34, Math.floor(terminalWidth * 0.27));
 const rightWidth = Math.max(78, terminalWidth - leftWidth - 12);
-const metricsMap = getFileMetricsMap(cwd, refs.base, refs.branch);
-const branchMetrics = getBranchMetrics(cwd, refs.base, refs.branch);
+const metricsMap = getFileMetricsMap(cwd, range);
+const branchMetrics = getBranchMetrics(cwd, range);
+const untrackedSet = range.includeWorktree ? new Set(getUntrackedFiles(cwd)) : undefined;
+const branchLabel = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
 const sections = buildDiffSections(
   files.map((filePath) => ({
     path: filePath,
@@ -38,14 +41,14 @@ const sections = buildDiffSections(
       deletions: 0,
       changedLines: 0,
     },
-    diff: getColoredFileDiff(cwd, refs.base, refs.branch, filePath, rightWidth),
+    diff: getColoredFileDiff(cwd, range, filePath, rightWidth, untrackedSet),
   })),
 );
 
 render(
   <App
-    base={refs.base}
-    branch={refs.branch}
+    base={range.base}
+    branch={branchLabel}
     sections={sections}
     branchMetrics={branchMetrics}
   />,
