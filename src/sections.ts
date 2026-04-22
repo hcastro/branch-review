@@ -20,6 +20,42 @@ export type DiffSection = {
   endLineExclusive: number;
 };
 
+const ANSI_SGR_TOKEN = /(\[[0-9;]*m)/;
+const RESET = '[0m';
+
+export function truncateAnsi(line: string, maxWidth: number) {
+  if (maxWidth <= 0) {
+    return RESET;
+  }
+
+  let output = '';
+  let visible = 0;
+  const parts = line.split(ANSI_SGR_TOKEN);
+
+  for (const part of parts) {
+    if (!part) continue;
+
+    if (part.startsWith('[')) {
+      output += part;
+      continue;
+    }
+
+    const remaining = maxWidth - visible;
+    if (remaining <= 0) break;
+
+    if (part.length <= remaining) {
+      output += part;
+      visible += part.length;
+    } else {
+      output += part.slice(0, remaining);
+      visible += remaining;
+      break;
+    }
+  }
+
+  return output + RESET;
+}
+
 function cyan(text: string) {
   return `\u001B[36m${text}\u001B[0m`;
 }
