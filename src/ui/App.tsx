@@ -423,15 +423,29 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
           hovered={diffHovered}
           setHovered={setDiffHovered}
         >
-          <Box justifyContent="space-between">
-            <Text color="cyan" bold wrap="truncate-end">{activeFilePath}</Text>
-            <Text color="gray">lines {visibleLineStart}-{visibleLineEnd}/{allDiffLines.length}</Text>
+          <Box width={diffContentWidth} flexShrink={0}>
+            <Text color="cyanBright" bold wrap="truncate-start">
+              {activeFilePath || ' '}
+            </Text>
           </Box>
-          {activeSection ? (
-            <Text color="yellow" wrap="truncate-end">{formatMetrics(activeSection.metrics)} • section {activeSectionIndex + 1}/{sections.length}</Text>
-          ) : (
-            <Text color="gray">No diff loaded.</Text>
-          )}
+          <Box width={diffContentWidth} flexShrink={0} justifyContent="space-between">
+            {activeSection ? (
+              <Box flexShrink={1}>
+                <Text color="yellow" wrap="truncate-end">
+                  {formatMetrics(activeSection.metrics)}
+                  {'  '}
+                  <Text color="gray">file {activeSectionIndex + 1}/{sections.length}</Text>
+                </Text>
+              </Box>
+            ) : (
+              <Text color="gray">No diff loaded.</Text>
+            )}
+            <Box flexShrink={0} marginLeft={1}>
+              <Text color="gray">
+                ln {visibleLineStart}-{visibleLineEnd}/{allDiffLines.length}
+              </Text>
+            </Box>
+          </Box>
           {visibleDiffLines.map((line, index) => (
             <Text key={`${diffOffset}-${index}`}>
               {line || ' '}

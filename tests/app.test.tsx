@@ -46,7 +46,7 @@ describe('App', () => {
     let frame = stripAnsi(instance.lastFrame());
     expect(frame).toContain('CLAUDE.md');
     expect(frame).toContain('2 files • +5 • -2 • 7 changed');
-    expect(frame).toContain('section 1/2');
+    expect(frame).toContain('file 1/2');
 
     for (let index = 0; index < 12; index += 1) {
       instance.stdin.write('j');
@@ -55,13 +55,13 @@ describe('App', () => {
 
     frame = stripAnsi(instance.lastFrame());
     expect(frame).toContain('src/App.tsx');
-    expect(frame).toContain('section 2/2');
+    expect(frame).toContain('file 2/2');
 
     instance.stdin.write('\u001B[A');
     await flush();
 
     frame = stripAnsi(instance.lastFrame());
-    expect(frame).toContain('section 1/2');
+    expect(frame).toContain('file 1/2');
     expect(frame).toContain('CLAUDE.md');
 
     instance.unmount();
