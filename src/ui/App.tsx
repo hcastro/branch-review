@@ -12,6 +12,7 @@ import {
   formatMetrics,
   getSectionForLine,
   getSectionIndexForLine,
+  truncateAnsi,
   type BranchMetrics,
   type DiffSection,
 } from '../sections.js';
@@ -88,13 +89,78 @@ const TreeFileRow = memo(function TreeFileRow({
   const glyph = row.kind === 'dir' ? '▾' : '•';
 
   return (
-    <Box ref={ref} flexShrink={0}>
+    <Box ref={ref}>
       <Text color={accent} backgroundColor={background} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
         {' '.repeat(row.depth * 2)}{glyph} {row.label}
       </Text>
     </Box>
   );
 });
+
+function TreePane({
+  panelRef,
+  width,
+  height,
+  hovered,
+  setHovered,
+  children,
+}: {
+  panelRef: React.RefObject<DOMElement>;
+  width: number;
+  height: number;
+  hovered: boolean;
+  setHovered: (hovered: boolean) => void;
+  children: React.ReactNode;
+}) {
+  useOnMouseHover(panelRef, setHovered);
+
+  return (
+    <Box
+      ref={panelRef}
+      width={width}
+      height={height}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={hovered ? 'cyan' : 'gray'}
+      paddingX={1}
+      marginRight={1}
+    >
+      {children}
+    </Box>
+  );
+}
+
+function DiffPane({
+  panelRef,
+  width,
+  height,
+  hovered,
+  setHovered,
+  children,
+}: {
+  panelRef: React.RefObject<DOMElement>;
+  width: number;
+  height: number;
+  hovered: boolean;
+  setHovered: (hovered: boolean) => void;
+  children: React.ReactNode;
+}) {
+  useOnMouseHover(panelRef, setHovered);
+
+  return (
+    <Box
+      ref={panelRef}
+      width={width}
+      height={height}
+      flexDirection="column"
+      borderStyle="round"
+      borderColor={hovered ? 'cyan' : 'gray'}
+      paddingX={1}
+    >
+      {children}
+    </Box>
+  );
+}
 
 function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProps) {
   const {exit} = useApp();
@@ -108,6 +174,7 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
 
   const leftWidth = Math.max(34, Math.floor(columns * 0.27));
   const rightWidth = Math.max(78, columns - leftWidth - 4);
+  const diffContentWidth = Math.max(1, rightWidth - 4);
   const contentHeight = Math.max(terminalRows - 9, 10);
   const visibleTreeRows = Math.max(contentHeight - 2, 4);
   const visibleDiffRows = Math.max(contentHeight - 2, 6);
@@ -121,9 +188,6 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
   const [diffHovered, setDiffHovered] = useState(false);
   const [treeHovered, setTreeHovered] = useState(false);
   const mouseAction = useMouseAction();
-
-  useOnMouseHover(treePanelRef, setTreeHovered);
-  useOnMouseHover(diffPanelRef, setDiffHovered);
 
   const activeSectionIndex = getSectionIndexForLine(sections, diffOffset);
   const activeSection = getSectionForLine(sections, diffOffset);
@@ -239,19 +303,14 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
       </Box>
 
       <Box>
-        <Box
-          ref={treePanelRef}
+        <TreePane
+          panelRef={treePanelRef}
           width={leftWidth}
           height={contentHeight}
-          flexDirection="column"
-          flexShrink={0}
-          overflow="hidden"
-          borderStyle="round"
-          borderColor={treeHovered ? 'cyan' : 'gray'}
-          paddingX={1}
-          marginRight={1}
+          hovered={treeHovered}
+          setHovered={setTreeHovered}
         >
-          <Box justifyContent="space-between" flexShrink={0}>
+          <Box justifyContent="space-between">
             <Text color="cyan">Changed files</Text>
             <Text color="gray">{treeRowStart}-{treeRowEnd}/{rows.length}</Text>
           </Box>
@@ -263,20 +322,16 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
               onSelect={jumpToFile}
             />
           ))}
-        </Box>
+        </TreePane>
 
-        <Box
-          ref={diffPanelRef}
+        <DiffPane
+          panelRef={diffPanelRef}
           width={rightWidth}
           height={contentHeight}
-          flexDirection="column"
-          flexShrink={0}
-          overflow="hidden"
-          borderStyle="round"
-          borderColor={diffHovered ? 'cyan' : 'gray'}
-          paddingX={1}
+          hovered={diffHovered}
+          setHovered={setDiffHovered}
         >
-          <Box justifyContent="space-between" flexShrink={0}>
+          <Box justifyContent="space-between">
             <Text color="cyan" bold wrap="truncate-end">{activeFilePath}</Text>
             <Text color="gray">lines {visibleLineStart}-{visibleLineEnd}/{allDiffLines.length}</Text>
           </Box>
@@ -286,11 +341,11 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
             <Text color="gray">No diff loaded.</Text>
           )}
           {visibleDiffLines.map((line, index) => (
-            <Text key={`${diffOffset}-${index}`} wrap="truncate-end">
-              {line || ' '}
+            <Text key={`${diffOffset}-${index}`}>
+              {truncateAnsi(line || ' ', diffContentWidth) || ' '}
             </Text>
           ))}
-        </Box>
+        </DiffPane>
       </Box>
 
       <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
