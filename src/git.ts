@@ -154,7 +154,7 @@ export function getBranchMetrics(cwd: string, range: DiffRange): BranchMetrics {
   };
 }
 
-const DELTA_FLAGS = "delta --no-gitconfig --dark --paging=never --line-numbers --navigate --syntax-theme='Monokai Extended' --file-style='bold yellow' --file-decoration-style='yellow box' --hunk-header-style='syntax file line-number' --plus-style='syntax #003800' --minus-style='syntax #3f0001'";
+const DELTA_FLAGS = "delta --no-gitconfig --dark --paging=never --line-numbers --navigate --line-fill-method=spaces --syntax-theme='Monokai Extended' --file-style='bold yellow' --file-decoration-style='yellow box' --hunk-header-style='syntax file line-number' --plus-style='syntax #003800' --minus-style='syntax #3f0001'";
 
 function pipeThroughDelta(cwd: string, gitCommand: string, width: number) {
   const widthFlag = `--width='${Math.max(width, 80)}'`;
