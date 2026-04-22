@@ -2,8 +2,7 @@ import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 're
 import {Box, DOMElement, Text, useApp, useInput, useStdout} from 'ink';
 import {
   MouseProvider,
-  useMouseAction,
-  useOnMouseClick,
+  useMouse,
   useOnMouseHover,
 } from '@zenobius/ink-mouse';
 import {buildTreeRows, type TreeRow} from '../tree.js';
@@ -12,7 +11,7 @@ import {
   formatMetrics,
   getSectionForLine,
   getSectionIndexForLine,
-  truncateAnsi,
+  wrapSections,
   type BranchMetrics,
   type DiffSection,
 } from '../sections.js';
@@ -25,6 +24,8 @@ type AppProps = {
   dimensions?: {columns: number; rows: number};
 };
 
+const SCROLL_STEP = 3;
+
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max));
 }
@@ -35,11 +36,11 @@ export function applyScrollDelta(currentOffset: number, maxOffset: number, delta
 
 export function applyMouseScroll(currentOffset: number, maxOffset: number, action: string | undefined) {
   if (action === 'scrolldown') {
-    return applyScrollDelta(currentOffset, maxOffset, 1);
+    return applyScrollDelta(currentOffset, maxOffset, SCROLL_STEP);
   }
 
   if (action === 'scrollup') {
-    return applyScrollDelta(currentOffset, maxOffset, -1);
+    return applyScrollDelta(currentOffset, maxOffset, -SCROLL_STEP);
   }
 
   return currentOffset;
@@ -65,31 +66,53 @@ function ensureVisible(index: number, currentOffset: number, viewportSize: numbe
   return currentOffset;
 }
 
+function getBounds(ref: React.RefObject<DOMElement>) {
+  const node = ref.current;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const yoga: any = node ? (node as {yogaNode?: unknown}).yogaNode : null;
+  if (!yoga) return null;
+
+  const layout = yoga.getComputedLayout();
+  let x = 0;
+  let y = 0;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let parent: any = (node as {parentNode?: unknown}).parentNode;
+  while (parent) {
+    if (!parent.yogaNode) break;
+    const parentLayout = parent.yogaNode.getComputedLayout();
+    x += parentLayout.left;
+    y += parentLayout.top;
+    parent = parent.parentNode;
+  }
+
+  return {
+    left: layout.left + x,
+    top: layout.top + y,
+    width: layout.width,
+    height: layout.height,
+  };
+}
+
+function isInside(bounds: {left: number; top: number; width: number; height: number} | null, x: number, y: number) {
+  if (!bounds) return false;
+  return x >= bounds.left && x < bounds.left + bounds.width && y >= bounds.top && y < bounds.top + bounds.height;
+}
+
 const TreeFileRow = memo(function TreeFileRow({
   row,
   selected,
-  onSelect,
+  hovered,
 }: {
   row: TreeRow;
   selected: boolean;
-  onSelect: (path: string) => void;
+  hovered: boolean;
 }) {
-  const ref = useRef<DOMElement>(null);
-  const [hovered, setHovered] = useState(false);
-
-  useOnMouseHover(ref, setHovered);
-  useOnMouseClick(ref, (clicked) => {
-    if (clicked && row.kind === 'file') {
-      onSelect(row.path);
-    }
-  });
-
   const accent = row.kind === 'dir' ? 'yellow' : selected ? 'black' : hovered ? 'cyan' : 'white';
   const background = selected ? 'cyan' : undefined;
   const glyph = row.kind === 'dir' ? '▾' : '•';
 
   return (
-    <Box ref={ref}>
+    <Box>
       <Text color={accent} backgroundColor={background} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
         {' '.repeat(row.depth * 2)}{glyph} {row.label}
       </Text>
@@ -162,15 +185,12 @@ function DiffPane({
   );
 }
 
-function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProps) {
+function AppContent({base, branch, sections: rawSections, branchMetrics, dimensions}: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
+  const mouse = useMouse();
   const columns = dimensions?.columns ?? stdout?.columns ?? 120;
   const terminalRows = dimensions?.rows ?? stdout?.rows ?? 40;
-
-  const files = useMemo(() => sections.map((section) => section.path), [sections]);
-  const rows = useMemo(() => buildTreeRows(files), [files]);
-  const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
 
   const leftWidth = Math.max(34, Math.floor(columns * 0.27));
   const rightWidth = Math.max(78, columns - leftWidth - 4);
@@ -178,6 +198,16 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
   const contentHeight = Math.max(terminalRows - 9, 10);
   const visibleTreeRows = Math.max(contentHeight - 2, 4);
   const visibleDiffRows = Math.max(contentHeight - 2, 6);
+
+  const sections = useMemo(
+    () => wrapSections(rawSections, diffContentWidth),
+    [rawSections, diffContentWidth],
+  );
+
+  const files = useMemo(() => sections.map((section) => section.path), [sections]);
+  const rows = useMemo(() => buildTreeRows(files), [files]);
+  const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
+
   const maxDiffOffset = Math.max(allDiffLines.length - visibleDiffRows, 0);
   const maxTreeOffset = Math.max(rows.length - visibleTreeRows, 0);
 
@@ -185,14 +215,23 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
   const diffPanelRef = useRef<DOMElement>(null);
   const [diffOffset, setDiffOffset] = useState(0);
   const [treeOffset, setTreeOffset] = useState(0);
-  const [diffHovered, setDiffHovered] = useState(false);
   const [treeHovered, setTreeHovered] = useState(false);
-  const mouseAction = useMouseAction();
+  const [diffHovered, setDiffHovered] = useState(false);
+  const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
 
   const activeSectionIndex = getSectionIndexForLine(sections, diffOffset);
   const activeSection = getSectionForLine(sections, diffOffset);
   const activeFilePath = activeSection?.path ?? '';
   const activeRowIndex = rows.findIndex((row) => row.path === activeFilePath);
+
+  const stateRef = useRef({
+    treeOffset,
+    maxTreeOffset,
+    maxDiffOffset,
+    visibleTreeRows,
+    rows,
+  });
+  stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows};
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
@@ -204,28 +243,6 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
       return ensureVisible(activeRowIndex, clamped, visibleTreeRows);
     });
   }, [activeRowIndex, maxTreeOffset, visibleTreeRows]);
-
-  useEffect(() => {
-    if (mouseAction !== 'scrollup' && mouseAction !== 'scrolldown') {
-      return;
-    }
-
-    if (treeHovered) {
-      setTreeOffset((current) => applyMouseScroll(current, maxTreeOffset, mouseAction));
-      return;
-    }
-
-    if (diffHovered) {
-      setDiffOffset((current) => applyMouseScroll(current, maxDiffOffset, mouseAction));
-    }
-  }, [mouseAction, treeHovered, diffHovered, maxTreeOffset, maxDiffOffset]);
-
-  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
-  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const visibleLineStart = diffOffset + 1;
-  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
-  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
-  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
 
   const jumpToFile = useCallback((filePath: string) => {
     const section = sections.find((entry) => entry.path === filePath);
@@ -240,6 +257,81 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
       setDiffOffset(section.startLine);
     }
   }, [sections]);
+
+  useEffect(() => {
+    const handleScroll = (position: {x: number; y: number}, direction: 'scrollup' | 'scrolldown' | null) => {
+      if (direction !== 'scrollup' && direction !== 'scrolldown') return;
+      const delta = direction === 'scrollup' ? -SCROLL_STEP : SCROLL_STEP;
+
+      const treeBounds = getBounds(treePanelRef);
+      if (isInside(treeBounds, position.x, position.y)) {
+        setTreeOffset((current) => applyScrollDelta(current, stateRef.current.maxTreeOffset, delta));
+        return;
+      }
+
+      const diffBounds = getBounds(diffPanelRef);
+      if (isInside(diffBounds, position.x, position.y)) {
+        setDiffOffset((current) => applyScrollDelta(current, stateRef.current.maxDiffOffset, delta));
+      }
+    };
+
+    mouse.events.on('scroll', handleScroll);
+    return () => mouse.events.off('scroll', handleScroll);
+  }, [mouse]);
+
+  useEffect(() => {
+    const handlePosition = (position: {x: number; y: number}) => {
+      const treeBounds = getBounds(treePanelRef);
+      if (!isInside(treeBounds, position.x, position.y) || !treeBounds) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+        return;
+      }
+
+      const relativeY = position.y - treeBounds.top - 2;
+      if (relativeY < 0 || relativeY >= stateRef.current.visibleTreeRows) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+        return;
+      }
+
+      const rowIndex = stateRef.current.treeOffset + relativeY;
+      if (rowIndex < 0 || rowIndex >= stateRef.current.rows.length) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+        return;
+      }
+
+      setHoveredTreeRow((current) => (current === rowIndex ? current : rowIndex));
+    };
+
+    mouse.events.on('position', handlePosition);
+    return () => mouse.events.off('position', handlePosition);
+  }, [mouse]);
+
+  useEffect(() => {
+    const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
+      if (action !== 'press') return;
+      const treeBounds = getBounds(treePanelRef);
+      if (!isInside(treeBounds, position.x, position.y) || !treeBounds) return;
+
+      const relativeY = position.y - treeBounds.top - 2;
+      if (relativeY < 0 || relativeY >= stateRef.current.visibleTreeRows) return;
+
+      const rowIndex = stateRef.current.treeOffset + relativeY;
+      const row = stateRef.current.rows[rowIndex];
+      if (row && row.kind === 'file') {
+        jumpToFile(row.path);
+      }
+    };
+
+    mouse.events.on('click', handleClick);
+    return () => mouse.events.off('click', handleClick);
+  }, [mouse, jumpToFile]);
+
+  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
+  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
+  const visibleLineStart = diffOffset + 1;
+  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
+  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
+  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
 
   useInput((input, key) => {
     if (key.downArrow) {
@@ -314,12 +406,12 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
             <Text color="cyan">Changed files</Text>
             <Text color="gray">{treeRowStart}-{treeRowEnd}/{rows.length}</Text>
           </Box>
-          {visibleRows.map((row) => (
+          {visibleRows.map((row, index) => (
             <TreeFileRow
               key={row.path}
               row={row}
               selected={row.kind === 'file' && row.path === activeFilePath}
-              onSelect={jumpToFile}
+              hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
             />
           ))}
         </TreePane>
@@ -342,7 +434,7 @@ function AppContent({base, branch, sections, branchMetrics, dimensions}: AppProp
           )}
           {visibleDiffLines.map((line, index) => (
             <Text key={`${diffOffset}-${index}`}>
-              {truncateAnsi(line || ' ', diffContentWidth) || ' '}
+              {line || ' '}
             </Text>
           ))}
         </DiffPane>

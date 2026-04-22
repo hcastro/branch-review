@@ -32,10 +32,11 @@ export function truncateAnsi(line: string, maxWidth: number) {
   let visible = 0;
   const parts = line.split(ANSI_SGR_TOKEN);
 
-  for (const part of parts) {
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
     if (!part) continue;
 
-    if (part.startsWith('[')) {
+    if (i % 2 === 1) {
       output += part;
       continue;
     }
@@ -54,6 +55,78 @@ export function truncateAnsi(line: string, maxWidth: number) {
   }
 
   return output + RESET;
+}
+
+export function wrapAnsi(line: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) {
+    return [''];
+  }
+
+  const parts = line.split(ANSI_SGR_TOKEN);
+  const result: string[] = [];
+  let current = '';
+  let visible = 0;
+  let activeStyle = '';
+
+  const flush = () => {
+    if (visible === 0 && current.length === 0) return;
+    result.push(current + RESET);
+    current = activeStyle;
+    visible = 0;
+  };
+
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+
+    if (i % 2 === 1) {
+      current += part;
+      activeStyle = part === RESET ? '' : activeStyle + part;
+      continue;
+    }
+
+    let remaining = part;
+    while (remaining.length > 0) {
+      const budget = maxWidth - visible;
+      if (budget <= 0) {
+        flush();
+        continue;
+      }
+
+      const chunk = remaining.slice(0, budget);
+      current += chunk;
+      visible += chunk.length;
+      remaining = remaining.slice(budget);
+    }
+  }
+
+  if (current.length > 0 || visible > 0) {
+    result.push(current + RESET);
+  }
+
+  if (result.length === 0) {
+    result.push('');
+  }
+
+  return result;
+}
+
+export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
+  let cursor = 0;
+  return sections.map((section) => {
+    const wrappedLines = section.lines.flatMap((line) => wrapAnsi(line, maxWidth));
+    const startLine = cursor;
+    const endLineExclusive = cursor + wrappedLines.length;
+    cursor = endLineExclusive;
+
+    return {
+      path: section.path,
+      metrics: section.metrics,
+      lines: wrappedLines,
+      startLine,
+      endLineExclusive,
+    };
+  });
 }
 
 function cyan(text: string) {
