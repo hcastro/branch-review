@@ -60,6 +60,23 @@ describe('section helpers', () => {
     }
   });
 
+  it('drops non-SGR CSI sequences so they cannot overwrite the pane border', () => {
+    // Delta's --line-fill-method=ansi emits \x1B[K (Erase in Line). If it
+    // leaks through, the terminal interprets it and overwrites whatever is
+    // drawn to the right of the content - specifically the pane border.
+    const withEraseEol = '\x1B[32mhi\x1B[K\x1B[0m';
+
+    const wrapped = wrapAnsi(withEraseEol, 10);
+    for (const piece of wrapped) {
+      expect(piece).not.toContain('\x1B[K');
+    }
+    expect(stripAnsi(wrapped.join(''))).toBe('hi');
+
+    const truncated = truncateAnsi(withEraseEol, 10);
+    expect(truncated).not.toContain('\x1B[K');
+    expect(stripAnsi(truncated)).toBe('hi');
+  });
+
   it('rewraps sections and recomputes line boundaries across wrapped lines', () => {
     const base = buildDiffSections([
       {

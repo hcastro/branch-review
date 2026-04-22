@@ -20,7 +20,7 @@ export type DiffSection = {
   endLineExclusive: number;
 };
 
-const ANSI_SGR_TOKEN = /(\[[0-9;]*m)/;
+const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
 const RESET = '[0m';
 
 export function truncateAnsi(line: string, maxWidth: number) {
@@ -30,14 +30,16 @@ export function truncateAnsi(line: string, maxWidth: number) {
 
   let output = '';
   let visible = 0;
-  const parts = line.split(ANSI_SGR_TOKEN);
+  const parts = line.split(ANSI_CSI_TOKEN);
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (!part) continue;
 
     if (i % 2 === 1) {
-      output += part;
+      if (part.endsWith('m')) {
+        output += part;
+      }
       continue;
     }
 
@@ -62,7 +64,7 @@ export function wrapAnsi(line: string, maxWidth: number): string[] {
     return [''];
   }
 
-  const parts = line.split(ANSI_SGR_TOKEN);
+  const parts = line.split(ANSI_CSI_TOKEN);
   const result: string[] = [];
   let current = '';
   let visible = 0;
@@ -80,6 +82,9 @@ export function wrapAnsi(line: string, maxWidth: number): string[] {
     if (!part) continue;
 
     if (i % 2 === 1) {
+      if (!part.endsWith('m')) {
+        continue;
+      }
       current += part;
       activeStyle = part === RESET ? '' : activeStyle + part;
       continue;
