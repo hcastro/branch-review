@@ -9,7 +9,6 @@ import {buildTreeRows, type TreeRow} from '../tree.js';
 import {
   flattenSectionLines,
   formatMetrics,
-  getSectionForLine,
   getSectionIndexForLine,
   padToWidth,
   truncateAnsi,
@@ -28,6 +27,7 @@ type AppProps = {
 };
 
 const SCROLL_STEP = 3;
+const DIFF_PANE_PADDING_X = 2;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max));
@@ -67,6 +67,25 @@ function ensureVisible(index: number, currentOffset: number, viewportSize: numbe
   }
 
   return currentOffset;
+}
+
+function getDominantSectionIndex(sections: DiffSection[], startLine: number, endLineExclusive: number) {
+  if (sections.length === 0) {
+    return -1;
+  }
+
+  let bestIndex = getSectionIndexForLine(sections, startLine);
+  let bestOverlap = -1;
+
+  for (const [index, section] of sections.entries()) {
+    const overlap = Math.min(endLineExclusive, section.endLineExclusive) - Math.max(startLine, section.startLine);
+    if (overlap > bestOverlap) {
+      bestIndex = index;
+      bestOverlap = overlap;
+    }
+  }
+
+  return bestIndex;
 }
 
 function getBounds(ref: React.RefObject<DOMElement>) {
@@ -182,7 +201,7 @@ function DiffPane({
       flexShrink={0}
       borderStyle="round"
       borderColor={hovered ? 'cyan' : 'gray'}
-      paddingX={1}
+      paddingX={DIFF_PANE_PADDING_X}
     >
       {children}
     </Box>
@@ -208,7 +227,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
 
   const leftWidth = Math.max(34, Math.floor(columns * 0.27));
   const rightWidth = Math.max(78, columns - leftWidth - 4);
-  const diffContentWidth = Math.max(1, rightWidth - 4);
+  const diffContentWidth = Math.max(1, rightWidth - 2 - DIFF_PANE_PADDING_X * 2);
   const contentHeight = Math.max(terminalRows - 9, 10);
   // Pane overhead: 2 borders + header rows.
   // Tree has 1 header row; diff has 2 (filename + metrics).
@@ -235,8 +254,8 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
   const [diffHovered, setDiffHovered] = useState(false);
   const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
 
-  const activeSectionIndex = getSectionIndexForLine(sections, diffOffset);
-  const activeSection = getSectionForLine(sections, diffOffset);
+  const activeSectionIndex = getDominantSectionIndex(sections, diffOffset, diffOffset + visibleDiffRows);
+  const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
   const activeRowIndex = rows.findIndex((row) => row.path === activeFilePath);
 
