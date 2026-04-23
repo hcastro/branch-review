@@ -175,17 +175,6 @@ pnpm link --global
 branch-review
 ```
 
-## Roadmap ideas
-
-- search within tree and diff
-- hunk navigation
-- file status badges
-- staged / unstaged modes
-- configurable themes and defaults
-- open current file in editor
-- export diff summary for AI tools
-- managed `git-delta` installation or packaging
-
 ## License
 
 MIT © hcastro
