@@ -11,6 +11,14 @@ function runGit(cwd: string, args: string[]) {
   }).trimEnd();
 }
 
+function tryRunGit(cwd: string, args: string[]) {
+  try {
+    return runGit(cwd, args);
+  } catch {
+    return null;
+  }
+}
+
 function hasRef(cwd: string, ref: string) {
   try {
     runGit(cwd, ['rev-parse', '--verify', '--quiet', ref]);
@@ -39,6 +47,30 @@ function resolveRef(cwd: string, requested: string) {
   if (hasRef(cwd, requested)) return requested;
   if (hasRef(cwd, `origin/${requested}`)) return `origin/${requested}`;
   return null;
+}
+
+export function inferBaseRef(cwd: string) {
+  const originHead = tryRunGit(cwd, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+  if (originHead && hasRef(cwd, originHead)) {
+    return originHead;
+  }
+
+  for (const candidate of ['development', 'main', 'master', 'trunk']) {
+    const resolved = resolveRef(cwd, candidate);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  const currentBranch = tryRunGit(cwd, ['branch', '--show-current']);
+  if (currentBranch) {
+    const resolved = resolveRef(cwd, currentBranch);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  throw new Error('Could not infer a base ref. Pass one explicitly, for example: branch-review HEAD main');
 }
 
 export function resolveRefs(cwd: string, requestedBranch: string, requestedBase: string): DiffRange {

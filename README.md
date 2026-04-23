@@ -49,10 +49,12 @@ pnpm add  -g github:hcastro/branch-review-cli
 Run inside any git repository:
 
 ```sh
-branch-review                      # HEAD vs development
-branch-review my-feature           # my-feature vs development
+branch-review                      # HEAD vs the detected base branch
+branch-review my-feature           # my-feature vs the detected base branch
 branch-review my-feature main      # my-feature vs main
 ```
+
+When you do not pass a base ref, the CLI uses `origin/HEAD` when available, then falls back to common base branch names such as `development`, `main`, `master`, and `trunk`.
 
 Both refs are resolved against local branches first, then `origin/<ref>`, so you can point at remote-only branches without checking them out.
 

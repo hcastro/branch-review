@@ -8,6 +8,7 @@ import {
   getChangedFiles,
   getColoredFileDiff,
   getFileMetricsMap,
+  inferBaseRef,
   getUntrackedFiles,
   resolveRefs,
 } from './git.js';
@@ -16,7 +17,7 @@ EventEmitter.defaultMaxListeners = 100;
 
 const cwd = process.cwd();
 const requestedBranch = process.argv[2] ?? 'HEAD';
-const requestedBase = process.argv[3] ?? 'development';
+const requestedBase = process.argv[3] ?? inferBaseRef(cwd);
 const range = resolveRefs(cwd, requestedBranch, requestedBase);
 const files = getChangedFiles(cwd, range);
 
