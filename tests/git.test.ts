@@ -23,7 +23,7 @@ function runGit(cwd: string, ...args: string[]) {
 }
 
 function createRepo(baseBranch = 'development') {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-cli-'));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-'));
   tempDirs.push(cwd);
 
   runGit(cwd, 'init', '-b', baseBranch);
@@ -127,7 +127,7 @@ describe('git helpers', () => {
   });
 
   it('prefers origin HEAD when a remote default branch is configured', () => {
-    const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-cli-remote-'));
+    const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-remote-'));
     tempDirs.push(remote);
     runGit(remote, 'init', '--bare', '--initial-branch', 'main');
 
