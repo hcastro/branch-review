@@ -120,12 +120,21 @@ function buildPlainPrefix(prefix: string): StyledCell[] {
   return [...prefix].map((char) => ({char, style: ''}));
 }
 
+function stripNonSgrCsi(line: string): string {
+  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, (match) => (match.endsWith('m') ? match : ''));
+}
+
 export function truncateAnsi(line: string, maxWidth: number) {
   if (maxWidth <= 0) {
     return RESET;
   }
 
-  const cells = toStyledCells(line);
+  const cleaned = stripNonSgrCsi(line);
+  if (visibleWidth(cleaned) <= maxWidth) {
+    return cleaned;
+  }
+
+  const cells = toStyledCells(cleaned);
   return renderStyledCells(cells.slice(0, maxWidth));
 }
 
@@ -152,7 +161,12 @@ export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''
     return [''];
   }
 
-  const cells = toStyledCells(line);
+  const cleaned = stripNonSgrCsi(line);
+  if (visibleWidth(cleaned) <= maxWidth) {
+    return [cleaned];
+  }
+
+  const cells = toStyledCells(cleaned);
   if (cells.length === 0) {
     return [''];
   }

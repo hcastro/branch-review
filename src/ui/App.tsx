@@ -9,6 +9,9 @@ import {buildTreeRows, type TreeRow} from '../tree.js';
 import {
   flattenSectionLines,
   formatMetrics,
+  frameBottomBorder,
+  frameLine,
+  frameTopBorder,
   getSectionIndexForLine,
   padToWidth,
   truncateAnsi,
@@ -199,9 +202,6 @@ function DiffPane({
       height={height}
       flexDirection="column"
       flexShrink={0}
-      borderStyle="round"
-      borderColor={hovered ? 'cyan' : 'gray'}
-      paddingX={DIFF_PANE_PADDING_X}
     >
       {children}
     </Box>
@@ -227,7 +227,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
 
   const leftWidth = Math.max(34, Math.floor(columns * 0.27));
   const rightWidth = Math.max(78, columns - leftWidth - 4);
-  const diffContentWidth = Math.max(1, rightWidth - 2 - DIFF_PANE_PADDING_X * 2);
+  const diffContentWidth = Math.max(1, rightWidth - 4);
   const contentHeight = Math.max(terminalRows - 9, 10);
   // Pane overhead: 2 borders + header rows.
   // Tree has 1 header row; diff has 2 (filename + metrics).
@@ -459,7 +459,8 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
           setHovered={setDiffHovered}
         >
           {(() => {
-            const inner = diffContentWidth;
+            const borderAnsi = diffHovered ? ANSI_CYAN : ANSI_GRAY;
+            const inner = Math.max(1, rightWidth - 4);
 
             const fileLabel = `${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
 
@@ -470,19 +471,19 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, dimensi
             const counterWidth = visibleWidth(counter);
             const metricsWidth = visibleWidth(metricsCore);
             const gap = Math.max(1, inner - metricsWidth - counterWidth);
-            const metricsRow = padToWidth(`${metricsCore}${' '.repeat(gap)}${counter}`, inner);
+            const metricsRow = `${metricsCore}${' '.repeat(gap)}${counter}`;
 
-            return (
-              <>
-                <Text>{padToWidth(truncateAnsi(fileLabel, inner), inner)}</Text>
-                <Text>{metricsRow}</Text>
-                {visibleDiffLines.map((line, i) => (
-                  <Text key={`diff-${i}`}>
-                    {padToWidth(truncateAnsi(line || ' ', inner), inner)}
-                  </Text>
-                ))}
-              </>
-            );
+            const rows: string[] = [
+              frameTopBorder(rightWidth, borderAnsi),
+              frameLine(fileLabel, inner, borderAnsi),
+              frameLine(metricsRow, inner, borderAnsi),
+            ];
+            for (const line of visibleDiffLines) {
+              rows.push(frameLine(line || ' ', inner, borderAnsi));
+            }
+            rows.push(frameBottomBorder(rightWidth, borderAnsi));
+
+            return rows.map((row, i) => <Text key={`diff-${i}`}>{row}</Text>);
           })()}
         </DiffPane>
       </Box>
