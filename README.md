@@ -2,6 +2,8 @@
 
 Review your branch like a pull request before you push it.
 
+![branch-review terminal UI screenshot](assets/branch-review-screenshot.png)
+
 `branch-review` is a terminal UI for doing a focused, local review of your Git changes. It is built for developers who live in the terminal and want a cleaner final review pass than raw `git diff`, without switching to GitHub or using a full Git dashboard.
 
 It is especially useful when AI agents made a lot of edits and you want a fast human pass over exactly what changed.
@@ -37,10 +39,6 @@ If you want to stage files, manage stashes, rebase, cherry-pick, and do general 
 `branch-review` is focused on one job:
 
 **reading and reviewing changes well before push or PR creation.**
-
-## Screenshot
-
-_Add a screenshot or GIF here._
 
 ## Requirements
 
