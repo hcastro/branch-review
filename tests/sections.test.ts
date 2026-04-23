@@ -6,6 +6,7 @@ import {
   formatMetrics,
   getSectionForLine,
   getSectionIndexForLine,
+  getContinuationPrefix,
   truncateAnsi,
   wrapAnsi,
   wrapSections,
@@ -58,6 +59,42 @@ describe('section helpers', () => {
     for (const piece of wrapped) {
       expect(piece.endsWith('[0m')).toBe(true);
     }
+  });
+
+  it('prefers whitespace boundaries so prose wraps by word when possible', () => {
+    const line = '[32mThe point of this plan[0m';
+    const wrapped = wrapAnsi(line, 10);
+
+    expect(wrapped.map(stripAnsi)).toEqual(['The point ', 'of this ', 'plan']);
+    expect(stripAnsi(wrapped.join(''))).toBe('The point of this plan');
+  });
+
+  it('falls back to hard splits when a single token is wider than the pane', () => {
+    const line = '[32msupercalifragilistic[0m';
+    const wrapped = wrapAnsi(line, 5);
+
+    expect(wrapped.map(stripAnsi)).toEqual(['super', 'calif', 'ragil', 'istic']);
+  });
+
+  it('detects hanging indents for guttered and bullet-prefixed lines', () => {
+    expect(getContinuationPrefix('  1 ⋮  1 │ const x = 1;')).toBe(' '.repeat(11));
+    expect(getContinuationPrefix('• path/to/file.md:12: The point of this plan')).toBe('  ');
+  });
+
+  it('adds a hanging indent to continuation lines when wrapping prose with prefixes', () => {
+    const wrapped = wrapAnsi(
+      '• path/to/file.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+      44,
+      '  ',
+    );
+
+    const plain = wrapped.map(stripAnsi);
+    expect(plain[0]).toBe('• path/to/file.md:12: The point of this ');
+    expect(plain[1]?.startsWith('  ')).toBe(true);
+    expect(plain[2]?.startsWith('  ')).toBe(true);
+    expect([plain[0], ...plain.slice(1).map((line) => line.trimStart())].join('')).toBe(
+      '• path/to/file.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+    );
   });
 
   it('drops non-SGR CSI sequences so they cannot overwrite the pane border', () => {

@@ -23,61 +23,17 @@ export type DiffSection = {
 const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
 const RESET = '[0m';
 
-export function truncateAnsi(line: string, maxWidth: number) {
-  if (maxWidth <= 0) {
-    return RESET;
-  }
+type StyledCell = {
+  char: string;
+  style: string;
+};
 
-  let output = '';
-  let visible = 0;
+function toStyledCells(line: string): StyledCell[] {
   const parts = line.split(ANSI_CSI_TOKEN);
-
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (!part) continue;
-
-    if (i % 2 === 1) {
-      if (part.endsWith('m')) {
-        output += part;
-      }
-      continue;
-    }
-
-    const remaining = maxWidth - visible;
-    if (remaining <= 0) break;
-
-    if (part.length <= remaining) {
-      output += part;
-      visible += part.length;
-    } else {
-      output += part.slice(0, remaining);
-      visible += remaining;
-      break;
-    }
-  }
-
-  return output + RESET;
-}
-
-export function wrapAnsi(line: string, maxWidth: number): string[] {
-  if (maxWidth <= 0) {
-    return [''];
-  }
-
-  const parts = line.split(ANSI_CSI_TOKEN);
-  const result: string[] = [];
-  let current = '';
-  let visible = 0;
+  const cells: StyledCell[] = [];
   let activeStyle = '';
 
-  const flush = () => {
-    if (visible === 0 && current.length === 0) return;
-    result.push(current + RESET);
-    current = activeStyle;
-    visible = 0;
-  };
-
-  for (let i = 0; i < parts.length; i++) {
+  for (let i = 0; i < parts.length; i += 1) {
     const part = parts[i];
     if (!part) continue;
 
@@ -85,35 +41,187 @@ export function wrapAnsi(line: string, maxWidth: number): string[] {
       if (!part.endsWith('m')) {
         continue;
       }
-      current += part;
+
       activeStyle = part === RESET ? '' : activeStyle + part;
       continue;
     }
 
-    let remaining = part;
+    for (let index = 0; index < part.length; index += 1) {
+      cells.push({char: part[index], style: activeStyle});
+    }
+  }
+
+  return cells;
+}
+
+function renderStyledCells(cells: StyledCell[]): string {
+  if (cells.length === 0) {
+    return RESET;
+  }
+
+  let output = '';
+  let currentStyle = '';
+
+  for (const cell of cells) {
+    if (cell.style !== currentStyle) {
+      if (currentStyle) {
+        output += RESET;
+      }
+
+      if (cell.style) {
+        output += cell.style;
+      }
+
+      currentStyle = cell.style;
+    }
+
+    output += cell.char;
+  }
+
+  return output + RESET;
+}
+
+function isWhitespace(char: string) {
+  return /\s/.test(char);
+}
+
+function tokenizeCells(cells: StyledCell[]) {
+  const tokens: Array<{start: number; end: number}> = [];
+  let index = 0;
+
+  while (index < cells.length) {
+    const start = index;
+
+    while (index < cells.length && isWhitespace(cells[index].char)) {
+      index += 1;
+    }
+
+    if (index === cells.length) {
+      tokens.push({start, end: index});
+      break;
+    }
+
+    while (index < cells.length && !isWhitespace(cells[index].char)) {
+      index += 1;
+    }
+
+    while (index < cells.length && isWhitespace(cells[index].char)) {
+      index += 1;
+    }
+
+    tokens.push({start, end: index});
+  }
+
+  return tokens;
+}
+
+function buildPlainPrefix(prefix: string): StyledCell[] {
+  return [...prefix].map((char) => ({char, style: ''}));
+}
+
+export function truncateAnsi(line: string, maxWidth: number) {
+  if (maxWidth <= 0) {
+    return RESET;
+  }
+
+  const cells = toStyledCells(line);
+  return renderStyledCells(cells.slice(0, maxWidth));
+}
+
+export function getContinuationPrefix(line: string): string {
+  const plain = line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+  const gutterIndex = plain.indexOf('│ ');
+
+  if (gutterIndex >= 0) {
+    return ' '.repeat(gutterIndex + 2);
+  }
+
+  const bulletMatch = plain.match(/^(\s*(?:[+\-•])\s+)/);
+  if (bulletMatch) {
+    return ' '.repeat(bulletMatch[1].length);
+  }
+
+  const indentMatch = plain.match(/^(\s+)/);
+  return indentMatch?.[1] ?? '';
+}
+
+export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''): string[] {
+  if (maxWidth <= 0) {
+    return [''];
+  }
+
+  const cells = toStyledCells(line);
+  if (cells.length === 0) {
+    return [''];
+  }
+
+  const rawPrefixCells = buildPlainPrefix(continuationPrefix);
+  const prefixCells = rawPrefixCells.length < maxWidth ? rawPrefixCells : [];
+  const prefixWidth = prefixCells.length;
+  const tokens = tokenizeCells(cells);
+  const result: StyledCell[][] = [];
+  let currentLine: StyledCell[] = [];
+  let currentWidth = 0;
+  let continuation = false;
+
+  const flush = () => {
+    if (currentLine.length === 0) {
+      return;
+    }
+
+    result.push(currentLine);
+    continuation = true;
+    currentLine = prefixCells.map((cell) => ({...cell}));
+    currentWidth = prefixWidth;
+  };
+
+  const appendCells = (input: StyledCell[]) => {
+    currentLine.push(...input);
+    currentWidth += input.length;
+  };
+
+  const lineHasContent = () => currentWidth > (continuation ? prefixWidth : 0);
+
+  for (const token of tokens) {
+    let remaining = cells.slice(token.start, token.end);
+
     while (remaining.length > 0) {
-      const budget = maxWidth - visible;
-      if (budget <= 0) {
+      const available = maxWidth - currentWidth;
+
+      if (available <= 0) {
         flush();
         continue;
       }
 
-      const chunk = remaining.slice(0, budget);
-      current += chunk;
-      visible += chunk.length;
-      remaining = remaining.slice(budget);
+      if (remaining.length <= available) {
+        appendCells(remaining);
+        remaining = [];
+        continue;
+      }
+
+      if (lineHasContent()) {
+        flush();
+        continue;
+      }
+
+      appendCells(remaining.slice(0, available));
+      remaining = remaining.slice(available);
+
+      if (remaining.length > 0) {
+        flush();
+      }
     }
   }
 
-  if (current.length > 0 || visible > 0) {
-    result.push(current + RESET);
+  if (currentLine.length > 0) {
+    result.push(currentLine);
   }
 
   if (result.length === 0) {
-    result.push('');
+    return [''];
   }
 
-  return result;
+  return result.map((lineCells) => renderStyledCells(lineCells));
 }
 
 export function visibleWidth(line: string): number {
@@ -149,7 +257,7 @@ export function frameBottomBorder(paneWidth: number, borderAnsi: string): string
 export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {
-    const wrappedLines = section.lines.flatMap((line) => wrapAnsi(line, maxWidth));
+    const wrappedLines = section.lines.flatMap((line) => wrapAnsi(line, maxWidth, getContinuationPrefix(line)));
     const startLine = cursor;
     const endLineExclusive = cursor + wrappedLines.length;
     cursor = endLineExclusive;
