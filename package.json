@@ -1,5 +1,5 @@
 {
-  "name": "@hcastro/branch-review-cli",
+  "name": "branch-review",
   "version": "0.1.0",
   "description": "Interactive terminal UI for reviewing a git branch diff against a base ref, powered by Ink and git-delta.",
   "keywords": [
@@ -16,18 +16,17 @@
   ],
   "author": "hcastro",
   "license": "MIT",
-  "homepage": "https://github.com/hcastro/branch-review-cli#readme",
+  "homepage": "https://github.com/hcastro/branch-review#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hcastro/branch-review-cli.git"
+    "url": "git+https://github.com/hcastro/branch-review.git"
   },
   "bugs": {
-    "url": "https://github.com/hcastro/branch-review-cli/issues"
+    "url": "https://github.com/hcastro/branch-review/issues"
   },
   "type": "module",
   "bin": {
-    "branch-review": "dist/cli.js",
-    "branch_review": "dist/cli.js"
+    "branch-review": "dist/cli.js"
   },
   "files": [
     "dist",

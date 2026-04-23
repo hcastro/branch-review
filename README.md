@@ -1,4 +1,4 @@
-# branch-review-cli
+# branch-review
 
 An interactive terminal UI for reviewing a git branch's diff against a base ref. Built with [Ink](https://github.com/vadimdemedes/ink) and rendered through [git-delta](https://github.com/dandavison/delta) for syntax-highlighted hunks.
 
@@ -23,21 +23,21 @@ brew install git-delta
 ### Global (recommended)
 
 ```sh
-pnpm add -g @hcastro/branch-review-cli
+pnpm add -g branch-review
 ```
 
-This exposes two equivalent binaries: `branch-review` and `branch_review`.
+This exposes the `branch-review` binary.
 
 ### One-off with `pnpm dlx`
 
 ```sh
-pnpm dlx @hcastro/branch-review-cli
+pnpm dlx branch-review
 ```
 
 ### Directly from GitHub
 
 ```sh
-pnpm add -g github:hcastro/branch-review-cli
+pnpm add -g github:hcastro/branch-review
 ```
 
 ## Usage
