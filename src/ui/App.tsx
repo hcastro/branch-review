@@ -209,6 +209,7 @@ function DiffPane({
 }
 
 const ANSI_CYAN_BRIGHT_BOLD = '[96;1m';
+const ANSI_CYAN = '[36m';
 const ANSI_GRAY = '[90m';
 const ANSI_RESET = '[0m';
 

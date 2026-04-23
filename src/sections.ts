@@ -134,8 +134,31 @@ export function truncateAnsi(line: string, maxWidth: number) {
     return cleaned;
   }
 
-  const cells = toStyledCells(cleaned);
-  return renderStyledCells(cells.slice(0, maxWidth));
+  const parts = cleaned.split(ANSI_CSI_TOKEN);
+  let output = '';
+  let visible = 0;
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (!part) continue;
+
+    if (i % 2 === 1) {
+      if (part.endsWith('m')) {
+        output += part;
+      }
+      continue;
+    }
+
+    for (const ch of part) {
+      if (visible >= maxWidth) {
+        return output + RESET;
+      }
+      output += ch;
+      visible += 1;
+    }
+  }
+
+  return output + RESET;
 }
 
 export function getContinuationPrefix(line: string): string {
@@ -156,6 +179,102 @@ export function getContinuationPrefix(line: string): string {
   return indentMatch?.[1] ?? '';
 }
 
+type AnsiSegment = {text: string; visible: number};
+
+function segmentize(line: string): AnsiSegment[] {
+  const parts = line.split(ANSI_CSI_TOKEN);
+  const segments: AnsiSegment[] = [];
+  let text = '';
+  let visible = 0;
+  let prevWasWhitespace = true;
+
+  const commit = () => {
+    if (text === '' && visible === 0) return;
+    segments.push({text, visible});
+    text = '';
+    visible = 0;
+  };
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (!part) continue;
+
+    if (i % 2 === 1) {
+      if (!part.endsWith('m')) continue;
+      text += part;
+      continue;
+    }
+
+    for (const ch of part) {
+      const isWs = /\s/.test(ch);
+      if (!isWs && prevWasWhitespace && visible > 0) {
+        commit();
+      }
+      text += ch;
+      visible += 1;
+      prevWasWhitespace = isWs;
+    }
+  }
+
+  commit();
+  return segments;
+}
+
+function takeVisible(
+  segment: AnsiSegment,
+  amount: number,
+): {head: AnsiSegment; tail: AnsiSegment} {
+  if (amount >= segment.visible) {
+    return {head: segment, tail: {text: '', visible: 0}};
+  }
+
+  const parts = segment.text.split(ANSI_CSI_TOKEN);
+  let headText = '';
+  let tailText = '';
+  let taken = 0;
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (!part) continue;
+
+    if (i % 2 === 1) {
+      if (!part.endsWith('m')) continue;
+      if (taken < amount) {
+        headText += part;
+      } else {
+        tailText += part;
+      }
+      continue;
+    }
+
+    for (const ch of part) {
+      if (taken < amount) {
+        headText += ch;
+        taken += 1;
+      } else {
+        tailText += ch;
+      }
+    }
+  }
+
+  return {
+    head: {text: headText, visible: amount},
+    tail: {text: tailText, visible: segment.visible - amount},
+  };
+}
+
+function updateActiveStyle(segmentText: string, activeStyle: string): string {
+  const parts = segmentText.split(ANSI_CSI_TOKEN);
+  let next = activeStyle;
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (i % 2 === 1 && part && part.endsWith('m')) {
+      next = part === RESET ? '' : next + part;
+    }
+  }
+  return next;
+}
+
 export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''): string[] {
   if (maxWidth <= 0) {
     return [''];
@@ -166,79 +285,73 @@ export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''
     return [cleaned];
   }
 
-  const cells = toStyledCells(cleaned);
-  if (cells.length === 0) {
-    return [''];
-  }
+  const safePrefix = continuationPrefix && continuationPrefix.length < maxWidth ? continuationPrefix : '';
+  const prefixWidth = safePrefix.length;
+  const segments = segmentize(cleaned);
 
-  const rawPrefixCells = buildPlainPrefix(continuationPrefix);
-  const prefixCells = rawPrefixCells.length < maxWidth ? rawPrefixCells : [];
-  const prefixWidth = prefixCells.length;
-  const tokens = tokenizeCells(cells);
-  const result: StyledCell[][] = [];
-  let currentLine: StyledCell[] = [];
-  let currentWidth = 0;
-  let continuation = false;
+  const result: string[] = [];
+  let lineText = '';
+  let lineVisible = 0;
+  let activeStyle = '';
 
-  const flush = () => {
-    if (currentLine.length === 0) {
-      return;
+  const flushLine = () => {
+    if (lineText === '' && lineVisible === 0) return;
+    result.push(lineText + RESET);
+    lineText = safePrefix + activeStyle;
+    lineVisible = prefixWidth;
+  };
+
+  for (const segment of segments) {
+    if (segment.visible === 0) {
+      lineText += segment.text;
+      activeStyle = updateActiveStyle(segment.text, activeStyle);
+      continue;
     }
 
-    result.push(currentLine);
-    continuation = true;
-    currentLine = prefixCells.map((cell) => ({...cell}));
-    currentWidth = prefixWidth;
-  };
+    if (lineVisible + segment.visible <= maxWidth) {
+      lineText += segment.text;
+      lineVisible += segment.visible;
+      activeStyle = updateActiveStyle(segment.text, activeStyle);
+      continue;
+    }
 
-  const appendCells = (input: StyledCell[]) => {
-    currentLine.push(...input);
-    currentWidth += input.length;
-  };
+    if (lineVisible > prefixWidth && segment.visible <= maxWidth - prefixWidth) {
+      flushLine();
+      lineText += segment.text;
+      lineVisible += segment.visible;
+      activeStyle = updateActiveStyle(segment.text, activeStyle);
+      continue;
+    }
 
-  const lineHasContent = () => currentWidth > (continuation ? prefixWidth : 0);
-
-  for (const token of tokens) {
-    let remaining = cells.slice(token.start, token.end);
-
-    while (remaining.length > 0) {
-      const available = maxWidth - currentWidth;
-
+    let remaining = segment;
+    while (remaining.visible > 0) {
+      const available = maxWidth - lineVisible;
       if (available <= 0) {
-        flush();
+        flushLine();
         continue;
       }
 
-      if (remaining.length <= available) {
-        appendCells(remaining);
-        remaining = [];
-        continue;
-      }
+      const {head, tail} = takeVisible(remaining, available);
+      lineText += head.text;
+      lineVisible += head.visible;
+      activeStyle = updateActiveStyle(head.text, activeStyle);
+      remaining = tail;
 
-      const nextLineAvailable = maxWidth - prefixWidth;
-      if (lineHasContent() && remaining.length <= nextLineAvailable) {
-        flush();
-        continue;
-      }
-
-      appendCells(remaining.slice(0, available));
-      remaining = remaining.slice(available);
-
-      if (remaining.length > 0) {
-        flush();
+      if (remaining.visible > 0) {
+        flushLine();
       }
     }
   }
 
-  if (currentLine.length > 0) {
-    result.push(currentLine);
+  if (lineVisible > 0 || (lineText !== '' && result.length === 0)) {
+    result.push(lineText + RESET);
   }
 
   if (result.length === 0) {
     return [''];
   }
 
-  return result.map((lineCells) => renderStyledCells(lineCells));
+  return result;
 }
 
 export function visibleWidth(line: string): number {
