@@ -23,25 +23,21 @@ brew install git-delta
 ### Global (recommended)
 
 ```sh
-npm  install -g @hcastro/branch-review-cli
-pnpm add  -g @hcastro/branch-review-cli
-yarn global add @hcastro/branch-review-cli
+pnpm add -g @hcastro/branch-review-cli
 ```
 
 This exposes two equivalent binaries: `branch-review` and `branch_review`.
 
-### One-off with `npx` / `pnpm dlx`
+### One-off with `pnpm dlx`
 
 ```sh
-npx  @hcastro/branch-review-cli
 pnpm dlx @hcastro/branch-review-cli
 ```
 
 ### Directly from GitHub
 
 ```sh
-npm  install -g github:hcastro/branch-review-cli
-pnpm add  -g github:hcastro/branch-review-cli
+pnpm add -g github:hcastro/branch-review-cli
 ```
 
 ## Usage
@@ -73,17 +69,17 @@ Both refs are resolved against local branches first, then `origin/<ref>`, so you
 ## Development
 
 ```sh
-npm install
-npm run dev         # run from source with tsx
-npm run build       # bundle to dist/ with tsup
-npm test            # vitest
+pnpm install
+pnpm dev           # run from source with tsx
+pnpm build         # bundle to dist/ with tsup
+pnpm test          # vitest
 ```
 
 To try a local build as a global command:
 
 ```sh
-npm run build
-npm link
+pnpm build
+pnpm link --global
 branch-review
 ```
 
