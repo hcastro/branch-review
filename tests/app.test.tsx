@@ -66,4 +66,32 @@ describe('App', () => {
 
     instance.unmount();
   });
+
+  it('renders wrapped diff lines with a hanging indent for continuation rows', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'notes.md',
+        metrics: {path: 'notes.md', additions: 1, deletions: 0, changedLines: 1},
+        diff: '• path/to/file.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 100, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame());
+    expect(frame).toContain('• path/to/file.md:12: The point');
+    expect(frame).toContain('  Stream problem at once.');
+
+    instance.unmount();
+  });
 });
