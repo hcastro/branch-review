@@ -4,6 +4,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {afterEach, describe, expect, it} from 'vitest';
 import {
+  inferBaseRef,
   getBranchMetrics,
   getChangedFiles,
   getFileMetricsMap,
@@ -21,11 +22,11 @@ function runGit(cwd: string, ...args: string[]) {
   }).trim();
 }
 
-function createRepo() {
+function createRepo(baseBranch = 'development') {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-cli-'));
   tempDirs.push(cwd);
 
-  runGit(cwd, 'init', '-b', 'development');
+  runGit(cwd, 'init', '-b', baseBranch);
   runGit(cwd, 'config', 'user.name', 'Test User');
   runGit(cwd, 'config', 'user.email', 'test@example.com');
 
@@ -109,5 +110,34 @@ describe('git helpers', () => {
     });
     expect(metricsMap.get('staged.ts')).toMatchObject({additions: 1, deletions: 0});
     expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 3, deletions: 1});
+  });
+
+  it('infers main when development is not present', () => {
+    const cwd = createRepo('main');
+
+    expect(inferBaseRef(cwd)).toBe('main');
+
+    const range = resolveRefs(cwd, 'feature/example', inferBaseRef(cwd));
+    expect(range).toMatchObject({
+      base: 'main',
+      branch: 'feature/example',
+      diffArg: 'main...feature/example',
+      includeWorktree: false,
+    });
+  });
+
+  it('prefers origin HEAD when a remote default branch is configured', () => {
+    const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-cli-remote-'));
+    tempDirs.push(remote);
+    runGit(remote, 'init', '--bare', '--initial-branch', 'main');
+
+    const cwd = createRepo('trunk');
+    runGit(cwd, 'remote', 'add', 'origin', remote);
+    runGit(cwd, 'push', '-u', 'origin', 'trunk');
+    runGit(cwd, 'push', 'origin', 'trunk:main');
+    runGit(cwd, 'fetch', 'origin');
+    runGit(cwd, 'remote', 'set-head', 'origin', 'main');
+
+    expect(inferBaseRef(cwd)).toBe('origin/main');
   });
 });
