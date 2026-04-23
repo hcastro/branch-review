@@ -89,8 +89,10 @@ describe('App', () => {
     await flush();
 
     const frame = stripAnsi(instance.lastFrame());
+    expect(frame).not.toContain('Δ notes.md');
+    expect(frame).toContain('╭');
     expect(frame).toContain('• path/to/file.md:12: The point');
-    expect(frame).toContain('  Stream problem at once.');
+    expect(frame).toContain('  mobile Stream problem at once.');
 
     instance.unmount();
   });

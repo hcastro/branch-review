@@ -22,6 +22,7 @@ export type DiffSection = {
 
 const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
 const RESET = '[0m';
+const SECTION_BORDER = '[36m';
 
 type StyledCell = {
   char: string;
@@ -130,10 +131,11 @@ export function truncateAnsi(line: string, maxWidth: number) {
 
 export function getContinuationPrefix(line: string): string {
   const plain = line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
-  const gutterIndex = plain.indexOf('│ ');
+  const gutterIndex = plain.indexOf('│');
 
   if (gutterIndex >= 0) {
-    return ' '.repeat(gutterIndex + 2);
+    const separatorPadding = plain[gutterIndex + 1] === ' ' ? ' ' : '';
+    return `${' '.repeat(gutterIndex)}│${separatorPadding}`;
   }
 
   const bulletMatch = plain.match(/^(\s*(?:[+\-•])\s+)/);
@@ -199,7 +201,8 @@ export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''
         continue;
       }
 
-      if (lineHasContent()) {
+      const nextLineAvailable = maxWidth - prefixWidth;
+      if (lineHasContent() && remaining.length <= nextLineAvailable) {
         flush();
         continue;
       }
@@ -257,7 +260,7 @@ export function frameBottomBorder(paneWidth: number, borderAnsi: string): string
 export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {
-    const wrappedLines = section.lines.flatMap((line) => wrapAnsi(line, maxWidth, getContinuationPrefix(line)));
+    const wrappedLines = section.lines.flatMap((line) => wrapSectionLine(line, maxWidth));
     const startLine = cursor;
     const endLineExclusive = cursor + wrappedLines.length;
     cursor = endLineExclusive;
@@ -272,8 +275,32 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
   });
 }
 
-function cyan(text: string) {
-  return `\u001B[36m${text}\u001B[0m`;
+function wrapSectionLine(line: string, maxWidth: number) {
+  if (isHunkHeader(line)) {
+    return frameWrappedLines(wrapAnsi(line, Math.max(maxWidth - 4, 1), getContinuationPrefix(line)), maxWidth);
+  }
+
+  return wrapAnsi(line, maxWidth, getContinuationPrefix(line));
+}
+
+function isHunkHeader(line: string) {
+  const plain = line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+  return /^• .+:\d+:/.test(plain);
+}
+
+function frameWrappedLines(lines: string[], maxWidth: number) {
+  if (maxWidth < 4) {
+    return lines;
+  }
+
+  const innerWidth = maxWidth - 4;
+  return [
+    '',
+    frameTopBorder(maxWidth, SECTION_BORDER),
+    ...lines.map((line) => frameLine(line, innerWidth, SECTION_BORDER)),
+    frameBottomBorder(maxWidth, SECTION_BORDER),
+    '',
+  ];
 }
 
 function yellow(text: string) {
@@ -288,10 +315,6 @@ function red(text: string) {
   return `\u001B[31m${text}\u001B[0m`;
 }
 
-function gray(text: string) {
-  return `\u001B[90m${text}\u001B[0m`;
-}
-
 export function formatMetrics(metrics: Pick<FileMetrics, 'additions' | 'deletions' | 'changedLines'>) {
   return `${green(`+${metrics.additions}`)} ${red(`-${metrics.deletions}`)} ${yellow(`${metrics.changedLines} changed`)}`;
 }
@@ -303,9 +326,6 @@ export function buildDiffSections(input: Array<{path: string; metrics: FileMetri
   for (const entry of input) {
     const diffLines = entry.diff.trimEnd().split('\n').filter(Boolean);
     const lines = [
-      cyan(`Δ ${entry.path}`),
-      `${formatMetrics(entry.metrics)} ${gray(`• ${diffLines.length} rendered lines`)}`,
-      gray('─'.repeat(72)),
       ...diffLines,
       '',
     ];

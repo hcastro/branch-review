@@ -7,6 +7,7 @@ import {
   inferBaseRef,
   getBranchMetrics,
   getChangedFiles,
+  getColoredFileDiff,
   getFileMetricsMap,
   getRawFileDiff,
   resolveRefs,
@@ -85,6 +86,19 @@ describe('git helpers', () => {
     expect(metricsMap.get('README.md')).toMatchObject({additions: 1, deletions: 0, changedLines: 1});
     expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 2, deletions: 1, changedLines: 3});
     expect(branchMetrics).toEqual({filesChanged: 2, additions: 3, deletions: 1, changedLines: 4});
+  });
+
+  it('renders delta output without nested file or hunk header boxes', () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'feature/example', 'development');
+    const diff = getColoredFileDiff(cwd, range, 'README.md', 80);
+    const plain = diff.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+
+    expect(plain).not.toContain('┐');
+    expect(plain).not.toContain('┘');
+    expect(plain).not.toContain('Δ README.md');
+    expect(plain).toContain('• README.md');
+    expect(plain).toContain('│# Example');
   });
 
   it('includes unstaged, staged, and untracked changes in worktree mode', () => {

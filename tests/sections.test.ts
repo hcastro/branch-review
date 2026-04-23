@@ -8,6 +8,7 @@ import {
   getSectionIndexForLine,
   getContinuationPrefix,
   truncateAnsi,
+  visibleWidth,
   wrapAnsi,
   wrapSections,
 } from '../src/sections.js';
@@ -77,8 +78,31 @@ describe('section helpers', () => {
   });
 
   it('detects hanging indents for guttered and bullet-prefixed lines', () => {
-    expect(getContinuationPrefix('  1 ⋮  1 │ const x = 1;')).toBe(' '.repeat(11));
+    expect(getContinuationPrefix('  1 ⋮  1 │ const x = 1;')).toBe(`${' '.repeat(9)}│ `);
+    expect(getContinuationPrefix('  1 ⋮    │old text')).toBe(`${' '.repeat(9)}│`);
     expect(getContinuationPrefix('• path/to/file.md:12: The point of this plan')).toBe('  ');
+  });
+
+  it('keeps the line-number gutter separator across wrapped delta rows', () => {
+    const line = '  1 ⋮  1 │ decision: prepend newly created comments and make selectors scroll exactly';
+    const wrapped = wrapAnsi(line, 44, getContinuationPrefix(line)).map(stripAnsi);
+
+    expect(wrapped).toEqual([
+      '  1 ⋮  1 │ decision: prepend newly created ',
+      '         │ comments and make selectors ',
+      '         │ scroll exactly',
+    ]);
+  });
+
+  it('keeps delta continuation rows inside the gutter when there is no separator padding', () => {
+    const line = '  1 ⋮    │old text that is long enough to wrap against the review pane';
+    const wrapped = wrapAnsi(line, 38, getContinuationPrefix(line)).map(stripAnsi);
+
+    expect(wrapped).toEqual([
+      '  1 ⋮    │old text that is long ',
+      '         │enough to wrap against the ',
+      '         │review pane',
+    ]);
   });
 
   it('adds a hanging indent to continuation lines when wrapping prose with prefixes', () => {
@@ -127,5 +151,32 @@ describe('section helpers', () => {
     expect(wrapped[0].lines.length).toBeGreaterThan(base[0].lines.length);
     expect(wrapped[0].startLine).toBe(0);
     expect(wrapped[0].endLineExclusive).toBe(wrapped[0].lines.length);
+  });
+
+  it('renders hunk headers with one width-constrained frame', () => {
+    const base = buildDiffSections([
+      {
+        path: 'notes.md',
+        metrics: {path: 'a.ts', additions: 12, deletions: 3, changedLines: 15},
+        diff: '• very/long/path/to/a/file/that/should/wrap.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+      },
+    ]);
+
+    const wrapped = wrapSections(base, 48);
+    const frameStart = wrapped[0].lines.findIndex((line) => stripAnsi(line).startsWith('╭'));
+    const plainHeader = wrapped[0].lines.slice(frameStart, frameStart + 5).map(stripAnsi);
+
+    expect(stripAnsi(wrapped[0].lines[frameStart - 1])).toBe('');
+    expect(plainHeader).toEqual([
+      `╭${'─'.repeat(46)}╮`,
+      '│ • very/long/path/to/a/file/that/should/wrap. │',
+      '│   md:12: The point of this plan is not to    │',
+      '│   solve every mobile Stream problem at once. │',
+      `╰${'─'.repeat(46)}╯`,
+    ]);
+    expect(stripAnsi(wrapped[0].lines[frameStart + 5])).toBe('');
+    for (const line of wrapped[0].lines.slice(frameStart, frameStart + 5)) {
+      expect(visibleWidth(line)).toBe(48);
+    }
   });
 });
