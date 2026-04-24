@@ -4,6 +4,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {afterEach, describe, expect, it} from 'vitest';
 import {
+  getChangedFileEntries,
   inferBaseRef,
   getBranchMetrics,
   getChangedFiles,
@@ -124,6 +125,46 @@ describe('git helpers', () => {
     });
     expect(metricsMap.get('staged.ts')).toMatchObject({additions: 1, deletions: 0});
     expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 3, deletions: 1});
+  });
+
+  it('returns status-aware changed file entries including untracked files', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-status-'));
+    tempDirs.push(cwd);
+
+    runGit(cwd, 'init', '-b', 'development');
+    runGit(cwd, 'config', 'user.name', 'Test User');
+    runGit(cwd, 'config', 'user.email', 'test@example.com');
+    fs.writeFileSync(path.join(cwd, 'modified.ts'), 'export const value = 1;\n');
+    fs.writeFileSync(path.join(cwd, 'deleted.ts'), 'export const deleted = true;\n');
+    fs.writeFileSync(path.join(cwd, 'old-name.ts'), 'export const renamed = true;\n');
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-m', 'initial');
+
+    runGit(cwd, 'checkout', '-b', 'feature/statuses');
+    fs.writeFileSync(path.join(cwd, 'modified.ts'), 'export const value = 2;\n');
+    fs.writeFileSync(path.join(cwd, 'added.ts'), 'export const added = true;\n');
+    runGit(cwd, 'mv', 'old-name.ts', 'renamed.ts');
+    runGit(cwd, 'rm', 'deleted.ts');
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-m', 'status changes');
+    fs.writeFileSync(path.join(cwd, 'untracked.ts'), 'export const local = true;\n');
+
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const entries = getChangedFileEntries(cwd, range);
+    const byPath = new Map(entries.map((entry) => [entry.path, entry]));
+
+    expect(byPath.get('modified.ts')).toMatchObject({status: 'modified'});
+    expect(byPath.get('added.ts')).toMatchObject({status: 'added'});
+    expect(byPath.get('deleted.ts')).toMatchObject({status: 'deleted'});
+    expect(byPath.get('renamed.ts')).toMatchObject({status: 'renamed', oldPath: 'old-name.ts'});
+    expect(byPath.get('untracked.ts')).toMatchObject({status: 'untracked'});
+    expect(entries.map((entry) => entry.path)).toEqual([
+      'added.ts',
+      'deleted.ts',
+      'modified.ts',
+      'renamed.ts',
+      'untracked.ts',
+    ]);
   });
 
   it('infers main when development is not present', () => {
