@@ -43,7 +43,7 @@ describe('App', () => {
 
     await flush();
 
-    let frame = stripAnsi(instance.lastFrame());
+    let frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('CLAUDE.md');
     expect(frame).toContain('2 files • +5 • -2 • 7 changed');
     expect(frame).toContain('file 1/2');
@@ -53,14 +53,14 @@ describe('App', () => {
       await flush();
     }
 
-    frame = stripAnsi(instance.lastFrame());
+    frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('src/App.tsx');
     expect(frame).toContain('file 2/2');
 
     instance.stdin.write('\u001B[A');
     await flush();
 
-    frame = stripAnsi(instance.lastFrame());
+    frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('file 1/2');
     expect(frame).toContain('CLAUDE.md');
 
@@ -88,7 +88,7 @@ describe('App', () => {
 
     await flush();
 
-    const frame = stripAnsi(instance.lastFrame());
+    const frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).not.toContain('Δ notes.md');
     expect(frame).toContain('╭');
     expect(frame).toContain('• path/to/file.md:12: The point');

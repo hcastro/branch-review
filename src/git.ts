@@ -19,6 +19,21 @@ function tryRunGit(cwd: string, args: string[]) {
   }
 }
 
+function runGitDiff(cwd: string, args: string[]) {
+  try {
+    return runGit(cwd, args);
+  } catch (err) {
+    const exitCode = (err as {status?: number}).status;
+    const stdout = (err as {stdout?: Buffer | string}).stdout;
+    if (exitCode === 1 && stdout !== undefined) {
+      const text = typeof stdout === 'string' ? stdout : stdout.toString('utf8');
+      return text.trimEnd();
+    }
+
+    throw err;
+  }
+}
+
 function hasRef(cwd: string, ref: string) {
   try {
     runGit(cwd, ['rev-parse', '--verify', '--quiet', ref]);
@@ -41,6 +56,14 @@ export type DiffRange = {
   branch: string;
   diffArg: string;
   includeWorktree: boolean;
+};
+
+export type FileStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked';
+
+export type ChangedFileEntry = {
+  path: string;
+  status: FileStatus;
+  oldPath?: string;
 };
 
 function resolveRef(cwd: string, requested: string) {
@@ -108,22 +131,60 @@ export function getUntrackedFiles(cwd: string) {
 }
 
 export function getChangedFiles(cwd: string, range: DiffRange) {
-  const tracked = runGit(cwd, ['diff', '--name-only', range.diffArg])
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
+  return getChangedFileEntries(cwd, range).map((entry) => entry.path);
+}
 
-  const all = new Set(tracked);
+function parseNameStatusLine(line: string): ChangedFileEntry | null {
+  const parts = line.split('\t');
+  const statusCode = parts[0];
+  if (!statusCode) return null;
+
+  if (statusCode.startsWith('R')) {
+    const oldPath = parts[1];
+    const nextPath = parts[2];
+    if (!oldPath || !nextPath) return null;
+    return {path: nextPath, oldPath, status: 'renamed'};
+  }
+
+  const filePath = parts.slice(1).join('\t');
+  if (!filePath) return null;
+
+  if (statusCode === 'A') return {path: filePath, status: 'added'};
+  if (statusCode === 'D') return {path: filePath, status: 'deleted'};
+  return {path: filePath, status: 'modified'};
+}
+
+export function getChangedFileEntries(cwd: string, range: DiffRange): ChangedFileEntry[] {
+  const entries = runGit(cwd, ['diff', '--name-status', range.diffArg])
+    .split('\n')
+    .map((line) => parseNameStatusLine(line.trim()))
+    .filter((entry): entry is ChangedFileEntry => Boolean(entry));
+
   if (range.includeWorktree) {
-    for (const file of getUntrackedFiles(cwd)) {
-      all.add(file);
+    const seen = new Set(entries.map((entry) => entry.path));
+    for (const filePath of getUntrackedFiles(cwd)) {
+      if (!seen.has(filePath)) {
+        entries.push({path: filePath, status: 'untracked'});
+        seen.add(filePath);
+      }
     }
   }
 
-  return [...all].sort((a, b) => a.localeCompare(b));
+  return entries.sort((left, right) => left.path.localeCompare(right.path));
 }
 
-export function getRawFileDiff(cwd: string, range: DiffRange, filePath: string) {
+export function getRawFileDiff(
+  cwd: string,
+  range: DiffRange,
+  filePath: string,
+  untrackedFiles?: ReadonlySet<string>,
+) {
+  const isUntracked = range.includeWorktree && (untrackedFiles?.has(filePath) ?? false);
+
+  if (isUntracked) {
+    return runGitDiff(cwd, ['diff', '--no-index', '--no-color', '--', '/dev/null', filePath]);
+  }
+
   return runGit(cwd, ['diff', '--no-color', range.diffArg, '--', filePath]);
 }
 
