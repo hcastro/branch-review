@@ -11,6 +11,7 @@ import type {ReviewModel} from '../src/review/model.js';
 import {debounce} from '../src/watch/debounce.js';
 import {
   createRepoWatcher,
+  getGitStateWatchPaths,
   getRepoWatchPaths,
   isIgnoredWatchPath,
   type CreateRepoWatcherOptions,
@@ -116,6 +117,16 @@ describe('watch helpers', () => {
     ]));
   });
 
+  it('includes narrow Git state paths for commit and index refreshes', () => {
+    const cwd = createRepo();
+
+    expect(getGitStateWatchPaths(cwd)).toEqual(expect.arrayContaining([
+      path.join(cwd, '.git', 'HEAD'),
+      path.join(cwd, '.git', 'index'),
+      path.join(cwd, '.git', 'logs', 'HEAD'),
+    ]));
+  });
+
   it('formats quiet footer state', () => {
     expect(formatWatchFooterStatus({state: 'watching'}, 1000)).toBe('watching');
     expect(formatWatchFooterStatus({state: 'refreshing'}, 1000)).toBe('refreshing...');
@@ -151,6 +162,37 @@ describe('watch helpers', () => {
 
     await ready;
     fs.writeFileSync(path.join(cwd, 'packages', 'app', 'lib', 'cold.ts'), 'export const cold = 2;\n');
+
+    await expect(Promise.race([
+      changed.then(() => 'changed'),
+      flush(1000).then(() => 'timeout'),
+    ])).resolves.toBe('changed');
+
+    await watcher.close();
+  });
+
+  it('fires when a staged worktree change is committed', async () => {
+    const cwd = createRepo();
+    fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 3;\n');
+    runGit(cwd, 'add', 'src/one.ts');
+
+    let resolveReady: () => void = () => {};
+    let resolveChange: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const changed = new Promise<void>((resolve) => {
+      resolveChange = resolve;
+    });
+    const watcher = createRepoWatcher({
+      repoRoot: cwd,
+      debounceMs: 20,
+      onReady: resolveReady,
+      onChange: resolveChange,
+    });
+
+    await ready;
+    runGit(cwd, 'commit', '-m', 'commit watched change');
 
     await expect(Promise.race([
       changed.then(() => 'changed'),
@@ -206,6 +248,53 @@ describe('ReviewController watch refresh', () => {
     expect(frame).toContain('two.ts');
     expect(frame).toContain('refreshed two');
     expect(frame).toContain('watching · updated');
+
+    instance.unmount();
+  });
+
+  it('re-resolves HEAD ranges so commits shrink worktree review', async () => {
+    const cwd = createRepo();
+    fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 3;\n');
+
+    const initialRange = resolveRefs(cwd, 'HEAD', 'HEAD');
+    const initialReview = reviewModel([{path: 'src/one.ts', text: 'worktree change'}]);
+    const emptyReview = reviewModel([]);
+    const buildReview = vi.fn((_options: {cwd: string; range: DiffRange; width: number}) => emptyReview);
+    let refreshedRange: DiffRange | undefined;
+    let triggerChange: (() => void) | undefined;
+    const createWatcher = vi.fn((options: CreateRepoWatcherOptions) => {
+      triggerChange = options.onChange;
+      return {close: vi.fn(async () => undefined)};
+    });
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={initialRange}
+        resolveRange={() => resolveRefs(cwd, 'HEAD', 'HEAD')}
+        initialReview={initialReview}
+        initialFingerprint={getReviewFingerprint(cwd, initialRange)}
+        watch
+        buildReview={(options) => {
+          refreshedRange = options.range;
+          return buildReview(options);
+        }}
+        createWatcher={createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('worktree change');
+
+    runGit(cwd, 'add', 'src/one.ts');
+    runGit(cwd, 'commit', '-m', 'commit watched change');
+    triggerChange?.();
+    await flush(10);
+
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(refreshedRange?.diffArg).toBe(runGit(cwd, 'rev-parse', 'HEAD'));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('No changes to review');
 
     instance.unmount();
   });

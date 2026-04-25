@@ -16,7 +16,8 @@ const cwd = process.cwd();
 const options = parseCliArgs(process.argv.slice(2), {interactive: Boolean(process.stdout.isTTY)});
 const requestedBranch = options.requestedBranch;
 const requestedBase = options.requestedBase ?? inferBaseRef(cwd);
-const range = resolveRefs(cwd, requestedBranch, requestedBase);
+const resolveCurrentRange = () => resolveRefs(cwd, requestedBranch, requestedBase);
+const range = resolveCurrentRange();
 
 const terminalWidth = process.stdout.columns ?? 160;
 const review = buildReviewModel({cwd, range, width: getModelWidth(terminalWidth)});
@@ -58,6 +59,7 @@ const instance = render(
   <ReviewController
     cwd={cwd}
     range={range}
+    resolveRange={resolveCurrentRange}
     initialReview={review}
     initialFingerprint={initialFingerprint}
     watch={options.watch}
