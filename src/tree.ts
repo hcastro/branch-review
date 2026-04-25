@@ -1,14 +1,18 @@
+import type {FileStatus} from './git.js';
+
 export type TreeRow = {
   kind: 'dir' | 'file';
   label: string;
   depth: number;
   path: string;
+  status?: FileStatus;
 };
 
 type TreeNode = {
   name: string;
   path: string;
   kind: 'dir' | 'file';
+  status?: FileStatus;
   children?: Map<string, TreeNode>;
 };
 
@@ -35,13 +39,14 @@ function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
     return;
   }
 
-  rows.push({kind: 'file', label: node.name, depth, path: node.path});
+  rows.push({kind: 'file', label: node.name, depth, path: node.path, status: node.status});
 }
 
-export function buildTreeRows(files: string[]): TreeRow[] {
+export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string, FileStatus>): TreeRow[] {
   const roots = new Map<string, TreeNode>();
 
   for (const filePath of [...files].sort(compareNames)) {
+    const status = statusByPath?.get(filePath);
     const parts = filePath.split('/');
 
     if (parts.length === 1) {
@@ -49,6 +54,7 @@ export function buildTreeRows(files: string[]): TreeRow[] {
         name: filePath,
         path: filePath,
         kind: 'file',
+        status,
       });
       continue;
     }
@@ -63,7 +69,7 @@ export function buildTreeRows(files: string[]): TreeRow[] {
 
       if (!existing) {
         const node: TreeNode = isFile
-          ? {name: part, path: currentPath, kind: 'file'}
+          ? {name: part, path: currentPath, kind: 'file', status}
           : {name: part, path: currentPath, kind: 'dir', children: new Map()};
         currentMap.set(part, node);
       }

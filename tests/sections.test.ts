@@ -164,18 +164,17 @@ describe('section helpers', () => {
 
     const wrapped = wrapSections(base, 48);
     const frameStart = wrapped[0].lines.findIndex((line) => stripAnsi(line).startsWith('╭'));
-    const plainHeader = wrapped[0].lines.slice(frameStart, frameStart + 5).map(stripAnsi);
+    const plainHeader = wrapped[0].lines.slice(frameStart, frameStart + 4).map(stripAnsi);
 
     expect(stripAnsi(wrapped[0].lines[frameStart - 1])).toBe('');
     expect(plainHeader).toEqual([
       `╭${'─'.repeat(46)}╮`,
       '│ • very/long/path/to/a/file/that/should/wrap. │',
-      '│   md:12: The point of this plan is not to    │',
-      '│   solve every mobile Stream problem at once. │',
+      '│   md:12:                                     │',
       `╰${'─'.repeat(46)}╯`,
     ]);
-    expect(stripAnsi(wrapped[0].lines[frameStart + 5])).toBe('');
-    for (const line of wrapped[0].lines.slice(frameStart, frameStart + 5)) {
+    expect(stripAnsi(wrapped[0].lines[frameStart + 4])).toBe('');
+    for (const line of wrapped[0].lines.slice(frameStart, frameStart + 4)) {
       expect(visibleWidth(line)).toBe(48);
     }
   });

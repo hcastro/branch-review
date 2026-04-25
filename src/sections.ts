@@ -20,6 +20,13 @@ export type DiffSection = {
   endLineExclusive: number;
 };
 
+export const HUNK_ACTION_LABELS = {
+  code: 'Copy code',
+  diff: 'Copy diff',
+  prompt: 'Copy prompt',
+  more: 'More',
+} as const;
+
 const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
 const RESET = '[0m';
 const SECTION_BORDER = '[36m';
@@ -404,7 +411,10 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
 
 function wrapSectionLine(line: string, maxWidth: number) {
   if (isHunkHeader(line)) {
-    return frameWrappedLines(wrapAnsi(line, Math.max(maxWidth - 4, 1), getContinuationPrefix(line)), maxWidth);
+    return frameWrappedLines(
+      wrapAnsi(compactHunkHeader(line), Math.max(maxWidth - 4, 1), getContinuationPrefix(line)),
+      maxWidth,
+    );
   }
 
   return wrapAnsi(line, maxWidth, getContinuationPrefix(line));
@@ -415,12 +425,17 @@ function isHunkHeader(line: string) {
   return /^• .+:\d+:/.test(plain);
 }
 
+function compactHunkHeader(line: string) {
+  return line.replace(/^(\x1B\[[0-9;]*[A-Za-z])*?(•\s+.+?:\d+:).*$/, '$2');
+}
+
 function frameWrappedLines(lines: string[], maxWidth: number) {
   if (maxWidth < 4) {
     return lines;
   }
 
   const innerWidth = maxWidth - 4;
+
   return [
     '',
     frameTopBorder(maxWidth, SECTION_BORDER),
