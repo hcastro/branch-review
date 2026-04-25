@@ -5,6 +5,8 @@ import {
   applyScrollDelta,
   findFocusedBlockLineIndex,
   getTreeRowHitFromPanel,
+  getTreeCopySlotWidth,
+  getTreeIndicatorWidth,
   shouldShowTreeCopy,
 } from '../src/ui/App.js';
 
@@ -82,5 +84,11 @@ describe('wheel helpers', () => {
     expect(shouldShowTreeCopy('file', false, true)).toBe(false);
     expect(shouldShowTreeCopy('file', false, false, true)).toBe(true);
     expect(shouldShowTreeCopy('dir', true, false)).toBe(false);
+  });
+
+  it('keeps the hidden tree copy slot the same width as the visible copy label', () => {
+    expect(getTreeCopySlotWidth(false)).toBe(' Copy'.length);
+    expect(getTreeIndicatorWidth(false)).toBe(1 + ' Copy'.length);
+    expect(getTreeIndicatorWidth(false)).toBeLessThan(getTreeIndicatorWidth(true));
   });
 });

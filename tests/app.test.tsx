@@ -383,6 +383,48 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('keeps file tree status badges separated from filenames when copy is hidden', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/qmd-query-playbook.md',
+        metrics: {path: 'src/qmd-query-playbook.md', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+query',
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions: 1, deletions: 0, changedLines: 1},
+      files: [{
+        path: 'src/qmd-query-playbook.md',
+        status: 'untracked',
+        metrics: {path: 'src/qmd-query-playbook.md', additions: 1, deletions: 0, changedLines: 1},
+        rawDiff: '',
+        renderedLines: ['+query'],
+        blocks: [],
+      }],
+    };
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        review={review}
+        dimensions={{columns: 220, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).not.toContain('qmd-query-playbook.mdU');
+
+    instance.unmount();
+  });
+
   it('does not treat Ctrl+K as normal k scrolling while palette is unavailable', async () => {
     const sections = buildDiffSections([
       {
