@@ -80,6 +80,7 @@ describe('wheel helpers', () => {
   it('shows tree copy text only while hovering a file row', () => {
     expect(shouldShowTreeCopy('file', true, false)).toBe(true);
     expect(shouldShowTreeCopy('file', false, true)).toBe(false);
+    expect(shouldShowTreeCopy('file', false, false, true)).toBe(true);
     expect(shouldShowTreeCopy('dir', true, false)).toBe(false);
   });
 });
