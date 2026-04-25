@@ -16,6 +16,7 @@ type WatchState =
 
 type ReviewBuilder = typeof buildReviewModel;
 type WatcherFactory = (options: CreateRepoWatcherOptions) => RepoWatcher;
+type RangeResolver = () => DiffRange;
 
 export type ReviewControllerProps = {
   cwd: string;
@@ -28,6 +29,7 @@ export type ReviewControllerProps = {
   initialFingerprint?: string;
   buildReview?: ReviewBuilder;
   createWatcher?: WatcherFactory;
+  resolveRange?: RangeResolver;
 };
 
 function formatError(error: unknown) {
@@ -65,11 +67,13 @@ export function ReviewController({
   initialFingerprint,
   buildReview = buildReviewModel,
   createWatcher = createRepoWatcher,
+  resolveRange,
 }: ReviewControllerProps) {
   const {stdout} = useStdout();
   const columns = dimensions?.columns ?? stdout?.columns ?? 160;
   const modelWidth = getModelWidth(columns);
   const [review, setReview] = useState(initialReview);
+  const [activeRange, setActiveRange] = useState(range);
   const [watchStatus, setWatchStatus] = useState<WatchState>(watch ? {state: 'watching'} : {state: 'off'});
   const fingerprintRef = useRef<string | null>(initialFingerprint ?? null);
   const refreshInFlightRef = useRef(false);
@@ -101,11 +105,13 @@ export function ReviewController({
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       try {
-        const nextFingerprint = getReviewFingerprint(cwd, range);
+        const nextRange = resolveRange?.() ?? range;
+        const nextFingerprint = getReviewFingerprint(cwd, nextRange);
         if (nextFingerprint !== fingerprintRef.current) {
-          const nextReview = buildReview({cwd, range, width: modelWidth});
+          const nextReview = buildReview({cwd, range: nextRange, width: modelWidth});
           if (!mountedRef.current) return;
           setReview(nextReview);
+          setActiveRange(nextRange);
           fingerprintRef.current = nextFingerprint;
         }
 
@@ -126,7 +132,7 @@ export function ReviewController({
     };
 
     void run();
-  }, [buildReview, cwd, modelWidth, range, watch]);
+  }, [buildReview, cwd, modelWidth, range, resolveRange, watch]);
 
   useEffect(() => {
     if (!watch) {
@@ -136,7 +142,9 @@ export function ReviewController({
 
     if (fingerprintRef.current === null) {
       try {
-        fingerprintRef.current = getReviewFingerprint(cwd, range);
+        const nextRange = resolveRange?.() ?? range;
+        fingerprintRef.current = getReviewFingerprint(cwd, nextRange);
+        setActiveRange(nextRange);
       } catch {
         fingerprintRef.current = null;
       }
@@ -154,14 +162,14 @@ export function ReviewController({
     return () => {
       void watcher.close();
     };
-  }, [createWatcher, cwd, range, refresh, watch, watchPoll]);
+  }, [createWatcher, cwd, range, refresh, resolveRange, watch, watchPoll]);
 
   const sections = useMemo(() => buildReviewSections(review), [review]);
   const footerStatus = formatWatchFooterStatus(watchStatus);
 
   return (
     <App
-      base={range.base}
+      base={activeRange.base}
       branch={review.branch}
       sections={sections}
       branchMetrics={review.metrics}
