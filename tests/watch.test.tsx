@@ -128,9 +128,11 @@ describe('watch helpers', () => {
   });
 
   it('formats quiet footer state', () => {
-    expect(formatWatchFooterStatus({state: 'watching'}, 1000)).toBe('watching');
+    expect(formatWatchFooterStatus({state: 'watching'}, 1000)).toBeUndefined();
     expect(formatWatchFooterStatus({state: 'refreshing'}, 1000)).toBe('refreshing...');
-    expect(formatWatchFooterStatus({state: 'watching', lastUpdatedAt: 1000}, 3200)).toBe('watching · updated 2s ago');
+    expect(formatWatchFooterStatus({state: 'watching', lastUpdatedAt: 1000}, 1000)).toBe('updated now');
+    expect(formatWatchFooterStatus({state: 'watching', lastUpdatedAt: 1000}, 2200)).toBe('updated 1s ago');
+    expect(formatWatchFooterStatus({state: 'watching', lastUpdatedAt: 1000}, 3200)).toBeUndefined();
   });
 
   it('changes the Git fingerprint when an existing worktree file changes', () => {
@@ -233,7 +235,7 @@ describe('ReviewController watch refresh', () => {
     );
 
     await flush();
-    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('watching');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('watching');
 
     triggerChange?.();
     await flush(10);
@@ -247,7 +249,8 @@ describe('ReviewController watch refresh', () => {
     expect(buildReview).toHaveBeenCalledTimes(1);
     expect(frame).toContain('two.ts');
     expect(frame).toContain('refreshed two');
-    expect(frame).toContain('watching · updated');
+    expect(frame).toContain('updated');
+    expect(frame).not.toContain('watching');
 
     instance.unmount();
   });
