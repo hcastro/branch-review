@@ -1,8 +1,10 @@
 import {describe, expect, it} from 'vitest';
 import {
+  buildAbsolutePathPayload,
   buildAllChangedPathsPayload,
   buildBranchPromptPayload,
   buildCodePayload,
+  buildFileContentsPayload,
   buildFileDiffPayload,
   buildFilePromptPayload,
   buildBlockDiffPayload,
@@ -59,6 +61,7 @@ const model: ReviewModel = {
 describe('copy payload builders', () => {
   it('builds path and content payloads', () => {
     expect(buildPathPayload(file)).toBe('src/example.ts');
+    expect(buildAbsolutePathPayload('/repo/src/example.ts')).toBe('/repo/src/example.ts');
     expect(buildPathLinePayload(file, block)).toBe('src/example.ts:1');
     expect(buildAllChangedPathsPayload(model)).toBe('src/example.ts');
     expect(buildCodePayload(block)).toMatchInlineSnapshot(`
@@ -67,6 +70,7 @@ describe('copy payload builders', () => {
     `);
     expect(buildBlockDiffPayload(block)).toBe(rawBlock);
     expect(buildFileDiffPayload(file)).toBe(file.rawDiff);
+    expect(buildFileContentsPayload('export const value = 2;\n')).toBe('export const value = 2;\n');
   });
 
   it('builds agent prompt payloads', () => {

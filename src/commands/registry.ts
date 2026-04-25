@@ -1,7 +1,9 @@
 import {
+  buildAbsolutePathPayload,
   buildAllChangedPathsPayload,
   buildBranchPromptPayload,
   buildCodePayload,
+  buildFileContentsPayload,
   buildFileDiffPayload,
   buildFilePromptPayload,
   buildBlockDiffPayload,
@@ -17,6 +19,8 @@ export type CommandContext = {
   model: ReviewModel;
   activeFile?: ReviewFile;
   focusedBlock?: ReviewBlock;
+  readFileContent?: (file: ReviewFile) => string | null;
+  resolveAbsolutePath?: (file: ReviewFile) => string | null;
 };
 
 export type CommandPayload = {
@@ -52,7 +56,7 @@ export const copyCommands: CommandDefinition[] = [
   {
     id: 'copy.filePrompt',
     group: 'Copy for agent',
-    title: 'Copy active file',
+    title: 'Copy active file context',
     shortcuts: [],
     isEnabled: (context) => Boolean(activeFile(context)),
     buildPayload: (context) => {
@@ -60,6 +64,27 @@ export const copyCommands: CommandDefinition[] = [
       if (!file) return null;
       return {
         text: buildFilePromptPayload(file),
+        toast: 'Copied file context',
+        hint: file.path,
+      };
+    },
+  },
+  {
+    id: 'copy.fileContents',
+    group: 'Copy content',
+    title: 'Copy active file contents',
+    shortcuts: [],
+    isEnabled: (context) => {
+      const file = activeFile(context);
+      return Boolean(file && file.status !== 'deleted');
+    },
+    buildPayload: (context) => {
+      const file = activeFile(context);
+      if (!file || file.status === 'deleted') return null;
+      const contents = context.readFileContent?.(file);
+      if (typeof contents !== 'string') return null;
+      return {
+        text: buildFileContentsPayload(contents),
         toast: 'Copied file',
         hint: file.path,
       };
@@ -93,6 +118,24 @@ export const copyCommands: CommandDefinition[] = [
       return {
         text: buildPathPayload(file),
         toast: 'Copied path',
+        hint: file.path,
+      };
+    },
+  },
+  {
+    id: 'copy.absolutePath',
+    group: 'Copy paths',
+    title: 'Copy active file absolute path',
+    shortcuts: [],
+    isEnabled: (context) => Boolean(activeFile(context)),
+    buildPayload: (context) => {
+      const file = activeFile(context);
+      if (!file) return null;
+      const absolutePath = context.resolveAbsolutePath?.(file);
+      if (typeof absolutePath !== 'string') return null;
+      return {
+        text: buildAbsolutePathPayload(absolutePath),
+        toast: 'Copied absolute path',
         hint: file.path,
       };
     },

@@ -31,6 +31,16 @@ async function clickFrameText(frame: string, text: string) {
   }
 }
 
+async function clickFrameTextOnce(frame: string, text: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes(text));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(text) ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  await emitMouseClickAt(column, row);
+}
+
 async function moveFrameText(frame: string, text: string) {
   const lines = stripAnsi(frame).split('\n');
   const row = lines.findIndex((line) => line.includes(text));
@@ -367,6 +377,7 @@ describe('App', () => {
     expect(frame).toContain('Copy path');
     expect(frame).toContain('Copy diff');
     expect(frame).toContain('Copy file');
+    expect(frame).not.toContain('Copy absolute path');
     expect(frame).toContain('Copy block');
     expect(frame).not.toContain('Copy prompt');
     expect(frame).toContain('Copy code');
@@ -513,16 +524,37 @@ describe('App', () => {
             command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
           };
         }}
+        readFileContent={() => 'export const value = 2;\nexport const next = 3;\n'}
+        resolveAbsolutePath={() => '/repo/src/example.ts'}
         dimensions={{columns: 160, rows: 18}}
       />,
     );
 
     await flush();
-    await clickFrameText(instance.lastFrame() ?? '', 'Copy path');
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy path');
     await flush();
 
     expect(writes).toContain('src/example.ts');
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied path · src/example.ts');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('Copy absolute path');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy absolute path');
+    await flush();
+
+    expect(writes).toContain('/repo/src/example.ts');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied absolute path · src/example.ts');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy diff');
+    await flush();
+
+    expect(writes).toContain(rawDiff);
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied file diff · src/example.ts');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy file');
+    await flush();
+
+    expect(writes).toContain('export const value = 2;\nexport const next = 3;\n');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied file · src/example.ts');
 
     await moveFrameText(instance.lastFrame() ?? '', 'export const value = 2;');
     await flush();

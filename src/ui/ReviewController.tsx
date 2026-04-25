@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import path from 'node:path';
 import {useStdout} from 'ink';
-import {getReviewFingerprint, type DiffRange} from '../git.js';
+import {getReviewFileContents, getReviewFingerprint, type DiffRange} from '../git.js';
 import {buildReviewModel, buildReviewSections} from '../review/build.js';
 import type {ReviewModel} from '../review/model.js';
 import type {ClipboardWriter} from '../commands/execute.js';
@@ -175,6 +176,8 @@ export function ReviewController({
       branchMetrics={review.metrics}
       review={review}
       copyWriter={copyWriter}
+      readFileContent={(file) => getReviewFileContents(cwd, activeRange, file)}
+      resolveAbsolutePath={(file) => path.resolve(cwd, file.path)}
       dimensions={dimensions}
       watchStatus={footerStatus}
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}

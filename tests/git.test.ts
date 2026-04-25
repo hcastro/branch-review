@@ -10,6 +10,7 @@ import {
   getChangedFiles,
   getColoredFileDiff,
   getFileMetricsMap,
+  getReviewFileContents,
   getRawFileDiff,
   resolveRefs,
 } from '../src/git.js';
@@ -125,6 +126,22 @@ describe('git helpers', () => {
     });
     expect(metricsMap.get('staged.ts')).toMatchObject({additions: 1, deletions: 0});
     expect(metricsMap.get('src/app.ts')).toMatchObject({additions: 3, deletions: 1});
+  });
+
+  it('reads full file contents for the reviewed version only on demand', () => {
+    const cwd = createRepo();
+    fs.writeFileSync(path.join(cwd, 'src', 'app.ts'), 'export const value = 4;\n');
+
+    const worktreeRange = resolveRefs(cwd, 'HEAD', 'development');
+    expect(getReviewFileContents(cwd, worktreeRange, {path: 'src/app.ts', status: 'modified'})).toBe(
+      'export const value = 4;\n',
+    );
+
+    const branchRange = resolveRefs(cwd, 'feature/example', 'development');
+    expect(getReviewFileContents(cwd, branchRange, {path: 'src/app.ts', status: 'modified'})).toBe(
+      'export const value = 2;\nexport const next = 3;\n',
+    );
+    expect(getReviewFileContents(cwd, branchRange, {path: 'missing.ts', status: 'deleted'})).toBeNull();
   });
 
   it('returns status-aware changed file entries including untracked files', () => {
