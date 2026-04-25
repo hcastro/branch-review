@@ -190,24 +190,31 @@ const TreeFileRow = memo(function TreeFileRow({
   const glyph = row.kind === 'dir' ? '▾' : '•';
   const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
   const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
-  const indicatorWidth = row.kind === 'file' ? 11 : 0;
+  const copySlotWidth = getTreeCopySlotWidth(copySucceeded);
+  const indicatorWidth = row.kind === 'file' ? getTreeIndicatorWidth(copySucceeded) : 0;
+  const labelWidth = row.kind === 'file'
+    ? Math.max(1, width - indicatorWidth - 1)
+    : width;
 
   return (
     <Box width={width}>
-      <Box width={Math.max(1, width - indicatorWidth)}>
+      <Box width={labelWidth}>
         <Text color={accent} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
           {' '.repeat(row.depth * 2)}{glyph} {row.label}
         </Text>
       </Box>
       {row.kind === 'file' && (
+        <>
+        <Box width={1} />
         <Box width={indicatorWidth} justifyContent="flex-end">
           <Text color={statusColor(row.status)} bold={Boolean(row.status)}>
             {statusLabel(row.status)}
           </Text>
           <Text color={copySucceeded ? 'greenBright' : copyHovered ? 'cyanBright' : 'gray'} bold={copySucceeded || copyHovered}>
-            {copyVisible ? ` ${copyLabel}` : '          '}
+            {copyVisible ? ` ${copyLabel}` : ' '.repeat(copySlotWidth)}
           </Text>
         </Box>
+        </>
       )}
     </Box>
   );
@@ -215,6 +222,14 @@ const TreeFileRow = memo(function TreeFileRow({
 
 export function shouldShowTreeCopy(rowKind: TreeRow['kind'], hovered: boolean, _selected: boolean, copied = false) {
   return rowKind === 'file' && (hovered || copied);
+}
+
+export function getTreeCopySlotWidth(copied = false) {
+  return copied ? visibleWidth(` ${successLabel('Copy')}`) : visibleWidth(' Copy');
+}
+
+export function getTreeIndicatorWidth(copied = false) {
+  return 1 + getTreeCopySlotWidth(copied);
 }
 
 function TreePane({
