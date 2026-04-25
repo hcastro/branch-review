@@ -6,7 +6,7 @@ import {
   type DiffRange,
 } from '../git.js';
 import type {BranchMetrics, FileMetrics} from '../sections.js';
-import {parseUnifiedDiffHunks} from '../hunks/parse.js';
+import {parseUnifiedDiffBlocks} from '../blocks/parse.js';
 import type {ReviewFile, ReviewModel} from './model.js';
 
 type BuildReviewModelOptions = {
@@ -55,7 +55,7 @@ export function buildReviewModel({cwd, range, width}: BuildReviewModelOptions): 
       metrics: metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
       rawDiff,
       renderedLines: splitRenderedLines(renderedDiff),
-      hunks: parseUnifiedDiffHunks(rawDiff, entry.path),
+      blocks: parseUnifiedDiffBlocks(rawDiff, entry.path),
     };
   });
 

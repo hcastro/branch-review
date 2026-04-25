@@ -1,8 +1,8 @@
 import {describe, expect, it} from 'vitest';
-import {parseUnifiedDiffHunks} from '../src/hunks/parse.js';
+import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
 
-describe('parseUnifiedDiffHunks', () => {
-  it('extracts hunk ranges, function headers, raw diff, and added code', () => {
+describe('parseUnifiedDiffBlocks', () => {
+  it('extracts block ranges, function headers, raw diff, and added code', () => {
     const rawDiff = [
       'diff --git a/src/example.ts b/src/example.ts',
       'index 1111111..2222222 100644',
@@ -17,10 +17,10 @@ describe('parseUnifiedDiffHunks', () => {
       '-const removed = true;',
     ].join('\n');
 
-    const hunks = parseUnifiedDiffHunks(rawDiff, 'src/example.ts');
+    const blocks = parseUnifiedDiffBlocks(rawDiff, 'src/example.ts');
 
-    expect(hunks).toHaveLength(2);
-    expect(hunks[0]).toMatchObject({
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0]).toMatchObject({
       id: 'src/example.ts:1:0',
       filePath: 'src/example.ts',
       oldStart: 1,
@@ -32,14 +32,14 @@ describe('parseUnifiedDiffHunks', () => {
       functionHeader: 'function example()',
       addedCode: 'const value = 2;\nconst next = 3;',
     });
-    expect(hunks[0]?.rawDiff).toMatchInlineSnapshot(`
+    expect(blocks[0]?.rawDiff).toMatchInlineSnapshot(`
       "@@ -1,2 +1,3 @@ function example()
        const before = true;
       -const value = 1;
       +const value = 2;
       +const next = 3;"
     `);
-    expect(hunks[1]).toMatchObject({
+    expect(blocks[1]).toMatchObject({
       id: 'src/example.ts:11:1',
       oldStart: 10,
       oldLines: 1,

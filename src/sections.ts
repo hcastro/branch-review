@@ -20,11 +20,10 @@ export type DiffSection = {
   endLineExclusive: number;
 };
 
-export const HUNK_ACTION_LABELS = {
+export const BLOCK_ACTION_LABELS = {
   code: 'Copy code',
   diff: 'Copy diff',
-  prompt: 'Copy prompt',
-  more: 'More',
+  prompt: 'Copy block',
 } as const;
 
 const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
@@ -410,9 +409,9 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
 }
 
 function wrapSectionLine(line: string, maxWidth: number) {
-  if (isHunkHeader(line)) {
+  if (isBlockHeader(line)) {
     return frameWrappedLines(
-      wrapAnsi(compactHunkHeader(line), Math.max(maxWidth - 4, 1), getContinuationPrefix(line)),
+      wrapAnsi(compactBlockHeader(line), Math.max(maxWidth - 4, 1), getContinuationPrefix(line)),
       maxWidth,
     );
   }
@@ -420,13 +419,17 @@ function wrapSectionLine(line: string, maxWidth: number) {
   return wrapAnsi(line, maxWidth, getContinuationPrefix(line));
 }
 
-function isHunkHeader(line: string) {
-  const plain = line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+function isBlockHeader(line: string) {
+  const plain = stripAnsi(line);
   return /^• .+:\d+:/.test(plain);
 }
 
-function compactHunkHeader(line: string) {
-  return line.replace(/^(\x1B\[[0-9;]*[A-Za-z])*?(•\s+.+?:\d+:).*$/, '$2');
+function compactBlockHeader(line: string) {
+  return stripAnsi(line).replace(/^(•\s+.+?:\d+:).*$/, '$1');
+}
+
+function stripAnsi(line: string) {
+  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
 }
 
 function frameWrappedLines(lines: string[], maxWidth: number) {

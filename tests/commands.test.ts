@@ -2,9 +2,9 @@ import {describe, expect, it} from 'vitest';
 import {MISSING_CLIPBOARD_MESSAGE} from '../src/clipboard/write.js';
 import {executeCopyCommand} from '../src/commands/execute.js';
 import {copyCommands, getCopyCommand, type CommandContext} from '../src/commands/registry.js';
-import type {ReviewFile, ReviewHunk, ReviewModel} from '../src/review/model.js';
+import type {ReviewFile, ReviewBlock, ReviewModel} from '../src/review/model.js';
 
-const hunk: ReviewHunk = {
+const block: ReviewBlock = {
   id: 'src/example.ts:10:0',
   filePath: 'src/example.ts',
   oldStart: 9,
@@ -23,7 +23,7 @@ const file: ReviewFile = {
   metrics: {path: 'src/example.ts', additions: 1, deletions: 1, changedLines: 2},
   rawDiff: 'diff --git a/src/example.ts b/src/example.ts\n@@ -9 +10 @@\n-old\n+new',
   renderedLines: [],
-  hunks: [hunk],
+  blocks: [block],
 };
 
 const model: ReviewModel = {
@@ -36,16 +36,16 @@ const model: ReviewModel = {
 
 describe('copy command registry', () => {
   it('uses one registry for palette, yank, and button payloads', () => {
-    const context: CommandContext = {model, activeFile: file, focusedHunk: hunk};
+    const context: CommandContext = {model, activeFile: file, focusedBlock: block};
 
     expect(copyCommands.map((command) => command.id)).toEqual([
       'copy.filePrompt',
-      'copy.hunkPrompt',
+      'copy.blockPrompt',
       'copy.path',
       'copy.pathLine',
       'copy.allPaths',
-      'copy.hunkCode',
-      'copy.hunkDiff',
+      'copy.blockCode',
+      'copy.blockDiff',
       'copy.fileDiff',
       'copy.branchPrompt',
     ]);
@@ -59,14 +59,14 @@ describe('copy command registry', () => {
       hint: 'src/example.ts',
     });
 
-    const hunkDiffCommand = getCopyCommand('copy.hunkDiff');
-    expect(hunkDiffCommand?.shortcuts).toEqual(['y h']);
-    expect(hunkDiffCommand?.buildPayload(context)?.text).toBe(hunk.rawDiff);
+    const blockDiffCommand = getCopyCommand('copy.blockDiff');
+    expect(blockDiffCommand?.shortcuts).toEqual(['y h']);
+    expect(blockDiffCommand?.buildPayload(context)?.text).toBe(block.rawDiff);
   });
 
   it('executes copy commands through an injectable clipboard writer', async () => {
     const writes: string[] = [];
-    const context: CommandContext = {model, activeFile: file, focusedHunk: hunk};
+    const context: CommandContext = {model, activeFile: file, focusedBlock: block};
 
     await expect(executeCopyCommand('copy.path', context, {
       write: async (text) => {

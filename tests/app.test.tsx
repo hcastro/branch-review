@@ -98,6 +98,52 @@ describe('App', () => {
     frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('file 1/2');
     expect(frame).toContain('CLAUDE.md');
+    expect(frame).toContain('↑/↓ jump file');
+    expect(frame).toContain('j/k scroll');
+    expect(frame).not.toContain('copy menu');
+    expect(frame).not.toContain('PgUp');
+    expect(frame).not.toContain('/ search');
+
+    instance.unmount();
+  });
+
+  it('steps through files predictably with arrow keys', async () => {
+    const sections = buildDiffSections(
+      Array.from({length: 5}, (_, index) => ({
+        path: `src/file-${index + 1}.ts`,
+        metrics: {path: `src/file-${index + 1}.ts`, additions: 1, deletions: 0, changedLines: 1},
+        diff: `line ${index + 1}`,
+      })),
+    );
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 5, additions: 5, deletions: 0, changedLines: 5}}
+        dimensions={{columns: 120, rows: 18}}
+      />,
+    );
+
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('file 1/5');
+
+    for (let index = 0; index < 4; index += 1) {
+      instance.stdin.write('\u001B[B');
+      await flush();
+    }
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('file 5/5');
+
+    for (let index = 0; index < 2; index += 1) {
+      instance.stdin.write('\u001B[A');
+      await flush();
+    }
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('src/file-3.ts');
+    expect(frame).toContain('file 3/5');
 
     instance.unmount();
   });
@@ -202,7 +248,7 @@ describe('App', () => {
         metrics: {path: 'src/example.ts', additions: 2, deletions: 1, changedLines: 3},
         rawDiff,
         renderedLines: [],
-        hunks: [{
+        blocks: [{
           id: 'src/example.ts:1:0',
           filePath: 'src/example.ts',
           oldStart: 1,
@@ -236,21 +282,49 @@ describe('App', () => {
     expect(frame).toContain('Copy');
     expect(frame).toContain('Copy path');
     expect(frame).toContain('Copy diff');
-    expect(frame).toContain('Copy prompt');
-    expect(frame).not.toContain('Copy code');
-    expect(frame).toContain('y copy menu');
-    expect(frame).toContain('palette');
-
-    await moveFrameText(instance.lastFrame() ?? '', 'export const value = 2;');
-    await flush();
-    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('Copy file');
+    expect(frame).toContain('Copy block');
+    expect(frame).not.toContain('Copy prompt');
     expect(frame).toContain('Copy code');
-    expect(frame).toContain('More');
+    expect(frame).not.toContain('palette');
+    expect(frame).not.toContain('copy menu');
+    expect(instance.lastFrame() ?? '').not.toContain('\u001B[96mCopy block');
+    expect(frame).not.toContain('More');
     expect(instance.lastFrame() ?? '').not.toContain('\u001B[96;1mCopy code');
 
     await moveFrameText(instance.lastFrame() ?? '', 'Copy code');
     await flush();
     expect(instance.lastFrame() ?? '').toContain('\u001B[96;1mCopy code');
+
+    instance.unmount();
+  });
+
+  it('does not treat Ctrl+K as normal k scrolling while palette is unavailable', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: Array.from({length: 12}, (_, index) => `line ${index + 1}`).join('\n'),
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    instance.stdin.write('\u000B');
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('✓ Palette is not available yet.');
+    expect(frame).toContain('ln 1-');
 
     instance.unmount();
   });
@@ -283,7 +357,7 @@ describe('App', () => {
         metrics: {path: 'src/example.ts', additions: 2, deletions: 1, changedLines: 3},
         rawDiff,
         renderedLines: [],
-        hunks: [{
+        blocks: [{
           id: 'src/example.ts:1:0',
           filePath: 'src/example.ts',
           oldStart: 1,
@@ -338,13 +412,13 @@ describe('App', () => {
     await emitMouseClickAt(actionColumn + 1, codeRow);
     await flush();
     expect(writes).not.toContain('export const value = 2;\nexport const next = 3;');
-    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('Copied hunk code');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('Copied block code');
 
     await clickFrameText(instance.lastFrame() ?? '', 'Copy code');
     await flush();
 
     expect(writes).toContain('export const value = 2;\nexport const next = 3;');
-    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied hunk code · src/example.ts:1');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied block code · src/example.ts:1');
 
     instance.unmount();
   });

@@ -1,14 +1,14 @@
-import type {ReviewHunk} from '../review/model.js';
+import type {ReviewBlock} from '../review/model.js';
 
-const HUNK_HEADER_PATTERN = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+const BLOCK_HEADER_PATTERN = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
 
 function parseLineCount(value: string | undefined) {
   return value === undefined ? 1 : Number(value);
 }
 
-function buildHunk(filePath: string, index: number, lines: string[]): ReviewHunk | null {
+function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlock | null {
   const header = lines[0];
-  const match = header?.match(HUNK_HEADER_PATTERN);
+  const match = header?.match(BLOCK_HEADER_PATTERN);
   if (!match) return null;
 
   const oldStart = Number(match[1]);
@@ -39,15 +39,15 @@ function buildHunk(filePath: string, index: number, lines: string[]): ReviewHunk
   };
 }
 
-export function parseUnifiedDiffHunks(rawDiff: string, filePath: string): ReviewHunk[] {
-  const hunks: ReviewHunk[] = [];
+export function parseUnifiedDiffBlocks(rawDiff: string, filePath: string): ReviewBlock[] {
+  const blocks: ReviewBlock[] = [];
   let current: string[] = [];
 
   for (const line of rawDiff.split('\n')) {
-    if (HUNK_HEADER_PATTERN.test(line)) {
+    if (BLOCK_HEADER_PATTERN.test(line)) {
       if (current.length > 0) {
-        const hunk = buildHunk(filePath, hunks.length, current);
-        if (hunk) hunks.push(hunk);
+        const block = buildBlock(filePath, blocks.length, current);
+        if (block) blocks.push(block);
       }
 
       current = [line];
@@ -60,9 +60,9 @@ export function parseUnifiedDiffHunks(rawDiff: string, filePath: string): Review
   }
 
   if (current.length > 0) {
-    const hunk = buildHunk(filePath, hunks.length, current);
-    if (hunk) hunks.push(hunk);
+    const block = buildBlock(filePath, blocks.length, current);
+    if (block) blocks.push(block);
   }
 
-  return hunks;
+  return blocks;
 }
