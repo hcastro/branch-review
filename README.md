@@ -127,26 +127,15 @@ first.
 
 ## Typical workflows
 
-### Review your current local changes before push
+### Review local changes as they happen
 
 ```sh
 branch-review
 ```
 
-Good for:
-
-- end-of-task review
-- AI-generated changes
-- checking untracked files before commit or push
-
-### Follow changes in real time
-
-```sh
-branch-review
-```
-
-In an interactive terminal, real-time updates are on by default. The tree,
-metrics, and diff refresh as your editor or coding agent changes files.
+Use this for end-of-task review, AI-generated changes, and checking untracked
+files before commit or push. In an interactive terminal, the view refreshes in
+real time as your editor or coding agent changes files.
 
 ### Review a feature branch against `main`
 
