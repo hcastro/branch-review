@@ -96,23 +96,25 @@ function ensureVisible(index: number, currentOffset: number, viewportSize: numbe
   return currentOffset;
 }
 
-function getDominantSectionIndex(sections: DiffSection[], startLine: number, endLineExclusive: number) {
+function getPrimaryVisibleSectionIndex(
+  sections: DiffSection[],
+  lines: string[],
+  startLine: number,
+  endLineExclusive: number,
+) {
   if (sections.length === 0) {
     return -1;
   }
 
-  let bestIndex = getSectionIndexForLine(sections, startLine);
-  let bestOverlap = -1;
-
-  for (const [index, section] of sections.entries()) {
-    const overlap = Math.min(endLineExclusive, section.endLineExclusive) - Math.max(startLine, section.startLine);
-    if (overlap > bestOverlap) {
-      bestIndex = index;
-      bestOverlap = overlap;
+  const start = clamp(startLine, 0, Math.max(lines.length - 1, 0));
+  const end = clamp(endLineExclusive, start + 1, lines.length);
+  for (let lineIndex = start; lineIndex < end; lineIndex += 1) {
+    if (stripAnsi(lines[lineIndex] ?? '').trim()) {
+      return getSectionIndexForLine(sections, lineIndex);
     }
   }
 
-  return bestIndex;
+  return getSectionIndexForLine(sections, start);
 }
 
 function getNodeBounds(node: DOMElement | null) {
@@ -657,14 +659,27 @@ export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; l
   return null;
 }
 
-function findBlockFromLine(line: string, activeFile: ReviewFile | undefined): ReviewBlock | undefined {
-  if (!activeFile) return undefined;
+function parseBlockLineTarget(line: string) {
   const plain = stripAnsi(line);
   const match = plain.match(/•\s+(.+):(\d+):/);
-  if (!match) return undefined;
+  if (!match) return null;
 
-  const lineStart = Number(match[2]);
-  return activeFile.blocks.find((block) => block.lineStart === lineStart) ?? activeFile.blocks[0];
+  return {
+    path: match[1]!,
+    lineStart: Number(match[2]),
+  };
+}
+
+function findBlockTargetFromLine(
+  line: string,
+  review: ReviewModel | undefined,
+): {file: ReviewFile; block: ReviewBlock} | undefined {
+  const target = parseBlockLineTarget(line);
+  if (!target || !review) return undefined;
+
+  const file = review.files.find((entry) => entry.path === target.path);
+  const block = file?.blocks.find((entry) => entry.lineStart === target.lineStart);
+  return file && block ? {file, block} : undefined;
 }
 
 function AppContent({
@@ -728,8 +743,13 @@ function AppContent({
     relativeOffset: 0,
   });
 
-  const topSectionIndex = getSectionIndexForLine(sections, diffOffset);
-  const activeSectionIndex = getDominantSectionIndex(sections, diffOffset, diffOffset + visibleDiffRows);
+  const topSectionIndex = getPrimaryVisibleSectionIndex(
+    sections,
+    allDiffLines,
+    diffOffset,
+    diffOffset + visibleDiffRows,
+  );
+  const activeSectionIndex = topSectionIndex;
   const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
   const activeTreePath = useMemo(() => findTreeSelectionPath(rows, activeFilePath), [activeFilePath, rows]);
@@ -744,8 +764,8 @@ function AppContent({
   );
   const focusedBlock = useMemo(() => {
     const focusedLine = focusedBlockLineIndex === null ? undefined : allDiffLines[focusedBlockLineIndex];
-    return focusedLine ? findBlockFromLine(focusedLine, activeFile) : activeFile?.blocks[0];
-  }, [activeFile, allDiffLines, focusedBlockLineIndex]);
+    return focusedLine ? findBlockTargetFromLine(focusedLine, review)?.block : activeFile?.blocks[0];
+  }, [activeFile, allDiffLines, focusedBlockLineIndex, review]);
 
   const stateRef = useRef({
     treeOffset,
@@ -1122,11 +1142,11 @@ function AppContent({
       const line = blockLineIndex === null ? undefined : allDiffLines[blockLineIndex];
       if (!line || diffLineIndex !== blockLineIndex) return;
 
-      const block = findBlockFromLine(line, activeFile);
+      const blockTarget = findBlockTargetFromLine(line, review);
       const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
-      if (!actionId) return;
+      if (!actionId || !blockTarget) return;
 
-      void runCopyCommand(actionId, activeFile, block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
+      void runCopyCommand(actionId, blockTarget.file, blockTarget.block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
     };
 
     mouse.events.on('click', handleClick);

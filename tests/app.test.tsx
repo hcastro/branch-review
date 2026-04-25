@@ -41,6 +41,16 @@ async function clickFrameTextOnce(frame: string, text: string) {
   await emitMouseClickAt(column, row);
 }
 
+async function clickFrameLineAction(frame: string, lineText: string, actionText: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes(lineText) && line.includes(actionText));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(actionText) ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  await emitMouseClickAt(column, row);
+}
+
 async function moveFrameText(frame: string, text: string) {
   const lines = stripAnsi(frame).split('\n');
   const row = lines.findIndex((line) => line.includes(text));
@@ -314,6 +324,39 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('keeps the top visible file active when the next file fills more of the viewport', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/short.ts',
+        metrics: {path: 'src/short.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '• src/short.ts:10:\nshort();',
+      },
+      {
+        path: 'src/long.ts',
+        metrics: {path: 'src/long.ts', additions: 8, deletions: 0, changedLines: 8},
+        diff: Array.from({length: 8}, (_, index) => `long line ${index + 1}`).join('\n'),
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 2, additions: 9, deletions: 0, changedLines: 9}}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('src/short.ts');
+    expect(frame).toContain('file 1/2');
+
+    instance.unmount();
+  });
+
   it('collapses and expands nested folders from the file tree', async () => {
     const sections = buildDiffSections([
       {
@@ -361,6 +404,115 @@ describe('App', () => {
     frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('▾ w');
     expect(frame).toContain('file 1/3');
+
+    instance.unmount();
+  });
+
+  it('copies the hovered block from its own file even when another file is active', async () => {
+    const shortRawDiff = [
+      '@@ -10 +10 @@ function short()',
+      '-short(false);',
+      '+short(true);',
+    ].join('\n');
+    const longRawDiff = [
+      '@@ -33 +33 @@ function long()',
+      '-long(false);',
+      '+long(true);',
+    ].join('\n');
+    const sections = buildDiffSections([
+      {
+        path: 'src/short.ts',
+        metrics: {path: 'src/short.ts', additions: 1, deletions: 1, changedLines: 2},
+        diff: '• src/short.ts:10: function short()\n  10 ⋮  10 │short(true);',
+      },
+      {
+        path: 'src/long.ts',
+        metrics: {path: 'src/long.ts', additions: 8, deletions: 1, changedLines: 9},
+        diff: [
+          '• src/long.ts:33: function long()',
+          '  33 ⋮  33 │long(true);',
+          ...Array.from({length: 8}, (_, index) => `long line ${index + 1}`),
+        ].join('\n'),
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 2, additions: 9, deletions: 2, changedLines: 11},
+      files: [
+        {
+          path: 'src/short.ts',
+          status: 'modified',
+          metrics: {path: 'src/short.ts', additions: 1, deletions: 1, changedLines: 2},
+          rawDiff: shortRawDiff,
+          renderedLines: [],
+          blocks: [{
+            id: 'src/short.ts:10:0',
+            filePath: 'src/short.ts',
+            oldStart: 10,
+            oldLines: 1,
+            newStart: 10,
+            newLines: 1,
+            lineStart: 10,
+            lineEnd: 10,
+            functionHeader: 'function short()',
+            rawDiff: shortRawDiff,
+            addedCode: 'short(true);',
+          }],
+        },
+        {
+          path: 'src/long.ts',
+          status: 'modified',
+          metrics: {path: 'src/long.ts', additions: 8, deletions: 1, changedLines: 9},
+          rawDiff: longRawDiff,
+          renderedLines: [],
+          blocks: [{
+            id: 'src/long.ts:33:0',
+            filePath: 'src/long.ts',
+            oldStart: 33,
+            oldLines: 1,
+            newStart: 33,
+            newLines: 1,
+            lineStart: 33,
+            lineEnd: 33,
+            functionHeader: 'function long()',
+            rawDiff: longRawDiff,
+            addedCode: 'long(true);',
+          }],
+        },
+      ],
+    };
+    const writes: string[] = [];
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 2, additions: 9, deletions: 2, changedLines: 11}}
+        review={review}
+        copyWriter={async (text) => {
+          writes.push(text);
+          return {
+            ok: true,
+            command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
+          };
+        }}
+        dimensions={{columns: 150, rows: 18}}
+      />,
+    );
+
+    await flush();
+    await moveFrameText(instance.lastFrame() ?? '', 'src/short.ts:10');
+    await flush();
+    await clickFrameLineAction(instance.lastFrame() ?? '', 'src/short.ts:10', 'Copy block');
+    await flush();
+
+    expect(writes.at(-1)).toContain('File: src/short.ts');
+    expect(writes.at(-1)).toContain('Lines: 10-10');
+    expect(writes.at(-1)).toContain(shortRawDiff);
+    expect(writes.at(-1)).not.toContain('src/long.ts');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied block · src/short.ts:10');
 
     instance.unmount();
   });
@@ -440,7 +592,7 @@ describe('App', () => {
 
     await moveFrameText(instance.lastFrame() ?? '', 'Copy code');
     await flush();
-    expect(instance.lastFrame() ?? '').toContain('\u001B[96;1mCopy code');
+    expect(instance.lastFrame() ?? '').toMatch(/\u001B\[(?:96;1|96m\u001B\[1)mCopy code/);
 
     instance.unmount();
   });
@@ -628,7 +780,7 @@ describe('App', () => {
 
     expect(writes).toContain('export const value = 2;\nexport const next = 3;');
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied block code · src/example.ts:1');
-    expect(instance.lastFrame() ?? '').toContain('\u001B[32;1m✓ Copied');
+    expect(instance.lastFrame() ?? '').toMatch(/\u001B\[(?:32;1|32m\u001B\[1)m✓ Copied/);
 
     instance.unmount();
   });
