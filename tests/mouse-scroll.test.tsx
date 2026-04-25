@@ -5,6 +5,7 @@ import {
   applyScrollDelta,
   findFocusedBlockLineIndex,
   getTreeRowHitFromPanel,
+  shouldShowTreeCopy,
 } from '../src/ui/App.js';
 
 describe('wheel helpers', () => {
@@ -74,5 +75,11 @@ describe('wheel helpers', () => {
     });
     expect(getTreeRowHitFromPanel(panel, 7, 4, options)).toBeNull();
     expect(getTreeRowHitFromPanel(panel, 40, 5, options)).toBeNull();
+  });
+
+  it('shows tree copy text only while hovering a file row', () => {
+    expect(shouldShowTreeCopy('file', true, false)).toBe(true);
+    expect(shouldShowTreeCopy('file', false, true)).toBe(false);
+    expect(shouldShowTreeCopy('dir', true, false)).toBe(false);
   });
 });
