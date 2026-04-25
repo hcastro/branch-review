@@ -26,7 +26,7 @@ export const BLOCK_ACTION_LABELS = {
   prompt: 'Copy block',
 } as const;
 
-const ANSI_CSI_TOKEN = /(\[[0-9;]*[A-Za-z])/;
+const ANSI_CSI_TOKEN = /(\[[0-9;:]*[A-Za-z])/;
 const RESET = '[0m';
 const SECTION_BORDER = '[36m';
 
@@ -126,8 +126,37 @@ function buildPlainPrefix(prefix: string): StyledCell[] {
   return [...prefix].map((char) => ({char, style: ''}));
 }
 
+function normalizeSgrToken(token: string): string {
+  if (!token.endsWith('m')) return '';
+
+  const rawParams = token.slice(2, -1).replaceAll(':', ';');
+  const params = rawParams ? rawParams.split(';') : ['0'];
+  const groups: string[][] = [];
+
+  for (let index = 0; index < params.length;) {
+    const code = params[index] || '0';
+    const mode = params[index + 1];
+    if ((code === '38' || code === '48') && mode === '2' && index + 4 < params.length) {
+      groups.push(params.slice(index, index + 5));
+      index += 5;
+      continue;
+    }
+
+    if ((code === '38' || code === '48') && mode === '5' && index + 2 < params.length) {
+      groups.push(params.slice(index, index + 3));
+      index += 3;
+      continue;
+    }
+
+    groups.push([code]);
+    index += 1;
+  }
+
+  return groups.map((group) => `\x1B[${group.join(';')}m`).join('');
+}
+
 function stripNonSgrCsi(line: string): string {
-  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, (match) => (match.endsWith('m') ? match : ''));
+  return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, normalizeSgrToken);
 }
 
 export function truncateAnsi(line: string, maxWidth: number) {

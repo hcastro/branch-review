@@ -138,6 +138,16 @@ describe('section helpers', () => {
     expect(stripAnsi(truncated)).toBe('hi');
   });
 
+  it('splits compound delta color sequences before wrapping', () => {
+    const compound = '\x1B[48;2;0;56;0;38;2;166;226;46mblocked user posts are removed\x1B[0m';
+    const wrapped = wrapAnsi(compound, 18);
+    const output = wrapped.join('');
+
+    expect(output).not.toContain('\x1B[48;2;0;56;0;38;2;166;226;46m');
+    expect(output).toContain('\x1B[48;2;0;56;0m\x1B[38;2;166;226;46m');
+    expect(stripAnsi(output)).toBe('blocked user posts are removed');
+  });
+
   it('rewraps sections and recomputes line boundaries across wrapped lines', () => {
     const base = buildDiffSections([
       {
