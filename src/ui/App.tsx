@@ -38,6 +38,8 @@ type AppProps = {
 
 const SCROLL_STEP = 3;
 const TOAST_TIMEOUT_MS = 2200;
+const COPY_SUCCESS_TIMEOUT_MS = 1200;
+const COPY_SUCCESS_LABEL = '✓ Copied';
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -277,6 +279,7 @@ const ANSI_CYAN_BRIGHT_BOLD = '[96;1m';
 const ANSI_CYAN_BRIGHT = '[96m';
 const ANSI_CYAN = '[36m';
 const ANSI_GRAY = '[90m';
+const ANSI_GREEN_BOLD = '[32;1m';
 const ANSI_GREEN = '[32m';
 const ANSI_RED = '[31m';
 const ANSI_YELLOW = '[33m';
@@ -288,6 +291,7 @@ type HoveredAction =
   | {kind: 'tree-copy'; rowIndex: number}
   | {kind: 'block'; id: string; lineIndex: number}
   | null;
+type CopiedAction = Exclude<HoveredAction, null>;
 
 function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
   if (current === next) return true;
@@ -327,9 +331,15 @@ function ansiStatus(status: FileStatus | undefined) {
   return `${color}${label}${ANSI_RESET}`;
 }
 
-function actionButton(label: string, primary = false) {
-  const color = primary ? ANSI_CYAN_BRIGHT : ANSI_GRAY;
-  return `${ANSI_GRAY}╭─${ANSI_RESET}${color}${label}${ANSI_RESET}${ANSI_GRAY}─╮${ANSI_RESET}`;
+function successLabel(label: string) {
+  const gap = Math.max(0, visibleWidth(label) - visibleWidth(COPY_SUCCESS_LABEL));
+  return `${COPY_SUCCESS_LABEL}${' '.repeat(gap)}`;
+}
+
+function actionButton(label: string, primary = false, copied = false) {
+  const text = copied ? successLabel(label) : label;
+  const color = copied ? ANSI_GREEN_BOLD : primary ? ANSI_CYAN_BRIGHT : ANSI_GRAY;
+  return `${ANSI_GRAY}╭─${ANSI_RESET}${color}${text}${ANSI_RESET}${ANSI_GRAY}─╮${ANSI_RESET}`;
 }
 
 function composeLeftRight(left: string, right: string, width: number) {
@@ -342,9 +352,9 @@ function composeLeftRight(left: string, right: string, width: number) {
   return `${safeLeft}${' '.repeat(gap)}${right}`;
 }
 
-function fileActions(hoveredAction?: string) {
+function fileActions(hoveredAction?: string, copiedAction?: string) {
   return FILE_ACTIONS
-    .map((action) => actionButton(action.label, action.id === hoveredAction))
+    .map((action) => actionButton(action.label, action.id === hoveredAction, action.id === copiedAction))
     .join(' ');
 }
 
@@ -360,13 +370,16 @@ function highlightActionLabel(line: string, actionId: string | undefined) {
   );
 }
 
-function blockActionsLine(hoveredAction?: string) {
+function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
   return BLOCK_ACTIONS
     .map((action) => {
-      const color = action.id === hoveredAction
+      const copied = action.id === copiedAction;
+      const color = copied
+        ? ANSI_GREEN_BOLD
+        : action.id === hoveredAction
         ? ANSI_CYAN_BRIGHT
         : ANSI_GRAY;
-      return `${color}${action.label}${ANSI_RESET}`;
+      return `${color}${copied ? successLabel(action.label) : action.label}${ANSI_RESET}`;
     })
     .join('  ');
 }
@@ -422,7 +435,7 @@ export function findFocusedBlockLineIndex(
   return null;
 }
 
-function addBlockActionsToLine(line: string, hoveredAction?: string) {
+function addBlockActionsToLine(line: string, hoveredAction?: string, copiedAction?: string) {
   const plain = stripAnsi(line);
   if (!isBlockContentLine(line)) return line;
 
@@ -432,7 +445,7 @@ function addBlockActionsToLine(line: string, hoveredAction?: string) {
 
   const contentWidth = contentEnd - contentStart;
   const leftText = plain.slice(contentStart, contentEnd).trimEnd();
-  const content = composeLeftRight(`${ANSI_CYAN}${leftText}${ANSI_RESET}`, blockActionsLine(hoveredAction), contentWidth);
+  const content = composeLeftRight(`${ANSI_CYAN}${leftText}${ANSI_RESET}`, blockActionsLine(hoveredAction, copiedAction), contentWidth);
 
   return `${ANSI_CYAN}│${ANSI_RESET} ${content} ${ANSI_CYAN}│${ANSI_RESET}`;
 }
@@ -560,6 +573,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
   const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
   const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
+  const [copiedAction, setCopiedAction] = useState<CopiedAction | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
   const topSectionIndex = getSectionIndexForLine(sections, diffOffset);
@@ -637,7 +651,18 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     return () => clearTimeout(timeout);
   }, [toast]);
 
-  const runCopyCommand = useCallback(async (commandId: string, commandFile = activeFile, commandBlock = focusedBlock) => {
+  useEffect(() => {
+    if (!copiedAction) return undefined;
+    const timeout = setTimeout(() => setCopiedAction(null), COPY_SUCCESS_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [copiedAction]);
+
+  const runCopyCommand = useCallback(async (
+    commandId: string,
+    commandFile = activeFile,
+    commandBlock = focusedBlock,
+    successAction?: CopiedAction,
+  ) => {
     if (!review || !commandFile) {
       showToast('Copy action unavailable.');
       return;
@@ -648,6 +673,10 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       activeFile: commandFile,
       focusedBlock: commandBlock,
     }, copyWriter ? {write: copyWriter} : {});
+
+    if (result.ok && successAction) {
+      setCopiedAction(successAction);
+    }
 
     showToast(result.toast, result.hint);
   }, [activeFile, copyWriter, focusedBlock, review, showToast]);
@@ -765,7 +794,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
         if (row && row.kind === 'file') {
           const rowFile = review?.files.find((file) => file.path === row.path);
           if (isTreeCopyTarget(relativeX, bounds.width) && rowFile) {
-            void runCopyCommand('copy.path', rowFile, rowFile.blocks[0]);
+            void runCopyCommand('copy.path', rowFile, rowFile.blocks[0], {kind: 'tree-copy', rowIndex});
             return;
           }
 
@@ -787,7 +816,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
         const fileHeaderLine = composeLeftRight(fileLabel, fileActions(), Math.max(1, rightWidth - 4));
         const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
         if (actionId) {
-          void runCopyCommand(actionId);
+          void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
         }
         return;
       }
@@ -801,7 +830,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
       if (!actionId) return;
 
-      void runCopyCommand(actionId, activeFile, block);
+      void runCopyCommand(actionId, activeFile, block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
     };
 
     mouse.events.on('click', handleClick);
@@ -925,7 +954,8 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
             const status = ansiStatus(activeStatus);
             const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
             const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-            const fileLabelWithActions = composeLeftRight(fileLabel, review ? fileActions(fileHover) : '', inner);
+            const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+            const fileLabelWithActions = composeLeftRight(fileLabel, review ? fileActions(fileHover, fileCopied) : '', inner);
 
             const metricsCore = activeSection
               ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
@@ -946,9 +976,12 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
               const blockHover = hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex
                 ? hoveredAction.id
                 : undefined;
+              const blockCopied = copiedAction?.kind === 'block' && copiedAction.lineIndex === absoluteLineIndex
+                ? copiedAction.id
+                : undefined;
               const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
               const visibleLine = visibleActionBlockLineIndex === absoluteLineIndex
-                ? addBlockActionsToLine(line || ' ', blockHover)
+                ? addBlockActionsToLine(line || ' ', blockHover, blockCopied)
                 : line || ' ';
               rows.push(frameLine(highlightActionLabel(visibleLine, blockHover), inner, borderAnsi));
             }

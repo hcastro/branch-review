@@ -419,6 +419,7 @@ describe('App', () => {
 
     expect(writes).toContain('export const value = 2;\nexport const next = 3;');
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied block code · src/example.ts:1');
+    expect(instance.lastFrame() ?? '').toContain('\u001B[32;1m✓ Copied');
 
     instance.unmount();
   });
