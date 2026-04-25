@@ -34,6 +34,8 @@ type AppProps = {
   review?: ReviewModel;
   copyWriter?: ClipboardWriter;
   dimensions?: {columns: number; rows: number};
+  watchStatus?: string;
+  emptyStateHint?: string;
 };
 
 const SCROLL_STEP = 3;
@@ -537,7 +539,17 @@ function findBlockFromLine(line: string, activeFile: ReviewFile | undefined): Re
   return activeFile.blocks.find((block) => block.lineStart === lineStart) ?? activeFile.blocks[0];
 }
 
-function AppContent({base, branch, sections: rawSections, branchMetrics, review, copyWriter, dimensions}: AppProps) {
+function AppContent({
+  base,
+  branch,
+  sections: rawSections,
+  branchMetrics,
+  review,
+  copyWriter,
+  dimensions,
+  watchStatus,
+  emptyStateHint,
+}: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
   const mouse = useMouse();
@@ -578,6 +590,11 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
   const [copiedAction, setCopiedAction] = useState<CopiedAction | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  const viewSnapshotRef = useRef({
+    path: '',
+    sectionIndex: 0,
+    relativeOffset: 0,
+  });
 
   const topSectionIndex = getSectionIndexForLine(sections, diffOffset);
   const activeSectionIndex = getDominantSectionIndex(sections, diffOffset, diffOffset + visibleDiffRows);
@@ -606,6 +623,38 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     treeContentWidth,
   });
   stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
+
+  useEffect(() => {
+    const snapshot = viewSnapshotRef.current;
+    if (!snapshot.path || sections.length === 0) {
+      setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
+      return;
+    }
+
+    const preservedSection = sections.find((section) => section.path === snapshot.path);
+    const fallbackSection = sections[clamp(snapshot.sectionIndex, 0, sections.length - 1)];
+    const nextSection = preservedSection ?? fallbackSection;
+    if (!nextSection) {
+      setDiffOffset(0);
+      return;
+    }
+
+    const nextOffset = clamp(
+      nextSection.startLine + snapshot.relativeOffset,
+      nextSection.startLine,
+      Math.max(nextSection.startLine, nextSection.endLineExclusive - 1),
+    );
+
+    setDiffOffset((current) => current === nextOffset ? current : nextOffset);
+  }, [sections, maxDiffOffset]);
+
+  useEffect(() => {
+    viewSnapshotRef.current = {
+      path: activeFilePath,
+      sectionIndex: activeSectionIndex,
+      relativeOffset: activeSection ? Math.max(0, diffOffset - activeSection.startLine) : 0,
+    };
+  }, [activeFilePath, activeSection, activeSectionIndex, diffOffset]);
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
@@ -858,6 +907,9 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
   const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
   const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
   const treeCounter = `${treeRowStart}-${treeRowEnd}/${rows.length}`;
+  const footerHints = watchStatus
+    ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
+    : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
 
   useInput((input, key) => {
     if (key.downArrow) {
@@ -956,17 +1008,18 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
           {(() => {
             const borderAnsi = diffHovered ? ANSI_CYAN : ANSI_GRAY;
             const inner = Math.max(1, rightWidth - 4);
+            const hasChanges = sections.length > 0;
 
             const activeStatus = review?.files.find((file) => file.path === activeFilePath)?.status;
             const status = ansiStatus(activeStatus);
             const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
             const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
             const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-            const fileLabelWithActions = composeLeftRight(fileLabel, review ? fileActions(fileHover, fileCopied) : '', inner);
+            const fileLabelWithActions = composeLeftRight(fileLabel, review && hasChanges ? fileActions(fileHover, fileCopied) : '', inner);
 
             const metricsCore = activeSection
               ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
-              : `${ANSI_GRAY}No diff loaded.${ANSI_RESET}`;
+              : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
             const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
             const counterWidth = visibleWidth(counter);
             const metricsWidth = visibleWidth(metricsCore);
@@ -978,6 +1031,11 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
               frameLine(fileLabelWithActions, inner, borderAnsi),
               frameLine(metricsRow, inner, borderAnsi),
             ];
+            if (!hasChanges) {
+              rows.push(frameLine(`${ANSI_CYAN_BRIGHT_BOLD}No changes to review${ANSI_RESET}`, inner, borderAnsi));
+              rows.push(frameLine(`${ANSI_GRAY}${emptyStateHint ?? 'Run again after making changes.'}${ANSI_RESET}`, inner, borderAnsi));
+            }
+
             for (const [index, line] of visibleDiffLines.entries()) {
               const absoluteLineIndex = diffOffset + index;
               const blockHover = hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex
@@ -1002,7 +1060,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
         {toast
           ? <Text color="cyan">✓ {toast}</Text>
-          : <Text color="gray">↑/↓ jump file • j/k scroll • g/G top-bottom • q quit</Text>}
+          : <Text color="gray">{footerHints}</Text>}
         <Text color="gray">{base}...{branch}</Text>
       </Box>
     </Box>

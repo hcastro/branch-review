@@ -1,10 +1,11 @@
 import React from 'react';
 import {EventEmitter} from 'node:events';
 import {render} from 'ink';
-import {App} from './ui/App.js';
-import {buildDiffSections} from './sections.js';
+import {parseCliArgs} from './cliArgs.js';
+import {ReviewController, getModelWidth} from './ui/ReviewController.js';
 import {
   inferBaseRef,
+  getReviewFingerprint,
   resolveRefs,
 } from './git.js';
 import {buildReviewModel} from './review/build.js';
@@ -12,27 +13,20 @@ import {buildReviewModel} from './review/build.js';
 EventEmitter.defaultMaxListeners = 100;
 
 const cwd = process.cwd();
-const requestedBranch = process.argv[2] ?? 'HEAD';
-const requestedBase = process.argv[3] ?? inferBaseRef(cwd);
+const options = parseCliArgs(process.argv.slice(2), {interactive: Boolean(process.stdout.isTTY)});
+const requestedBranch = options.requestedBranch;
+const requestedBase = options.requestedBase ?? inferBaseRef(cwd);
 const range = resolveRefs(cwd, requestedBranch, requestedBase);
 
 const terminalWidth = process.stdout.columns ?? 160;
-const leftWidth = Math.max(34, Math.floor(terminalWidth * 0.27));
-const rightWidth = Math.max(78, terminalWidth - leftWidth - 12);
-const review = buildReviewModel({cwd, range, width: rightWidth});
+const review = buildReviewModel({cwd, range, width: getModelWidth(terminalWidth)});
 
-if (review.files.length === 0) {
+if (!options.watch && review.files.length === 0) {
   console.log(`No file changes between ${range.base} and ${range.branch}.`);
   process.exit(0);
 }
 
-const sections = buildDiffSections(
-  review.files.map((file) => ({
-    path: file.path,
-    metrics: file.metrics,
-    diff: file.renderedLines.join('\n'),
-  })),
-);
+const initialFingerprint = options.watch ? getReviewFingerprint(cwd, range) : undefined;
 
 const useAltScreen = Boolean(process.stdout.isTTY);
 let altScreenActive = false;
@@ -61,12 +55,13 @@ process.on('SIGTERM', () => {
 });
 
 const instance = render(
-  <App
-    base={range.base}
-    branch={review.branch}
-    sections={sections}
-    branchMetrics={review.metrics}
-    review={review}
+  <ReviewController
+    cwd={cwd}
+    range={range}
+    initialReview={review}
+    initialFingerprint={initialFingerprint}
+    watch={options.watch}
+    watchPoll={options.watchPoll}
   />,
 );
 

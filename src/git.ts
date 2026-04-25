@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import {createHash} from 'node:crypto';
 import {execFileSync} from 'node:child_process';
 import type {BranchMetrics, FileMetrics} from './sections.js';
 
@@ -245,6 +246,47 @@ export function getBranchMetrics(cwd: string, range: DiffRange): BranchMetrics {
     deletions: fileMetrics.reduce((sum, item) => sum + item.deletions, 0),
     changedLines: fileMetrics.reduce((sum, item) => sum + item.changedLines, 0),
   };
+}
+
+function statFingerprint(cwd: string, filePath: string) {
+  try {
+    const stat = fs.statSync(path.join(cwd, filePath));
+    return `${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+export function getReviewFingerprint(cwd: string, range: DiffRange) {
+  const entries = getChangedFileEntries(cwd, range);
+  const metrics = getFileMetricsMap(cwd, range);
+  const head = tryRunGit(cwd, ['rev-parse', 'HEAD']) ?? '';
+  const raw = runGitDiff(cwd, ['diff', '--raw', '-z', range.diffArg]);
+  const hash = createHash('sha1');
+
+  hash.update(range.base);
+  hash.update('\0');
+  hash.update(range.branch);
+  hash.update('\0');
+  hash.update(head);
+  hash.update('\0');
+  hash.update(raw);
+
+  for (const entry of entries) {
+    const metric = metrics.get(entry.path);
+    hash.update('\0');
+    hash.update(entry.status);
+    hash.update('\0');
+    hash.update(entry.oldPath ?? '');
+    hash.update('\0');
+    hash.update(entry.path);
+    hash.update('\0');
+    hash.update(metric ? `${metric.additions}:${metric.deletions}:${metric.changedLines}` : '0:0:0');
+    hash.update('\0');
+    hash.update(statFingerprint(cwd, entry.path));
+  }
+
+  return hash.digest('hex');
 }
 
 const DELTA_FLAGS = "delta --no-gitconfig --dark --paging=never --line-numbers --navigate --line-fill-method=spaces --syntax-theme='Monokai Extended' --file-style='omit' --hunk-header-style='syntax file line-number' --hunk-header-decoration-style='omit' --plus-style='syntax #003800' --minus-style='syntax #3f0001'";
