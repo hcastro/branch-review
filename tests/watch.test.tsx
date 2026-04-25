@@ -127,6 +127,16 @@ describe('watch helpers', () => {
     ]));
   });
 
+  it('includes remote ref paths for push and fetch refreshes', () => {
+    const cwd = createRepo();
+    runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'development');
+
+    expect(getGitStateWatchPaths(cwd)).toEqual(expect.arrayContaining([
+      path.join(cwd, '.git', 'refs', 'remotes'),
+      path.join(cwd, '.git', 'logs', 'refs', 'remotes'),
+    ]));
+  });
+
   it('formats quiet footer state', () => {
     expect(formatWatchFooterStatus({state: 'watching'}, 1000)).toBeUndefined();
     expect(formatWatchFooterStatus({state: 'refreshing'}, 1000)).toBe('refreshing...');
@@ -195,6 +205,36 @@ describe('watch helpers', () => {
 
     await ready;
     runGit(cwd, 'commit', '-m', 'commit watched change');
+
+    await expect(Promise.race([
+      changed.then(() => 'changed'),
+      flush(1000).then(() => 'timeout'),
+    ])).resolves.toBe('changed');
+
+    await watcher.close();
+  });
+
+  it('fires when a remote-tracking ref moves', async () => {
+    const cwd = createRepo();
+    runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'development');
+
+    let resolveReady: () => void = () => {};
+    let resolveChange: () => void = () => {};
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    const changed = new Promise<void>((resolve) => {
+      resolveChange = resolve;
+    });
+    const watcher = createRepoWatcher({
+      repoRoot: cwd,
+      debounceMs: 20,
+      onReady: resolveReady,
+      onChange: resolveChange,
+    });
+
+    await ready;
+    runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'HEAD');
 
     await expect(Promise.race([
       changed.then(() => 'changed'),
@@ -292,6 +332,52 @@ describe('ReviewController watch refresh', () => {
 
     runGit(cwd, 'add', 'src/one.ts');
     runGit(cwd, 'commit', '-m', 'commit watched change');
+    triggerChange?.();
+    await flush(10);
+
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(refreshedRange?.diffArg).toBe(runGit(cwd, 'rev-parse', 'HEAD'));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('No changes to review');
+
+    instance.unmount();
+  });
+
+  it('re-resolves remote bases so pushed changes leave the default review', async () => {
+    const cwd = createRepo();
+    runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'development');
+
+    const initialRange = resolveRefs(cwd, 'HEAD', 'origin/development');
+    const initialReview = reviewModel([{path: 'src/one.ts', text: 'unpushed branch change'}]);
+    const emptyReview = reviewModel([]);
+    const buildReview = vi.fn((_options: {cwd: string; range: DiffRange; width: number}) => emptyReview);
+    let refreshedRange: DiffRange | undefined;
+    let triggerChange: (() => void) | undefined;
+    const createWatcher = vi.fn((options: CreateRepoWatcherOptions) => {
+      triggerChange = options.onChange;
+      return {close: vi.fn(async () => undefined)};
+    });
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={initialRange}
+        resolveRange={() => resolveRefs(cwd, 'HEAD', 'origin/development')}
+        initialReview={initialReview}
+        initialFingerprint={getReviewFingerprint(cwd, initialRange)}
+        watch
+        buildReview={(options) => {
+          refreshedRange = options.range;
+          return buildReview(options);
+        }}
+        createWatcher={createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('unpushed branch change');
+
+    runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'HEAD');
     triggerChange?.();
     await flush(10);
 

@@ -96,9 +96,12 @@ export function getGitStateWatchPaths(repoRoot: string) {
   const currentRef = tryRunGit(repoRoot, ['symbolic-ref', '--quiet', 'HEAD']);
   const paths = new Set([
     path.join(gitDir, 'HEAD'),
+    path.join(gitDir, 'FETCH_HEAD'),
     path.join(gitDir, 'index'),
     path.join(gitDir, 'logs', 'HEAD'),
     path.join(commonGitDir, 'packed-refs'),
+    path.join(commonGitDir, 'refs', 'remotes'),
+    path.join(commonGitDir, 'logs', 'refs', 'remotes'),
   ]);
 
   if (currentRef?.startsWith('refs/')) {
