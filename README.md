@@ -1,44 +1,54 @@
 # branch-review
 
-Review your branch like a pull request before you push it.
+A local PR-style review UI for your terminal.
+
+Review your branch, worktree, and AI-generated code changes before you push.
 
 ![branch-review terminal UI screenshot](assets/branch-review-screenshot.png)
 
-`branch-review` is a terminal UI for doing a focused, local review of your Git changes. It is built for developers who live in the terminal and want a cleaner final review pass than raw `git diff`, without switching to GitHub or using a full Git dashboard.
+`branch-review` is for the review pass that happens before GitHub.
 
-It is especially useful when AI agents made a lot of edits and you want a fast human pass over exactly what changed.
+It gives you a GitHub-like changed-files view in your terminal, with a file tree,
+syntax-highlighted diffs, live refresh, and one-click copy actions for sending
+paths, diff blocks, files, or agent-ready context to AI coding tools.
 
 ## Why this exists
 
-GitHub has a great code review reading experience.
-
-But a lot of code gets reviewed too late:
+GitHub has a great code review reading experience, but a lot of code gets
+reviewed too late:
 
 - after you already pushed
 - after you already opened a PR
-- after an AI tool touched 20 files and you want to sanity-check the result locally
+- after an AI agent touched 20 files and you want to sanity-check the result locally
 
 `branch-review` brings that review step into the terminal.
 
-## What it does
+## Features
 
-- shows a file tree on the left and the current diff on the right
-- compares a branch against any base ref
-- supports `HEAD + worktree` review for local, unpushed changes
-- includes untracked files in local review mode
-- shows branch-wide and per-file change metrics
-- supports mouse and keyboard navigation
-- renders syntax-highlighted diffs through `git-delta`
+- PR-style review before code leaves your machine
+- Real-time updates as you or an AI agent edits code
+- Changed-file tree with status markers for what changed
+- Collapsible folders for large reviews
+- Syntax-highlighted diffs powered by `git-delta`
+- Per-file and branch-wide change metrics
+- Copy actions for paths, absolute paths, file diffs, full files, block diffs, block code, and agent-ready block context
+- Works with local worktree changes, branches, and remote branches
 
-## What it is not
+## Copy actions
 
-`branch-review` is not trying to be a full Git client.
+Hover a file or diff block to copy useful review context:
 
-If you want to stage files, manage stashes, rebase, cherry-pick, and do general repository operations, tools like `lazygit`, `gitui`, or `tig` are better fits.
+| Action | Copies |
+| --- | --- |
+| Copy path | Current file path, relative to the repo |
+| Copy absolute path | Current file path as an absolute path |
+| Copy diff | Current file diff |
+| Copy file | Current file contents |
+| Copy code | Added code from the focused diff block |
+| Copy block | Agent-ready context for the focused diff block |
 
-`branch-review` is focused on one job:
-
-**reading and reviewing changes well before push or PR creation.**
+This is useful when you want to hand a specific path, file, diff block, or code
+snippet to Claude Code, Codex, Cursor, ChatGPT, Slack, or a GitHub comment.
 
 ## Requirements
 
@@ -78,10 +88,12 @@ branch-review
 
 Default behavior:
 
-- branch: `HEAD`
+- branch: `HEAD + worktree`
 - base: the detected base branch
+- watch: enabled in interactive terminals
 
-Base detection uses `origin/HEAD` when available, then falls back to common branch names such as `development`, `main`, `master`, and `trunk`.
+Base detection uses `origin/HEAD` when available, then falls back to common branch
+names such as `development`, `main`, `master`, and `trunk`.
 
 Examples:
 
@@ -90,6 +102,7 @@ branch-review                      # HEAD + worktree vs detected base
 branch-review my-feature           # my-feature vs detected base
 branch-review my-feature main      # my-feature vs main
 branch-review HEAD main            # current local worktree vs main
+branch-review HEAD HEAD            # working tree changes only
 ```
 
 Ref resolution behavior:
@@ -97,7 +110,8 @@ Ref resolution behavior:
 - tries local refs first
 - falls back to `origin/<ref>` when available
 
-So you can review against remote-only base branches without checking them out first.
+So you can review against remote-only base branches without checking them out
+first.
 
 ## Navigation
 
@@ -105,9 +119,9 @@ So you can review against remote-only base branches without checking them out fi
 | --- | --- |
 | `↑` / `↓` | jump to previous / next file |
 | `j` / `k` | scroll diff down / up |
-| `PgDn` / `PgUp` | page down / up |
 | `g` / `G` | jump to top / bottom |
 | click file | jump diff to that file |
+| click folder | collapse / expand that folder |
 | trackpad / mouse wheel | scroll hovered pane |
 | `q` / `Esc` | quit |
 
@@ -124,6 +138,15 @@ Good for:
 - end-of-task review
 - AI-generated changes
 - checking untracked files before commit or push
+
+### Follow changes in real time
+
+```sh
+branch-review
+```
+
+In an interactive terminal, real-time updates are on by default. The tree,
+metrics, and diff refresh as your editor or coding agent changes files.
 
 ### Review a feature branch against `main`
 
@@ -144,17 +167,6 @@ branch-review my-feature release/2026.04
 ```
 
 If the local ref is missing, `branch-review` will try `origin/release/2026.04`.
-
-## How it works
-
-`branch-review` uses Git directly for file discovery and metrics, then pipes file diffs through `delta` for rendering.
-
-High-level flow:
-
-- `git diff --name-only` builds the changed file list
-- `git diff --numstat` builds file and branch metrics
-- `git diff --color=always ... -- <file>` renders each file diff
-- `delta` turns that diff into a more readable terminal review view
 
 ## Development
 
