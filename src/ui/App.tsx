@@ -182,7 +182,7 @@ const TreeFileRow = memo(function TreeFileRow({
 }) {
   const accent = row.kind === 'dir' ? 'yellow' : selected ? 'cyanBright' : hovered ? 'cyan' : 'white';
   const glyph = row.kind === 'dir' ? '▾' : '•';
-  const copyVisible = row.kind === 'file' && (selected || hovered);
+  const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected);
   const indicatorWidth = row.kind === 'file' ? 8 : 0;
 
   return (
@@ -205,6 +205,10 @@ const TreeFileRow = memo(function TreeFileRow({
     </Box>
   );
 });
+
+export function shouldShowTreeCopy(rowKind: TreeRow['kind'], hovered: boolean, _selected: boolean) {
+  return rowKind === 'file' && hovered;
+}
 
 function TreePane({
   panelRef,
