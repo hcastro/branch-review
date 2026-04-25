@@ -16,6 +16,10 @@ export function buildPathPayload(file: Pick<ReviewFile, 'path'>) {
   return file.path;
 }
 
+export function buildAbsolutePathPayload(absolutePath: string) {
+  return absolutePath;
+}
+
 export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, block: Pick<ReviewBlock, 'lineStart'>) {
   return `${file.path}:${block.lineStart}`;
 }
@@ -34,6 +38,10 @@ export function buildBlockDiffPayload(block: Pick<ReviewBlock, 'rawDiff'>) {
 
 export function buildFileDiffPayload(file: Pick<ReviewFile, 'rawDiff'>) {
   return file.rawDiff;
+}
+
+export function buildFileContentsPayload(contents: string) {
+  return contents;
 }
 
 export function buildBlockPromptPayload(file: Pick<ReviewFile, 'path'>, block: ReviewBlock) {

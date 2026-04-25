@@ -33,6 +33,8 @@ type AppProps = {
   branchMetrics: BranchMetrics;
   review?: ReviewModel;
   copyWriter?: ClipboardWriter;
+  readFileContent?: (file: ReviewFile) => string | null;
+  resolveAbsolutePath?: (file: ReviewFile) => string | null;
   dimensions?: {columns: number; rows: number};
   watchStatus?: string;
   emptyStateHint?: string;
@@ -45,8 +47,9 @@ const COPY_SUCCESS_LABEL = '✓ Copied';
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
-  {id: 'copy.filePrompt', label: 'Copy file'},
+  {id: 'copy.fileContents', label: 'Copy file'},
 ] as const;
+const ABSOLUTE_PATH_ACTION = {id: 'copy.absolutePath', label: 'Copy absolute path'} as const;
 const BLOCK_ACTIONS = [
   {id: 'copy.blockCode', label: BLOCK_ACTION_LABELS.code},
   {id: 'copy.blockDiff', label: BLOCK_ACTION_LABELS.diff},
@@ -378,16 +381,126 @@ function fileActions(hoveredAction?: string, copiedAction?: string) {
     .join(' ');
 }
 
+function shouldRevealAbsolutePathAction(hoveredAction?: string, copiedAction?: string) {
+  return hoveredAction === 'copy.path'
+    || hoveredAction === 'copy.absolutePath'
+    || copiedAction === 'copy.path'
+    || copiedAction === 'copy.absolutePath';
+}
+
 function highlightActionLabel(line: string, actionId: string | undefined) {
   if (!actionId) return line;
 
-  const action = [...FILE_ACTIONS, ...BLOCK_ACTIONS].find((entry) => entry.id === actionId);
+  const action = [...FILE_ACTIONS, ABSOLUTE_PATH_ACTION, ...BLOCK_ACTIONS].find((entry) => entry.id === actionId);
   if (!action) return line;
 
   return line.replace(
     action.label,
     `${ANSI_CYAN_BRIGHT_BOLD}${action.label}${ANSI_RESET}`,
   );
+}
+
+type StyledCell = {
+  char: string;
+  style: string;
+};
+
+function toStyledCells(line: string) {
+  const parts = line.split(/(\x1B\[[0-9;]*[A-Za-z])/);
+  const cells: StyledCell[] = [];
+  let style = '';
+
+  for (const part of parts) {
+    if (!part) continue;
+    if (/^\x1B\[[0-9;]*[A-Za-z]$/.test(part)) {
+      style = part === ANSI_RESET ? '' : style + part;
+      continue;
+    }
+
+    for (const char of part) {
+      cells.push({char, style});
+    }
+  }
+
+  return cells;
+}
+
+function renderStyledCells(cells: StyledCell[]) {
+  let output = '';
+  let style = '';
+
+  for (const cell of cells) {
+    if (cell.style !== style) {
+      output += cell.style || ANSI_RESET;
+      style = cell.style;
+    }
+
+    output += cell.char;
+  }
+
+  return output + ANSI_RESET;
+}
+
+function overlayAnsiAt(baseLine: string, overlay: string, start: number, width: number) {
+  const baseCells = toStyledCells(padToWidth(truncateAnsi(baseLine, width), width)).slice(0, width);
+  const overlayCells = toStyledCells(overlay);
+  const overlayWidth = visibleWidth(overlay);
+  if (overlayWidth <= 0 || overlayWidth > width) return baseLine;
+
+  const safeStart = clamp(start, 0, Math.max(0, width - overlayWidth));
+  for (let index = 0; index < overlayCells.length && safeStart + index < baseCells.length; index += 1) {
+    baseCells[safeStart + index] = overlayCells[index]!;
+  }
+
+  return renderStyledCells(baseCells);
+}
+
+function filePathActionTextStart(fileHeaderLine: string) {
+  const plain = stripAnsi(fileHeaderLine);
+  const pathStart = plain.indexOf(FILE_ACTIONS[0].label);
+  if (pathStart >= 0) return pathStart;
+
+  const copiedStart = plain.indexOf(COPY_SUCCESS_LABEL);
+  return copiedStart >= 0 ? copiedStart : null;
+}
+
+function filePathActionCenterStart(fileHeaderLine: string, labelWidth: number) {
+  const plain = stripAnsi(fileHeaderLine);
+  const textStart = filePathActionTextStart(fileHeaderLine);
+  if (textStart === null) return null;
+
+  const frameStart = plain.lastIndexOf('╭', textStart);
+  const frameEnd = plain.indexOf('╮', textStart);
+  if (frameStart < 0 || frameEnd < 0 || frameEnd <= frameStart) {
+    return textStart;
+  }
+
+  const frameWidth = frameEnd - frameStart + 1;
+  return frameStart + Math.floor((frameWidth - labelWidth) / 2);
+}
+
+function secondaryPathActionLabel(hoveredAction?: string, copiedAction?: string) {
+  const copied = copiedAction === ABSOLUTE_PATH_ACTION.id;
+  const hovered = hoveredAction === ABSOLUTE_PATH_ACTION.id;
+  const label = copied ? successLabel(ABSOLUTE_PATH_ACTION.label) : ABSOLUTE_PATH_ACTION.label;
+  const color = copied ? ANSI_GREEN_BOLD : hovered ? ANSI_CYAN_BRIGHT_BOLD : ANSI_GRAY;
+  return `${color}${label}${ANSI_RESET}`;
+}
+
+function addAbsolutePathActionToMetricsRow(
+  metricsRow: string,
+  fileHeaderLine: string,
+  hoveredAction: string | undefined,
+  copiedAction: string | undefined,
+  width: number,
+) {
+  if (!shouldRevealAbsolutePathAction(hoveredAction, copiedAction)) return metricsRow;
+
+  const label = secondaryPathActionLabel(hoveredAction, copiedAction);
+  const start = filePathActionCenterStart(fileHeaderLine, visibleWidth(label));
+  if (start === null) return metricsRow;
+
+  return overlayAnsiAt(metricsRow, label, start, width);
 }
 
 function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
@@ -561,6 +674,8 @@ function AppContent({
   branchMetrics,
   review,
   copyWriter,
+  readFileContent,
+  resolveAbsolutePath,
   dimensions,
   watchStatus,
   emptyStateHint,
@@ -638,6 +753,17 @@ function AppContent({
     treeContentWidth,
   });
   stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
+
+  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
+  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
+  const visibleLineStart = diffOffset + 1;
+  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
+  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
+  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
+  const treeCounter = `${treeRowStart}-${treeRowEnd}/${rows.length}`;
+  const footerHints = watchStatus
+    ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
+    : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
 
   useEffect(() => {
     const snapshot = viewSnapshotRef.current;
@@ -739,6 +865,8 @@ function AppContent({
       model: review,
       activeFile: commandFile,
       focusedBlock: commandBlock,
+      readFileContent,
+      resolveAbsolutePath,
     }, copyWriter ? {write: copyWriter} : {});
 
     if (result.ok && successAction) {
@@ -746,7 +874,7 @@ function AppContent({
     }
 
     showToast(result.toast, result.hint);
-  }, [activeFile, copyWriter, focusedBlock, review, showToast]);
+  }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
   useEffect(() => {
     const handleScroll = (position: {x: number; y: number}, direction: 'scrollup' | 'scrolldown' | null) => {
@@ -805,8 +933,33 @@ function AppContent({
           const status = ansiStatus(activeStatus);
           const inner = Math.max(1, rightWidth - 4);
           const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-          const fileHeaderLine = composeLeftRight(fileLabel, fileActions(), inner);
+          const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
+          const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+          const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
           const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
+          if (actionId) {
+            nextHoveredAction = {kind: 'file-header', id: actionId};
+          }
+        } else if (relativeY === 2) {
+          const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
+          const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+          const activeStatus = activeFile?.status;
+          const status = ansiStatus(activeStatus);
+          const inner = Math.max(1, rightWidth - 4);
+          const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
+          const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
+          const metricsCore = activeSection
+            ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+            : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
+          const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
+          const metricsWidth = visibleWidth(metricsCore);
+          const counterWidth = visibleWidth(counter);
+          const metricsLine = `${metricsCore}${' '.repeat(Math.max(1, inner - metricsWidth - counterWidth))}${counter}`;
+          const actionId = getActionFromRenderedLine(
+            relativeX - 2,
+            addAbsolutePathActionToMetricsRow(metricsLine, fileHeaderLine, currentFileHover, currentFileCopied, inner),
+            [ABSOLUTE_PATH_ACTION],
+          );
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
           }
@@ -840,11 +993,18 @@ function AppContent({
   }, [
     activeFile,
     activeFilePath,
+    activeSection,
+    activeSectionIndex,
     allDiffLines,
+    copiedAction,
     diffOffset,
     getTreeRowHit,
+    hoveredAction,
     mouse,
     rightWidth,
+    sections.length,
+    visibleLineEnd,
+    visibleLineStart,
   ]);
 
   useEffect(() => {
@@ -880,8 +1040,36 @@ function AppContent({
         const activeStatus = activeFile?.status;
         const status = ansiStatus(activeStatus);
         const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', Math.max(1, rightWidth - 4))}${ANSI_RESET}`;
-        const fileHeaderLine = composeLeftRight(fileLabel, fileActions(), Math.max(1, rightWidth - 4));
+        const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
+        const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+        const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), Math.max(1, rightWidth - 4));
         const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
+        if (actionId) {
+          void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
+        }
+        return;
+      }
+
+      if (relativeY === 2) {
+        const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
+        const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+        const activeStatus = activeFile?.status;
+        const status = ansiStatus(activeStatus);
+        const inner = Math.max(1, rightWidth - 4);
+        const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
+        const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
+        const metricsCore = activeSection
+          ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+          : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
+        const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
+        const metricsWidth = visibleWidth(metricsCore);
+        const counterWidth = visibleWidth(counter);
+        const metricsLine = `${metricsCore}${' '.repeat(Math.max(1, inner - metricsWidth - counterWidth))}${counter}`;
+        const actionId = getActionFromRenderedLine(
+          relativeX - 2,
+          addAbsolutePathActionToMetricsRow(metricsLine, fileHeaderLine, currentFileHover, currentFileCopied, inner),
+          [ABSOLUTE_PATH_ACTION],
+        );
         if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
         }
@@ -904,27 +1092,24 @@ function AppContent({
     return () => mouse.events.off('click', handleClick);
   }, [
     activeFile,
+    activeFilePath,
+    activeSection,
+    activeSectionIndex,
     allDiffLines,
+    copiedAction,
     diffOffset,
     getTreeRowHit,
+    hoveredAction,
     mouse,
     jumpToFile,
     review,
     rightWidth,
     runCopyCommand,
+    sections.length,
     showToast,
+    visibleLineEnd,
+    visibleLineStart,
   ]);
-
-  const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
-  const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const visibleLineStart = diffOffset + 1;
-  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
-  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
-  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
-  const treeCounter = `${treeRowStart}-${treeRowEnd}/${rows.length}`;
-  const footerHints = watchStatus
-    ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
-    : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
 
   useInput((input, key) => {
     if (key.downArrow) {
@@ -1039,7 +1224,14 @@ function AppContent({
             const counterWidth = visibleWidth(counter);
             const metricsWidth = visibleWidth(metricsCore);
             const gap = Math.max(1, inner - metricsWidth - counterWidth);
-            const metricsRow = `${metricsCore}${' '.repeat(gap)}${counter}`;
+            const baseMetricsRow = `${metricsCore}${' '.repeat(gap)}${counter}`;
+            const metricsRow = addAbsolutePathActionToMetricsRow(
+              baseMetricsRow,
+              fileLabelWithActions,
+              fileHover,
+              fileCopied,
+              inner,
+            );
 
             const rows: string[] = [
               frameTopBorder(rightWidth, borderAnsi),

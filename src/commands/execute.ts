@@ -1,5 +1,5 @@
 import {writeClipboard, type ClipboardWriteResult} from '../clipboard/write.js';
-import {getCopyCommand, type CommandContext} from './registry.js';
+import {getCopyCommand, type CommandContext, type CommandPayload} from './registry.js';
 
 export type CopyCommandExecutionResult =
   | {
@@ -51,7 +51,19 @@ export async function executeCopyCommand(
     };
   }
 
-  const payload = command.buildPayload(context);
+  let payload: CommandPayload | null;
+  try {
+    payload = command.buildPayload(context);
+  } catch (error) {
+    return {
+      ok: false,
+      commandId,
+      toast: 'Copy action unavailable.',
+      ...(error instanceof Error ? {hint: error.message} : {}),
+      reason: 'disabled',
+    };
+  }
+
   if (!payload) {
     return {
       ok: false,

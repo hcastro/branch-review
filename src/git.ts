@@ -12,6 +12,14 @@ function runGit(cwd: string, args: string[]) {
   }).trimEnd();
 }
 
+function runGitRaw(cwd: string, args: string[]) {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
 function tryRunGit(cwd: string, args: string[]) {
   try {
     return runGit(cwd, args);
@@ -187,6 +195,30 @@ export function getRawFileDiff(
   }
 
   return runGit(cwd, ['diff', '--no-color', range.diffArg, '--', filePath]);
+}
+
+export function getReviewFileContents(
+  cwd: string,
+  range: DiffRange,
+  file: Pick<ChangedFileEntry, 'path' | 'status'>,
+) {
+  if (file.status === 'deleted') {
+    return null;
+  }
+
+  if (range.includeWorktree || file.status === 'untracked') {
+    try {
+      return fs.readFileSync(path.join(cwd, file.path), 'utf8');
+    } catch {
+      return null;
+    }
+  }
+
+  try {
+    return runGitRaw(cwd, ['show', `${range.branch}:${file.path}`]);
+  } catch {
+    return null;
+  }
 }
 
 export function getFileStat(cwd: string, range: DiffRange, filePath: string) {
