@@ -5,7 +5,7 @@ import {
   useMouse,
   useOnMouseHover,
 } from '@zenobius/ink-mouse';
-import {buildTreeRows, type TreeRow} from '../tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, type TreeRow} from '../tree.js';
 import {
   flattenSectionLines,
   formatMetrics,
@@ -189,8 +189,8 @@ const TreeFileRow = memo(function TreeFileRow({
   copySucceeded: boolean;
   width: number;
 }) {
-  const accent = row.kind === 'dir' ? 'yellow' : selected ? 'cyanBright' : hovered ? 'cyan' : 'white';
-  const glyph = row.kind === 'dir' ? '▾' : '•';
+  const accent = selected ? 'cyanBright' : row.kind === 'dir' ? 'yellow' : hovered ? 'cyan' : 'white';
+  const glyph = row.kind === 'dir' ? row.expanded === false ? '▸' : '▾' : '•';
   const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
   const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
   const copySlotWidth = getTreeCopySlotWidth(copySucceeded);
@@ -202,7 +202,7 @@ const TreeFileRow = memo(function TreeFileRow({
   return (
     <Box width={width}>
       <Box width={labelWidth}>
-        <Text color={accent} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
+        <Text color={accent} bold={selected} dimColor={row.kind === 'dir' && !selected} wrap="truncate-end">
           {' '.repeat(row.depth * 2)}{glyph} {row.label}
         </Text>
       </Box>
@@ -703,7 +703,9 @@ function AppContent({
 
   const files = useMemo(() => sections.map((section) => section.path), [sections]);
   const statusByPath = useMemo(() => new Map(review?.files.map((file) => [file.path, file.status]) ?? []), [review]);
-  const rows = useMemo(() => buildTreeRows(files, statusByPath), [files, statusByPath]);
+  const [collapsedTreePaths, setCollapsedTreePaths] = useState<Set<string>>(() => new Set());
+  const allTreeRows = useMemo(() => buildTreeRows(files, statusByPath), [files, statusByPath]);
+  const rows = useMemo(() => applyTreeCollapse(allTreeRows, collapsedTreePaths), [allTreeRows, collapsedTreePaths]);
   const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
 
   const maxDiffOffset = Math.max(allDiffLines.length - visibleDiffRows, 0);
@@ -730,7 +732,8 @@ function AppContent({
   const activeSectionIndex = getDominantSectionIndex(sections, diffOffset, diffOffset + visibleDiffRows);
   const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
-  const activeRowIndex = rows.findIndex((row) => row.path === activeFilePath);
+  const activeTreePath = useMemo(() => findTreeSelectionPath(rows, activeFilePath), [activeFilePath, rows]);
+  const activeRowIndex = rows.findIndex((row) => row.path === activeTreePath);
   const activeFile = useMemo(
     () => review?.files.find((file) => file.path === activeFilePath),
     [activeFilePath, review],
@@ -753,6 +756,26 @@ function AppContent({
     treeContentWidth,
   });
   stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
+
+  useEffect(() => {
+    const availableDirectories = new Set(
+      allTreeRows.filter((row) => row.kind === 'dir').map((row) => row.path),
+    );
+
+    setCollapsedTreePaths((current) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const treePath of current) {
+        if (availableDirectories.has(treePath)) {
+          next.add(treePath);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [allTreeRows]);
 
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
@@ -821,6 +844,19 @@ function AppContent({
       setDiffOffset(section.startLine);
     }
   }, [sections]);
+
+  const toggleTreeDirectory = useCallback((directoryPath: string) => {
+    setCollapsedTreePaths((current) => {
+      const next = new Set(current);
+      if (next.has(directoryPath)) {
+        next.delete(directoryPath);
+      } else {
+        next.add(directoryPath);
+      }
+
+      return next;
+    });
+  }, []);
 
   const getTreeRowHit = useCallback((x: number, y: number) => getTreeRowHitFromPanel(
     getBounds(treePanelRef),
@@ -1018,6 +1054,11 @@ function AppContent({
 
         const {rowIndex, relativeX, bounds} = treeRowHit;
         const row = stateRef.current.rows[rowIndex];
+        if (row?.kind === 'dir') {
+          toggleTreeDirectory(row.path);
+          return;
+        }
+
         if (row && row.kind === 'file') {
           const rowFile = review?.files.find((file) => file.path === row.path);
           if (isTreeCopyTarget(relativeX, bounds.width) && rowFile) {
@@ -1107,6 +1148,7 @@ function AppContent({
     runCopyCommand,
     sections.length,
     showToast,
+    toggleTreeDirectory,
     visibleLineEnd,
     visibleLineStart,
   ]);
@@ -1183,7 +1225,7 @@ function AppContent({
             <TreeFileRow
               key={row.path}
               row={row}
-              selected={row.kind === 'file' && row.path === activeFilePath}
+              selected={row.path === activeTreePath}
               hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
               copyHovered={
                 hoveredAction?.kind === 'tree-copy'
