@@ -148,6 +148,90 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('preserves the selected file when refreshed sections still contain it', async () => {
+    const firstSections = buildDiffSections([
+      {
+        path: 'src/one.ts',
+        metrics: {path: 'src/one.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'one before',
+      },
+      {
+        path: 'src/two.ts',
+        metrics: {path: 'src/two.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'two before',
+      },
+    ]);
+    const nextSections = buildDiffSections([
+      {
+        path: 'src/one.ts',
+        metrics: {path: 'src/one.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'one after',
+      },
+      {
+        path: 'src/two.ts',
+        metrics: {path: 'src/two.ts', additions: 2, deletions: 0, changedLines: 2},
+        diff: 'two after',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={firstSections}
+        branchMetrics={{filesChanged: 2, additions: 2, deletions: 0, changedLines: 2}}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    instance.stdin.write('\u001B[B');
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('file 2/2');
+
+    instance.rerender(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={nextSections}
+        branchMetrics={{filesChanged: 2, additions: 3, deletions: 0, changedLines: 3}}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('src/two.ts');
+    expect(frame).toContain('two after');
+    expect(frame).toContain('file 2/2');
+
+    instance.unmount();
+  });
+
+  it('renders an empty state without exiting the app', async () => {
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={[]}
+        branchMetrics={{filesChanged: 0, additions: 0, deletions: 0, changedLines: 0}}
+        dimensions={{columns: 120, rows: 16}}
+        watchStatus="watching"
+        emptyStateHint="Watching for repo updates..."
+      />,
+    );
+
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('0 files • +0 • -0 • 0 changed');
+    expect(frame).toContain('No changes to review');
+    expect(frame).toContain('Watching for repo updates...');
+    expect(frame).toContain('watching • ↑/↓ jump file');
+
+    instance.unmount();
+  });
+
   it('renders wrapped diff lines with a hanging indent for continuation rows', async () => {
     const sections = buildDiffSections([
       {

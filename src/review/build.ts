@@ -5,7 +5,7 @@ import {
   getRawFileDiff,
   type DiffRange,
 } from '../git.js';
-import type {BranchMetrics, FileMetrics} from '../sections.js';
+import {buildDiffSections, type BranchMetrics, type DiffSection, type FileMetrics} from '../sections.js';
 import {parseUnifiedDiffBlocks} from '../blocks/parse.js';
 import type {ReviewFile, ReviewModel} from './model.js';
 
@@ -68,4 +68,14 @@ export function buildReviewModel({cwd, range, width}: BuildReviewModelOptions): 
     metrics: calculateBranchMetrics(files),
     files,
   };
+}
+
+export function buildReviewSections(review: Pick<ReviewModel, 'files'>): DiffSection[] {
+  return buildDiffSections(
+    review.files.map((file) => ({
+      path: file.path,
+      metrics: file.metrics,
+      diff: file.renderedLines.join('\n'),
+    })),
+  );
 }
