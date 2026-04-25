@@ -18,6 +18,7 @@ type WatchState =
 type ReviewBuilder = typeof buildReviewModel;
 type WatcherFactory = (options: CreateRepoWatcherOptions) => RepoWatcher;
 type RangeResolver = () => DiffRange;
+const WATCH_UPDATE_STATUS_TIMEOUT_MS = 2200;
 
 export type ReviewControllerProps = {
   cwd: string;
@@ -51,10 +52,13 @@ export function formatWatchFooterStatus(status: WatchState, now = Date.now()) {
   if (status.state === 'refreshing') return 'refreshing...';
   if (status.state === 'paused') return `watch paused: ${status.message}`;
   if (status.state === 'error') return `watch error: ${status.message}`;
-  if (!status.lastUpdatedAt) return 'watching';
+  if (!status.lastUpdatedAt) return undefined;
 
-  const seconds = Math.max(0, Math.floor((now - status.lastUpdatedAt) / 1000));
-  return `watching · updated ${seconds === 0 ? 'now' : `${seconds}s ago`}`;
+  const elapsed = Math.max(0, now - status.lastUpdatedAt);
+  if (elapsed >= WATCH_UPDATE_STATUS_TIMEOUT_MS) return undefined;
+
+  const seconds = Math.floor(elapsed / 1000);
+  return `updated ${seconds === 0 ? 'now' : `${seconds}s ago`}`;
 }
 
 export function ReviewController({
@@ -164,6 +168,21 @@ export function ReviewController({
       void watcher.close();
     };
   }, [createWatcher, cwd, range, refresh, resolveRange, watch, watchPoll]);
+
+  useEffect(() => {
+    if (watchStatus.state !== 'watching' || !watchStatus.lastUpdatedAt) return undefined;
+
+    const lastUpdatedAt = watchStatus.lastUpdatedAt;
+    const timeout = setTimeout(() => {
+      setWatchStatus((current) => (
+        current.state === 'watching' && current.lastUpdatedAt === lastUpdatedAt
+          ? {state: 'watching'}
+          : current
+      ));
+    }, WATCH_UPDATE_STATUS_TIMEOUT_MS);
+
+    return () => clearTimeout(timeout);
+  }, [watchStatus]);
 
   const sections = useMemo(() => buildReviewSections(review), [review]);
   const footerStatus = formatWatchFooterStatus(watchStatus);

@@ -226,7 +226,7 @@ describe('App', () => {
         sections={[]}
         branchMetrics={{filesChanged: 0, additions: 0, deletions: 0, changedLines: 0}}
         dimensions={{columns: 120, rows: 16}}
-        watchStatus="watching"
+        watchStatus="updated now"
         emptyStateHint="Watching for repo updates..."
       />,
     );
@@ -237,7 +237,7 @@ describe('App', () => {
     expect(frame).toContain('0 files • +0 • -0 • 0 changed');
     expect(frame).toContain('No changes to review');
     expect(frame).toContain('Watching for repo updates...');
-    expect(frame).toContain('watching • ↑/↓ jump file');
+    expect(frame).toContain('updated now • ↑/↓ jump file');
 
     instance.unmount();
   });
