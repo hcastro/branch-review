@@ -314,6 +314,57 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('collapses and expands nested folders from the file tree', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'w/src/App.tsx',
+        metrics: {path: 'w/src/App.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+web',
+      },
+      {
+        path: 'w/test/App.test.tsx',
+        metrics: {path: 'w/test/App.test.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+test',
+      },
+      {
+        path: 'a/src/server.ts',
+        metrics: {path: 'a/src/server.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+server',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 3, additions: 3, deletions: 0, changedLines: 3}}
+        dimensions={{columns: 140, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('▾ w');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', '▾ w');
+    await flush();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('▸ w');
+    expect(frame).toContain('file 1/3');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', '▸ w');
+    await flush();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('▾ w');
+    expect(frame).toContain('file 1/3');
+
+    instance.unmount();
+  });
+
   it('renders copy affordances from the review model', async () => {
     const rawDiff = [
       'diff --git a/src/example.ts b/src/example.ts',

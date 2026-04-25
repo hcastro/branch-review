@@ -6,6 +6,7 @@ export type TreeRow = {
   depth: number;
   path: string;
   status?: FileStatus;
+  expanded?: boolean;
 };
 
 type TreeNode = {
@@ -95,4 +96,58 @@ export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string
   }
 
   return rows;
+}
+
+function isDescendantOf(filePath: string, directoryPath: string) {
+  return filePath.startsWith(`${directoryPath}/`);
+}
+
+export function applyTreeCollapse(rows: TreeRow[], collapsedPaths: ReadonlySet<string>): TreeRow[] {
+  const visibleRows: TreeRow[] = [];
+  const collapsedAncestors: string[] = [];
+
+  for (const row of rows) {
+    while (
+      collapsedAncestors.length > 0
+      && !isDescendantOf(row.path, collapsedAncestors[collapsedAncestors.length - 1]!)
+    ) {
+      collapsedAncestors.pop();
+    }
+
+    if (collapsedAncestors.length > 0) continue;
+
+    if (row.kind === 'dir') {
+      const expanded = !collapsedPaths.has(row.path);
+      visibleRows.push({...row, expanded});
+      if (!expanded) {
+        collapsedAncestors.push(row.path);
+      }
+      continue;
+    }
+
+    visibleRows.push(row);
+  }
+
+  return visibleRows;
+}
+
+export function findTreeSelectionPath(rows: TreeRow[], activeFilePath: string) {
+  if (!activeFilePath) return '';
+  if (rows.some((row) => row.kind === 'file' && row.path === activeFilePath)) {
+    return activeFilePath;
+  }
+
+  let collapsedParent: TreeRow | undefined;
+  for (const row of rows) {
+    if (
+      row.kind === 'dir'
+      && row.expanded === false
+      && isDescendantOf(activeFilePath, row.path)
+      && (!collapsedParent || row.path.length > collapsedParent.path.length)
+    ) {
+      collapsedParent = row;
+    }
+  }
+
+  return collapsedParent?.path ?? activeFilePath;
 }

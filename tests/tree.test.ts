@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {buildTreeRows} from '../src/tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath} from '../src/tree.js';
 
 describe('buildTreeRows', () => {
   it('expands changed file paths into a stable directory tree', () => {
@@ -55,5 +55,39 @@ describe('buildTreeRows', () => {
       {path: 'src/app.ts', status: 'modified'},
       {path: 'src/new.ts', status: 'added'},
     ]);
+  });
+
+  it('collapses nested directory descendants while keeping sibling rows visible', () => {
+    const rows = buildTreeRows([
+      'apps/web/src/App.tsx',
+      'apps/web/test/App.test.tsx',
+      'apps/api/src/server.ts',
+      'README.md',
+    ]);
+
+    const collapsed = applyTreeCollapse(rows, new Set(['apps/web']));
+
+    expect(collapsed.map((row) => ({
+      kind: row.kind,
+      path: row.path,
+      expanded: row.expanded,
+    }))).toEqual([
+      {kind: 'file', path: 'README.md', expanded: undefined},
+      {kind: 'dir', path: 'apps', expanded: true},
+      {kind: 'dir', path: 'apps/api', expanded: true},
+      {kind: 'dir', path: 'apps/api/src', expanded: true},
+      {kind: 'file', path: 'apps/api/src/server.ts', expanded: undefined},
+      {kind: 'dir', path: 'apps/web', expanded: false},
+    ]);
+  });
+
+  it('selects the collapsed parent when the active file is hidden', () => {
+    const rows = applyTreeCollapse(
+      buildTreeRows(['apps/web/src/App.tsx', 'apps/api/src/server.ts']),
+      new Set(['apps/web']),
+    );
+
+    expect(findTreeSelectionPath(rows, 'apps/web/src/App.tsx')).toBe('apps/web');
+    expect(findTreeSelectionPath(rows, 'apps/api/src/server.ts')).toBe('apps/api/src/server.ts');
   });
 });
