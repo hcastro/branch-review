@@ -66,6 +66,7 @@ const instance = render(
     branch={review.branch}
     sections={sections}
     branchMetrics={review.metrics}
+    review={review}
   />,
 );
 

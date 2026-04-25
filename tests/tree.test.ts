@@ -38,4 +38,22 @@ describe('buildTreeRows', () => {
       },
     ]);
   });
+
+  it('attaches status metadata to file rows', () => {
+    const rows = buildTreeRows(
+      ['src/app.ts', 'src/new.ts'],
+      new Map([
+        ['src/app.ts', 'modified'],
+        ['src/new.ts', 'added'],
+      ]),
+    );
+
+    expect(rows.filter((row) => row.kind === 'file').map((row) => ({
+      path: row.path,
+      status: row.status,
+    }))).toEqual([
+      {path: 'src/app.ts', status: 'modified'},
+      {path: 'src/new.ts', status: 'added'},
+    ]);
+  });
 });
