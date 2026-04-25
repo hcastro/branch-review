@@ -64,7 +64,7 @@ describe('buildReviewModel', () => {
     expect(example?.rawDiff).toContain('diff --git a/example.ts b/example.ts');
     expect(example?.rawDiff).toContain('@@');
     expect(example?.renderedLines.join('\n')).toContain('example.ts');
-    expect(example?.hunks[0]?.addedCode).toBe('export const value = 2;\nexport const next = 3;');
+    expect(example?.blocks[0]?.addedCode).toBe('export const value = 2;\nexport const next = 3;');
 
     const untracked = model.files.find((file) => file.path === 'untracked.ts');
     expect(untracked).toMatchObject({
@@ -72,6 +72,6 @@ describe('buildReviewModel', () => {
       metrics: {additions: 1, deletions: 0, changedLines: 1},
     });
     expect(untracked?.rawDiff).toContain('--- /dev/null');
-    expect(untracked?.hunks[0]?.addedCode).toBe('export const local = true;');
+    expect(untracked?.blocks[0]?.addedCode).toBe('export const local = true;');
   });
 });

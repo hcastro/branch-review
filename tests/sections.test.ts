@@ -153,7 +153,7 @@ describe('section helpers', () => {
     expect(wrapped[0].endLineExclusive).toBe(wrapped[0].lines.length);
   });
 
-  it('renders hunk headers with one width-constrained frame', () => {
+  it('renders block headers with one width-constrained frame', () => {
     const base = buildDiffSections([
       {
         path: 'notes.md',
@@ -177,5 +177,20 @@ describe('section helpers', () => {
     for (const line of wrapped[0].lines.slice(frameStart, frameStart + 4)) {
       expect(visibleWidth(line)).toBe(48);
     }
+  });
+
+  it('removes styled block context after the path and line label', () => {
+    const base = buildDiffSections([
+      {
+        path: 'handler.ts',
+        metrics: {path: 'handler.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '\u001B[36m• apps/core-service/src/events/handlers/create-user-handler.ts:39:\u001B[0m \u001B[35mexport async function processCreateNewUserEvent\u001B[0m',
+      },
+    ]);
+
+    const wrapped = wrapSections(base, 120);
+    const rendered = wrapped[0].lines.map(stripAnsi).join('\n');
+    expect(rendered).toContain('• apps/core-service/src/events/handlers/create-user-handler.ts:39:');
+    expect(rendered).not.toContain('export async function processCreateNewUserEvent');
   });
 });

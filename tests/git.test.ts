@@ -89,7 +89,7 @@ describe('git helpers', () => {
     expect(branchMetrics).toEqual({filesChanged: 2, additions: 3, deletions: 1, changedLines: 4});
   });
 
-  it('renders delta output without nested file or hunk header boxes', () => {
+  it('renders delta output without nested file or block header boxes', () => {
     const cwd = createRepo();
     const range = resolveRefs(cwd, 'feature/example', 'development');
     const diff = getColoredFileDiff(cwd, range, 'README.md', 80);

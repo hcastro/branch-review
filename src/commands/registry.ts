@@ -4,19 +4,19 @@ import {
   buildCodePayload,
   buildFileDiffPayload,
   buildFilePromptPayload,
-  buildHunkDiffPayload,
-  buildHunkPromptPayload,
+  buildBlockDiffPayload,
+  buildBlockPromptPayload,
   buildPathLinePayload,
   buildPathPayload,
 } from '../clipboard/payloads.js';
-import type {ReviewFile, ReviewHunk, ReviewModel} from '../review/model.js';
+import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
 
 export type CommandGroup = 'Copy for agent' | 'Copy paths' | 'Copy content' | 'Export';
 
 export type CommandContext = {
   model: ReviewModel;
   activeFile?: ReviewFile;
-  focusedHunk?: ReviewHunk;
+  focusedBlock?: ReviewBlock;
 };
 
 export type CommandPayload = {
@@ -38,21 +38,21 @@ function activeFile(context: CommandContext) {
   return context.activeFile ?? null;
 }
 
-function focusedHunk(context: CommandContext) {
-  return context.focusedHunk ?? null;
+function focusedBlock(context: CommandContext) {
+  return context.focusedBlock ?? null;
 }
 
-function fileAndHunk(context: CommandContext) {
+function fileAndBlock(context: CommandContext) {
   const file = activeFile(context);
-  const hunk = focusedHunk(context);
-  return file && hunk ? {file, hunk} : null;
+  const block = focusedBlock(context);
+  return file && block ? {file, block} : null;
 }
 
 export const copyCommands: CommandDefinition[] = [
   {
     id: 'copy.filePrompt',
     group: 'Copy for agent',
-    title: 'Copy active file as prompt',
+    title: 'Copy active file',
     shortcuts: [],
     isEnabled: (context) => Boolean(activeFile(context)),
     buildPayload: (context) => {
@@ -60,24 +60,24 @@ export const copyCommands: CommandDefinition[] = [
       if (!file) return null;
       return {
         text: buildFilePromptPayload(file),
-        toast: 'Copied file prompt',
+        toast: 'Copied file',
         hint: file.path,
       };
     },
   },
   {
-    id: 'copy.hunkPrompt',
+    id: 'copy.blockPrompt',
     group: 'Copy for agent',
-    title: 'Copy focused hunk as prompt',
+    title: 'Copy focused block',
     shortcuts: [],
-    isEnabled: (context) => Boolean(fileAndHunk(context)),
+    isEnabled: (context) => Boolean(fileAndBlock(context)),
     buildPayload: (context) => {
-      const target = fileAndHunk(context);
+      const target = fileAndBlock(context);
       if (!target) return null;
       return {
-        text: buildHunkPromptPayload(target.file, target.hunk),
-        toast: 'Copied hunk prompt',
-        hint: `${target.file.path}:${target.hunk.lineStart}`,
+        text: buildBlockPromptPayload(target.file, target.block),
+        toast: 'Copied block',
+        hint: `${target.file.path}:${target.block.lineStart}`,
       };
     },
   },
@@ -100,16 +100,16 @@ export const copyCommands: CommandDefinition[] = [
   {
     id: 'copy.pathLine',
     group: 'Copy paths',
-    title: 'Copy focused hunk path:line',
+    title: 'Copy focused block path:line',
     shortcuts: ['y l'],
-    isEnabled: (context) => Boolean(fileAndHunk(context)),
+    isEnabled: (context) => Boolean(fileAndBlock(context)),
     buildPayload: (context) => {
-      const target = fileAndHunk(context);
+      const target = fileAndBlock(context);
       if (!target) return null;
       return {
-        text: buildPathLinePayload(target.file, target.hunk),
+        text: buildPathLinePayload(target.file, target.block),
         toast: 'Copied path:line',
-        hint: `${target.file.path}:${target.hunk.lineStart}`,
+        hint: `${target.file.path}:${target.block.lineStart}`,
       };
     },
   },
@@ -126,34 +126,34 @@ export const copyCommands: CommandDefinition[] = [
     }),
   },
   {
-    id: 'copy.hunkCode',
+    id: 'copy.blockCode',
     group: 'Copy content',
-    title: 'Copy focused hunk code',
+    title: 'Copy focused block code',
     shortcuts: ['y c'],
-    isEnabled: (context) => Boolean(focusedHunk(context)),
+    isEnabled: (context) => Boolean(focusedBlock(context)),
     buildPayload: (context) => {
-      const hunk = focusedHunk(context);
-      if (!hunk) return null;
+      const block = focusedBlock(context);
+      if (!block) return null;
       return {
-        text: buildCodePayload(hunk),
-        toast: 'Copied hunk code',
-        hint: `${hunk.filePath}:${hunk.lineStart}`,
+        text: buildCodePayload(block),
+        toast: 'Copied block code',
+        hint: `${block.filePath}:${block.lineStart}`,
       };
     },
   },
   {
-    id: 'copy.hunkDiff',
+    id: 'copy.blockDiff',
     group: 'Copy content',
-    title: 'Copy focused hunk diff',
+    title: 'Copy focused block diff',
     shortcuts: ['y h'],
-    isEnabled: (context) => Boolean(focusedHunk(context)),
+    isEnabled: (context) => Boolean(focusedBlock(context)),
     buildPayload: (context) => {
-      const hunk = focusedHunk(context);
-      if (!hunk) return null;
+      const block = focusedBlock(context);
+      if (!block) return null;
       return {
-        text: buildHunkDiffPayload(hunk),
-        toast: 'Copied hunk diff',
-        hint: `${hunk.filePath}:${hunk.lineStart}`,
+        text: buildBlockDiffPayload(block),
+        toast: 'Copied block diff',
+        hint: `${block.filePath}:${block.lineStart}`,
       };
     },
   },
@@ -176,12 +176,12 @@ export const copyCommands: CommandDefinition[] = [
   {
     id: 'copy.branchPrompt',
     group: 'Export',
-    title: 'Copy branch review as prompt',
+    title: 'Copy branch review',
     shortcuts: ['y a'],
     isEnabled: (context) => context.model.files.length > 0,
     buildPayload: (context) => ({
       text: buildBranchPromptPayload(context.model),
-      toast: 'Copied branch prompt',
+      toast: 'Copied branch review',
       hint: `${context.model.files.length} files`,
     }),
   },

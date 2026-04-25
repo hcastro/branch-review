@@ -13,7 +13,7 @@ import {
   frameLine,
   frameTopBorder,
   getSectionIndexForLine,
-  HUNK_ACTION_LABELS,
+  BLOCK_ACTION_LABELS,
   padToWidth,
   truncateAnsi,
   visibleWidth,
@@ -24,7 +24,7 @@ import {
 import type {FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
-import type {ReviewFile, ReviewHunk, ReviewModel} from '../review/model.js';
+import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
 
 type AppProps = {
   base: string;
@@ -41,13 +41,12 @@ const TOAST_TIMEOUT_MS = 2200;
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
-  {id: 'copy.filePrompt', label: 'Copy prompt'},
+  {id: 'copy.filePrompt', label: 'Copy file'},
 ] as const;
-const HUNK_ACTIONS = [
-  {id: 'copy.hunkCode', label: HUNK_ACTION_LABELS.code},
-  {id: 'copy.hunkDiff', label: HUNK_ACTION_LABELS.diff},
-  {id: 'copy.hunkPrompt', label: HUNK_ACTION_LABELS.prompt},
-  {id: 'more', label: HUNK_ACTION_LABELS.more},
+const BLOCK_ACTIONS = [
+  {id: 'copy.blockCode', label: BLOCK_ACTION_LABELS.code},
+  {id: 'copy.blockDiff', label: BLOCK_ACTION_LABELS.diff},
+  {id: 'copy.blockPrompt', label: BLOCK_ACTION_LABELS.prompt},
 ] as const;
 
 function clamp(value: number, min: number, max: number) {
@@ -139,7 +138,9 @@ function getBounds(ref: React.RefObject<DOMElement>) {
   return getNodeBounds(ref.current);
 }
 
-function isInside(bounds: {left: number; top: number; width: number; height: number} | null, x: number, y: number) {
+type Bounds = {left: number; top: number; width: number; height: number};
+
+function isInside(bounds: Bounds | null, x: number, y: number) {
   if (!bounds) return false;
   return x >= bounds.left && x < bounds.left + bounds.width && y >= bounds.top && y < bounds.top + bounds.height;
 }
@@ -170,34 +171,33 @@ const TreeFileRow = memo(function TreeFileRow({
   row,
   selected,
   hovered,
+  copyHovered,
   width,
-  rowRef,
 }: {
   row: TreeRow;
   selected: boolean;
   hovered: boolean;
+  copyHovered: boolean;
   width: number;
-  rowRef?: React.Ref<DOMElement>;
 }) {
-  const accent = row.kind === 'dir' ? 'yellow' : selected ? 'black' : hovered ? 'cyan' : 'white';
-  const background = selected ? 'cyan' : undefined;
+  const accent = row.kind === 'dir' ? 'yellow' : selected ? 'cyanBright' : hovered ? 'cyan' : 'white';
   const glyph = row.kind === 'dir' ? '▾' : '•';
   const copyVisible = row.kind === 'file' && (selected || hovered);
   const indicatorWidth = row.kind === 'file' ? 8 : 0;
 
   return (
-    <Box ref={rowRef} width={width}>
+    <Box width={width}>
       <Box width={Math.max(1, width - indicatorWidth)}>
-        <Text color={accent} backgroundColor={background} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
+        <Text color={accent} bold={selected} dimColor={row.kind === 'dir'} wrap="truncate-end">
           {' '.repeat(row.depth * 2)}{glyph} {row.label}
         </Text>
       </Box>
       {row.kind === 'file' && (
         <Box width={indicatorWidth} justifyContent="flex-end">
-          <Text color={statusColor(row.status)} backgroundColor={selected ? 'cyan' : undefined} bold={Boolean(row.status)}>
+          <Text color={statusColor(row.status)} bold={Boolean(row.status)}>
             {statusLabel(row.status)}
           </Text>
-          <Text color={copyVisible ? 'cyan' : 'gray'} backgroundColor={selected ? 'cyan' : undefined}>
+          <Text color={copyHovered ? 'cyanBright' : 'gray'} bold={copyHovered}>
             {copyVisible ? ' Copy' : '     '}
           </Text>
         </Box>
@@ -280,9 +280,29 @@ const ANSI_MAGENTA = '[35m';
 const ANSI_RESET = '[0m';
 
 type HoveredAction =
-  | {kind: 'file'; id: string}
-  | {kind: 'hunk'; id: string; lineIndex: number}
+  | {kind: 'file-header'; id: string}
+  | {kind: 'tree-copy'; rowIndex: number}
+  | {kind: 'block'; id: string; lineIndex: number}
   | null;
+
+function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
+  if (current === next) return true;
+  if (!current || !next || current.kind !== next.kind) return false;
+
+  if (current.kind === 'file-header' && next.kind === 'file-header') {
+    return current.id === next.id;
+  }
+
+  if (current.kind === 'tree-copy' && next.kind === 'tree-copy') {
+    return current.rowIndex === next.rowIndex;
+  }
+
+  if (current.kind === 'block' && next.kind === 'block') {
+    return current.id === next.id && current.lineIndex === next.lineIndex;
+  }
+
+  return false;
+}
 
 function truncateStart(text: string, maxWidth: number): string {
   if (text.length <= maxWidth) return text;
@@ -320,14 +340,14 @@ function composeLeftRight(left: string, right: string, width: number) {
 
 function fileActions(hoveredAction?: string) {
   return FILE_ACTIONS
-    .map((action) => actionButton(action.label, action.id === 'copy.filePrompt' || action.id === hoveredAction))
+    .map((action) => actionButton(action.label, action.id === hoveredAction))
     .join(' ');
 }
 
 function highlightActionLabel(line: string, actionId: string | undefined) {
   if (!actionId) return line;
 
-  const action = [...FILE_ACTIONS, ...HUNK_ACTIONS].find((entry) => entry.id === actionId);
+  const action = [...FILE_ACTIONS, ...BLOCK_ACTIONS].find((entry) => entry.id === actionId);
   if (!action) return line;
 
   return line.replace(
@@ -336,8 +356,8 @@ function highlightActionLabel(line: string, actionId: string | undefined) {
   );
 }
 
-function hunkActionsLine(hoveredAction?: string) {
-  return HUNK_ACTIONS
+function blockActionsLine(hoveredAction?: string) {
+  return BLOCK_ACTIONS
     .map((action) => {
       const color = action.id === hoveredAction
         ? ANSI_CYAN_BRIGHT
@@ -347,13 +367,13 @@ function hunkActionsLine(hoveredAction?: string) {
     .join('  ');
 }
 
-function isHunkContentLine(line: string) {
+function isBlockContentLine(line: string) {
   return /^│\s+• .+:\d+:/.test(stripAnsi(line));
 }
 
-function findHunkContentLineIndex(lines: string[], index: number) {
+function findBlockContentLineIndex(lines: string[], index: number) {
   for (const candidate of [index, index - 1, index + 1, index - 2, index + 2]) {
-    if (candidate >= 0 && candidate < lines.length && isHunkContentLine(lines[candidate] ?? '')) {
+    if (candidate >= 0 && candidate < lines.length && isBlockContentLine(lines[candidate] ?? '')) {
       return candidate;
     }
   }
@@ -361,21 +381,46 @@ function findHunkContentLineIndex(lines: string[], index: number) {
   return null;
 }
 
-function findHoveredHunkLineIndex(lines: string[], index: number) {
+function findHoveredBlockLineIndex(lines: string[], index: number) {
   const scanFloor = Math.max(0, index - 500);
   for (let candidate = index; candidate >= scanFloor; candidate -= 1) {
     const line = lines[candidate] ?? '';
-    if (isHunkContentLine(line)) {
+    if (isBlockContentLine(line)) {
       return candidate;
     }
   }
 
-  return findHunkContentLineIndex(lines, index);
+  return findBlockContentLineIndex(lines, index);
 }
 
-function addHunkActionsToLine(line: string, hoveredAction?: string) {
+export function findFocusedBlockLineIndex(
+  lines: string[],
+  section: Pick<DiffSection, 'startLine' | 'endLineExclusive'> | null,
+  visibleTopLine: number,
+) {
+  if (!section || section.endLineExclusive <= section.startLine) {
+    return null;
+  }
+
+  const clampedTop = clamp(visibleTopLine, section.startLine, section.endLineExclusive - 1);
+  for (let candidate = clampedTop; candidate >= section.startLine; candidate -= 1) {
+    if (isBlockContentLine(lines[candidate] ?? '')) {
+      return candidate;
+    }
+  }
+
+  for (let candidate = section.startLine; candidate < section.endLineExclusive; candidate += 1) {
+    if (isBlockContentLine(lines[candidate] ?? '')) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function addBlockActionsToLine(line: string, hoveredAction?: string) {
   const plain = stripAnsi(line);
-  if (!isHunkContentLine(line)) return line;
+  if (!isBlockContentLine(line)) return line;
 
   const contentStart = plain.indexOf('│ ') + 2;
   const contentEnd = plain.lastIndexOf(' │');
@@ -383,7 +428,7 @@ function addHunkActionsToLine(line: string, hoveredAction?: string) {
 
   const contentWidth = contentEnd - contentStart;
   const leftText = plain.slice(contentStart, contentEnd).trimEnd();
-  const content = composeLeftRight(`${ANSI_CYAN}${leftText}${ANSI_RESET}`, hunkActionsLine(hoveredAction), contentWidth);
+  const content = composeLeftRight(`${ANSI_CYAN}${leftText}${ANSI_RESET}`, blockActionsLine(hoveredAction), contentWidth);
 
   return `${ANSI_CYAN}│${ANSI_RESET} ${content} ${ANSI_CYAN}│${ANSI_RESET}`;
 }
@@ -394,6 +439,48 @@ function stripAnsi(line: string) {
 
 function makeToast(message: string, hint?: string) {
   return hint ? `${message} · ${hint}` : message;
+}
+
+export function getTreeRowHitFromPanel(
+  panelBounds: Bounds | null,
+  x: number,
+  y: number,
+  {
+    treeOffset,
+    visibleTreeRows,
+    rowsLength,
+    contentWidth,
+  }: {
+    treeOffset: number;
+    visibleTreeRows: number;
+    rowsLength: number;
+    contentWidth: number;
+  },
+) {
+  if (!isInside(panelBounds, x, y) || !panelBounds) return null;
+
+  // TreePane uses a one-cell border and one-cell horizontal padding.
+  // Row 0 inside the panel is the top border, row 1 is "Changed files",
+  // and changed-file rows start at row 2.
+  const visibleIndex = y - panelBounds.top - 2;
+  if (visibleIndex < 0 || visibleIndex >= visibleTreeRows) return null;
+
+  const rowIndex = treeOffset + visibleIndex;
+  if (rowIndex < 0 || rowIndex >= rowsLength) return null;
+
+  const rowLeft = panelBounds.left + 2;
+  if (x < rowLeft || x >= rowLeft + contentWidth) return null;
+
+  return {
+    rowIndex,
+    relativeX: x - rowLeft,
+    bounds: {
+      left: rowLeft,
+      top: y,
+      width: contentWidth,
+      height: 1,
+    },
+  };
 }
 
 function isTreeCopyTarget(relativeX: number, width: number) {
@@ -420,14 +507,14 @@ export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; l
   return null;
 }
 
-function findHunkFromLine(line: string, activeFile: ReviewFile | undefined): ReviewHunk | undefined {
+function findBlockFromLine(line: string, activeFile: ReviewFile | undefined): ReviewBlock | undefined {
   if (!activeFile) return undefined;
   const plain = stripAnsi(line);
   const match = plain.match(/•\s+(.+):(\d+):/);
   if (!match) return undefined;
 
   const lineStart = Number(match[2]);
-  return activeFile.hunks.find((hunk) => hunk.lineStart === lineStart) ?? activeFile.hunks[0];
+  return activeFile.blocks.find((block) => block.lineStart === lineStart) ?? activeFile.blocks[0];
 }
 
 function AppContent({base, branch, sections: rawSections, branchMetrics, review, copyWriter, dimensions}: AppProps) {
@@ -462,16 +549,16 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
 
   const treePanelRef = useRef<DOMElement>(null);
   const diffPanelRef = useRef<DOMElement>(null);
-  const treeRowRefs = useRef(new Map<number, DOMElement>());
   const [diffOffset, setDiffOffset] = useState(0);
   const [treeOffset, setTreeOffset] = useState(0);
   const [treeHovered, setTreeHovered] = useState(false);
   const [diffHovered, setDiffHovered] = useState(false);
   const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
-  const [hoveredHunkLineIndex, setHoveredHunkLineIndex] = useState<number | null>(null);
+  const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  const topSectionIndex = getSectionIndexForLine(sections, diffOffset);
   const activeSectionIndex = getDominantSectionIndex(sections, diffOffset, diffOffset + visibleDiffRows);
   const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
@@ -480,7 +567,14 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     () => review?.files.find((file) => file.path === activeFilePath),
     [activeFilePath, review],
   );
-  const focusedHunk = activeFile?.hunks[0];
+  const focusedBlockLineIndex = useMemo(
+    () => findFocusedBlockLineIndex(allDiffLines, activeSection, diffOffset),
+    [activeSection, allDiffLines, diffOffset],
+  );
+  const focusedBlock = useMemo(() => {
+    const focusedLine = focusedBlockLineIndex === null ? undefined : allDiffLines[focusedBlockLineIndex];
+    return focusedLine ? findBlockFromLine(focusedLine, activeFile) : activeFile?.blocks[0];
+  }, [activeFile, allDiffLines, focusedBlockLineIndex]);
 
   const stateRef = useRef({
     treeOffset,
@@ -488,8 +582,9 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     maxDiffOffset,
     visibleTreeRows,
     rows,
+    treeContentWidth,
   });
-  stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows};
+  stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
@@ -516,25 +611,17 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     }
   }, [sections]);
 
-  const setTreeRowRef = useCallback((rowIndex: number) => (element: DOMElement | null) => {
-    if (element) {
-      treeRowRefs.current.set(rowIndex, element);
-      return;
-    }
-
-    treeRowRefs.current.delete(rowIndex);
-  }, []);
-
-  const getTreeRowHit = useCallback((x: number, y: number) => {
-    for (const [rowIndex, element] of treeRowRefs.current) {
-      const bounds = getNodeBounds(element);
-      if (bounds && isInside(bounds, x, y)) {
-        return {rowIndex, bounds};
-      }
-    }
-
-    return null;
-  }, []);
+  const getTreeRowHit = useCallback((x: number, y: number) => getTreeRowHitFromPanel(
+    getBounds(treePanelRef),
+    x,
+    y,
+    {
+      treeOffset: stateRef.current.treeOffset,
+      visibleTreeRows: stateRef.current.visibleTreeRows,
+      rowsLength: stateRef.current.rows.length,
+      contentWidth: stateRef.current.treeContentWidth,
+    },
+  ), []);
 
   const showToast = useCallback((message: string, hint?: string) => {
     setToast(makeToast(message, hint));
@@ -546,7 +633,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     return () => clearTimeout(timeout);
   }, [toast]);
 
-  const runCopyCommand = useCallback(async (commandId: string, commandFile = activeFile, commandHunk = focusedHunk) => {
+  const runCopyCommand = useCallback(async (commandId: string, commandFile = activeFile, commandBlock = focusedBlock) => {
     if (!review || !commandFile) {
       showToast('Copy action unavailable.');
       return;
@@ -555,11 +642,11 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     const result = await executeCopyCommand(commandId, {
       model: review,
       activeFile: commandFile,
-      focusedHunk: commandHunk,
+      focusedBlock: commandBlock,
     }, copyWriter ? {write: copyWriter} : {});
 
     showToast(result.toast, result.hint);
-  }, [activeFile, copyWriter, focusedHunk, review, showToast]);
+  }, [activeFile, copyWriter, focusedBlock, review, showToast]);
 
   useEffect(() => {
     const handleScroll = (position: {x: number; y: number}, direction: 'scrollup' | 'scrolldown' | null) => {
@@ -587,7 +674,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
     const handlePosition = (position: {x: number; y: number}) => {
       const mousePosition = normalizeMousePosition(position);
       let nextHoveredAction: HoveredAction = null;
-      let nextHoveredHunkLineIndex: number | null = null;
+      let nextHoveredBlockLineIndex: number | null = null;
       const treeBounds = getBounds(treePanelRef);
       if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
         setHoveredTreeRow((current) => (current === null ? current : null));
@@ -596,15 +683,14 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
         if (!treeRowHit) {
           setHoveredTreeRow((current) => (current === null ? current : null));
         } else {
-          const {rowIndex, bounds} = treeRowHit;
+          const {rowIndex, relativeX, bounds} = treeRowHit;
           if (rowIndex < 0 || rowIndex >= stateRef.current.rows.length) {
             setHoveredTreeRow((current) => (current === null ? current : null));
           } else {
             setHoveredTreeRow((current) => (current === rowIndex ? current : rowIndex));
             const row = stateRef.current.rows[rowIndex];
-            const relativeX = mousePosition.x - bounds.left;
             if (row?.kind === 'file' && isTreeCopyTarget(relativeX, bounds.width)) {
-              nextHoveredAction = {kind: 'file', id: 'copy.path'};
+              nextHoveredAction = {kind: 'tree-copy', rowIndex};
             }
           }
         }
@@ -622,29 +708,27 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
           const fileHeaderLine = composeLeftRight(fileLabel, fileActions(), inner);
           const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
           if (actionId) {
-            nextHoveredAction = {kind: 'file', id: actionId};
+            nextHoveredAction = {kind: 'file-header', id: actionId};
           }
         } else {
           const diffLineIndex = diffOffset + relativeY - 3;
-          const hunkLineIndex = findHoveredHunkLineIndex(allDiffLines, diffLineIndex);
-          nextHoveredHunkLineIndex = hunkLineIndex;
-          const line = hunkLineIndex === null ? undefined : allDiffLines[hunkLineIndex];
-          if (line && hunkLineIndex !== null && diffLineIndex === hunkLineIndex) {
-            const actionId = getActionFromRenderedLine(relativeX - 2, addHunkActionsToLine(line), HUNK_ACTIONS);
+          const blockLineIndex = findHoveredBlockLineIndex(allDiffLines, diffLineIndex);
+          nextHoveredBlockLineIndex = blockLineIndex;
+          const line = blockLineIndex === null ? undefined : allDiffLines[blockLineIndex];
+          if (line && blockLineIndex !== null && diffLineIndex === blockLineIndex) {
+            const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
             if (actionId) {
-              nextHoveredAction = {kind: 'hunk', id: actionId, lineIndex: hunkLineIndex};
+              nextHoveredAction = {kind: 'block', id: actionId, lineIndex: blockLineIndex};
             }
           }
         }
       }
 
-      setHoveredHunkLineIndex((current) => (current === nextHoveredHunkLineIndex ? current : nextHoveredHunkLineIndex));
+      setHoveredBlockLineIndex((current) => (current === nextHoveredBlockLineIndex ? current : nextHoveredBlockLineIndex));
 
       setHoveredAction((current) => {
-        if (current?.kind === nextHoveredAction?.kind && current?.id === nextHoveredAction?.id) {
-          if (current?.kind !== 'hunk' || nextHoveredAction?.kind !== 'hunk' || current.lineIndex === nextHoveredAction.lineIndex) {
-            return current;
-          }
+        if (hoveredActionsEqual(current, nextHoveredAction)) {
+          return current;
         }
 
         return nextHoveredAction;
@@ -672,13 +756,12 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
         if (!treeRowHit) return;
 
-        const {rowIndex, bounds} = treeRowHit;
+        const {rowIndex, relativeX, bounds} = treeRowHit;
         const row = stateRef.current.rows[rowIndex];
         if (row && row.kind === 'file') {
-          const relativeX = mousePosition.x - bounds.left;
           const rowFile = review?.files.find((file) => file.path === row.path);
           if (isTreeCopyTarget(relativeX, bounds.width) && rowFile) {
-            void runCopyCommand('copy.path', rowFile, rowFile.hunks[0]);
+            void runCopyCommand('copy.path', rowFile, rowFile.blocks[0]);
             return;
           }
 
@@ -706,20 +789,15 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       }
 
       const diffLineIndex = diffOffset + relativeY - 3;
-      const hunkLineIndex = findHoveredHunkLineIndex(allDiffLines, diffLineIndex);
-      const line = hunkLineIndex === null ? undefined : allDiffLines[hunkLineIndex];
-      if (!line || diffLineIndex !== hunkLineIndex) return;
+      const blockLineIndex = findHoveredBlockLineIndex(allDiffLines, diffLineIndex);
+      const line = blockLineIndex === null ? undefined : allDiffLines[blockLineIndex];
+      if (!line || diffLineIndex !== blockLineIndex) return;
 
-      const hunk = findHunkFromLine(line, activeFile);
-      const actionId = getActionFromRenderedLine(relativeX - 2, addHunkActionsToLine(line), HUNK_ACTIONS);
+      const block = findBlockFromLine(line, activeFile);
+      const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
       if (!actionId) return;
 
-      if (actionId === 'more') {
-        showToast('More actions coming soon.');
-        return;
-      }
-
-      void runCopyCommand(actionId, activeFile, hunk);
+      void runCopyCommand(actionId, activeFile, block);
     };
 
     mouse.events.on('click', handleClick);
@@ -747,12 +825,12 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
 
   useInput((input, key) => {
     if (key.downArrow) {
-      jumpToSection(activeSectionIndex + 1);
+      jumpToSection(topSectionIndex + 1);
       return;
     }
 
     if (key.upArrow) {
-      jumpToSection(activeSectionIndex - 1);
+      jumpToSection(topSectionIndex - 1);
       return;
     }
 
@@ -761,18 +839,13 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       return;
     }
 
+    if ((key.ctrl || key.meta) && input.toLowerCase() === 'k') {
+      showToast('Palette is not available yet.');
+      return;
+    }
+
     if (input === 'k') {
       setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, -1));
-      return;
-    }
-
-    if (key.pageDown) {
-      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, visibleDiffRows));
-      return;
-    }
-
-    if (key.pageUp) {
-      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, -visibleDiffRows));
       return;
     }
 
@@ -814,15 +887,21 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
           hovered={treeHovered}
           setHovered={setTreeHovered}
         >
-          <Text>{composeLeftRight(`${ANSI_CYAN}Changed files${ANSI_RESET}`, `${ANSI_GRAY}${treeCounter}${ANSI_RESET}`, treeContentWidth)}</Text>
+          <Box width={treeContentWidth} justifyContent="space-between">
+            <Text color="cyan">Changed files</Text>
+            <Text color="gray">{treeCounter}</Text>
+          </Box>
           {visibleRows.map((row, index) => (
             <TreeFileRow
               key={row.path}
               row={row}
               selected={row.kind === 'file' && row.path === activeFilePath}
               hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
+              copyHovered={
+                hoveredAction?.kind === 'tree-copy'
+                && hoveredAction.rowIndex === treeOffset + index
+              }
               width={treeContentWidth}
-              rowRef={setTreeRowRef(treeOffset + index)}
             />
           ))}
         </TreePane>
@@ -841,7 +920,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
             const activeStatus = review?.files.find((file) => file.path === activeFilePath)?.status;
             const status = ansiStatus(activeStatus);
             const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-            const fileHover = hoveredAction?.kind === 'file' ? hoveredAction.id : undefined;
+            const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
             const fileLabelWithActions = composeLeftRight(fileLabel, review ? fileActions(fileHover) : '', inner);
 
             const metricsCore = activeSection
@@ -860,13 +939,14 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
             ];
             for (const [index, line] of visibleDiffLines.entries()) {
               const absoluteLineIndex = diffOffset + index;
-              const hunkHover = hoveredAction?.kind === 'hunk' && hoveredAction.lineIndex === absoluteLineIndex
+              const blockHover = hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex
                 ? hoveredAction.id
                 : undefined;
-              const visibleLine = hoveredHunkLineIndex === absoluteLineIndex
-                ? addHunkActionsToLine(line || ' ', hunkHover)
+              const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
+              const visibleLine = visibleActionBlockLineIndex === absoluteLineIndex
+                ? addBlockActionsToLine(line || ' ', blockHover)
                 : line || ' ';
-              rows.push(frameLine(highlightActionLabel(visibleLine, hunkHover), inner, borderAnsi));
+              rows.push(frameLine(highlightActionLabel(visibleLine, blockHover), inner, borderAnsi));
             }
             rows.push(frameBottomBorder(rightWidth, borderAnsi));
 
@@ -878,7 +958,7 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
       <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
         {toast
           ? <Text color="cyan">✓ {toast}</Text>
-          : <Text color="gray">{process.platform === 'darwin' ? '⌘K' : 'Ctrl+K'} palette • y copy menu • ↑/↓ jump file • PgUp/PgDn page • g/G top-bottom • / search • q quit</Text>}
+          : <Text color="gray">↑/↓ jump file • j/k scroll • g/G top-bottom • q quit</Text>}
         <Text color="gray">{base}...{branch}</Text>
       </Box>
     </Box>

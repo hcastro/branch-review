@@ -1,4 +1,4 @@
-import type {ReviewFile, ReviewHunk, ReviewModel} from '../review/model.js';
+import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
 
 function formatNumber(value: number) {
   return value.toLocaleString('en-US');
@@ -16,37 +16,37 @@ export function buildPathPayload(file: Pick<ReviewFile, 'path'>) {
   return file.path;
 }
 
-export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, hunk: Pick<ReviewHunk, 'lineStart'>) {
-  return `${file.path}:${hunk.lineStart}`;
+export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, block: Pick<ReviewBlock, 'lineStart'>) {
+  return `${file.path}:${block.lineStart}`;
 }
 
 export function buildAllChangedPathsPayload(model: Pick<ReviewModel, 'files'>) {
   return model.files.map((file) => file.path).join('\n');
 }
 
-export function buildCodePayload(hunk: Pick<ReviewHunk, 'addedCode'>) {
-  return hunk.addedCode;
+export function buildCodePayload(block: Pick<ReviewBlock, 'addedCode'>) {
+  return block.addedCode;
 }
 
-export function buildHunkDiffPayload(hunk: Pick<ReviewHunk, 'rawDiff'>) {
-  return hunk.rawDiff;
+export function buildBlockDiffPayload(block: Pick<ReviewBlock, 'rawDiff'>) {
+  return block.rawDiff;
 }
 
 export function buildFileDiffPayload(file: Pick<ReviewFile, 'rawDiff'>) {
   return file.rawDiff;
 }
 
-export function buildHunkPromptPayload(file: Pick<ReviewFile, 'path'>, hunk: ReviewHunk) {
+export function buildBlockPromptPayload(file: Pick<ReviewFile, 'path'>, block: ReviewBlock) {
   const lines = [
     `File: ${file.path}`,
-    `Lines: ${hunk.lineStart}-${hunk.lineEnd}`,
+    `Lines: ${block.lineStart}-${block.lineEnd}`,
   ];
 
-  if (hunk.functionHeader) {
-    lines.push(`Function: ${hunk.functionHeader}`);
+  if (block.functionHeader) {
+    lines.push(`Function: ${block.functionHeader}`);
   }
 
-  lines.push('', fencedDiff(hunk.rawDiff));
+  lines.push('', fencedDiff(block.rawDiff));
   return lines.join('\n');
 }
 

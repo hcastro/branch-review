@@ -1,7 +1,7 @@
 import type {BranchMetrics, FileMetrics} from '../sections.js';
 import type {FileStatus} from '../git.js';
 
-export type ReviewHunk = {
+export type ReviewBlock = {
   id: string;
   filePath: string;
   oldStart: number;
@@ -22,7 +22,7 @@ export type ReviewFile = {
   metrics: FileMetrics;
   rawDiff: string;
   renderedLines: string[];
-  hunks: ReviewHunk[];
+  blocks: ReviewBlock[];
 };
 
 export type ReviewModel = {

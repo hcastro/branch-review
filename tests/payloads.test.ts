@@ -5,14 +5,14 @@ import {
   buildCodePayload,
   buildFileDiffPayload,
   buildFilePromptPayload,
-  buildHunkDiffPayload,
-  buildHunkPromptPayload,
+  buildBlockDiffPayload,
+  buildBlockPromptPayload,
   buildPathLinePayload,
   buildPathPayload,
 } from '../src/clipboard/payloads.js';
-import type {ReviewFile, ReviewHunk, ReviewModel} from '../src/review/model.js';
+import type {ReviewFile, ReviewBlock, ReviewModel} from '../src/review/model.js';
 
-const rawHunk = [
+const rawBlock = [
   '@@ -1,2 +1,3 @@ function example()',
   ' const before = true;',
   '-const value = 1;',
@@ -20,7 +20,7 @@ const rawHunk = [
   '+const next = 3;',
 ].join('\n');
 
-const hunk: ReviewHunk = {
+const block: ReviewBlock = {
   id: 'src/example.ts:1:0',
   filePath: 'src/example.ts',
   oldStart: 1,
@@ -30,7 +30,7 @@ const hunk: ReviewHunk = {
   lineStart: 1,
   lineEnd: 3,
   functionHeader: 'function example()',
-  rawDiff: rawHunk,
+  rawDiff: rawBlock,
   addedCode: 'const value = 2;\nconst next = 3;',
 };
 
@@ -42,10 +42,10 @@ const file: ReviewFile = {
     'diff --git a/src/example.ts b/src/example.ts',
     '--- a/src/example.ts',
     '+++ b/src/example.ts',
-    rawHunk,
+    rawBlock,
   ].join('\n'),
   renderedLines: [],
-  hunks: [hunk],
+  blocks: [block],
 };
 
 const model: ReviewModel = {
@@ -59,18 +59,18 @@ const model: ReviewModel = {
 describe('copy payload builders', () => {
   it('builds path and content payloads', () => {
     expect(buildPathPayload(file)).toBe('src/example.ts');
-    expect(buildPathLinePayload(file, hunk)).toBe('src/example.ts:1');
+    expect(buildPathLinePayload(file, block)).toBe('src/example.ts:1');
     expect(buildAllChangedPathsPayload(model)).toBe('src/example.ts');
-    expect(buildCodePayload(hunk)).toMatchInlineSnapshot(`
+    expect(buildCodePayload(block)).toMatchInlineSnapshot(`
       "const value = 2;
       const next = 3;"
     `);
-    expect(buildHunkDiffPayload(hunk)).toBe(rawHunk);
+    expect(buildBlockDiffPayload(block)).toBe(rawBlock);
     expect(buildFileDiffPayload(file)).toBe(file.rawDiff);
   });
 
   it('builds agent prompt payloads', () => {
-    expect(buildHunkPromptPayload(file, hunk)).toMatchInlineSnapshot(`
+    expect(buildBlockPromptPayload(file, block)).toMatchInlineSnapshot(`
       "File: src/example.ts
       Lines: 1-3
       Function: function example()
