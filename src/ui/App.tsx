@@ -174,18 +174,21 @@ const TreeFileRow = memo(function TreeFileRow({
   selected,
   hovered,
   copyHovered,
+  copySucceeded,
   width,
 }: {
   row: TreeRow;
   selected: boolean;
   hovered: boolean;
   copyHovered: boolean;
+  copySucceeded: boolean;
   width: number;
 }) {
   const accent = row.kind === 'dir' ? 'yellow' : selected ? 'cyanBright' : hovered ? 'cyan' : 'white';
   const glyph = row.kind === 'dir' ? '▾' : '•';
-  const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected);
-  const indicatorWidth = row.kind === 'file' ? 8 : 0;
+  const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
+  const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
+  const indicatorWidth = row.kind === 'file' ? 11 : 0;
 
   return (
     <Box width={width}>
@@ -199,8 +202,8 @@ const TreeFileRow = memo(function TreeFileRow({
           <Text color={statusColor(row.status)} bold={Boolean(row.status)}>
             {statusLabel(row.status)}
           </Text>
-          <Text color={copyHovered ? 'cyanBright' : 'gray'} bold={copyHovered}>
-            {copyVisible ? ' Copy' : '     '}
+          <Text color={copySucceeded ? 'greenBright' : copyHovered ? 'cyanBright' : 'gray'} bold={copySucceeded || copyHovered}>
+            {copyVisible ? ` ${copyLabel}` : '          '}
           </Text>
         </Box>
       )}
@@ -208,8 +211,8 @@ const TreeFileRow = memo(function TreeFileRow({
   );
 });
 
-export function shouldShowTreeCopy(rowKind: TreeRow['kind'], hovered: boolean, _selected: boolean) {
-  return rowKind === 'file' && hovered;
+export function shouldShowTreeCopy(rowKind: TreeRow['kind'], hovered: boolean, _selected: boolean, copied = false) {
+  return rowKind === 'file' && (hovered || copied);
 }
 
 function TreePane({
@@ -933,6 +936,10 @@ function AppContent({base, branch, sections: rawSections, branchMetrics, review,
               copyHovered={
                 hoveredAction?.kind === 'tree-copy'
                 && hoveredAction.rowIndex === treeOffset + index
+              }
+              copySucceeded={
+                copiedAction?.kind === 'tree-copy'
+                && copiedAction.rowIndex === treeOffset + index
               }
               width={treeContentWidth}
             />
