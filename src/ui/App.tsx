@@ -6,6 +6,7 @@ import {
   useOnMouseHover,
 } from '@zenobius/ink-mouse';
 import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, type TreeRow} from '../tree.js';
+import {writeClipboard} from '../clipboard/write.js';
 import {
   flattenSectionLines,
   formatMetrics,
@@ -43,6 +44,7 @@ type AppProps = {
 const SCROLL_STEP = 3;
 const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
+const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
 const COPY_SUCCESS_LABEL = '✓ Copied';
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
@@ -310,6 +312,7 @@ const ANSI_RED = '[31m';
 const ANSI_YELLOW = '[33m';
 const ANSI_MAGENTA = '[35m';
 const ANSI_RESET = '[0m';
+const ANSI_SELECTION = '[48;2;28;68;76m[97;1m';
 
 type HoveredAction =
   | {kind: 'file-header'; id: string}
@@ -317,6 +320,12 @@ type HoveredAction =
   | {kind: 'block'; id: string; lineIndex: number}
   | null;
 type CopiedAction = Exclude<HoveredAction, null>;
+type CodeSelectionPoint = {lineIndex: number; column: number};
+type CodeSelection = {
+  anchor: CodeSelectionPoint;
+  focus: CodeSelectionPoint;
+  active: boolean;
+};
 
 function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
   if (current === next) return true;
@@ -408,13 +417,13 @@ type StyledCell = {
 };
 
 function toStyledCells(line: string) {
-  const parts = line.split(/(\x1B\[[0-9;]*[A-Za-z])/);
+  const parts = line.split(/(\x1B\[[0-9;:]*[A-Za-z])/);
   const cells: StyledCell[] = [];
   let style = '';
 
   for (const part of parts) {
     if (!part) continue;
-    if (/^\x1B\[[0-9;]*[A-Za-z]$/.test(part)) {
+    if (/^\x1B\[[0-9;:]*[A-Za-z]$/.test(part)) {
       style = part === ANSI_RESET ? '' : style + part;
       continue;
     }
@@ -441,6 +450,106 @@ function renderStyledCells(cells: StyledCell[]) {
   }
 
   return output + ANSI_RESET;
+}
+
+function compareSelectionPoints(a: CodeSelectionPoint, b: CodeSelectionPoint) {
+  if (a.lineIndex !== b.lineIndex) {
+    return a.lineIndex - b.lineIndex;
+  }
+
+  return a.column - b.column;
+}
+
+function selectionPointsEqual(a: CodeSelectionPoint, b: CodeSelectionPoint) {
+  return a.lineIndex === b.lineIndex && a.column === b.column;
+}
+
+function codeSelectionsEqual(a: CodeSelection | null, b: CodeSelection | null) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.active === b.active
+    && selectionPointsEqual(a.anchor, b.anchor)
+    && selectionPointsEqual(a.focus, b.focus);
+}
+
+function normalizeCodeSelection(selection: CodeSelection) {
+  return compareSelectionPoints(selection.anchor, selection.focus) <= 0
+    ? {start: selection.anchor, end: selection.focus}
+    : {start: selection.focus, end: selection.anchor};
+}
+
+function getCodeContentRange(line: string) {
+  const plain = stripAnsi(line);
+  const separatorIndex = plain.indexOf('│');
+  if (separatorIndex <= 0 || plain.startsWith('│')) {
+    return null;
+  }
+
+  let start = separatorIndex + 1;
+  if (plain[start] === ' ') {
+    start += 1;
+  }
+
+  return {
+    start,
+    text: plain.slice(start),
+  };
+}
+
+function selectedColumnRangeForLine(lineIndex: number, lineText: string, selection: CodeSelection) {
+  const code = getCodeContentRange(lineText);
+  if (!code) return null;
+
+  const {start, end} = normalizeCodeSelection(selection);
+  if (lineIndex < start.lineIndex || lineIndex > end.lineIndex) {
+    return null;
+  }
+
+  const textLength = code.text.length;
+  const selectionStart = lineIndex === start.lineIndex ? clamp(start.column, 0, textLength) : 0;
+  const selectionEnd = lineIndex === end.lineIndex ? clamp(end.column + 1, 0, textLength) : textLength;
+  if (selectionEnd <= selectionStart) {
+    return null;
+  }
+
+  return {
+    start: code.start + selectionStart,
+    end: code.start + selectionEnd,
+  };
+}
+
+function highlightSelectedCode(line: string, lineIndex: number, selection: CodeSelection | null) {
+  if (!selection) return line;
+
+  const range = selectedColumnRangeForLine(lineIndex, line, selection);
+  if (!range) return line;
+
+  const cells = toStyledCells(line);
+  for (let index = range.start; index < range.end && index < cells.length; index += 1) {
+    const cell = cells[index];
+    if (cell) {
+      cell.style = `${cell.style}${ANSI_SELECTION}`;
+    }
+  }
+
+  return renderStyledCells(cells);
+}
+
+export function getSelectedCodeText(lines: string[], selection: CodeSelection) {
+  const {start, end} = normalizeCodeSelection(selection);
+  const selectedLines: string[] = [];
+
+  for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
+    const code = getCodeContentRange(lines[lineIndex] ?? '');
+    if (!code) continue;
+
+    const textLength = code.text.length;
+    const selectionStart = lineIndex === start.lineIndex ? clamp(start.column, 0, textLength) : 0;
+    const selectionEnd = lineIndex === end.lineIndex ? clamp(end.column + 1, 0, textLength) : textLength;
+    selectedLines.push(code.text.slice(selectionStart, Math.max(selectionStart, selectionEnd)));
+  }
+
+  return selectedLines.join('\n');
 }
 
 function overlayAnsiAt(baseLine: string, overlay: string, start: number, width: number) {
@@ -736,6 +845,12 @@ function AppContent({
   const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
   const [copiedAction, setCopiedAction] = useState<CopiedAction | null>(null);
+  const [codeSelection, setCodeSelectionState] = useState<CodeSelection | null>(null);
+  const codeSelectionRef = useRef<CodeSelection | null>(null);
+  const renderedCodeSelectionRef = useRef<CodeSelection | null>(null);
+  const pendingCodeSelectionRef = useRef<CodeSelection | null>(null);
+  const codeSelectionRenderTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastCodeSelectionRenderAtRef = useRef(0);
   const [toast, setToast] = useState<string | null>(null);
   const viewSnapshotRef = useRef({
     path: '',
@@ -894,6 +1009,66 @@ function AppContent({
     setToast(makeToast(message, hint));
   }, []);
 
+  const renderCodeSelection = useCallback((selection: CodeSelection | null) => {
+    if (codeSelectionsEqual(renderedCodeSelectionRef.current, selection)) {
+      return;
+    }
+
+    renderedCodeSelectionRef.current = selection;
+    setCodeSelectionState(selection);
+  }, []);
+
+  const setCodeSelection = useCallback((selection: CodeSelection | null) => {
+    if (codeSelectionsEqual(codeSelectionRef.current, selection)) {
+      return;
+    }
+
+    codeSelectionRef.current = selection;
+    pendingCodeSelectionRef.current = null;
+    if (codeSelectionRenderTimerRef.current) {
+      clearTimeout(codeSelectionRenderTimerRef.current);
+      codeSelectionRenderTimerRef.current = null;
+    }
+
+    lastCodeSelectionRenderAtRef.current = Date.now();
+    renderCodeSelection(selection);
+  }, [renderCodeSelection]);
+
+  const scheduleCodeSelection = useCallback((selection: CodeSelection | null) => {
+    if (codeSelectionsEqual(codeSelectionRef.current, selection)) {
+      return;
+    }
+
+    codeSelectionRef.current = selection;
+    pendingCodeSelectionRef.current = selection;
+
+    const now = Date.now();
+    const elapsed = now - lastCodeSelectionRenderAtRef.current;
+    const delay = Math.max(0, CODE_SELECTION_RENDER_INTERVAL_MS - elapsed);
+    if (delay === 0) {
+      pendingCodeSelectionRef.current = null;
+      lastCodeSelectionRenderAtRef.current = now;
+      renderCodeSelection(selection);
+      return;
+    }
+
+    if (!codeSelectionRenderTimerRef.current) {
+      codeSelectionRenderTimerRef.current = setTimeout(() => {
+        codeSelectionRenderTimerRef.current = null;
+        const nextSelection = pendingCodeSelectionRef.current;
+        pendingCodeSelectionRef.current = null;
+        lastCodeSelectionRenderAtRef.current = Date.now();
+        renderCodeSelection(nextSelection);
+      }, delay);
+    }
+  }, [renderCodeSelection]);
+
+  useEffect(() => () => {
+    if (codeSelectionRenderTimerRef.current) {
+      clearTimeout(codeSelectionRenderTimerRef.current);
+    }
+  }, []);
+
   useEffect(() => {
     if (!toast) return undefined;
     const timeout = setTimeout(() => setToast(null), TOAST_TIMEOUT_MS);
@@ -932,6 +1107,51 @@ function AppContent({
     showToast(result.toast, result.hint);
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
+  const getCodeSelectionPoint = useCallback((mousePosition: {x: number; y: number}) => {
+    const diffBounds = getBounds(diffPanelRef);
+    if (!isInside(diffBounds, mousePosition.x, mousePosition.y) || !diffBounds) return null;
+
+    const relativeY = mousePosition.y - diffBounds.top;
+    if (relativeY < 3) return null;
+
+    const lineIndex = diffOffset + relativeY - 3;
+    if (lineIndex < 0 || lineIndex >= allDiffLines.length) return null;
+
+    const innerColumn = mousePosition.x - diffBounds.left - 2;
+    const code = getCodeContentRange(allDiffLines[lineIndex] ?? '');
+    if (!code || innerColumn < code.start) return null;
+
+    return {
+      lineIndex,
+      column: clamp(innerColumn - code.start, 0, code.text.length),
+    };
+  }, [allDiffLines, diffOffset]);
+
+  const copyCodeSelection = useCallback(async (selection: CodeSelection) => {
+    if (compareSelectionPoints(selection.anchor, selection.focus) === 0) {
+      setCodeSelection(null);
+      return;
+    }
+
+    const text = getSelectedCodeText(allDiffLines, selection);
+    if (!text) {
+      setCodeSelection(null);
+      return;
+    }
+
+    try {
+      const result = await (copyWriter ?? writeClipboard)(text);
+      if (result.ok) {
+        const lineCount = text.split('\n').length;
+        showToast('Copied selection', lineCount === 1 ? `${text.length} chars` : `${lineCount} lines`);
+      } else {
+        showToast(result.message, result.hint);
+      }
+    } catch (error) {
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined);
+    }
+  }, [allDiffLines, copyWriter, setCodeSelection, showToast]);
+
   useEffect(() => {
     const handleScroll = (position: {x: number; y: number}, direction: 'scrollup' | 'scrolldown' | null) => {
       if (direction !== 'scrollup' && direction !== 'scrolldown') return;
@@ -956,6 +1176,18 @@ function AppContent({
 
   useEffect(() => {
     const handlePosition = (position: {x: number; y: number}) => {
+      if (codeSelectionRef.current?.active) {
+        if (hoveredAction !== null) {
+          setHoveredAction(null);
+        }
+
+        if (hoveredBlockLineIndex !== null) {
+          setHoveredBlockLineIndex(null);
+        }
+
+        return;
+      }
+
       const mousePosition = normalizeMousePosition(position);
       let nextHoveredAction: HoveredAction = null;
       let nextHoveredBlockLineIndex: number | null = null;
@@ -1056,6 +1288,7 @@ function AppContent({
     diffOffset,
     getTreeRowHit,
     hoveredAction,
+    hoveredBlockLineIndex,
     mouse,
     rightWidth,
     sections.length,
@@ -1064,9 +1297,62 @@ function AppContent({
   ]);
 
   useEffect(() => {
-    const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
-      if (action !== 'press') return;
+    const handleDrag = (position: {x: number; y: number}, action: 'dragging' | null) => {
+      const currentSelection = codeSelectionRef.current;
+      if (!currentSelection) return;
+
       const mousePosition = normalizeMousePosition(position);
+      const point = getCodeSelectionPoint(mousePosition);
+      const nextSelection = point ? {...currentSelection, focus: point, active: action === 'dragging'} : {
+        ...currentSelection,
+        active: action === 'dragging',
+      };
+
+      if (action === 'dragging') {
+        scheduleCodeSelection(nextSelection);
+      } else {
+        setCodeSelection(nextSelection);
+      }
+
+      if (action === null) {
+        void copyCodeSelection(nextSelection);
+      }
+    };
+
+    mouse.events.on('drag', handleDrag);
+    return () => mouse.events.off('drag', handleDrag);
+  }, [copyCodeSelection, getCodeSelectionPoint, mouse, scheduleCodeSelection, setCodeSelection]);
+
+  useEffect(() => {
+    const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
+      const mousePosition = normalizeMousePosition(position);
+      if (action === 'release') {
+        const currentSelection = codeSelectionRef.current;
+        if (!currentSelection?.active) return;
+        const point = getCodeSelectionPoint(mousePosition);
+        const nextSelection = {
+          ...currentSelection,
+          ...(point ? {focus: point} : {}),
+          active: false,
+        };
+        setCodeSelection(nextSelection);
+        void copyCodeSelection(nextSelection);
+        return;
+      }
+
+      if (action !== 'press') return;
+
+      const selectionPoint = getCodeSelectionPoint(mousePosition);
+      if (selectionPoint) {
+        setHoveredAction(null);
+        setCodeSelection({anchor: selectionPoint, focus: selectionPoint, active: true});
+        return;
+      }
+
+      if (codeSelectionRef.current) {
+        setCodeSelection(null);
+      }
+
       const treeBounds = getBounds(treePanelRef);
       if (isInside(treeBounds, mousePosition.x, mousePosition.y) && treeBounds) {
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
@@ -1159,13 +1445,16 @@ function AppContent({
     allDiffLines,
     copiedAction,
     diffOffset,
+    getCodeSelectionPoint,
     getTreeRowHit,
     hoveredAction,
     mouse,
+    copyCodeSelection,
     jumpToFile,
     review,
     rightWidth,
     runCopyCommand,
+    setCodeSelection,
     sections.length,
     showToast,
     toggleTreeDirectory,
@@ -1317,7 +1606,8 @@ function AppContent({
               const visibleLine = visibleActionBlockLineIndex === absoluteLineIndex
                 ? addBlockActionsToLine(line || ' ', blockHover, blockCopied)
                 : line || ' ';
-              rows.push(frameLine(highlightActionLabel(visibleLine, blockHover), inner, borderAnsi));
+              const selectedLine = highlightSelectedCode(visibleLine, absoluteLineIndex, codeSelection);
+              rows.push(frameLine(highlightActionLabel(selectedLine, blockHover), inner, borderAnsi));
             }
             rows.push(frameBottomBorder(rightWidth, borderAnsi));
 

@@ -15,6 +15,26 @@ async function emitMouseClickAt(column: number, row: number) {
   await flush();
 }
 
+async function emitMousePressAt(column: number, row: number) {
+  process.stdin.emit('data', `\u001B[<0;${column + 1};${row + 1}M`);
+  await flush();
+}
+
+async function emitMouseDragAt(column: number, row: number, release = false) {
+  process.stdin.emit('data', `\u001B[<32;${column + 1};${row + 1}${release ? 'm' : 'M'}`);
+  await flush();
+}
+
+function getFrameTextPosition(frame: string, lineText: string, text: string, offset = 0) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes(lineText));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(text) ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  return {column: column + offset, row};
+}
+
 async function clickFrameText(frame: string, text: string) {
   const lines = stripAnsi(frame).split('\n');
   const row = lines.findIndex((line) => line.includes(text));
@@ -635,6 +655,81 @@ describe('App', () => {
 
     const frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).not.toContain('qmd-query-playbook.mdU');
+
+    instance.unmount();
+  });
+
+  it('copies dragged code selections without line number gutters', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 2, deletions: 0, changedLines: 2},
+        diff: [
+          '• src/example.ts:10: function example()',
+          '  10 ⋮  10 │ const first = 1;',
+          '  11 ⋮  11 │ const secondName = call();',
+        ].join('\n'),
+      },
+    ]);
+    const writes: string[] = [];
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 2, deletions: 0, changedLines: 2}}
+        copyWriter={async (text) => {
+          writes.push(text);
+          return {
+            ok: true,
+            command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
+          };
+        }}
+        dimensions={{columns: 150, rows: 24}}
+      />,
+    );
+
+    await flush();
+
+    const singleLineFrame = instance.lastFrame() ?? '';
+    const singleStart = getFrameTextPosition(singleLineFrame, 'const secondName = call();', 'secondName');
+    const singleEnd = getFrameTextPosition(
+      singleLineFrame,
+      'const secondName = call();',
+      'secondName',
+      'secondName'.length - 1,
+    );
+
+    await emitMousePressAt(singleStart.column, singleStart.row);
+    await emitMouseDragAt(singleEnd.column, singleEnd.row);
+    await emitMouseDragAt(singleEnd.column, singleEnd.row, true);
+    await flush();
+
+    expect(writes.at(-1)).toBe('secondName');
+    expect(writes.at(-1)).not.toContain('11');
+    expect(writes.at(-1)).not.toContain('│');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied selection · 10 chars');
+    expect(instance.lastFrame() ?? '').toContain('\u001B[48;2;28;68;76m');
+
+    const multiLineFrame = instance.lastFrame() ?? '';
+    const multiStart = getFrameTextPosition(multiLineFrame, 'const first = 1;', 'first');
+    const multiEnd = getFrameTextPosition(
+      multiLineFrame,
+      'const secondName = call();',
+      'secondName',
+      'secondName'.length - 1,
+    );
+
+    await emitMousePressAt(multiStart.column, multiStart.row);
+    await emitMouseDragAt(multiEnd.column, multiEnd.row);
+    await emitMouseDragAt(multiEnd.column, multiEnd.row, true);
+    await flush();
+
+    expect(writes.at(-1)).toBe('first = 1;\nconst secondName');
+    expect(writes.at(-1)).not.toContain('10 ⋮');
+    expect(writes.at(-1)).not.toContain('11 ⋮');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied selection · 2 lines');
 
     instance.unmount();
   });
