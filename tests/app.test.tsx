@@ -537,6 +537,120 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('collapses and expands a block from its header without breaking copy actions', async () => {
+    const firstRawDiff = [
+      '@@ -1 +1 @@ function one()',
+      '-const one = false;',
+      '+const one = true;',
+    ].join('\n');
+    const secondRawDiff = [
+      '@@ -10 +10 @@ function two()',
+      '-const two = false;',
+      '+const two = true;',
+    ].join('\n');
+    const sections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 2, deletions: 2, changedLines: 4},
+        diff: [
+          '• src/example.ts:1: function one()',
+          '  1 ⋮  1 │const one = true;',
+          '• src/example.ts:10: function two()',
+          ' 10 ⋮ 10 │const two = true;',
+        ].join('\n'),
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions: 2, deletions: 2, changedLines: 4},
+      files: [{
+        path: 'src/example.ts',
+        status: 'modified',
+        metrics: {path: 'src/example.ts', additions: 2, deletions: 2, changedLines: 4},
+        rawDiff: [firstRawDiff, secondRawDiff].join('\n'),
+        renderedLines: [],
+        blocks: [
+          {
+            id: 'src/example.ts:1:0',
+            filePath: 'src/example.ts',
+            oldStart: 1,
+            oldLines: 1,
+            newStart: 1,
+            newLines: 1,
+            lineStart: 1,
+            lineEnd: 1,
+            functionHeader: 'function one()',
+            rawDiff: firstRawDiff,
+            addedCode: 'const one = true;',
+          },
+          {
+            id: 'src/example.ts:10:1',
+            filePath: 'src/example.ts',
+            oldStart: 10,
+            oldLines: 1,
+            newStart: 10,
+            newLines: 1,
+            lineStart: 10,
+            lineEnd: 10,
+            functionHeader: 'function two()',
+            rawDiff: secondRawDiff,
+            addedCode: 'const two = true;',
+          },
+        ],
+      }],
+    };
+    const writes: string[] = [];
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 2, deletions: 2, changedLines: 4}}
+        review={review}
+        copyWriter={async (text) => {
+          writes.push(text);
+          return {
+            ok: true,
+            command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
+          };
+        }}
+        dimensions={{columns: 150, rows: 30}}
+      />,
+    );
+
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('▾ src/example.ts:1');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'src/example.ts:1');
+    await flush();
+
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('▸ src/example.ts:1');
+    expect(frame).not.toContain('collapsed ·');
+    expect(frame).not.toContain('const one = true;');
+    expect(frame).toContain('const two = true;');
+
+    await clickFrameLineAction(instance.lastFrame() ?? '', 'src/example.ts:1', 'Copy block');
+    await flush();
+
+    expect(writes.at(-1)).toContain('File: src/example.ts');
+    expect(writes.at(-1)).toContain('Lines: 1-1');
+    expect(writes.at(-1)).toContain(firstRawDiff);
+    expect(writes.at(-1)).not.toContain(secondRawDiff);
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'src/example.ts:1');
+    await flush();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('▾ src/example.ts:1');
+    expect(frame).toContain('const one = true;');
+    expect(frame).not.toContain('collapsed ·');
+
+    instance.unmount();
+  });
+
   it('renders copy affordances from the review model', async () => {
     const rawDiff = [
       'diff --git a/src/example.ts b/src/example.ts',
