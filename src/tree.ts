@@ -9,6 +9,14 @@ export type TreeRow = {
   expanded?: boolean;
 };
 
+function statusLabel(status: FileStatus | undefined) {
+  if (status === 'added') return 'A';
+  if (status === 'deleted') return 'D';
+  if (status === 'renamed') return 'R';
+  if (status === 'untracked') return 'U';
+  return status ? 'M' : '';
+}
+
 type TreeNode = {
   name: string;
   path: string;
@@ -150,4 +158,19 @@ export function findTreeSelectionPath(rows: TreeRow[], activeFilePath: string) {
   }
 
   return collapsedParent?.path ?? activeFilePath;
+}
+
+export function formatTreePayload(rows: TreeRow[]) {
+  if (rows.length === 0) {
+    return 'Changed files\n(no changes)';
+  }
+
+  return [
+    'Changed files',
+    ...rows.map((row) => {
+      const glyph = row.kind === 'dir' ? '▾' : '•';
+      const suffix = row.kind === 'file' ? ` ${statusLabel(row.status)}`.trimEnd() : '';
+      return `${' '.repeat(row.depth * 2)}${glyph} ${row.label}${suffix}`;
+    }),
+  ].join('\n');
 }
