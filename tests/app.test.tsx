@@ -839,6 +839,7 @@ describe('App', () => {
             command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
           };
         }}
+        repoRoot="/repo"
         dimensions={{columns: 140, rows: 18}}
       />,
     );
@@ -854,11 +855,13 @@ describe('App', () => {
     await flush();
 
     expect(writes.at(-1)).toBe([
-      'Changed files',
-      '• README.md M',
-      '▾ src',
-      '  • app.ts M',
-      '  • new.ts A',
+      '```',
+      '/repo',
+      '├── README.md',
+      '└── src',
+      '    ├── app.ts',
+      '    └── new.ts',
+      '```',
     ].join('\n'));
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied file tree · 3 files');
 
@@ -965,7 +968,7 @@ describe('App', () => {
 
     const frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('✓ Palette is not available yet.');
-    expect(frame).toContain('ln 1-');
+    expect(frame).toContain('line 1');
 
     instance.unmount();
   });
@@ -1047,6 +1050,13 @@ describe('App', () => {
 
     expect(writes).toContain('/repo/src/example.ts');
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied absolute path · src/example.ts');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied');
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('Copy absolute path');
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy absolute path');
+    await flush();
+
+    expect(writes.filter((entry) => entry === '/repo/src/example.ts')).toHaveLength(1);
 
     await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy diff');
     await flush();
