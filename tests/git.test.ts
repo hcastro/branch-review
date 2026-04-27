@@ -9,6 +9,7 @@ import {
   getBranchMetrics,
   getChangedFiles,
   getColoredFileDiff,
+  getCurrentBranchName,
   getFileMetricsMap,
   getReviewFileContents,
   getRawFileDiff,
@@ -211,5 +212,11 @@ describe('git helpers', () => {
     runGit(cwd, 'remote', 'set-head', 'origin', 'main');
 
     expect(inferBaseRef(cwd)).toBe('origin/main');
+  });
+
+  it('returns the current branch name', () => {
+    const cwd = createRepo();
+
+    expect(getCurrentBranchName(cwd)).toBe('feature/example');
   });
 });

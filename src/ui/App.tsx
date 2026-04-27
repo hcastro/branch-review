@@ -37,6 +37,7 @@ type AppProps = {
   readFileContent?: (file: ReviewFile) => string | null;
   resolveAbsolutePath?: (file: ReviewFile) => string | null;
   repoRoot?: string;
+  worktreeBranchName?: string;
   dimensions?: {columns: number; rows: number};
   watchStatus?: string;
   emptyStateHint?: string;
@@ -165,6 +166,25 @@ function normalizeMousePosition(position: {x: number; y: number}) {
   };
 }
 
+function isWorktreeLabelTarget(bounds: Bounds | null, x: number, y: number, branch: string) {
+  const worktreeStart = branch.indexOf('worktree');
+  if (!bounds || worktreeStart < 0) return false;
+  if (y !== bounds.top + 1) return false;
+
+  const labelStart = bounds.left + 2 + visibleWidth('branch-review ') + worktreeStart;
+  const labelEnd = labelStart + visibleWidth('worktree');
+  return x >= labelStart && x < labelEnd;
+}
+
+function isBaseLabelTarget(bounds: Bounds | null, x: number, y: number, branch: string, base: string) {
+  if (!bounds) return false;
+  if (y !== bounds.top + 1) return false;
+
+  const labelStart = bounds.left + 2 + visibleWidth('branch-review ') + visibleWidth(branch) + visibleWidth(' against ');
+  const labelEnd = labelStart + visibleWidth(base);
+  return x >= labelStart && x < labelEnd;
+}
+
 function statusColor(status: FileStatus | undefined) {
   if (status === 'added' || status === 'untracked') return 'green';
   if (status === 'deleted') return 'red';
@@ -178,6 +198,31 @@ function statusLabel(status: FileStatus | undefined) {
   if (status === 'renamed') return 'R';
   if (status === 'untracked') return 'U';
   return status ? 'M' : '';
+}
+
+function statusHint(status: FileStatus | undefined) {
+  if (status === 'added') return 'file status added';
+  if (status === 'deleted') return 'file status deleted';
+  if (status === 'renamed') return 'file status renamed';
+  if (status === 'untracked') return 'file status untracked';
+  if (status === 'modified') return 'file status modified';
+  return null;
+}
+
+function copyActionHint(actionId: string) {
+  if (actionId === 'copy.path') return 'copies relative file path';
+  if (actionId === 'copy.absolutePath') return 'copies absolute file path';
+  if (actionId === 'copy.fileDiff') return 'copies file diff';
+  if (actionId === 'copy.fileContents') return 'copies full file contents';
+  if (actionId === 'copy.blockCode') return 'copies added code only';
+  if (actionId === 'copy.blockDiff') return 'copies block diff';
+  if (actionId === 'copy.blockPrompt') return 'copies block with file and line context';
+  if (actionId === 'copy.tree') return 'copies changed-file tree';
+  return null;
+}
+
+function isTreeStatusTarget(relativeX: number, width: number, copied = false) {
+  return relativeX === Math.max(0, width - getTreeIndicatorWidth(copied));
 }
 
 const TreeFileRow = memo(function TreeFileRow({
@@ -889,6 +934,7 @@ function AppContent({
   readFileContent,
   resolveAbsolutePath,
   repoRoot = process.cwd(),
+  worktreeBranchName,
   dimensions,
   watchStatus,
   emptyStateHint,
@@ -896,6 +942,7 @@ function AppContent({
   const {exit} = useApp();
   const {stdout} = useStdout();
   const mouse = useMouse();
+  const topBarRef = useRef<DOMElement>(null);
   const columns = dimensions?.columns ?? stdout?.columns ?? 120;
   const terminalRows = dimensions?.rows ?? stdout?.rows ?? 40;
 
@@ -938,6 +985,7 @@ function AppContent({
   const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
   const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
+  const [infoTip, setInfoTip] = useState<string | null>(null);
   const [copiedAction, setCopiedAction] = useState<CopiedAction | null>(null);
   const [codeSelection, setCodeSelectionState] = useState<CodeSelection | null>(null);
   const codeSelectionRef = useRef<CodeSelection | null>(null);
@@ -1320,10 +1368,22 @@ function AppContent({
           setHoveredBlockLineIndex(null);
         }
 
+        setInfoTip((current) => (current ? null : current));
         return;
       }
 
       const mousePosition = normalizeMousePosition(position);
+      const topBarBounds = getBounds(topBarRef);
+      let nextInfoTip: string | null = null;
+      if (
+        worktreeBranchName
+        && isWorktreeLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, branch)
+      ) {
+        nextInfoTip = `current branch ${worktreeBranchName}`;
+      } else if (isBaseLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, branch, base)) {
+        nextInfoTip = `comparison base ${base}`;
+      }
+
       let nextHoveredAction: HoveredAction = null;
       let nextHoveredBlockLineIndex: number | null = null;
       const treeBounds = getBounds(treePanelRef);
@@ -1332,6 +1392,7 @@ function AppContent({
       } else if (isTreeHeaderCopyTarget(treeBounds, mousePosition.x, mousePosition.y, stateRef.current.treeContentWidth)) {
         setHoveredTreeRow((current) => (current === null ? current : null));
         nextHoveredAction = {kind: 'tree-header', id: 'copy.tree'};
+        nextInfoTip = copyActionHint('copy.tree');
       } else {
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
         if (!treeRowHit) {
@@ -1345,6 +1406,16 @@ function AppContent({
             const row = stateRef.current.rows[rowIndex];
             if (row?.kind === 'file' && isTreeCopyTarget(relativeX, bounds.width)) {
               nextHoveredAction = {kind: 'tree-copy', rowIndex};
+              nextInfoTip = copyActionHint('copy.path');
+            } else if (
+              row?.kind === 'file'
+              && isTreeStatusTarget(
+                relativeX,
+                bounds.width,
+                copiedAction?.kind === 'tree-copy' && copiedAction.rowIndex === rowIndex,
+              )
+            ) {
+              nextInfoTip = statusHint(row.status);
             }
           }
         }
@@ -1365,6 +1436,7 @@ function AppContent({
           const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
+            nextInfoTip = copyActionHint(actionId);
           }
         } else if (relativeY === 2) {
           const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
@@ -1384,6 +1456,7 @@ function AppContent({
           );
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
+            nextInfoTip = copyActionHint(actionId);
           }
         } else {
           const diffLineIndex = diffOffset + relativeY - 3;
@@ -1394,12 +1467,14 @@ function AppContent({
             const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
             if (actionId) {
               nextHoveredAction = {kind: 'block', id: actionId, lineIndex: blockLineIndex};
+              nextInfoTip = copyActionHint(actionId);
             }
           }
         }
       }
 
       setHoveredBlockLineIndex((current) => (current === nextHoveredBlockLineIndex ? current : nextHoveredBlockLineIndex));
+      setInfoTip((current) => (current === nextInfoTip ? current : nextInfoTip));
 
       setHoveredAction((current) => {
         if (hoveredActionsEqual(current, nextHoveredAction)) {
@@ -1418,6 +1493,8 @@ function AppContent({
     activeSection,
     activeSectionIndex,
     allDiffLines,
+    base,
+    branch,
     copiedAction,
     diffOffset,
     getTreeRowHit,
@@ -1426,6 +1503,7 @@ function AppContent({
     mouse,
     rightWidth,
     sections.length,
+    worktreeBranchName,
   ]);
 
   useEffect(() => {
@@ -1643,7 +1721,7 @@ function AppContent({
 
   return (
     <Box flexDirection="column">
-      <Box borderStyle="round" borderColor="cyan" paddingX={1} justifyContent="space-between">
+      <Box ref={topBarRef} borderStyle="round" borderColor="cyan" paddingX={1} justifyContent="space-between">
         <Box>
           <Text color="cyanBright" bold>branch-review</Text>
           <Text color="gray"> </Text>
@@ -1651,9 +1729,17 @@ function AppContent({
           <Text color="gray"> against </Text>
           <Text color="yellow">{base}</Text>
         </Box>
-        <Text color="magentaBright">
-          {branchMetrics.filesChanged} files • +{branchMetrics.additions} • -{branchMetrics.deletions} • {branchMetrics.changedLines} changed
-        </Text>
+        {infoTip
+          ? (
+            <Text color="cyanBright" bold wrap="truncate-end">
+              {truncateStart(infoTip, Math.max(18, columns - visibleWidth('branch-review ') - visibleWidth(branch) - visibleWidth(' against ') - visibleWidth(base) - 8))}
+            </Text>
+          )
+          : (
+            <Text color="magentaBright">
+              {branchMetrics.filesChanged} files • +{branchMetrics.additions} • -{branchMetrics.deletions} • {branchMetrics.changedLines} changed
+            </Text>
+          )}
       </Box>
 
       <Box>

@@ -78,10 +78,21 @@ async function moveFrameText(frame: string, text: string) {
   const column = lines[row]?.indexOf(text) ?? -1;
   expect(column).toBeGreaterThanOrEqual(0);
 
-  for (const delta of [-1, 0, 1, 2]) {
+  for (const delta of [-1, 1, 2, 0]) {
     process.stdin.emit('data', `\u001B[<35;${column + delta + 1};${row + 1}M`);
     await flush();
   }
+}
+
+async function moveFrameTreeStatus(frame: string, lineText: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes(lineText));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf('M      │') ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  process.stdin.emit('data', `\u001B[<35;${column + 1};${row + 1}M`);
+  await flush();
 }
 
 const branchMetrics: BranchMetrics = {
@@ -268,6 +279,97 @@ describe('App', () => {
     expect(frame).toContain('No changes to review');
     expect(frame).toContain('Watching for repo updates...');
     expect(frame).toContain('updated now • ↑/↓ jump file');
+
+    instance.unmount();
+  });
+
+  it('shows top-bar helper text when hovering compact review labels', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+example',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="origin/development"
+        branch="HEAD + worktree"
+        worktreeBranchName="feature/review-tooltip"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 160, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('current branch feature/review-tooltip');
+
+    await moveFrameText(instance.lastFrame() ?? '', 'worktree');
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('current branch feature/review-tooltip');
+
+    await moveFrameText(instance.lastFrame() ?? '', 'origin/development');
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('comparison base origin/development');
+
+    instance.unmount();
+  });
+
+  it('shows helper text for status badges and copy actions', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+example',
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions: 1, deletions: 0, changedLines: 1},
+      files: [{
+        path: 'src/example.ts',
+        status: 'modified',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        rawDiff: '',
+        renderedLines: ['+example'],
+        blocks: [],
+      }],
+    };
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        review={review}
+        dimensions={{columns: 160, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    await moveFrameTreeStatus(instance.lastFrame() ?? '', '• example.ts');
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('file status modified');
+
+    await moveFrameText(instance.lastFrame() ?? '', 'Copy tree');
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('copies changed-file tree');
+
+    await moveFrameText(instance.lastFrame() ?? '', 'Copy file');
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('copies full file contents');
 
     instance.unmount();
   });
