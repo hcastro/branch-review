@@ -636,7 +636,7 @@ function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
 }
 
 function isBlockContentLine(line: string) {
-  return /^│\s+• .+:\d+:/.test(stripAnsi(line));
+  return /^│\s+[•▾▸] .+:\d+:/.test(stripAnsi(line));
 }
 
 function findBlockContentLineIndex(lines: string[], index: number) {
@@ -702,7 +702,7 @@ function addBlockActionsToLine(line: string, hoveredAction?: string, copiedActio
 }
 
 function stripAnsi(line: string) {
-  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
+  return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, '');
 }
 
 function makeToast(message: string, hint?: string) {
@@ -788,7 +788,7 @@ export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; l
 
 function parseBlockLineTarget(line: string) {
   const plain = stripAnsi(line);
-  const match = plain.match(/•\s+(.+):(\d+):/);
+  const match = plain.match(/[•▾▸]\s+(.+):(\d+):/);
   if (!match) return null;
 
   return {
@@ -807,6 +807,73 @@ function findBlockTargetFromLine(
   const file = review.files.find((entry) => entry.path === target.path);
   const block = file?.blocks.find((entry) => entry.lineStart === target.lineStart);
   return file && block ? {file, block} : undefined;
+}
+
+function decorateBlockHeaderLine(line: string, review: ReviewModel | undefined, collapsedBlockIds: ReadonlySet<string>) {
+  if (!isBlockContentLine(line)) return line;
+
+  const target = findBlockTargetFromLine(line, review);
+  if (!target) return line;
+
+  const glyph = collapsedBlockIds.has(target.block.id) ? '▸' : '▾';
+  return line.replace(/[•▾▸](?=\s+)/, glyph);
+}
+
+function collapseSectionLines(
+  lines: string[],
+  review: ReviewModel | undefined,
+  collapsedBlockIds: ReadonlySet<string>,
+) {
+  if (!review || collapsedBlockIds.size === 0) return lines;
+
+  const headerIndices = lines
+    .map((line, index) => isBlockContentLine(line) ? index : -1)
+    .filter((index) => index >= 0);
+  if (headerIndices.length === 0) return lines;
+
+  const output: string[] = [];
+  let cursor = 0;
+
+  for (const [index, headerIndex] of headerIndices.entries()) {
+    const nextHeaderIndex = headerIndices[index + 1];
+    const headerBodyStart = Math.min(lines.length, headerIndex + 3);
+    const nextHeaderStart = nextHeaderIndex === undefined
+      ? lines.length
+      : Math.max(headerBodyStart, nextHeaderIndex - 2);
+
+    output.push(...lines.slice(cursor, headerBodyStart));
+
+    const target = findBlockTargetFromLine(lines[headerIndex] ?? '', review);
+    if (target && collapsedBlockIds.has(target.block.id)) {
+      cursor = nextHeaderStart;
+    } else {
+      cursor = headerBodyStart;
+    }
+  }
+
+  output.push(...lines.slice(cursor));
+  return output;
+}
+
+function applyCollapsedBlocks(
+  sections: DiffSection[],
+  review: ReviewModel | undefined,
+  collapsedBlockIds: ReadonlySet<string>,
+) {
+  let cursor = 0;
+  return sections.map((section) => {
+    const lines = collapseSectionLines(section.lines, review, collapsedBlockIds);
+    const startLine = cursor;
+    const endLineExclusive = cursor + lines.length;
+    cursor = endLineExclusive;
+
+    return {
+      ...section,
+      lines,
+      startLine,
+      endLineExclusive,
+    };
+  });
 }
 
 function AppContent({
@@ -838,9 +905,14 @@ function AppContent({
   const visibleTreeRows = Math.max(contentHeight - 3, 4);
   const visibleDiffRows = Math.max(contentHeight - 4, 6);
 
-  const sections = useMemo(
+  const [collapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
+  const wrappedSections = useMemo(
     () => wrapSections(rawSections, diffContentWidth),
     [rawSections, diffContentWidth],
+  );
+  const sections = useMemo(
+    () => applyCollapsedBlocks(wrappedSections, review, collapsedBlockIds),
+    [collapsedBlockIds, review, wrappedSections],
   );
 
   const files = useMemo(() => sections.map((section) => section.path), [sections]);
@@ -930,6 +1002,23 @@ function AppContent({
     });
   }, [allTreeRows]);
 
+  useEffect(() => {
+    const availableBlockIds = new Set(review?.files.flatMap((file) => file.blocks.map((block) => block.id)) ?? []);
+    setCollapsedBlockIds((current) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const blockId of current) {
+        if (availableBlockIds.has(blockId)) {
+          next.add(blockId);
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : current;
+    });
+  }, [review]);
+
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
   const visibleLineStart = diffOffset + 1;
@@ -1002,6 +1091,19 @@ function AppContent({
         next.delete(directoryPath);
       } else {
         next.add(directoryPath);
+      }
+
+      return next;
+    });
+  }, []);
+
+  const toggleBlock = useCallback((blockId: string) => {
+    setCollapsedBlockIds((current) => {
+      const next = new Set(current);
+      if (next.has(blockId)) {
+        next.delete(blockId);
+      } else {
+        next.add(blockId);
       }
 
       return next;
@@ -1469,9 +1571,14 @@ function AppContent({
 
       const blockTarget = findBlockTargetFromLine(line, review);
       const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
-      if (!actionId || !blockTarget) return;
+      if (!blockTarget) return;
 
-      void runCopyCommand(actionId, blockTarget.file, blockTarget.block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
+      if (actionId) {
+        void runCopyCommand(actionId, blockTarget.file, blockTarget.block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
+        return;
+      }
+
+      toggleBlock(blockTarget.block.id);
     };
 
     mouse.events.on('click', handleClick);
@@ -1497,6 +1604,7 @@ function AppContent({
     setCodeSelection,
     sections.length,
     showToast,
+    toggleBlock,
     toggleTreeDirectory,
     visibleLineEnd,
     visibleLineStart,
@@ -1648,9 +1756,10 @@ function AppContent({
                 ? copiedAction.id
                 : undefined;
               const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
+              const blockStateLine = decorateBlockHeaderLine(line || ' ', review, collapsedBlockIds);
               const visibleLine = visibleActionBlockLineIndex === absoluteLineIndex
-                ? addBlockActionsToLine(line || ' ', blockHover, blockCopied)
-                : line || ' ';
+                ? addBlockActionsToLine(blockStateLine, blockHover, blockCopied)
+                : blockStateLine;
               const selectedLine = highlightSelectedCode(visibleLine, absoluteLineIndex, codeSelection);
               rows.push(frameLine(highlightActionLabel(selectedLine, blockHover), inner, borderAnsi));
             }
