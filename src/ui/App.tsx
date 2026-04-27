@@ -47,6 +47,7 @@ const SCROLL_STEP = 3;
 const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
+const TREE_TOOLTIP_DELAY_MS = 300;
 const COPY_SUCCESS_LABEL = '✓ Copied';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const FILE_ACTIONS = [
@@ -153,10 +154,34 @@ function getBounds(ref: React.RefObject<DOMElement>) {
 }
 
 type Bounds = {left: number; top: number; width: number; height: number};
+type TreeTooltip = {text: string; left: number; top: number; width: number};
 
 function isInside(bounds: Bounds | null, x: number, y: number) {
   if (!bounds) return false;
   return x >= bounds.left && x < bounds.left + bounds.width && y >= bounds.top && y < bounds.top + bounds.height;
+}
+
+function buildTreeTooltip(text: string, bounds: Bounds, columns: number, terminalRows: number): TreeTooltip {
+  const maxWidth = Math.max(12, columns - 4);
+  const width = clamp(visibleWidth(text) + 4, 12, maxWidth);
+  const tooltipHeight = 3;
+  const preferredLeft = bounds.left + bounds.width + 1;
+  const left = preferredLeft + width <= columns
+    ? preferredLeft
+    : clamp(bounds.left, 0, Math.max(0, columns - width));
+  const preferredTop = bounds.top + 1;
+  const top = preferredTop + tooltipHeight <= terminalRows
+    ? preferredTop
+    : Math.max(0, bounds.top - tooltipHeight);
+
+  return {text, left, top, width};
+}
+
+function treeTooltipsEqual(left: TreeTooltip | null, right: TreeTooltip | null) {
+  return left?.text === right?.text
+    && left?.left === right?.left
+    && left?.top === right?.top
+    && left?.width === right?.width;
 }
 
 function normalizeMousePosition(position: {x: number; y: number}) {
@@ -225,6 +250,24 @@ function isTreeStatusTarget(relativeX: number, width: number, copied = false) {
   return relativeX === Math.max(0, width - getTreeIndicatorWidth(copied));
 }
 
+function treeRowGlyph(row: Pick<TreeRow, 'kind' | 'expanded'>) {
+  return row.kind === 'dir' ? row.expanded === false ? '▸' : '▾' : '•';
+}
+
+function treeRowLabelText(row: Pick<TreeRow, 'depth' | 'expanded' | 'kind' | 'label'>) {
+  return `${' '.repeat(row.depth * 2)}${treeRowGlyph(row)} ${row.label}`;
+}
+
+function treeRowLabelWidth(row: Pick<TreeRow, 'kind'>, width: number, copied = false) {
+  return row.kind === 'file'
+    ? Math.max(1, width - getTreeIndicatorWidth(copied) - 1)
+    : width;
+}
+
+function isTreeRowLabelTruncated(row: Pick<TreeRow, 'depth' | 'expanded' | 'kind' | 'label'>, width: number, copied = false) {
+  return visibleWidth(treeRowLabelText(row)) > treeRowLabelWidth(row, width, copied);
+}
+
 const TreeFileRow = memo(function TreeFileRow({
   row,
   selected,
@@ -241,20 +284,17 @@ const TreeFileRow = memo(function TreeFileRow({
   width: number;
 }) {
   const accent = selected ? 'cyanBright' : row.kind === 'dir' ? 'yellow' : hovered ? 'cyan' : 'white';
-  const glyph = row.kind === 'dir' ? row.expanded === false ? '▸' : '▾' : '•';
   const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
   const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
   const copySlotWidth = getTreeCopySlotWidth(copySucceeded);
   const indicatorWidth = row.kind === 'file' ? getTreeIndicatorWidth(copySucceeded) : 0;
-  const labelWidth = row.kind === 'file'
-    ? Math.max(1, width - indicatorWidth - 1)
-    : width;
+  const labelWidth = treeRowLabelWidth(row, width, copySucceeded);
 
   return (
     <Box width={width}>
       <Box width={labelWidth}>
         <Text color={accent} bold={selected} dimColor={row.kind === 'dir' && !selected} wrap="truncate-end">
-          {' '.repeat(row.depth * 2)}{glyph} {row.label}
+          {treeRowLabelText(row)}
         </Text>
       </Box>
       {row.kind === 'file' && (
@@ -316,6 +356,30 @@ function TreePane({
       marginRight={1}
     >
       {children}
+    </Box>
+  );
+}
+
+function TreeTooltipOverlay({tooltip}: {tooltip: TreeTooltip}) {
+  const inner = Math.max(1, tooltip.width - 4);
+  const horizontal = '─'.repeat(inner + 2);
+  const text = padToWidth(truncateStart(tooltip.text, inner), inner);
+
+  return (
+    <Box
+      position="absolute"
+      marginLeft={tooltip.left}
+      marginTop={tooltip.top}
+      width={tooltip.width}
+      flexDirection="column"
+    >
+      <Text color="gray">{`╭${horizontal}╮`}</Text>
+      <Box width={tooltip.width}>
+        <Text color="gray">│ </Text>
+        <Text color="white">{text}</Text>
+        <Text color="gray"> │</Text>
+      </Box>
+      <Text color="gray">{`╰${horizontal}╯`}</Text>
     </Box>
   );
 }
@@ -986,6 +1050,10 @@ function AppContent({
   const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
   const [infoTip, setInfoTip] = useState<string | null>(null);
+  const [treeTooltip, setTreeTooltip] = useState<TreeTooltip | null>(null);
+  const treeTooltipRef = useRef<TreeTooltip | null>(null);
+  const pendingTreeTooltipRef = useRef<TreeTooltip | null>(null);
+  const treeTooltipTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [copiedAction, setCopiedAction] = useState<CopiedAction | null>(null);
   const [codeSelection, setCodeSelectionState] = useState<CodeSelection | null>(null);
   const codeSelectionRef = useRef<CodeSelection | null>(null);
@@ -1033,6 +1101,16 @@ function AppContent({
     treeContentWidth,
   });
   stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
+
+  useEffect(() => {
+    treeTooltipRef.current = treeTooltip;
+  }, [treeTooltip]);
+
+  useEffect(() => () => {
+    if (treeTooltipTimerRef.current) {
+      clearTimeout(treeTooltipTimerRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     const availableDirectories = new Set(
@@ -1175,6 +1253,58 @@ function AppContent({
   const showToast = useCallback((message: string, hint?: string) => {
     setToast(makeToast(message, hint));
   }, []);
+
+  const clearTreeTooltip = useCallback(() => {
+    if (treeTooltipTimerRef.current) {
+      clearTimeout(treeTooltipTimerRef.current);
+      treeTooltipTimerRef.current = null;
+    }
+
+    pendingTreeTooltipRef.current = null;
+    treeTooltipRef.current = null;
+    setTreeTooltip((current) => current ? null : current);
+  }, []);
+
+  useEffect(() => {
+    if (!treeHovered) {
+      clearTreeTooltip();
+    }
+  }, [clearTreeTooltip, treeHovered]);
+
+  const scheduleTreeTooltip = useCallback((nextTooltip: TreeTooltip | null) => {
+    if (!nextTooltip) {
+      clearTreeTooltip();
+      return;
+    }
+
+    if (treeTooltipsEqual(treeTooltipRef.current, nextTooltip)) {
+      return;
+    }
+
+    if (treeTooltipsEqual(pendingTreeTooltipRef.current, nextTooltip)) {
+      return;
+    }
+
+    if (treeTooltipTimerRef.current) {
+      clearTimeout(treeTooltipTimerRef.current);
+    }
+
+    pendingTreeTooltipRef.current = nextTooltip;
+    treeTooltipRef.current = null;
+    setTreeTooltip((current) => current ? null : current);
+    treeTooltipTimerRef.current = setTimeout(() => {
+      const pending = pendingTreeTooltipRef.current;
+      treeTooltipTimerRef.current = null;
+      pendingTreeTooltipRef.current = null;
+
+      if (!pending) {
+        return;
+      }
+
+      treeTooltipRef.current = pending;
+      setTreeTooltip(pending);
+    }, TREE_TOOLTIP_DELAY_MS);
+  }, [clearTreeTooltip]);
 
   const renderCodeSelection = useCallback((selection: CodeSelection | null) => {
     if (codeSelectionsEqual(renderedCodeSelectionRef.current, selection)) {
@@ -1369,6 +1499,7 @@ function AppContent({
         }
 
         setInfoTip((current) => (current ? null : current));
+        clearTreeTooltip();
         return;
       }
 
@@ -1386,6 +1517,7 @@ function AppContent({
 
       let nextHoveredAction: HoveredAction = null;
       let nextHoveredBlockLineIndex: number | null = null;
+      let nextTreeTooltip: TreeTooltip | null = null;
       const treeBounds = getBounds(treePanelRef);
       if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
         setHoveredTreeRow((current) => (current === null ? current : null));
@@ -1404,6 +1536,7 @@ function AppContent({
           } else {
             setHoveredTreeRow((current) => (current === rowIndex ? current : rowIndex));
             const row = stateRef.current.rows[rowIndex];
+            const treeCopySucceeded = copiedAction?.kind === 'tree-copy' && copiedAction.rowIndex === rowIndex;
             if (row?.kind === 'file' && isTreeCopyTarget(relativeX, bounds.width)) {
               nextHoveredAction = {kind: 'tree-copy', rowIndex};
               nextInfoTip = copyActionHint('copy.path');
@@ -1412,10 +1545,17 @@ function AppContent({
               && isTreeStatusTarget(
                 relativeX,
                 bounds.width,
-                copiedAction?.kind === 'tree-copy' && copiedAction.rowIndex === rowIndex,
+                treeCopySucceeded,
               )
             ) {
-              nextInfoTip = statusHint(row.status);
+              const hint = statusHint(row.status);
+              nextTreeTooltip = hint ? buildTreeTooltip(hint, bounds, columns, terminalRows) : null;
+            } else if (
+              row?.kind === 'file'
+              && relativeX < treeRowLabelWidth(row, bounds.width, treeCopySucceeded)
+              && isTreeRowLabelTruncated(row, bounds.width, treeCopySucceeded)
+            ) {
+              nextTreeTooltip = buildTreeTooltip(row.label, bounds, columns, terminalRows);
             }
           }
         }
@@ -1475,6 +1615,7 @@ function AppContent({
 
       setHoveredBlockLineIndex((current) => (current === nextHoveredBlockLineIndex ? current : nextHoveredBlockLineIndex));
       setInfoTip((current) => (current === nextInfoTip ? current : nextInfoTip));
+      scheduleTreeTooltip(nextTreeTooltip);
 
       setHoveredAction((current) => {
         if (hoveredActionsEqual(current, nextHoveredAction)) {
@@ -1495,6 +1636,8 @@ function AppContent({
     allDiffLines,
     base,
     branch,
+    clearTreeTooltip,
+    columns,
     copiedAction,
     diffOffset,
     getTreeRowHit,
@@ -1503,6 +1646,8 @@ function AppContent({
     mouse,
     rightWidth,
     sections.length,
+    scheduleTreeTooltip,
+    terminalRows,
     worktreeBranchName,
   ]);
 
@@ -1847,6 +1992,7 @@ function AppContent({
           : <Text color="gray">{footerHints}</Text>}
         <Text color="gray">{base}...{branch}</Text>
       </Box>
+      {treeTooltip ? <TreeTooltipOverlay tooltip={treeTooltip} /> : null}
     </Box>
   );
 }

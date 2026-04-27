@@ -10,8 +10,18 @@ async function flush() {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function waitForTreeTooltip() {
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  await flush();
+}
+
 async function emitMouseClickAt(column: number, row: number) {
   process.stdin.emit('data', `\u001B[<0;${column + 1};${row + 1}M`);
+  await flush();
+}
+
+async function emitMouseMoveAt(column: number, row: number) {
+  process.stdin.emit('data', `\u001B[<35;${column + 1};${row + 1}M`);
   await flush();
 }
 
@@ -89,6 +99,17 @@ async function moveFrameTreeStatus(frame: string, lineText: string) {
   const row = lines.findIndex((line) => line.includes(lineText));
   expect(row).toBeGreaterThanOrEqual(0);
   const column = lines[row]?.indexOf('M      │') ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  process.stdin.emit('data', `\u001B[<35;${column + 1};${row + 1}M`);
+  await flush();
+}
+
+async function moveFrameTreeFilename(frame: string, lineText: string, text: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes(lineText));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(text) ?? -1;
   expect(column).toBeGreaterThanOrEqual(0);
 
   process.stdin.emit('data', `\u001B[<35;${column + 1};${row + 1}M`);
@@ -359,17 +380,130 @@ describe('App', () => {
     await moveFrameTreeStatus(instance.lastFrame() ?? '', '• example.ts');
     await flush();
 
-    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('file status modified');
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).not.toContain('file status modified');
+    expect(frame).toContain('1 files • +1 • -0 • 1 changed');
+
+    await waitForTreeTooltip();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('file status modified');
+    expect(frame).toContain('│ file status modified │');
+    expect(frame).toContain('1 files • +1 • -0 • 1 changed');
 
     await moveFrameText(instance.lastFrame() ?? '', 'Copy tree');
     await flush();
 
-    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('copies changed-file tree');
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('copies changed-file tree');
+    expect(frame).not.toContain('1 files • +1 • -0 • 1 changed');
 
     await moveFrameText(instance.lastFrame() ?? '', 'Copy file');
     await flush();
 
     expect(stripAnsi(instance.lastFrame() ?? '')).toContain('copies full file contents');
+
+    instance.unmount();
+  });
+
+  it('shows the full filename helper for truncated tree file rows', async () => {
+    const longName = 'stream-v3-thread-lifecycle.integration.test.ts';
+    const sections = buildDiffSections([
+      {
+        path: `src/${longName}`,
+        metrics: {path: `src/${longName}`, additions: 1, deletions: 0, changedLines: 1},
+        diff: '+example',
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions: 1, deletions: 0, changedLines: 1},
+      files: [{
+        path: `src/${longName}`,
+        status: 'modified',
+        metrics: {path: `src/${longName}`, additions: 1, deletions: 0, changedLines: 1},
+        rawDiff: '',
+        renderedLines: ['+example'],
+        blocks: [],
+      }],
+    };
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        review={review}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    await moveFrameTreeFilename(instance.lastFrame() ?? '', '• stream-v3', 'stream-v3');
+    await flush();
+
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).not.toContain(longName);
+    expect(frame).toContain('1 files • +1 • -0 • 1 changed');
+
+    await waitForTreeTooltip();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain(longName);
+    expect(frame).toContain(`│ ${longName} │`);
+    expect(frame).toContain('1 files • +1 • -0 • 1 changed');
+
+    instance.unmount();
+  });
+
+  it('cancels a pending tree tooltip when the pointer leaves the file tree', async () => {
+    const longName = 'stream-v3-user-provisioning-util.ts';
+    const sections = buildDiffSections([
+      {
+        path: `src/${longName}`,
+        metrics: {path: `src/${longName}`, additions: 1, deletions: 0, changedLines: 1},
+        diff: '+example',
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions: 1, deletions: 0, changedLines: 1},
+      files: [{
+        path: `src/${longName}`,
+        status: 'modified',
+        metrics: {path: `src/${longName}`, additions: 1, deletions: 0, changedLines: 1},
+        rawDiff: '',
+        renderedLines: ['+example'],
+        blocks: [],
+      }],
+    };
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        review={review}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    await moveFrameTreeFilename(instance.lastFrame() ?? '', '• stream-v3', 'stream-v3');
+    await flush();
+    await emitMouseMoveAt(0, 0);
+    await waitForTreeTooltip();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).not.toContain(longName);
 
     instance.unmount();
   });
