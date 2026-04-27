@@ -1,7 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import path from 'node:path';
 import {useStdout} from 'ink';
-import {getReviewFileContents, getReviewFingerprint, type DiffRange} from '../git.js';
+import {getCurrentBranchName, getReviewFileContents, getReviewFingerprint, type DiffRange} from '../git.js';
 import {buildReviewModel, buildReviewSections} from '../review/build.js';
 import type {ReviewModel} from '../review/model.js';
 import type {ClipboardWriter} from '../commands/execute.js';
@@ -84,6 +84,7 @@ export function ReviewController({
   const refreshInFlightRef = useRef(false);
   const refreshPendingRef = useRef(false);
   const mountedRef = useRef(true);
+  const worktreeBranchName = useMemo(() => getCurrentBranchName(cwd) ?? undefined, [cwd]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -198,6 +199,7 @@ export function ReviewController({
       readFileContent={(file) => getReviewFileContents(cwd, activeRange, file)}
       resolveAbsolutePath={(file) => path.resolve(cwd, file.path)}
       repoRoot={cwd}
+      worktreeBranchName={activeRange.includeWorktree ? worktreeBranchName : undefined}
       dimensions={dimensions}
       watchStatus={footerStatus}
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}

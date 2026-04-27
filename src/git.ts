@@ -105,6 +105,10 @@ export function inferBaseRef(cwd: string) {
   throw new Error('Could not infer a base ref. Pass one explicitly, for example: branch-review HEAD main');
 }
 
+export function getCurrentBranchName(cwd: string) {
+  return tryRunGit(cwd, ['branch', '--show-current']) || null;
+}
+
 export function resolveRefs(cwd: string, requestedBranch: string, requestedBase: string): DiffRange {
   const base = resolveRef(cwd, requestedBase);
   if (!base) {
