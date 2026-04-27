@@ -101,12 +101,14 @@ describe('buildTreeRows', () => {
       ]),
     );
 
-    expect(formatTreePayload(rows)).toBe([
-      'Changed files',
-      '• README.md M',
-      '▾ src',
-      '  • app.ts M',
-      '  • new.ts A',
+    expect(formatTreePayload(rows, '/repo')).toBe([
+      '```',
+      '/repo',
+      '├── README.md',
+      '└── src',
+      '    ├── app.ts',
+      '    └── new.ts',
+      '```',
     ].join('\n'));
   });
 });

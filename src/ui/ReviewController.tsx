@@ -197,6 +197,7 @@ export function ReviewController({
       copyWriter={copyWriter}
       readFileContent={(file) => getReviewFileContents(cwd, activeRange, file)}
       resolveAbsolutePath={(file) => path.resolve(cwd, file.path)}
+      repoRoot={cwd}
       dimensions={dimensions}
       watchStatus={footerStatus}
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}

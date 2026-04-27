@@ -9,14 +9,6 @@ export type TreeRow = {
   expanded?: boolean;
 };
 
-function statusLabel(status: FileStatus | undefined) {
-  if (status === 'added') return 'A';
-  if (status === 'deleted') return 'D';
-  if (status === 'renamed') return 'R';
-  if (status === 'untracked') return 'U';
-  return status ? 'M' : '';
-}
-
 type TreeNode = {
   name: string;
   path: string;
@@ -160,17 +152,42 @@ export function findTreeSelectionPath(rows: TreeRow[], activeFilePath: string) {
   return collapsedParent?.path ?? activeFilePath;
 }
 
-export function formatTreePayload(rows: TreeRow[]) {
+function hasLaterSibling(rows: TreeRow[], rowIndex: number, depth: number) {
+  for (let index = rowIndex + 1; index < rows.length; index += 1) {
+    const row = rows[index]!;
+    if (row.depth < depth) return false;
+    if (row.depth === depth) return true;
+  }
+
+  return false;
+}
+
+function treePrefix(rows: TreeRow[], rowIndex: number, depth: number) {
+  let prefix = '';
+  for (let ancestorDepth = 0; ancestorDepth < depth; ancestorDepth += 1) {
+    prefix += hasLaterSibling(rows, rowIndex, ancestorDepth) ? '│   ' : '    ';
+  }
+
+  return prefix;
+}
+
+export function formatTreePayload(rows: TreeRow[], rootPath = '.') {
   if (rows.length === 0) {
-    return 'Changed files\n(no changes)';
+    return [
+      '```',
+      rootPath,
+      '└── (no selected files)',
+      '```',
+    ].join('\n');
   }
 
   return [
-    'Changed files',
-    ...rows.map((row) => {
-      const glyph = row.kind === 'dir' ? '▾' : '•';
-      const suffix = row.kind === 'file' ? ` ${statusLabel(row.status)}`.trimEnd() : '';
-      return `${' '.repeat(row.depth * 2)}${glyph} ${row.label}${suffix}`;
+    '```',
+    rootPath,
+    ...rows.map((row, index) => {
+      const connector = hasLaterSibling(rows, index, row.depth) ? '├──' : '└──';
+      return `${treePrefix(rows, index, row.depth)}${connector} ${row.label}`;
     }),
+    '```',
   ].join('\n');
 }

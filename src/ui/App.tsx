@@ -36,6 +36,7 @@ type AppProps = {
   copyWriter?: ClipboardWriter;
   readFileContent?: (file: ReviewFile) => string | null;
   resolveAbsolutePath?: (file: ReviewFile) => string | null;
+  repoRoot?: string;
   dimensions?: {columns: number; rows: number};
   watchStatus?: string;
   emptyStateHint?: string;
@@ -395,7 +396,11 @@ function composeLeftRight(left: string, right: string, width: number) {
 
 function fileActions(hoveredAction?: string, copiedAction?: string) {
   return FILE_ACTIONS
-    .map((action) => actionButton(action.label, action.id === hoveredAction, action.id === copiedAction))
+    .map((action) => actionButton(
+      action.label,
+      action.id === hoveredAction,
+      action.id === copiedAction || (action.id === 'copy.path' && copiedAction === ABSOLUTE_PATH_ACTION.id),
+    ))
     .join(' ');
 }
 
@@ -403,7 +408,7 @@ function shouldRevealAbsolutePathAction(hoveredAction?: string, copiedAction?: s
   return hoveredAction === 'copy.path'
     || hoveredAction === 'copy.absolutePath'
     || copiedAction === 'copy.path'
-    || copiedAction === 'copy.absolutePath';
+    || copiedAction === ABSOLUTE_PATH_ACTION.id;
 }
 
 function highlightActionLabel(line: string, actionId: string | undefined) {
@@ -598,11 +603,9 @@ function filePathActionCenterStart(fileHeaderLine: string, labelWidth: number) {
 }
 
 function secondaryPathActionLabel(hoveredAction?: string, copiedAction?: string) {
-  const copied = copiedAction === ABSOLUTE_PATH_ACTION.id;
-  const hovered = hoveredAction === ABSOLUTE_PATH_ACTION.id;
-  const label = copied ? successLabel(ABSOLUTE_PATH_ACTION.label) : ABSOLUTE_PATH_ACTION.label;
-  const color = copied ? ANSI_GREEN_BOLD : hovered ? ANSI_CYAN_BRIGHT_BOLD : ANSI_GRAY;
-  return `${color}${label}${ANSI_RESET}`;
+  const hovered = hoveredAction === ABSOLUTE_PATH_ACTION.id && copiedAction !== ABSOLUTE_PATH_ACTION.id;
+  const color = hovered ? ANSI_CYAN_BRIGHT_BOLD : ANSI_GRAY;
+  return `${color}${ABSOLUTE_PATH_ACTION.label}${ANSI_RESET}`;
 }
 
 function addAbsolutePathActionToMetricsRow(
@@ -885,6 +888,7 @@ function AppContent({
   copyWriter,
   readFileContent,
   resolveAbsolutePath,
+  repoRoot = process.cwd(),
   dimensions,
   watchStatus,
   emptyStateHint,
@@ -1021,8 +1025,6 @@ function AppContent({
 
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const visibleLineStart = diffOffset + 1;
-  const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
   const footerHints = watchStatus
     ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
     : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
@@ -1225,7 +1227,7 @@ function AppContent({
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
   const copyFileTree = useCallback(async () => {
-    const text = formatTreePayload(allTreeRows);
+    const text = formatTreePayload(allTreeRows, repoRoot);
 
     try {
       const result = await (copyWriter ?? writeClipboard)(text);
@@ -1238,7 +1240,7 @@ function AppContent({
     } catch (error) {
       showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined);
     }
-  }, [allTreeRows, copyWriter, files.length, showToast]);
+  }, [allTreeRows, copyWriter, files.length, repoRoot, showToast]);
 
   const getCodeSelectionPoint = useCallback((mousePosition: {x: number; y: number}) => {
     const diffBounds = getBounds(diffPanelRef);
@@ -1375,14 +1377,10 @@ function AppContent({
           const metricsCore = activeSection
             ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
             : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-          const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
-          const metricsWidth = visibleWidth(metricsCore);
-          const counterWidth = visibleWidth(counter);
-          const metricsLine = `${metricsCore}${' '.repeat(Math.max(1, inner - metricsWidth - counterWidth))}${counter}`;
           const actionId = getActionFromRenderedLine(
             relativeX - 2,
-            addAbsolutePathActionToMetricsRow(metricsLine, fileHeaderLine, currentFileHover, currentFileCopied, inner),
-            [ABSOLUTE_PATH_ACTION],
+            addAbsolutePathActionToMetricsRow(metricsCore, fileHeaderLine, currentFileHover, currentFileCopied, inner),
+            currentFileCopied === ABSOLUTE_PATH_ACTION.id ? [] : [ABSOLUTE_PATH_ACTION],
           );
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
@@ -1428,8 +1426,6 @@ function AppContent({
     mouse,
     rightWidth,
     sections.length,
-    visibleLineEnd,
-    visibleLineStart,
   ]);
 
   useEffect(() => {
@@ -1549,14 +1545,10 @@ function AppContent({
         const metricsCore = activeSection
           ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
           : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-        const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
-        const metricsWidth = visibleWidth(metricsCore);
-        const counterWidth = visibleWidth(counter);
-        const metricsLine = `${metricsCore}${' '.repeat(Math.max(1, inner - metricsWidth - counterWidth))}${counter}`;
         const actionId = getActionFromRenderedLine(
           relativeX - 2,
-          addAbsolutePathActionToMetricsRow(metricsLine, fileHeaderLine, currentFileHover, currentFileCopied, inner),
-          [ABSOLUTE_PATH_ACTION],
+          addAbsolutePathActionToMetricsRow(metricsCore, fileHeaderLine, currentFileHover, currentFileCopied, inner),
+          currentFileCopied === ABSOLUTE_PATH_ACTION.id ? [] : [ABSOLUTE_PATH_ACTION],
         );
         if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
@@ -1606,8 +1598,6 @@ function AppContent({
     showToast,
     toggleBlock,
     toggleTreeDirectory,
-    visibleLineEnd,
-    visibleLineStart,
   ]);
 
   useInput((input, key) => {
@@ -1724,13 +1714,8 @@ function AppContent({
             const metricsCore = activeSection
               ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
               : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-            const counter = `${ANSI_GRAY}ln ${visibleLineStart}-${visibleLineEnd}/${allDiffLines.length}${ANSI_RESET}`;
-            const counterWidth = visibleWidth(counter);
-            const metricsWidth = visibleWidth(metricsCore);
-            const gap = Math.max(1, inner - metricsWidth - counterWidth);
-            const baseMetricsRow = `${metricsCore}${' '.repeat(gap)}${counter}`;
             const metricsRow = addAbsolutePathActionToMetricsRow(
-              baseMetricsRow,
+              metricsCore,
               fileLabelWithActions,
               fileHover,
               fileCopied,
