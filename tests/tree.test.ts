@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath} from '../src/tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload} from '../src/tree.js';
 
 describe('buildTreeRows', () => {
   it('expands changed file paths into a stable directory tree', () => {
@@ -89,5 +89,24 @@ describe('buildTreeRows', () => {
 
     expect(findTreeSelectionPath(rows, 'apps/web/src/App.tsx')).toBe('apps/web');
     expect(findTreeSelectionPath(rows, 'apps/api/src/server.ts')).toBe('apps/api/src/server.ts');
+  });
+
+  it('formats the full changed-file tree for copy payloads', () => {
+    const rows = buildTreeRows(
+      ['README.md', 'src/app.ts', 'src/new.ts'],
+      new Map([
+        ['README.md', 'modified'],
+        ['src/app.ts', 'modified'],
+        ['src/new.ts', 'added'],
+      ]),
+    );
+
+    expect(formatTreePayload(rows)).toBe([
+      'Changed files',
+      '• README.md M',
+      '▾ src',
+      '  • app.ts M',
+      '  • new.ts A',
+    ].join('\n'));
   });
 });

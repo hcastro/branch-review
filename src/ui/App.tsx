@@ -5,7 +5,7 @@ import {
   useMouse,
   useOnMouseHover,
 } from '@zenobius/ink-mouse';
-import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, type TreeRow} from '../tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload, type TreeRow} from '../tree.js';
 import {writeClipboard} from '../clipboard/write.js';
 import {
   flattenSectionLines,
@@ -46,6 +46,7 @@ const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
 const COPY_SUCCESS_LABEL = '✓ Copied';
+const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -262,6 +263,7 @@ function TreePane({
       width={width}
       height={height}
       flexDirection="column"
+      flexShrink={0}
       borderStyle="round"
       borderColor={hovered ? 'cyan' : 'gray'}
       paddingX={1}
@@ -316,6 +318,7 @@ const ANSI_SELECTION = '[48;2;28;68;76m[97;1m';
 
 type HoveredAction =
   | {kind: 'file-header'; id: string}
+  | {kind: 'tree-header'; id: 'copy.tree'}
   | {kind: 'tree-copy'; rowIndex: number}
   | {kind: 'block'; id: string; lineIndex: number}
   | null;
@@ -332,6 +335,10 @@ function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
   if (!current || !next || current.kind !== next.kind) return false;
 
   if (current.kind === 'file-header' && next.kind === 'file-header') {
+    return current.id === next.id;
+  }
+
+  if (current.kind === 'tree-header' && next.kind === 'tree-header') {
     return current.id === next.id;
   }
 
@@ -748,6 +755,17 @@ function isTreeCopyTarget(relativeX: number, width: number) {
   return relativeX >= Math.max(0, width - 5);
 }
 
+function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number, contentWidth: number) {
+  if (!isInside(panelBounds, x, y) || !panelBounds) return false;
+
+  const headerY = panelBounds.top + 1;
+  if (y !== headerY) return false;
+
+  const rowLeft = panelBounds.left + 2;
+  const labelWidth = visibleWidth(TREE_HEADER_COPY_LABEL);
+  return x >= rowLeft + Math.max(0, contentWidth - labelWidth) && x < rowLeft + contentWidth;
+}
+
 export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; label: string}>>(
   relativeX: number,
   renderedLine: string,
@@ -916,9 +934,6 @@ function AppContent({
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
   const visibleLineStart = diffOffset + 1;
   const visibleLineEnd = Math.min(diffOffset + visibleDiffRows, allDiffLines.length);
-  const treeRowStart = rows.length === 0 ? 0 : treeOffset + 1;
-  const treeRowEnd = Math.min(treeOffset + visibleTreeRows, rows.length);
-  const treeCounter = `${treeRowStart}-${treeRowEnd}/${rows.length}`;
   const footerHints = watchStatus
     ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
     : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
@@ -1107,6 +1122,22 @@ function AppContent({
     showToast(result.toast, result.hint);
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
+  const copyFileTree = useCallback(async () => {
+    const text = formatTreePayload(allTreeRows);
+
+    try {
+      const result = await (copyWriter ?? writeClipboard)(text);
+      if (result.ok) {
+        setCopiedAction({kind: 'tree-header', id: 'copy.tree'});
+        showToast('Copied file tree', `${files.length} files`);
+      } else {
+        showToast(result.message, result.hint);
+      }
+    } catch (error) {
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined);
+    }
+  }, [allTreeRows, copyWriter, files.length, showToast]);
+
   const getCodeSelectionPoint = useCallback((mousePosition: {x: number; y: number}) => {
     const diffBounds = getBounds(diffPanelRef);
     if (!isInside(diffBounds, mousePosition.x, mousePosition.y) || !diffBounds) return null;
@@ -1194,6 +1225,9 @@ function AppContent({
       const treeBounds = getBounds(treePanelRef);
       if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
         setHoveredTreeRow((current) => (current === null ? current : null));
+      } else if (isTreeHeaderCopyTarget(treeBounds, mousePosition.x, mousePosition.y, stateRef.current.treeContentWidth)) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+        nextHoveredAction = {kind: 'tree-header', id: 'copy.tree'};
       } else {
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
         if (!treeRowHit) {
@@ -1355,6 +1389,11 @@ function AppContent({
 
       const treeBounds = getBounds(treePanelRef);
       if (isInside(treeBounds, mousePosition.x, mousePosition.y) && treeBounds) {
+        if (isTreeHeaderCopyTarget(treeBounds, mousePosition.x, mousePosition.y, stateRef.current.treeContentWidth)) {
+          void copyFileTree();
+          return;
+        }
+
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
         if (!treeRowHit) return;
 
@@ -1450,6 +1489,7 @@ function AppContent({
     hoveredAction,
     mouse,
     copyCodeSelection,
+    copyFileTree,
     jumpToFile,
     review,
     rightWidth,
@@ -1528,7 +1568,12 @@ function AppContent({
         >
           <Box width={treeContentWidth} justifyContent="space-between">
             <Text color="cyan">Changed files</Text>
-            <Text color="gray">{treeCounter}</Text>
+            <Text
+              color={copiedAction?.kind === 'tree-header' ? 'greenBright' : hoveredAction?.kind === 'tree-header' ? 'cyanBright' : 'gray'}
+              bold={copiedAction?.kind === 'tree-header' || hoveredAction?.kind === 'tree-header'}
+            >
+              {copiedAction?.kind === 'tree-header' ? successLabel(TREE_HEADER_COPY_LABEL) : TREE_HEADER_COPY_LABEL}
+            </Text>
           </Box>
           {visibleRows.map((row, index) => (
             <TreeFileRow

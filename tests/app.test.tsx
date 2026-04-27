@@ -659,6 +659,98 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('copies the changed-file tree from the tree header', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'README.md',
+        metrics: {path: 'README.md', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+readme',
+      },
+      {
+        path: 'src/app.ts',
+        metrics: {path: 'src/app.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+app',
+      },
+      {
+        path: 'src/new.ts',
+        metrics: {path: 'src/new.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+new',
+      },
+    ]);
+    const review: ReviewModel = {
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 3, additions: 3, deletions: 0, changedLines: 3},
+      files: [
+        {
+          path: 'README.md',
+          status: 'modified',
+          metrics: {path: 'README.md', additions: 1, deletions: 0, changedLines: 1},
+          rawDiff: '',
+          renderedLines: ['+readme'],
+          blocks: [],
+        },
+        {
+          path: 'src/app.ts',
+          status: 'modified',
+          metrics: {path: 'src/app.ts', additions: 1, deletions: 0, changedLines: 1},
+          rawDiff: '',
+          renderedLines: ['+app'],
+          blocks: [],
+        },
+        {
+          path: 'src/new.ts',
+          status: 'added',
+          metrics: {path: 'src/new.ts', additions: 1, deletions: 0, changedLines: 1},
+          rawDiff: '',
+          renderedLines: ['+new'],
+          blocks: [],
+        },
+      ],
+    };
+    const writes: string[] = [];
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={sections}
+        branchMetrics={{filesChanged: 3, additions: 3, deletions: 0, changedLines: 3}}
+        review={review}
+        copyWriter={async (text) => {
+          writes.push(text);
+          return {
+            ok: true,
+            command: {command: '/usr/bin/pbcopy', args: [], displayName: 'pbcopy'},
+          };
+        }}
+        dimensions={{columns: 140, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    const treeHeader = frame.split('\n').find((line) => line.includes('Changed files')) ?? '';
+    expect(treeHeader).toContain('Copy tree');
+    expect(treeHeader).not.toMatch(/\d+-\d+\/\d+/);
+
+    await clickFrameTextOnce(instance.lastFrame() ?? '', 'Copy tree');
+    await flush();
+
+    expect(writes.at(-1)).toBe([
+      'Changed files',
+      '• README.md M',
+      '▾ src',
+      '  • app.ts M',
+      '  • new.ts A',
+    ].join('\n'));
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✓ Copied file tree · 3 files');
+
+    instance.unmount();
+  });
+
   it('copies dragged code selections without line number gutters', async () => {
     const sections = buildDiffSections([
       {
