@@ -45,6 +45,27 @@ function getFrameTextPosition(frame: string, lineText: string, text: string, off
   return {column: column + offset, row};
 }
 
+function getTreeRightBorderPosition(frame: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes('Changed files') && line.includes('Copy tree'));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const line = lines[row] ?? '';
+  const column = line.indexOf('│', line.indexOf('Copy tree'));
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  return {column, row};
+}
+
+function getTreeHeaderActionPosition(frame: string, actionText: string) {
+  const lines = stripAnsi(frame).split('\n');
+  const row = lines.findIndex((line) => line.includes('Changed files') || line.includes('Files'));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(actionText) ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  return {column, row};
+}
+
 async function clickFrameText(frame: string, text: string) {
   const lines = stripAnsi(frame).split('\n');
   const row = lines.findIndex((line) => line.includes(text));
@@ -660,6 +681,171 @@ describe('App', () => {
     frame = stripAnsi(instance.lastFrame() ?? '');
     expect(frame).toContain('▾ w');
     expect(frame).toContain('file 1/3');
+
+    instance.unmount();
+  });
+
+  it('resizes the file tree by dragging its right border', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'apps/bezzy-web/components/VeryLongComponentName.tsx',
+        metrics: {path: 'apps/bezzy-web/components/VeryLongComponentName.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+component',
+      },
+      {
+        path: 'core-service/src/events/handlers/sync-user-data-with-vendors.ts',
+        metrics: {path: 'core-service/src/events/handlers/sync-user-data-with-vendors.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+handler',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 2, additions: 2, deletions: 0, changedLines: 2}}
+        dimensions={{columns: 180, rows: 22}}
+      />,
+    );
+
+    await flush();
+
+    const before = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    await emitMouseMoveAt(before.column + 1, before.row);
+    await flush();
+
+    expect(instance.lastFrame() ?? '').toContain('\u001B[96m');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('┃');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('drag ↔ resize file tree');
+
+    await emitMousePressAt(before.column, before.row);
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('Changed files');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('Files        ›');
+
+    await emitMouseDragAt(before.column + 18, before.row);
+    await emitMouseDragAt(before.column + 18, before.row, true);
+    await flush();
+
+    const after = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    expect(after.column).toBeGreaterThan(before.column + 10);
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('VeryLongComponent');
+
+    instance.unmount();
+  });
+
+  it('allows the file tree to resize wider for dense reviews', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'apps/bezzy-web/components/VeryLongComponentName.tsx',
+        metrics: {path: 'apps/bezzy-web/components/VeryLongComponentName.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+component',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 180, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    const before = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    await emitMousePressAt(before.column, before.row);
+    await emitMouseDragAt(before.column + 100, before.row);
+    await emitMouseDragAt(before.column + 100, before.row, true);
+    await flush();
+
+    const after = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    expect(after.column).toBeGreaterThanOrEqual(before.column + 60);
+
+    instance.unmount();
+  });
+
+  it('collapses and expands the file tree from the header control', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'apps/bezzy-web/components/VeryLongComponentName.tsx',
+        metrics: {path: 'apps/bezzy-web/components/VeryLongComponentName.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+component',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 160, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('Changed files');
+    expect(frame).toContain('Copy tree');
+
+    const collapse = getTreeHeaderActionPosition(instance.lastFrame() ?? '', '‹');
+    await emitMouseClickAt(collapse.column, collapse.row);
+    await flush();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('Files');
+    expect(frame).toContain('1 files');
+    expect(frame).toContain('›');
+    expect(frame).not.toContain('Copy tree');
+    expect(frame).not.toContain('• VeryLong');
+
+    const expand = getTreeHeaderActionPosition(instance.lastFrame() ?? '', '›');
+    await emitMouseClickAt(expand.column, expand.row);
+    await flush();
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('Changed files');
+    expect(frame).toContain('Copy tree');
+
+    instance.unmount();
+  });
+
+  it('collapses the file tree when resized to its minimum width', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'apps/bezzy-web/components/VeryLongComponentName.tsx',
+        metrics: {path: 'apps/bezzy-web/components/VeryLongComponentName.tsx', additions: 1, deletions: 0, changedLines: 1},
+        diff: '+component',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 180, rows: 18}}
+      />,
+    );
+
+    await flush();
+
+    const before = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    await emitMousePressAt(before.column, before.row);
+    await emitMouseDragAt(before.column - 30, before.row);
+    await emitMouseDragAt(before.column - 30, before.row, true);
+    await flush();
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('Files');
+    expect(frame).toContain('1 files');
+    expect(frame).toContain('›');
+    expect(frame).not.toContain('• VeryLong');
 
     instance.unmount();
   });

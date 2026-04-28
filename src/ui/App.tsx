@@ -44,12 +44,19 @@ type AppProps = {
 };
 
 const SCROLL_STEP = 3;
+const DEFAULT_TREE_WIDTH_RATIO = 0.27;
+const MAX_TREE_WIDTH_RATIO = 0.75;
+const MIN_TREE_WIDTH = 34;
+const COLLAPSED_TREE_WIDTH = 18;
+const MIN_DIFF_WIDTH = 40;
 const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
 const TREE_TOOLTIP_DELAY_MS = 300;
 const COPY_SUCCESS_LABEL = '✓ Copied';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
+const TREE_COLLAPSE_LABEL = '‹';
+const TREE_EXPAND_LABEL = '›';
 const FILE_ACTIONS = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -159,6 +166,44 @@ type TreeTooltip = {text: string; left: number; top: number; width: number};
 function isInside(bounds: Bounds | null, x: number, y: number) {
   if (!bounds) return false;
   return x >= bounds.left && x < bounds.left + bounds.width && y >= bounds.top && y < bounds.top + bounds.height;
+}
+
+function getTreeWidthLimits(columns: number) {
+  const maxWithDiff = columns - MIN_DIFF_WIDTH - 4;
+  const maxByRatio = Math.floor(columns * MAX_TREE_WIDTH_RATIO);
+  const max = Math.max(MIN_TREE_WIDTH, Math.min(maxWithDiff, maxByRatio));
+  return {min: Math.min(MIN_TREE_WIDTH, max), max};
+}
+
+function defaultTreeWidth(columns: number) {
+  const {min, max} = getTreeWidthLimits(columns);
+  return clamp(Math.floor(columns * DEFAULT_TREE_WIDTH_RATIO), min, max);
+}
+
+function isTreeResizeTarget(bounds: Bounds | null, x: number, y: number) {
+  if (!bounds) return false;
+  if (y <= bounds.top || y >= bounds.top + bounds.height - 1) return false;
+
+  const rightBorder = bounds.left + bounds.width - 1;
+  return x >= rightBorder - 1 && x <= rightBorder + 2;
+}
+
+function treeHeaderActionLabel(collapsed: boolean, copied = false) {
+  if (collapsed) return TREE_EXPAND_LABEL;
+  const copyLabel = copied ? successLabel(TREE_HEADER_COPY_LABEL) : TREE_HEADER_COPY_LABEL;
+  return `${TREE_COLLAPSE_LABEL}  ${copyLabel}`;
+}
+
+function isTreeToggleTarget(panelBounds: Bounds | null, x: number, y: number, contentWidth: number, collapsed: boolean, copied = false) {
+  if (!isInside(panelBounds, x, y) || !panelBounds) return false;
+
+  const headerY = panelBounds.top + 1;
+  if (y !== headerY) return false;
+
+  const rowLeft = panelBounds.left + 2;
+  const actionLabel = treeHeaderActionLabel(collapsed, copied);
+  const actionStart = rowLeft + Math.max(0, contentWidth - visibleWidth(actionLabel));
+  return x >= actionStart && x < actionStart + visibleWidth(collapsed ? TREE_EXPAND_LABEL : TREE_COLLAPSE_LABEL);
 }
 
 function buildTreeTooltip(text: string, bounds: Bounds, columns: number, terminalRows: number): TreeTooltip {
@@ -331,6 +376,7 @@ function TreePane({
   width,
   height,
   hovered,
+  resizeActive,
   setHovered,
   children,
 }: {
@@ -338,6 +384,7 @@ function TreePane({
   width: number;
   height: number;
   hovered: boolean;
+  resizeActive: boolean;
   setHovered: (hovered: boolean) => void;
   children: React.ReactNode;
 }) {
@@ -351,9 +398,9 @@ function TreePane({
       flexDirection="column"
       flexShrink={0}
       borderStyle="round"
-      borderColor={hovered ? 'cyan' : 'gray'}
+      borderColor={resizeActive ? 'gray' : hovered ? 'cyan' : 'gray'}
+      borderRightColor={resizeActive ? 'cyanBright' : hovered ? 'cyan' : 'gray'}
       paddingX={1}
-      marginRight={1}
     >
       {children}
     </Box>
@@ -867,15 +914,17 @@ function isTreeCopyTarget(relativeX: number, width: number) {
   return relativeX >= Math.max(0, width - 5);
 }
 
-function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number, contentWidth: number) {
+function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number, contentWidth: number, copied = false) {
   if (!isInside(panelBounds, x, y) || !panelBounds) return false;
 
   const headerY = panelBounds.top + 1;
   if (y !== headerY) return false;
 
   const rowLeft = panelBounds.left + 2;
-  const labelWidth = visibleWidth(TREE_HEADER_COPY_LABEL);
-  return x >= rowLeft + Math.max(0, contentWidth - labelWidth) && x < rowLeft + contentWidth;
+  const actionLabel = treeHeaderActionLabel(false, copied);
+  const actionStart = rowLeft + Math.max(0, contentWidth - visibleWidth(actionLabel));
+  const copyStart = actionStart + visibleWidth(`${TREE_COLLAPSE_LABEL}  `);
+  return x >= copyStart && x < rowLeft + contentWidth;
 }
 
 export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; label: string}>>(
@@ -1010,8 +1059,13 @@ function AppContent({
   const columns = dimensions?.columns ?? stdout?.columns ?? 120;
   const terminalRows = dimensions?.rows ?? stdout?.rows ?? 40;
 
-  const leftWidth = Math.max(34, Math.floor(columns * 0.27));
-  const rightWidth = Math.max(78, columns - leftWidth - 4);
+  const [treeWidthOverride, setTreeWidthOverride] = useState<number | null>(null);
+  const [treeCollapsed, setTreeCollapsed] = useState(false);
+  const treeWidthLimits = useMemo(() => getTreeWidthLimits(columns), [columns]);
+  const leftWidth = treeCollapsed
+    ? COLLAPSED_TREE_WIDTH
+    : clamp(treeWidthOverride ?? defaultTreeWidth(columns), treeWidthLimits.min, treeWidthLimits.max);
+  const rightWidth = Math.max(MIN_DIFF_WIDTH, columns - leftWidth - 4);
   const diffContentWidth = Math.max(1, rightWidth - 4);
   const treeContentWidth = Math.max(1, leftWidth - 4);
   const contentHeight = Math.max(terminalRows - 9, 10);
@@ -1046,6 +1100,12 @@ function AppContent({
   const [treeOffset, setTreeOffset] = useState(0);
   const [treeHovered, setTreeHovered] = useState(false);
   const [diffHovered, setDiffHovered] = useState(false);
+  const [treeResizeHovered, setTreeResizeHovered] = useState(false);
+  const [treeResizing, setTreeResizing] = useState(false);
+  const treeResizingRef = useRef(false);
+  const treeResizeMovedRef = useRef(false);
+  const treeResizeStartRef = useRef<{mouseX: number; width: number} | null>(null);
+  const [treeToggleHovered, setTreeToggleHovered] = useState(false);
   const [hoveredTreeRow, setHoveredTreeRow] = useState<number | null>(null);
   const [hoveredBlockLineIndex, setHoveredBlockLineIndex] = useState<number | null>(null);
   const [hoveredAction, setHoveredAction] = useState<HoveredAction>(null);
@@ -1253,6 +1313,21 @@ function AppContent({
   const showToast = useCallback((message: string, hint?: string) => {
     setToast(makeToast(message, hint));
   }, []);
+
+  const resizeTreeToMouse = useCallback((mouseX: number) => {
+    const start = treeResizeStartRef.current;
+    if (!start) return;
+
+    const nextWidth = start.width + mouseX - start.mouseX;
+    if (nextWidth <= treeWidthLimits.min) {
+      setTreeCollapsed(true);
+      setTreeWidthOverride(treeWidthLimits.min);
+      return;
+    }
+
+    setTreeCollapsed(false);
+    setTreeWidthOverride(clamp(nextWidth, treeWidthLimits.min, treeWidthLimits.max));
+  }, [treeWidthLimits.max, treeWidthLimits.min]);
 
   const clearTreeTooltip = useCallback(() => {
     if (treeTooltipTimerRef.current) {
@@ -1519,9 +1594,30 @@ function AppContent({
       let nextHoveredBlockLineIndex: number | null = null;
       let nextTreeTooltip: TreeTooltip | null = null;
       const treeBounds = getBounds(treePanelRef);
-      if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
+      const nextTreeResizeHovered = isTreeResizeTarget(treeBounds, mousePosition.x, mousePosition.y);
+      const treeHeaderCopied = copiedAction?.kind === 'tree-header';
+      const nextTreeToggleHovered = isTreeToggleTarget(
+        treeBounds,
+        mousePosition.x,
+        mousePosition.y,
+        stateRef.current.treeContentWidth,
+        treeCollapsed,
+        treeHeaderCopied,
+      );
+      if (nextTreeResizeHovered) {
         setHoveredTreeRow((current) => (current === null ? current : null));
-      } else if (isTreeHeaderCopyTarget(treeBounds, mousePosition.x, mousePosition.y, stateRef.current.treeContentWidth)) {
+      } else if (nextTreeToggleHovered) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+        nextInfoTip = treeCollapsed ? 'expand file tree' : 'collapse file tree';
+      } else if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
+        setHoveredTreeRow((current) => (current === null ? current : null));
+      } else if (!treeCollapsed && isTreeHeaderCopyTarget(
+        treeBounds,
+        mousePosition.x,
+        mousePosition.y,
+        stateRef.current.treeContentWidth,
+        treeHeaderCopied,
+      )) {
         setHoveredTreeRow((current) => (current === null ? current : null));
         nextHoveredAction = {kind: 'tree-header', id: 'copy.tree'};
         nextInfoTip = copyActionHint('copy.tree');
@@ -1616,6 +1712,8 @@ function AppContent({
       setHoveredBlockLineIndex((current) => (current === nextHoveredBlockLineIndex ? current : nextHoveredBlockLineIndex));
       setInfoTip((current) => (current === nextInfoTip ? current : nextInfoTip));
       scheduleTreeTooltip(nextTreeTooltip);
+      setTreeResizeHovered((current) => current === nextTreeResizeHovered ? current : nextTreeResizeHovered);
+      setTreeToggleHovered((current) => current === nextTreeToggleHovered ? current : nextTreeToggleHovered);
 
       setHoveredAction((current) => {
         if (hoveredActionsEqual(current, nextHoveredAction)) {
@@ -1648,11 +1746,31 @@ function AppContent({
     sections.length,
     scheduleTreeTooltip,
     terminalRows,
+    treeCollapsed,
     worktreeBranchName,
   ]);
 
   useEffect(() => {
     const handleDrag = (position: {x: number; y: number}, action: 'dragging' | null) => {
+      if (treeResizingRef.current) {
+        const mousePosition = normalizeMousePosition(position);
+        if (action === 'dragging') {
+          treeResizeMovedRef.current = true;
+          resizeTreeToMouse(mousePosition.x);
+          return;
+        }
+
+        if (treeResizeMovedRef.current) {
+          resizeTreeToMouse(mousePosition.x);
+        }
+
+        treeResizingRef.current = false;
+        treeResizeMovedRef.current = false;
+        treeResizeStartRef.current = null;
+        setTreeResizing(false);
+        return;
+      }
+
       const currentSelection = codeSelectionRef.current;
       if (!currentSelection) return;
 
@@ -1676,12 +1794,20 @@ function AppContent({
 
     mouse.events.on('drag', handleDrag);
     return () => mouse.events.off('drag', handleDrag);
-  }, [copyCodeSelection, getCodeSelectionPoint, mouse, scheduleCodeSelection, setCodeSelection]);
+  }, [copyCodeSelection, getCodeSelectionPoint, mouse, resizeTreeToMouse, scheduleCodeSelection, setCodeSelection]);
 
   useEffect(() => {
     const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
       const mousePosition = normalizeMousePosition(position);
       if (action === 'release') {
+        if (treeResizingRef.current) {
+          treeResizingRef.current = false;
+          treeResizeMovedRef.current = false;
+          treeResizeStartRef.current = null;
+          setTreeResizing(false);
+          return;
+        }
+
         const currentSelection = codeSelectionRef.current;
         if (!currentSelection?.active) return;
         const point = getCodeSelectionPoint(mousePosition);
@@ -1697,6 +1823,33 @@ function AppContent({
 
       if (action !== 'press') return;
 
+      const treeBounds = getBounds(treePanelRef);
+      const treeHeaderCopied = copiedAction?.kind === 'tree-header';
+      if (isTreeToggleTarget(
+        treeBounds,
+        mousePosition.x,
+        mousePosition.y,
+        stateRef.current.treeContentWidth,
+        treeCollapsed,
+        treeHeaderCopied,
+      )) {
+        setTreeCollapsed((current) => !current);
+        setHoveredAction(null);
+        clearTreeTooltip();
+        return;
+      }
+
+      if (isTreeResizeTarget(treeBounds, mousePosition.x, mousePosition.y)) {
+        treeResizingRef.current = true;
+        treeResizeMovedRef.current = false;
+        treeResizeStartRef.current = {mouseX: mousePosition.x, width: leftWidth};
+        setTreeResizing(true);
+        setHoveredAction(null);
+        setHoveredTreeRow(null);
+        clearTreeTooltip();
+        return;
+      }
+
       const selectionPoint = getCodeSelectionPoint(mousePosition);
       if (selectionPoint) {
         setHoveredAction(null);
@@ -1708,12 +1861,19 @@ function AppContent({
         setCodeSelection(null);
       }
 
-      const treeBounds = getBounds(treePanelRef);
       if (isInside(treeBounds, mousePosition.x, mousePosition.y) && treeBounds) {
-        if (isTreeHeaderCopyTarget(treeBounds, mousePosition.x, mousePosition.y, stateRef.current.treeContentWidth)) {
+        if (!treeCollapsed && isTreeHeaderCopyTarget(
+          treeBounds,
+          mousePosition.x,
+          mousePosition.y,
+          stateRef.current.treeContentWidth,
+          treeHeaderCopied,
+        )) {
           void copyFileTree();
           return;
         }
+
+        if (treeCollapsed) return;
 
         const treeRowHit = getTreeRowHit(mousePosition.x, mousePosition.y);
         if (!treeRowHit) return;
@@ -1804,16 +1964,19 @@ function AppContent({
     activeSection,
     activeSectionIndex,
     allDiffLines,
+    clearTreeTooltip,
     copiedAction,
     diffOffset,
     getCodeSelectionPoint,
     getTreeRowHit,
     hoveredAction,
+    leftWidth,
     mouse,
     copyCodeSelection,
     copyFileTree,
     jumpToFile,
     review,
+    resizeTreeToMouse,
     rightWidth,
     runCopyCommand,
     setCodeSelection,
@@ -1821,6 +1984,7 @@ function AppContent({
     showToast,
     toggleBlock,
     toggleTreeDirectory,
+    treeCollapsed,
   ]);
 
   useInput((input, key) => {
@@ -1892,35 +2056,53 @@ function AppContent({
           panelRef={treePanelRef}
           width={leftWidth}
           height={contentHeight}
-          hovered={treeHovered}
+          hovered={treeHovered || treeResizeHovered || treeResizing}
+          resizeActive={treeResizeHovered || treeResizing}
           setHovered={setTreeHovered}
         >
           <Box width={treeContentWidth} justifyContent="space-between">
-            <Text color="cyan">Changed files</Text>
+            <Text color="cyan">{treeCollapsed ? 'Files' : 'Changed files'}</Text>
             <Text
-              color={copiedAction?.kind === 'tree-header' ? 'greenBright' : hoveredAction?.kind === 'tree-header' ? 'cyanBright' : 'gray'}
-              bold={copiedAction?.kind === 'tree-header' || hoveredAction?.kind === 'tree-header'}
+              color={
+                treeToggleHovered
+                  ? 'cyanBright'
+                  : copiedAction?.kind === 'tree-header'
+                    ? 'greenBright'
+                    : hoveredAction?.kind === 'tree-header'
+                      ? 'cyanBright'
+                      : 'gray'
+              }
+              bold={treeToggleHovered || copiedAction?.kind === 'tree-header' || hoveredAction?.kind === 'tree-header'}
             >
-              {copiedAction?.kind === 'tree-header' ? successLabel(TREE_HEADER_COPY_LABEL) : TREE_HEADER_COPY_LABEL}
+              {treeHeaderActionLabel(treeCollapsed, copiedAction?.kind === 'tree-header')}
             </Text>
           </Box>
-          {visibleRows.map((row, index) => (
-            <TreeFileRow
-              key={row.path}
-              row={row}
-              selected={row.path === activeTreePath}
-              hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
-              copyHovered={
-                hoveredAction?.kind === 'tree-copy'
-                && hoveredAction.rowIndex === treeOffset + index
-              }
-              copySucceeded={
-                copiedAction?.kind === 'tree-copy'
-                && copiedAction.rowIndex === treeOffset + index
-              }
-              width={treeContentWidth}
-            />
-          ))}
+          {treeCollapsed
+            ? (
+              <>
+                <Box width={treeContentWidth}>
+                  <Text color="magentaBright" bold>{files.length}</Text>
+                  <Text color="gray"> files</Text>
+                </Box>
+              </>
+            )
+            : visibleRows.map((row, index) => (
+              <TreeFileRow
+                key={row.path}
+                row={row}
+                selected={row.path === activeTreePath}
+                hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
+                copyHovered={
+                  hoveredAction?.kind === 'tree-copy'
+                  && hoveredAction.rowIndex === treeOffset + index
+                }
+                copySucceeded={
+                  copiedAction?.kind === 'tree-copy'
+                  && copiedAction.rowIndex === treeOffset + index
+                }
+                width={treeContentWidth}
+              />
+            ))}
         </TreePane>
 
         <DiffPane
