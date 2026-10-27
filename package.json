@@ -1,7 +1,7 @@
 {
   "name": "branch-review",
   "version": "0.1.0",
-  "description": "Interactive terminal UI for reviewing a git branch diff against a base ref, powered by Ink and git-delta.",
+  "description": "A local, PR-style review UI for your terminal. Review branch, worktree, and AI-generated changes before they leave your machine.",
   "keywords": [
     "cli",
     "git",
@@ -12,7 +12,10 @@
     "ink",
     "delta",
     "terminal",
-    "tui"
+    "tui",
+    "ai",
+    "agents",
+    "claude-code"
   ],
   "author": "hcastro",
   "license": "MIT",
@@ -41,7 +44,8 @@
     "build": "tsup",
     "dev": "tsx src/cli.tsx",
     "test": "vitest run",
-    "prepublishOnly": "pnpm run build"
+    "typecheck": "tsc --noEmit",
+    "prepare": "tsup"
   },
   "publishConfig": {
     "access": "public"
