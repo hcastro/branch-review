@@ -398,7 +398,7 @@ function treeArrivalColor(entry: ArrivalEntry | undefined, now: number) {
 }
 
 function getTreeWidthLimits(columns: number) {
-  const maxWithDiff = columns - MIN_DIFF_WIDTH - 4;
+  const maxWithDiff = columns - MIN_DIFF_WIDTH;
   const maxByRatio = Math.floor(columns * MAX_TREE_WIDTH_RATIO);
   const max = Math.max(MIN_TREE_WIDTH, Math.min(maxWithDiff, maxByRatio));
   return {min: Math.min(MIN_TREE_WIDTH, max), max};
@@ -1300,7 +1300,7 @@ function AppContent({
   const leftWidth = treeCollapsed
     ? COLLAPSED_TREE_WIDTH
     : clamp(treeWidthOverride ?? defaultTreeWidth(columns), treeWidthLimits.min, treeWidthLimits.max);
-  const rightWidth = Math.max(MIN_DIFF_WIDTH, columns - leftWidth - 4);
+  const rightWidth = Math.max(MIN_DIFF_WIDTH, columns - leftWidth);
   const diffContentWidth = Math.max(1, rightWidth - 4);
   const treeContentWidth = Math.max(1, leftWidth - 4);
   const contentHeight = Math.max(terminalRows - 9, 10);

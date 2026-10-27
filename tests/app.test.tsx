@@ -200,6 +200,36 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('sizes the tree and diff panes to the full terminal width', async () => {
+    const sections = buildDiffSections([
+      {
+        path: 'src/App.tsx',
+        metrics: {path: 'src/App.tsx', additions: 3, deletions: 1, changedLines: 4},
+        diff: 'b1\nb2\nb3\nb4',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="main"
+        branch="feature/example"
+        sections={sections}
+        branchMetrics={branchMetrics}
+        dimensions={{columns: 100, rows: 16}}
+      />,
+    );
+
+    await flush();
+
+    const lines = stripAnsi(instance.lastFrame() ?? '').split('\n');
+    const topBar = lines[0] ?? '';
+    const paneTops = lines.find((line) => line.startsWith('╭') && line.includes('╮╭')) ?? '';
+    expect(topBar.trimEnd()).toHaveLength(100);
+    expect(paneTops.trimEnd()).toHaveLength(100);
+
+    instance.unmount();
+  });
+
   it('steps through files predictably with arrow keys', async () => {
     const sections = buildDiffSections(
       Array.from({length: 5}, (_, index) => ({
