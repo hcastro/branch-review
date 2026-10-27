@@ -48,7 +48,7 @@ function formatError(error: unknown) {
 
 export function getModelWidth(columns: number) {
   const leftWidth = Math.max(34, Math.floor(columns * 0.27));
-  return Math.max(78, columns - leftWidth - 12);
+  return Math.max(78, columns - leftWidth - 8);
 }
 
 export function formatWatchFooterStatus(status: WatchState, now = Date.now()) {
