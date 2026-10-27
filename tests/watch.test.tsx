@@ -173,6 +173,9 @@ describe('watch helpers', () => {
     });
 
     await ready;
+    // FSEvents can fold a write made right after the stream starts into the
+    // file's creation event, so let the stream settle before editing.
+    await flush(150);
     fs.writeFileSync(path.join(cwd, 'packages', 'app', 'lib', 'cold.ts'), 'export const cold = 2;\n');
 
     await expect(Promise.race([
