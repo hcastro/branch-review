@@ -157,6 +157,42 @@ branch-review my-feature release/2026.04
 
 If the local ref is missing, `branch-review` will try `origin/release/2026.04`.
 
+## Claude Code skill
+
+This repo bundles an agent skill at [`skills/branch-review`](skills/branch-review)
+that teaches coding agents how to invoke the CLI.
+
+The point is the handoff. An agent can't drive a full-screen TTY app, so instead
+of trying, it works out which repo or worktree the changes actually live in,
+picks the right refs, and hands back a single command:
+
+```sh
+cd '/Users/me/code/app' && branch-review
+```
+
+The command is copied to your clipboard automatically. Paste, review, quit with `q`.
+
+Ask for it whenever you want to see what an agent just wrote — "let me review
+this", "/branch-review", "show me the diff before you continue".
+
+### Install
+
+Symlink the skill into your user skills directory so it tracks the repo:
+
+```sh
+ln -s "$PWD/skills/branch-review" ~/.claude/skills/branch-review
+```
+
+Or copy it if you'd rather pin a version:
+
+```sh
+cp -R skills/branch-review ~/.claude/skills/branch-review
+```
+
+Project scope works the same way — use `.claude/skills/` inside a repo to make
+the skill available only there. Other agent tools that read `SKILL.md` can point
+at the same directory.
+
 ## Development
 
 ```sh
