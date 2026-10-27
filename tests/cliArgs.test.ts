@@ -8,6 +8,7 @@ describe('parseCliArgs', () => {
       requestedBase: undefined,
       watch: true,
       watchPoll: false,
+      animations: true,
     });
   });
 
@@ -17,6 +18,7 @@ describe('parseCliArgs', () => {
       requestedBase: 'main',
       watch: false,
       watchPoll: false,
+      animations: true,
     });
 
     expect(parseCliArgs(['--watch', 'feature/demo', 'main'], {interactive: false}).watch).toBe(true);
@@ -27,6 +29,18 @@ describe('parseCliArgs', () => {
     expect(parseCliArgs(['--watch-poll'], {interactive: false})).toMatchObject({
       watch: true,
       watchPoll: true,
+    });
+  });
+
+  it('supports disabling and re-enabling arrival animations', () => {
+    expect(parseCliArgs(['--no-animations'], {interactive: true})).toMatchObject({
+      animations: false,
+    });
+    expect(parseCliArgs(['--animations', '--no-animations'], {interactive: true})).toMatchObject({
+      animations: false,
+    });
+    expect(parseCliArgs(['--no-animations', '--animations'], {interactive: true})).toMatchObject({
+      animations: true,
     });
   });
 });

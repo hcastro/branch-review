@@ -301,6 +301,150 @@ describe('App', () => {
     instance.unmount();
   });
 
+  it('animates newly rendered code changes after refresh and then settles', async () => {
+    const firstRawDiff = [
+      'diff --git a/src/example.ts b/src/example.ts',
+      '--- a/src/example.ts',
+      '+++ b/src/example.ts',
+      '@@ -1 +1 @@ function example()',
+      '-export const value = 1;',
+      '+export const value = 2;',
+    ].join('\n');
+    const nextRawDiff = [
+      'diff --git a/src/example.ts b/src/example.ts',
+      '--- a/src/example.ts',
+      '+++ b/src/example.ts',
+      '@@ -1 +1,2 @@ function example()',
+      '-export const value = 1;',
+      '+export const value = 3;',
+      '+export const next = 4;',
+    ].join('\n');
+    const firstSections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 1, changedLines: 2},
+        diff: '• src/example.ts:1: function example()\n  1 ⋮  1 │export const value = 2;',
+      },
+    ]);
+    const nextSections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 2, deletions: 1, changedLines: 3},
+        diff: '• src/example.ts:1: function example()\n  1 ⋮  1 │export const value = 3;\n    ⋮  2 │export const next = 4;',
+      },
+    ]);
+    const makeReview = (rawDiff: string, additions: number, addedCode: string): ReviewModel => ({
+      base: 'development',
+      branch: 'HEAD + worktree',
+      label: 'development...HEAD + worktree',
+      metrics: {filesChanged: 1, additions, deletions: 1, changedLines: additions + 1},
+      files: [{
+        path: 'src/example.ts',
+        status: 'modified',
+        metrics: {path: 'src/example.ts', additions, deletions: 1, changedLines: additions + 1},
+        rawDiff,
+        renderedLines: [],
+        blocks: [{
+          id: 'src/example.ts:1:0',
+          filePath: 'src/example.ts',
+          oldStart: 1,
+          oldLines: 1,
+          newStart: 1,
+          newLines: additions,
+          lineStart: 1,
+          lineEnd: additions,
+          functionHeader: 'function example()',
+          rawDiff: rawDiff.split('\n').slice(3).join('\n'),
+          addedCode,
+        }],
+      }],
+    });
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={firstSections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 1, changedLines: 2}}
+        review={makeReview(firstRawDiff, 1, 'export const value = 2;')}
+        dimensions={{columns: 130, rows: 20}}
+        animations
+      />,
+    );
+
+    await flush();
+    expect(instance.lastFrame() ?? '').not.toContain('\u001B[48;2;');
+
+    instance.rerender(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={nextSections}
+        branchMetrics={{filesChanged: 1, additions: 2, deletions: 1, changedLines: 3}}
+        review={makeReview(nextRawDiff, 2, 'export const value = 3;\nexport const next = 4;')}
+        dimensions={{columns: 130, rows: 20}}
+        animations
+      />,
+    );
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('export const next = 4;');
+    expect(instance.lastFrame() ?? '').toContain('\u001B[48;2;');
+
+    await new Promise((resolve) => setTimeout(resolve, 2760));
+    await flush();
+
+    expect(instance.lastFrame() ?? '').not.toContain('\u001B[48;2;');
+
+    instance.unmount();
+  });
+
+  it('can disable arrival animations for static rendering', async () => {
+    const firstSections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'before',
+      },
+    ]);
+    const nextSections = buildDiffSections([
+      {
+        path: 'src/example.ts',
+        metrics: {path: 'src/example.ts', additions: 1, deletions: 0, changedLines: 1},
+        diff: 'after',
+      },
+    ]);
+
+    const instance = render(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={firstSections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 120, rows: 16}}
+        animations={false}
+      />,
+    );
+
+    await flush();
+    instance.rerender(
+      <App
+        base="development"
+        branch="HEAD + worktree"
+        sections={nextSections}
+        branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
+        dimensions={{columns: 120, rows: 16}}
+        animations={false}
+      />,
+    );
+    await flush();
+
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('after');
+    expect(instance.lastFrame() ?? '').not.toContain('\u001B[48;2;');
+
+    instance.unmount();
+  });
+
   it('renders an empty state without exiting the app', async () => {
     const instance = render(
       <App

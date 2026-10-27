@@ -1,4 +1,4 @@
-import React, {memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import {Box, DOMElement, Text, useApp, useInput, useStdout} from 'ink';
 import {
   MouseProvider,
@@ -41,6 +41,7 @@ type AppProps = {
   dimensions?: {columns: number; rows: number};
   watchStatus?: string;
   emptyStateHint?: string;
+  animations?: boolean;
 };
 
 const SCROLL_STEP = 3;
@@ -53,6 +54,9 @@ const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
 const TREE_TOOLTIP_DELAY_MS = 300;
+const ARRIVAL_ANIMATION_DURATION_MS = 2600;
+const ARRIVAL_ANIMATION_TICK_MS = 130;
+const MAX_ANIMATED_ENTRIES = 120;
 const COPY_SUCCESS_LABEL = '✓ Copied';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
@@ -68,6 +72,24 @@ const BLOCK_ACTIONS = [
   {id: 'copy.blockDiff', label: BLOCK_ACTION_LABELS.diff},
   {id: 'copy.blockPrompt', label: BLOCK_ACTION_LABELS.prompt},
 ] as const;
+
+type ArrivalKind = 'new' | 'changed';
+type ArrivalEntry = {startedAt: number; kind: ArrivalKind};
+type ArrivalAnimations = {
+  files: Map<string, ArrivalEntry>;
+  blocks: Map<string, ArrivalEntry>;
+};
+type ArrivalSnapshot = {
+  files: Map<string, {
+    signature: string;
+    kind: ArrivalKind;
+    blocks: Map<string, string>;
+  }>;
+};
+
+type WrappedSectionCacheEntry = {
+  lines: string[];
+};
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max));
@@ -166,6 +188,213 @@ type TreeTooltip = {text: string; left: number; top: number; width: number};
 function isInside(bounds: Bounds | null, x: number, y: number) {
   if (!bounds) return false;
   return x >= bounds.left && x < bounds.left + bounds.width && y >= bounds.top && y < bounds.top + bounds.height;
+}
+
+function hashText(text: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
+function sectionWrapCacheKey(section: DiffSection, maxWidth: number) {
+  const signature = section.signature
+    ?? hashText(`${section.metrics.additions}:${section.metrics.deletions}:${section.metrics.changedLines}:${section.lines.join('\n')}`);
+  return `${maxWidth}\0${section.path}\0${signature}`;
+}
+
+function wrapSectionsWithCache(
+  sections: DiffSection[],
+  maxWidth: number,
+  cache: Map<string, WrappedSectionCacheEntry>,
+) {
+  const nextCache = new Map<string, WrappedSectionCacheEntry>();
+  let cursor = 0;
+
+  const wrapped = sections.map((section) => {
+    const key = sectionWrapCacheKey(section, maxWidth);
+    let entry = cache.get(key);
+    if (!entry) {
+      const wrappedSection = wrapSections([section], maxWidth)[0];
+      entry = {lines: wrappedSection?.lines ?? []};
+    }
+
+    nextCache.set(key, entry);
+    const startLine = cursor;
+    const endLineExclusive = cursor + entry.lines.length;
+    cursor = endLineExclusive;
+
+    return {
+      ...section,
+      lines: entry.lines,
+      startLine,
+      endLineExclusive,
+    };
+  });
+
+  cache.clear();
+  for (const [key, value] of nextCache) {
+    cache.set(key, value);
+  }
+
+  return wrapped;
+}
+
+function blockAnimationKey(filePath: string, block: Pick<ReviewBlock, 'id'>) {
+  return `${filePath}\0${block.id}`;
+}
+
+function fileArrivalKind(file: Pick<ReviewFile, 'status'> | undefined): ArrivalKind {
+  return file?.status === 'added' || file?.status === 'untracked' ? 'new' : 'changed';
+}
+
+function buildArrivalSnapshot(review: ReviewModel | undefined, sections: DiffSection[]): ArrivalSnapshot {
+  if (review) {
+    return {
+      files: new Map(review.files.map((file) => {
+        const blocks = new Map(file.blocks.map((block) => [
+          blockAnimationKey(file.path, block),
+          block.signature ?? hashText(`${block.lineStart}:${block.lineEnd}:${block.rawDiff}:${block.addedCode}`),
+        ]));
+        return [
+          file.path,
+          {
+            signature: file.signature ?? hashText(`${file.status}:${file.rawDiff}:${file.metrics.additions}:${file.metrics.deletions}`),
+            kind: fileArrivalKind(file),
+            blocks,
+          },
+        ];
+      })),
+    };
+  }
+
+  return {
+    files: new Map(sections.map((section) => [
+      section.path,
+      {
+        signature: hashText(`${section.metrics.additions}:${section.metrics.deletions}:${section.lines.join('\n')}`),
+        kind: 'changed' as const,
+        blocks: new Map<string, string>(),
+      },
+    ])),
+  };
+}
+
+function diffArrivalSnapshots(previous: ArrivalSnapshot, next: ArrivalSnapshot, startedAt: number): ArrivalAnimations {
+  const files = new Map<string, ArrivalEntry>();
+  const blocks = new Map<string, ArrivalEntry>();
+  let count = 0;
+
+  for (const [path, file] of next.files) {
+    if (count >= MAX_ANIMATED_ENTRIES) break;
+    const previousFile = previous.files.get(path);
+    const fileKind = previousFile ? 'changed' : file.kind;
+    if (!previousFile || previousFile.signature !== file.signature) {
+      files.set(path, {startedAt, kind: fileKind});
+      count += 1;
+    }
+
+    for (const [blockKey, blockSignature] of file.blocks) {
+      if (count >= MAX_ANIMATED_ENTRIES) break;
+      if (previousFile?.blocks.get(blockKey) !== blockSignature) {
+        blocks.set(blockKey, {startedAt, kind: fileKind});
+        count += 1;
+      }
+    }
+  }
+
+  return {files, blocks};
+}
+
+function pruneArrivalAnimations(animations: ArrivalAnimations, now: number): ArrivalAnimations {
+  const files = new Map<string, ArrivalEntry>();
+  const blocks = new Map<string, ArrivalEntry>();
+
+  for (const [key, entry] of animations.files) {
+    if (now - entry.startedAt < ARRIVAL_ANIMATION_DURATION_MS) {
+      files.set(key, entry);
+    }
+  }
+
+  for (const [key, entry] of animations.blocks) {
+    if (now - entry.startedAt < ARRIVAL_ANIMATION_DURATION_MS) {
+      blocks.set(key, entry);
+    }
+  }
+
+  return {files, blocks};
+}
+
+function hasArrivalAnimations(animations: ArrivalAnimations) {
+  return animations.files.size > 0 || animations.blocks.size > 0;
+}
+
+function arrivalProgress(entry: ArrivalEntry, now: number) {
+  return clamp((now - entry.startedAt) / ARRIVAL_ANIMATION_DURATION_MS, 0, 1);
+}
+
+function arrivalBackgroundStyle(entry: ArrivalEntry, now: number) {
+  const progress = arrivalProgress(entry, now);
+  if (progress >= 1) return null;
+
+  const ramp = entry.kind === 'new'
+    ? [
+      '[48;2;18;72;38m',
+      '[48;2;17;68;37m',
+      '[48;2;15;60;34m',
+      '[48;2;13;52;31m',
+      '[48;2;11;44;28m',
+      '[48;2;9;36;25m',
+      '[48;2;7;28;22m',
+      '[48;2;5;20;18m',
+    ]
+    : [
+      '[48;2;17;64;72m',
+      '[48;2;16;60;69m',
+      '[48;2;14;54;63m',
+      '[48;2;12;47;57m',
+      '[48;2;10;39;49m',
+      '[48;2;8;32;41m',
+      '[48;2;6;25;33m',
+      '[48;2;4;19;27m',
+    ];
+
+  if (progress < 0.08) return ramp[0]!;
+  if (progress < 0.18) return ramp[1]!;
+  if (progress < 0.31) return ramp[2]!;
+  if (progress < 0.46) return ramp[3]!;
+  if (progress < 0.62) return ramp[4]!;
+  if (progress < 0.78) return ramp[5]!;
+  if (progress < 0.92) return ramp[6]!;
+  return ramp[7]!;
+}
+
+function applyArrivalWash(line: string, entry: ArrivalEntry | undefined, now: number) {
+  if (!entry) return line;
+  const style = arrivalBackgroundStyle(entry, now);
+  if (!style) return line;
+
+  const cells = toStyledCells(line);
+  for (const cell of cells) {
+    cell.style = `${cell.style}${style}`;
+  }
+
+  return renderStyledCells(cells);
+}
+
+function treeArrivalColor(entry: ArrivalEntry | undefined, now: number) {
+  if (!entry) return null;
+  const progress = arrivalProgress(entry, now);
+  if (progress >= 1) return null;
+
+  if (entry.kind === 'new') {
+    return progress < 0.4 ? 'greenBright' : 'green';
+  }
+
+  return progress < 0.4 ? 'cyanBright' : 'cyan';
 }
 
 function getTreeWidthLimits(columns: number) {
@@ -319,6 +548,8 @@ const TreeFileRow = memo(function TreeFileRow({
   hovered,
   copyHovered,
   copySucceeded,
+  arrivalEntry,
+  arrivalNow,
   width,
 }: {
   row: TreeRow;
@@ -326,9 +557,12 @@ const TreeFileRow = memo(function TreeFileRow({
   hovered: boolean;
   copyHovered: boolean;
   copySucceeded: boolean;
+  arrivalEntry?: ArrivalEntry;
+  arrivalNow: number;
   width: number;
 }) {
-  const accent = selected ? 'cyanBright' : row.kind === 'dir' ? 'yellow' : hovered ? 'cyan' : 'white';
+  const arrivalColor = treeArrivalColor(arrivalEntry, arrivalNow);
+  const accent = selected ? 'cyanBright' : arrivalColor ?? (row.kind === 'dir' ? 'yellow' : hovered ? 'cyan' : 'white');
   const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
   const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
   const copySlotWidth = getTreeCopySlotWidth(copySucceeded);
@@ -338,7 +572,7 @@ const TreeFileRow = memo(function TreeFileRow({
   return (
     <Box width={width}>
       <Box width={labelWidth}>
-        <Text color={accent} bold={selected} dimColor={row.kind === 'dir' && !selected} wrap="truncate-end">
+        <Text color={accent} bold={selected || Boolean(arrivalColor)} dimColor={row.kind === 'dir' && !selected && !arrivalColor} wrap="truncate-end">
           {treeRowLabelText(row)}
         </Text>
       </Box>
@@ -1051,6 +1285,7 @@ function AppContent({
   dimensions,
   watchStatus,
   emptyStateHint,
+  animations = false,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -1075,8 +1310,9 @@ function AppContent({
   const visibleDiffRows = Math.max(contentHeight - 4, 6);
 
   const [collapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
+  const wrappedSectionCacheRef = useRef<Map<string, WrappedSectionCacheEntry>>(new Map());
   const wrappedSections = useMemo(
-    () => wrapSections(rawSections, diffContentWidth),
+    () => wrapSectionsWithCache(rawSections, diffContentWidth, wrappedSectionCacheRef.current),
     [rawSections, diffContentWidth],
   );
   const sections = useMemo(
@@ -1127,6 +1363,13 @@ function AppContent({
     sectionIndex: 0,
     relativeOffset: 0,
   });
+  const arrivalSnapshotRef = useRef<ArrivalSnapshot | null>(null);
+  const [arrivalAnimations, setArrivalAnimations] = useState<ArrivalAnimations>(() => ({
+    files: new Map(),
+    blocks: new Map(),
+  }));
+  const [arrivalNow, setArrivalNow] = useState(0);
+  const arrivalActive = hasArrivalAnimations(arrivalAnimations);
 
   const topSectionIndex = getPrimaryVisibleSectionIndex(
     sections,
@@ -1165,6 +1408,43 @@ function AppContent({
   useEffect(() => {
     treeTooltipRef.current = treeTooltip;
   }, [treeTooltip]);
+
+  useLayoutEffect(() => {
+    if (!animations) {
+      arrivalSnapshotRef.current = null;
+      setArrivalAnimations((current) => hasArrivalAnimations(current) ? {files: new Map(), blocks: new Map()} : current);
+      return;
+    }
+
+    const nextSnapshot = buildArrivalSnapshot(review, rawSections);
+    const previousSnapshot = arrivalSnapshotRef.current;
+    arrivalSnapshotRef.current = nextSnapshot;
+
+    if (!previousSnapshot) {
+      return;
+    }
+
+    const now = Date.now();
+    const nextAnimations = diffArrivalSnapshots(previousSnapshot, nextSnapshot, now);
+    if (!hasArrivalAnimations(nextAnimations)) {
+      return;
+    }
+
+    setArrivalNow(now);
+    setArrivalAnimations(nextAnimations);
+  }, [animations, rawSections, review]);
+
+  useEffect(() => {
+    if (!arrivalActive) return undefined;
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+      setArrivalNow(now);
+      setArrivalAnimations((current) => pruneArrivalAnimations(current, now));
+    }, ARRIVAL_ANIMATION_TICK_MS);
+
+    return () => clearInterval(interval);
+  }, [arrivalActive]);
 
   useEffect(() => () => {
     if (treeTooltipTimerRef.current) {
@@ -2100,6 +2380,8 @@ function AppContent({
                   copiedAction?.kind === 'tree-copy'
                   && copiedAction.rowIndex === treeOffset + index
                 }
+                arrivalEntry={row.kind === 'file' ? arrivalAnimations.files.get(row.path) : undefined}
+                arrivalNow={arrivalNow}
                 width={treeContentWidth}
               />
             ))}
@@ -2120,9 +2402,14 @@ function AppContent({
             const activeStatus = review?.files.find((file) => file.path === activeFilePath)?.status;
             const status = ansiStatus(activeStatus);
             const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
+            const fileArrival = arrivalAnimations.files.get(activeFilePath);
             const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
             const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-            const fileLabelWithActions = composeLeftRight(fileLabel, review && hasChanges ? fileActions(fileHover, fileCopied) : '', inner);
+            const fileLabelWithActions = applyArrivalWash(
+              composeLeftRight(fileLabel, review && hasChanges ? fileActions(fileHover, fileCopied) : '', inner),
+              fileArrival,
+              arrivalNow,
+            );
 
             const metricsCore = activeSection
               ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
@@ -2147,6 +2434,13 @@ function AppContent({
 
             for (const [index, line] of visibleDiffLines.entries()) {
               const absoluteLineIndex = diffOffset + index;
+              const currentBlockHeaderLineIndex = findHoveredBlockLineIndex(allDiffLines, absoluteLineIndex);
+              const currentBlockTarget = currentBlockHeaderLineIndex === null
+                ? undefined
+                : findBlockTargetFromLine(allDiffLines[currentBlockHeaderLineIndex] ?? '', review);
+              const blockArrival = currentBlockTarget
+                ? arrivalAnimations.blocks.get(blockAnimationKey(currentBlockTarget.file.path, currentBlockTarget.block))
+                : undefined;
               const blockHover = hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex
                 ? hoveredAction.id
                 : undefined;
@@ -2159,7 +2453,8 @@ function AppContent({
                 ? addBlockActionsToLine(blockStateLine, blockHover, blockCopied)
                 : blockStateLine;
               const selectedLine = highlightSelectedCode(visibleLine, absoluteLineIndex, codeSelection);
-              rows.push(frameLine(highlightActionLabel(selectedLine, blockHover), inner, borderAnsi));
+              const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
+              rows.push(frameLine(highlightActionLabel(arrivalLine, blockHover), inner, borderAnsi));
             }
             rows.push(frameBottomBorder(rightWidth, borderAnsi));
 

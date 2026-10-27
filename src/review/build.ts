@@ -37,6 +37,16 @@ function splitRenderedLines(diff: string) {
   return diff.trimEnd().split('\n').filter(Boolean);
 }
 
+function hashText(text: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
 export function buildReviewModel({cwd, range, width}: BuildReviewModelOptions): ReviewModel {
   const entries = getChangedFileEntries(cwd, range);
   const metricsMap = getFileMetricsMap(cwd, range);
@@ -52,6 +62,7 @@ export function buildReviewModel({cwd, range, width}: BuildReviewModelOptions): 
       path: entry.path,
       oldPath: entry.oldPath,
       status: entry.status,
+      signature: hashText(`${entry.status}:${rawDiff}`),
       metrics: metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
       rawDiff,
       renderedLines: splitRenderedLines(renderedDiff),
@@ -74,6 +85,7 @@ export function buildReviewSections(review: Pick<ReviewModel, 'files'>): DiffSec
   return buildDiffSections(
     review.files.map((file) => ({
       path: file.path,
+      signature: file.signature,
       metrics: file.metrics,
       diff: file.renderedLines.join('\n'),
     })),

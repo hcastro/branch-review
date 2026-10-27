@@ -6,6 +6,7 @@ import {buildReviewModel, buildReviewSections} from '../review/build.js';
 import type {ReviewModel} from '../review/model.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import {createRepoWatcher, type CreateRepoWatcherOptions, type RepoWatcher} from '../watch/repoWatcher.js';
+import {refreshReviewInWorker} from '../review/workerRefresh.js';
 import {App} from './App.js';
 
 type WatchState =
@@ -26,12 +27,15 @@ export type ReviewControllerProps = {
   initialReview: ReviewModel;
   watch: boolean;
   watchPoll?: boolean;
+  animations?: boolean;
   copyWriter?: ClipboardWriter;
   dimensions?: {columns: number; rows: number};
   initialFingerprint?: string;
   buildReview?: ReviewBuilder;
   createWatcher?: WatcherFactory;
   resolveRange?: RangeResolver;
+  requestedBranch?: string;
+  requestedBase?: string;
 };
 
 function formatError(error: unknown) {
@@ -67,12 +71,15 @@ export function ReviewController({
   initialReview,
   watch,
   watchPoll = false,
+  animations = true,
   copyWriter,
   dimensions,
   initialFingerprint,
   buildReview = buildReviewModel,
   createWatcher = createRepoWatcher,
   resolveRange,
+  requestedBranch,
+  requestedBase,
 }: ReviewControllerProps) {
   const {stdout} = useStdout();
   const columns = dimensions?.columns ?? stdout?.columns ?? 160;
@@ -111,10 +118,20 @@ export function ReviewController({
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       try {
-        const nextRange = resolveRange?.() ?? range;
-        const nextFingerprint = getReviewFingerprint(cwd, nextRange);
+        const workerRefreshAvailable = requestedBranch && requestedBase && buildReview === buildReviewModel;
+        const next = workerRefreshAvailable
+          ? await refreshReviewInWorker({
+            cwd,
+            requestedBranch,
+            requestedBase,
+            width: modelWidth,
+            previousFingerprint: fingerprintRef.current,
+          })
+          : null;
+        const nextRange = next?.range ?? resolveRange?.() ?? range;
+        const nextFingerprint = next?.fingerprint ?? getReviewFingerprint(cwd, nextRange);
         if (nextFingerprint !== fingerprintRef.current) {
-          const nextReview = buildReview({cwd, range: nextRange, width: modelWidth});
+          const nextReview = next?.review ?? buildReview({cwd, range: nextRange, width: modelWidth});
           if (!mountedRef.current) return;
           setReview(nextReview);
           setActiveRange(nextRange);
@@ -138,7 +155,7 @@ export function ReviewController({
     };
 
     void run();
-  }, [buildReview, cwd, modelWidth, range, resolveRange, watch]);
+  }, [buildReview, cwd, modelWidth, range, requestedBase, requestedBranch, resolveRange, watch]);
 
   useEffect(() => {
     if (!watch) {
@@ -203,6 +220,7 @@ export function ReviewController({
       dimensions={dimensions}
       watchStatus={footerStatus}
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}
+      animations={animations}
     />
   );
 }

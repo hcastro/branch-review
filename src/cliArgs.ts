@@ -3,6 +3,7 @@ export type CliOptions = {
   requestedBase?: string;
   watch: boolean;
   watchPoll: boolean;
+  animations: boolean;
 };
 
 export function parseCliArgs(argv: string[], {interactive}: {interactive: boolean}): CliOptions {
@@ -10,6 +11,7 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
   let watchFlag = false;
   let noWatch = false;
   let watchPoll = false;
+  let animations = true;
 
   for (const arg of argv) {
     if (arg === '--watch') {
@@ -28,6 +30,16 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
       continue;
     }
 
+    if (arg === '--animations') {
+      animations = true;
+      continue;
+    }
+
+    if (arg === '--no-animations') {
+      animations = false;
+      continue;
+    }
+
     positional.push(arg);
   }
 
@@ -36,5 +48,6 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
     requestedBase: positional[1],
     watch: noWatch ? false : watchFlag || interactive,
     watchPoll,
+    animations,
   };
 }

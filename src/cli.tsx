@@ -64,6 +64,9 @@ const instance = render(
     initialFingerprint={initialFingerprint}
     watch={options.watch}
     watchPoll={options.watchPoll}
+    animations={options.animations}
+    requestedBranch={requestedBranch}
+    requestedBase={requestedBase}
   />,
 );
 

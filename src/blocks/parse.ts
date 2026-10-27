@@ -2,6 +2,16 @@ import type {ReviewBlock} from '../review/model.js';
 
 const BLOCK_HEADER_PATTERN = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
 
+function hashText(text: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
 function parseLineCount(value: string | undefined) {
   return value === undefined ? 1 : Number(value);
 }
@@ -24,9 +34,12 @@ function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlo
     .map((line) => line.slice(1))
     .join('\n');
 
+  const rawDiff = lines.join('\n').trimEnd();
+
   return {
     id: `${filePath}:${newStart}:${index}`,
     filePath,
+    signature: hashText(`${newStart}:${newLines}:${rawDiff}:${addedCode}`),
     oldStart,
     oldLines,
     newStart,
@@ -34,7 +47,7 @@ function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlo
     lineStart,
     lineEnd,
     functionHeader,
-    rawDiff: lines.join('\n').trimEnd(),
+    rawDiff,
     addedCode,
   };
 }

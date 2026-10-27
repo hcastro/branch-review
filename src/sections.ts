@@ -14,6 +14,7 @@ export type BranchMetrics = {
 
 export type DiffSection = {
   path: string;
+  signature?: string;
   metrics: FileMetrics;
   lines: string[];
   startLine: number;
@@ -429,6 +430,7 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
 
     return {
       path: section.path,
+      signature: section.signature,
       metrics: section.metrics,
       lines: wrappedLines,
       startLine,
@@ -493,7 +495,7 @@ export function formatMetrics(metrics: Pick<FileMetrics, 'additions' | 'deletion
   return `${green(`+${metrics.additions}`)} ${red(`-${metrics.deletions}`)} ${yellow(`${metrics.changedLines} changed`)}`;
 }
 
-export function buildDiffSections(input: Array<{path: string; metrics: FileMetrics; diff: string}>): DiffSection[] {
+export function buildDiffSections(input: Array<{path: string; signature?: string; metrics: FileMetrics; diff: string}>): DiffSection[] {
   const sections: DiffSection[] = [];
   let lineCursor = 0;
 
@@ -506,6 +508,7 @@ export function buildDiffSections(input: Array<{path: string; metrics: FileMetri
 
     sections.push({
       path: entry.path,
+      signature: 'signature' in entry && typeof entry.signature === 'string' ? entry.signature : undefined,
       metrics: entry.metrics,
       lines,
       startLine: lineCursor,

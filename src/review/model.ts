@@ -4,6 +4,7 @@ import type {FileStatus} from '../git.js';
 export type ReviewBlock = {
   id: string;
   filePath: string;
+  signature?: string;
   oldStart: number;
   oldLines: number;
   newStart: number;
@@ -19,6 +20,7 @@ export type ReviewFile = {
   path: string;
   oldPath?: string;
   status: FileStatus;
+  signature?: string;
   metrics: FileMetrics;
   rawDiff: string;
   renderedLines: string[];
