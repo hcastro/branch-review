@@ -24,7 +24,8 @@ note() { printf '%s\n' "$1" >&2; }
 root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) \
   || die "not inside a git repository: $target"
 
-git_root() { git -C "$root" "$@"; }
+# Read-only access to the repo. fsmonitor is off so no hook or daemon runs.
+git_root() { git -C "$root" -c core.fsmonitor=false "$@"; }
 
 # Resolve a ref the way the CLI does: local ref first, then origin/<ref>.
 resolve_ref() {
@@ -52,20 +53,44 @@ infer_base() {
   [[ -n $current ]] && resolve_ref "$current"
 }
 
+# Sets clip_tool to the tool that took the text. xclip and wl-copy leave a
+# child running that would hold an inherited stdout or stderr open, so the
+# tools get neither.
+clip_tool=
 copy_to_clipboard() {
   local text=$1 tool
   for tool in pbcopy wl-copy xclip clip.exe; do
     command -v "$tool" >/dev/null 2>&1 || continue
     case $tool in
-      xclip) printf '%s' "$text" | xclip -selection clipboard && { printf '%s' "$tool"; return 0; } ;;
-      *)     printf '%s' "$text" | "$tool" && { printf '%s' "$tool"; return 0; } ;;
-    esac
+      xclip) printf '%s' "$text" | xclip -selection clipboard >/dev/null 2>&1 ;;
+      *)     printf '%s' "$text" | "$tool" >/dev/null 2>&1 ;;
+    esac && { clip_tool=$tool; return 0; }
   done
   return 1
 }
 
+# Single-quote a word for any POSIX shell. The replacement lives in a variable
+# because bash 3.2 (macOS /bin/bash) keeps the backslashes of an inline one.
 shell_quote() {
-  printf "'%s'" "${1//\'/\'\\\'\'}"
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
+}
+
+# Worktree diffs refresh stat info in the index they read. They run against a
+# private copy so the repo's own index is never rewritten. Call this in the
+# main shell, not in $(...), so the EXIT trap sees the file to remove.
+tmp_index=
+cleanup() { if [[ -n $tmp_index ]]; then rm -f "$tmp_index" "$tmp_index.lock"; fi; }
+trap cleanup EXIT
+
+make_private_index() {
+  local index
+  index=$(git_root rev-parse --git-path index) || die "cannot locate the index in $root"
+  [[ $index == /* ]] || index="$root/$index"
+  tmp_index=$(mktemp "${TMPDIR:-/tmp}/branch-review-index.XXXXXX") \
+    || die "cannot create a temporary index"
+  # A repo with no index file yet has an empty index; a missing file reads that way.
+  cp "$index" "$tmp_index" 2>/dev/null || rm -f "$tmp_index"
 }
 
 effective_base=${base:-$(infer_base)}
@@ -88,28 +113,42 @@ fi
 # --- state report -----------------------------------------------------------
 
 current_branch=$(git_root branch --show-current 2>/dev/null)
-tracked=$(git_root diff --name-only "$diff_arg" | grep -c . || true)
 untracked=0
 if [[ $includes_worktree == yes ]]; then
+  make_private_index
+  tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff --name-only "$diff_arg" | grep -c . || true)
   untracked=$(git_root ls-files --others --exclude-standard | grep -c . || true)
+  dirty=$(git_root --no-optional-locks status --porcelain | grep -c . || true)
+  uncommitted="$dirty entries"
+  reviewed_tip=HEAD
+else
+  tracked=$(git_root diff --no-ext-diff --name-only "$diff_arg" | grep -c . || true)
+  uncommitted="not in this review (reviewing $branch, not the worktree)"
+  reviewed_tip=$resolved_branch
 fi
 changed=$((tracked + untracked))
-ahead=$(git_root rev-list --count "$resolved_base..HEAD" 2>/dev/null || echo 0)
-dirty=$(git_root status --porcelain | grep -c . || true)
+ahead=$(git_root rev-list --count "$resolved_base..$reviewed_tip" 2>/dev/null || echo 0)
 
+# A linked worktree has its own git dir inside the main repo's common dir. A
+# submodule or --separate-git-dir checkout also has a .git file, but its git
+# dir is its own common dir.
+abs_dir() { (unset CDPATH; cd "$root" && cd "$1" && pwd -P); }
 is_worktree=no
-[[ -f $root/.git ]] && is_worktree=yes
+git_dir=$(git_root rev-parse --git-dir 2>/dev/null) \
+  && common_dir=$(git_root rev-parse --git-common-dir 2>/dev/null) \
+  && [[ $(abs_dir "$git_dir") != "$(abs_dir "$common_dir")" ]] \
+  && is_worktree=yes
 
 note "repo:        $root"
 note "worktree:    $is_worktree"
 note "branch:      ${current_branch:-<detached>}  (reviewing: $branch)"
 note "base:        $resolved_base$([[ -z $base ]] && printf ' (auto-detected)')"
 note "commits:     $ahead ahead of base"
-note "uncommitted: $dirty entries"
+note "uncommitted: $uncommitted"
 note "in review:   $changed files ($tracked tracked, $untracked untracked)"
 
 command -v branch-review >/dev/null 2>&1 \
-  || note "warning: branch-review is not on PATH — install with: pnpm add -g branch-review"
+  || note "warning: branch-review is not on PATH — install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review"
 command -v delta >/dev/null 2>&1 \
   || note "warning: git-delta is not on PATH — diffs need it: brew install git-delta"
 [[ $changed -eq 0 ]] \
@@ -117,16 +156,15 @@ command -v delta >/dev/null 2>&1 \
 
 # --- command ----------------------------------------------------------------
 
-args=()
+# Every word is quoted: ref names may hold ;, &, |, $(), backticks and quotes.
+cmd="cd $(shell_quote "$root") && branch-review"
 if [[ -n $base ]]; then
-  args=("$branch" "$base")
+  cmd+=" $(shell_quote "$branch") $(shell_quote "$base")"
 elif [[ $branch != HEAD ]]; then
-  args=("$branch")
+  cmd+=" $(shell_quote "$branch")"
 fi
 
-cmd="cd $(shell_quote "$root") && branch-review${args[*]:+ ${args[*]}}"
-
-if clip_tool=$(copy_to_clipboard "$cmd"); then
+if copy_to_clipboard "$cmd"; then
   note "copied to clipboard via $clip_tool"
 else
   note "warning: no clipboard tool found (pbcopy/wl-copy/xclip/clip.exe) — copy manually"

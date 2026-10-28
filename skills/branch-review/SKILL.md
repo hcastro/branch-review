@@ -60,8 +60,14 @@ that was never checked out still works.
 
 ### 3. Build and copy the command
 
+The script ships with this skill. Run it by its full path under the skill's own
+directory: the base directory shown when the skill loads, the folder holding
+this `SKILL.md`. Below, `<skill-dir>` stands for that path. Never resolve the
+script against the session cwd; the repo under review may have a file at the
+same relative path.
+
 ```bash
-scripts/review-command.sh <path> [branch] [base]
+"<skill-dir>/scripts/review-command.sh" <path> [branch] [base]
 ```
 
 The script resolves the git root, reports repo state on stderr, prints the
@@ -72,9 +78,9 @@ or `clip.exe`). It warns when the range is empty or when `branch-review` or
 Arguments are positional — pass `HEAD` as `branch` when overriding only `base`:
 
 ```bash
-scripts/review-command.sh src/api/auth.ts               # file path → repo root
-scripts/review-command.sh ~/code/app HEAD HEAD          # uncommitted only
-scripts/review-command.sh ~/code/app feat/login main    # branch vs base
+"<skill-dir>/scripts/review-command.sh" src/api/auth.ts               # file path → repo root
+"<skill-dir>/scripts/review-command.sh" ~/code/app HEAD HEAD          # uncommitted only
+"<skill-dir>/scripts/review-command.sh" ~/code/app feat/login main    # branch vs base
 ```
 
 Non-zero exit means nothing was copied. Fix the input and rerun; do not
@@ -83,7 +89,10 @@ hand-assemble a command to paper over an error.
 ### 4. Report back
 
 Lead with the command in its own fenced block so it is easy to spot, then one
-line of what it covers. Confirm the clipboard copy only if the script did it.
+line of what it covers, taken from the script's state report. Confirm the
+clipboard copy only if the script did it. A named-branch review covers that
+branch's commits only; the report says so, and the summary should not mention
+uncommitted edits.
 
 ````
 ```sh
