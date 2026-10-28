@@ -34,9 +34,17 @@ export type ReviewFile = {
   /**
    * Set when rawDiff can't be copied: the diff failed to load (rawDiff is
    * empty), or git printed it as bytes that are not valid UTF-8. Every copy
-   * of this file's diff, blocks or contents fails with this reason.
+   * of this file's diff or blocks fails with this reason. Copy file contents
+   * is not blocked by it: that reads the file itself and fails only when the
+   * file can't be read or is not UTF-8 text.
    */
   rawDiffError?: string;
+  /**
+   * Set when git listed the file's name as bytes that are not valid UTF-8.
+   * `path` then holds octal escapes for those bytes and names no real file,
+   * so every copy of this file, its path included, fails with this reason.
+   */
+  pathError?: string;
 };
 
 export type ReviewModel = {

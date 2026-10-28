@@ -1,12 +1,22 @@
 import {
-  getChangedFileEntries,
+  currentBranchNameOperation,
+  fileMetricsOperation,
   isFatalToolError,
-  readFileMetrics,
-  readRawFileDiff,
-  renderDiffForDisplay,
+  progressTick,
+  rawFileDiffOperation,
+  renderDiffOperation,
+  resolveRefsOperation,
+  reviewChangesOperation,
+  reviewFingerprintOperation,
+  runOperation,
+  runOperationAsync,
+  runWithPrivateIndexAsync,
   withPrivateIndex,
   type ChangedFileEntry,
   type DiffRange,
+  type GitOperation,
+  type ReviewChanges,
+  type ReviewMetrics,
 } from '../git.js';
 import {escapeHiddenCharacters} from '../controlChars.js';
 import {buildDiffSections, type BranchMetrics, type DiffSection, type FileMetrics} from '../sections.js';
@@ -19,6 +29,8 @@ type BuildReviewModelOptions = {
   width: number;
   /** Called after each file is built, error rows included, before the next starts. */
   onFileBuilt?: () => void;
+  /** Called once per file in every loop over the changed files. */
+  onProgress?: () => void;
 };
 
 function emptyMetrics(path: string): FileMetrics {
@@ -89,13 +101,13 @@ function errorMessage(error: unknown) {
 // One file that can't be diffed or rendered becomes a file with `error` set
 // instead of failing the whole review. A missing git or delta affects every
 // file, and an interrupt stops the build, so those still throw.
-function buildReviewFile(
+function* reviewFileOperation(
   {cwd, range, width}: BuildReviewModelOptions,
   entry: ChangedFileEntry,
   metrics: FileMetrics,
   metricsError: string | undefined,
   untrackedFiles: ReadonlySet<string>,
-): ReviewFile {
+): GitOperation<ReviewFile> {
   let rawDiff = '';
   let renderedLines: string[] = [];
   let error: string | undefined;
@@ -103,11 +115,13 @@ function buildReviewFile(
   let loaded = false;
 
   try {
-    const diff = readRawFileDiff(cwd, range, entry.path, untrackedFiles, entry.oldPath);
+    // A name that isn't UTF-8 names no file git or the filesystem can find.
+    if (entry.nameError !== undefined) throw new Error(entry.nameError);
+    const diff = yield* rawFileDiffOperation(cwd, range, entry.path, untrackedFiles, entry.oldPath);
     rawDiff = diff.text;
     loaded = true;
     if (!diff.utf8) rawDiffError = 'not UTF-8 text';
-    renderedLines = splitRenderedLines(renderDiffForDisplay(cwd, rawDiff, width));
+    renderedLines = splitRenderedLines(yield* renderDiffOperation(cwd, rawDiff, width));
     if (renderedLines.length === 0) renderedLines = [describeNoTextChange(rawDiff)];
   } catch (caught) {
     if (isFatalToolError(caught)) throw caught;
@@ -132,41 +146,107 @@ function buildReviewFile(
     blocks: parseUnifiedDiffBlocks(rawDiff, entry.path),
     ...(error === undefined ? {} : {error}),
     ...(rawDiffError === undefined ? {} : {rawDiffError}),
+    ...(entry.nameError === undefined ? {} : {pathError: entry.nameError}),
+  };
+}
+
+// The build from changes and metrics already read for the range.
+function* reviewModelOperation(
+  options: BuildReviewModelOptions,
+  {entries}: ReviewChanges,
+  {metrics: metricsMap, errors: metricsErrors}: ReviewMetrics,
+): GitOperation<ReviewModel> {
+  const {range} = options;
+  const untrackedFiles = new Set(
+    entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
+  );
+
+  const files: ReviewFile[] = [];
+  for (const entry of entries) {
+    files.push(yield* reviewFileOperation(
+      options,
+      entry,
+      metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
+      metricsErrors.get(entry.path),
+      untrackedFiles,
+    ));
+    options.onFileBuilt?.();
+    yield* progressTick();
+  }
+
+  const branch = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
+
+  return {
+    base: range.base,
+    branch,
+    label: `${range.base}...${branch}`,
+    metrics: calculateBranchMetrics(files),
+    files,
   };
 }
 
 export function buildReviewModel(options: BuildReviewModelOptions): ReviewModel {
   const {cwd, range} = options;
 
-  return withPrivateIndex(cwd, () => {
-    const entries = getChangedFileEntries(cwd, range);
-    const {metrics: metricsMap, errors: metricsErrors} = readFileMetrics(cwd, range);
-    const untrackedFiles = new Set(
-      entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
-    );
+  return withPrivateIndex(cwd, () => runOperation((function* () {
+    const changes = yield* reviewChangesOperation(cwd, range);
+    const metrics = yield* fileMetricsOperation(cwd, range, changes);
+    return yield* reviewModelOperation(options, changes, metrics);
+  })(), options.onProgress));
+}
 
-    const files = entries.map((entry) => {
-      const file = buildReviewFile(
-        options,
-        entry,
-        metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
-        metricsErrors.get(entry.path),
-        untrackedFiles,
-      );
-      options.onFileBuilt?.();
-      return file;
-    });
+export type RefreshReviewOptions = {
+  cwd: string;
+  requestedBranch: string;
+  requestedBase: string;
+  width: number;
+  /** The fingerprint of the review on screen; the build is skipped while it still matches. */
+  previousFingerprint: string | null;
+  /** Called once per file in every loop over the changed files, and on every chunk git or delta prints. */
+  onProgress?: () => void;
+  /** Aborting kills the git or delta that is running and rejects with AbortedError. */
+  signal?: AbortSignal;
+};
 
-    const branch = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
+export type RefreshReviewResult = {
+  range: DiffRange;
+  fingerprint: string;
+  branchName: string | null;
+  /** Set only when the fingerprint differs from `previousFingerprint`. */
+  review?: ReviewModel;
+};
 
-    return {
-      base: range.base,
-      branch,
-      label: `${range.base}...${branch}`,
-      metrics: calculateBranchMetrics(files),
-      files,
-    };
-  });
+/**
+ * Resolves the refs, takes the review fingerprint and the current branch,
+ * and builds the review when the fingerprint changed, all with asynchronous
+ * git and delta calls so the event loop stays free. The changes and line
+ * counts are read once and shared by the fingerprint and the build; the
+ * fingerprint is taken before any diff is read, so a write that lands during
+ * the build changes the next fingerprint. Errors are the ones the synchronous
+ * functions throw, with git's stderr attached.
+ */
+export async function refreshReview({
+  cwd,
+  requestedBranch,
+  requestedBase,
+  width,
+  previousFingerprint,
+  onProgress,
+  signal,
+}: RefreshReviewOptions): Promise<RefreshReviewResult> {
+  const control = {onProgress, signal};
+  const range = await runOperationAsync(resolveRefsOperation(cwd, requestedBranch, requestedBase), control);
+
+  return runWithPrivateIndexAsync(cwd, function* (): GitOperation<RefreshReviewResult> {
+    const changes = yield* reviewChangesOperation(cwd, range);
+    const metrics = yield* fileMetricsOperation(cwd, range, changes);
+    const fingerprint = yield* reviewFingerprintOperation(cwd, range, changes, metrics);
+    const branchName = yield* currentBranchNameOperation(cwd);
+    if (fingerprint === previousFingerprint) return {range, fingerprint, branchName};
+
+    const review = yield* reviewModelOperation({cwd, range, width}, changes, metrics);
+    return {range, fingerprint, branchName, review};
+  }, control);
 }
 
 export function buildReviewSections(review: Pick<ReviewModel, 'files'>): DiffSection[] {

@@ -59,6 +59,13 @@ function assertDiffCopyable(file: Pick<ReviewFile, 'rawDiffError'> | undefined) 
   if (file?.rawDiffError !== undefined) throw new Error(file.rawDiffError);
 }
 
+// A file whose name is not valid UTF-8 is shown under an escaped name that
+// names no real file, so no copy may hand that name (or anything read
+// through it) on as if it were the file's.
+function assertPathCopyable(file: Pick<ReviewFile, 'pathError'> | undefined) {
+  if (file?.pathError !== undefined) throw new Error(file.pathError);
+}
+
 function blockFile(context: CommandContext, block: ReviewBlock) {
   return context.model.files.find((file) => file.path === block.filePath) ?? context.activeFile;
 }
@@ -73,6 +80,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file) return null;
+      assertPathCopyable(file);
       assertDiffCopyable(file);
       return {
         text: buildFilePromptPayload(file),
@@ -93,6 +101,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file || file.status === 'deleted') return null;
+      assertPathCopyable(file);
       const contents = context.readFileContent?.(file);
       if (typeof contents !== 'string') return null;
       return {
@@ -111,6 +120,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const target = fileAndBlock(context);
       if (!target) return null;
+      assertPathCopyable(target.file);
       assertDiffCopyable(blockFile(context, target.block));
       return {
         text: buildBlockPromptPayload(target.file, target.block),
@@ -128,6 +138,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file) return null;
+      assertPathCopyable(file);
       return {
         text: buildPathPayload(file),
         toast: 'Copied path',
@@ -144,6 +155,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file) return null;
+      assertPathCopyable(file);
       const absolutePath = context.resolveAbsolutePath?.(file);
       if (typeof absolutePath !== 'string') return null;
       return {
@@ -162,6 +174,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const target = fileAndBlock(context);
       if (!target) return null;
+      assertPathCopyable(target.file);
       return {
         text: buildPathLinePayload(target.file, target.block),
         toast: 'Copied path:line',
@@ -175,11 +188,15 @@ export const copyCommands: CommandDefinition[] = [
     title: 'Copy all changed paths',
     shortcuts: ['y A'],
     isEnabled: (context) => context.model.files.length > 0,
-    buildPayload: (context) => ({
-      text: buildAllChangedPathsPayload(context.model),
-      toast: 'Copied all changed paths',
-      hint: `${context.model.files.length} files`,
-    }),
+    buildPayload: (context) => {
+      const unnamed = context.model.files.find((file) => file.pathError !== undefined);
+      if (unnamed) throw new Error(`${unnamed.pathError}: ${unnamed.path}`);
+      return {
+        text: buildAllChangedPathsPayload(context.model),
+        toast: 'Copied all changed paths',
+        hint: `${context.model.files.length} files`,
+      };
+    },
   },
   {
     id: 'copy.blockCode',
