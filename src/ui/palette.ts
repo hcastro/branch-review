@@ -16,11 +16,12 @@ export function isPlainDiffMode(env: Env = process.env) {
   return isColorDisabled(env);
 }
 
-// `terminalLevel` is chalk's level, which Ink colours with. A level of 0 with
-// no explicit request means stdout is not a terminal (a test or a pipe); the
-// pane then keeps full colour, as it did before this palette existed.
+// Whether colour is on comes only from the colour-off rule delta runs under;
+// `terminalLevel` (chalk's level, which Ink colours with) only sets the depth.
+// A level of 0 means stdout is not a terminal (a test or a pipe); the pane
+// then keeps full colour, as it did before this palette existed.
 export function resolveColorDepth(env: Env = process.env, terminalLevel: number = chalk.level): ColorDepth {
-  if (isPlainDiffMode(env) || env.FORCE_COLOR === 'false') return 0;
+  if (isPlainDiffMode(env)) return 0;
   if (terminalLevel >= 3) return 3;
   if (terminalLevel === 2) return 2;
   if (terminalLevel === 1) return 1;
@@ -48,8 +49,7 @@ export type Palette = {
     reset: string;
     bold: string;
     cyan: string;
-    cyanBright: string;
-    cyanBrightBold: string;
+    cyanBold: string;
     gray: string;
     green: string;
     greenBold: string;
@@ -75,8 +75,9 @@ export function createPalette(depth: ColorDepth): Palette {
       reset: RESET,
       bold: BOLD,
       cyan: code('\u001B[36m'),
-      cyanBright: code('\u001B[96m'),
-      cyanBrightBold: enabled ? '\u001B[96;1m' : BOLD,
+      // Chrome text (title, file path, buttons) uses plain cyan with bold:
+      // bright cyan washes out on light backgrounds.
+      cyanBold: enabled ? '\u001B[36;1m' : BOLD,
       gray: code('\u001B[90m'),
       green: code('\u001B[32m'),
       greenBold: enabled ? '\u001B[32;1m' : BOLD,

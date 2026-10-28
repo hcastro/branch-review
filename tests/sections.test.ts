@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import stripAnsi from 'strip-ansi';
 import {
   buildDiffSections,
+  fitBlockHeaderLabel,
   flattenSectionLines,
   formatMetrics,
   getSectionForLine,
@@ -282,5 +283,22 @@ describe('section helpers', () => {
     const rendered = wrapped[0].lines.map(stripAnsi).join('\n');
     expect(rendered).toContain('• apps/core-service/src/events/handlers/create-user-handler.ts:39:');
     expect(rendered).not.toContain('export async function processCreateNewUserEvent');
+  });
+});
+
+describe('block header labels', () => {
+  const label = '• packages/server/src/handlers/very-long-module-name.ts:120:';
+
+  it('drops the start of the path and keeps `:<line>:` whole', () => {
+    for (const width of [32, 20, 12, 9]) {
+      const fitted = fitBlockHeaderLabel(label, width);
+      expect(visibleWidth(fitted), `width ${width}`).toBeLessThanOrEqual(width);
+      expect(fitted, `width ${width}`).toMatch(/^• …\S+:120:$/);
+    }
+    expect(fitBlockHeaderLabel(label, 32)).toBe('• …very-long-module-name.ts:120:');
+  });
+
+  it('leaves a label that fits unchanged', () => {
+    expect(fitBlockHeaderLabel('• a.ts:3:', 20)).toBe('• a.ts:3:');
   });
 });

@@ -1,6 +1,6 @@
 import React from 'react';
 import stripAnsi from 'strip-ansi';
-import {render} from 'ink-testing-library';
+import {renderSized} from './ui-fixtures.js';
 import {describe, expect, it} from 'vitest';
 import {App} from '../src/ui/App.js';
 import {buildDiffSections, type BranchMetrics} from '../src/sections.js';
@@ -159,7 +159,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -209,7 +209,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="main"
         branch="feature/example"
@@ -239,7 +239,7 @@ describe('App', () => {
       })),
     );
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -299,7 +299,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -392,7 +392,7 @@ describe('App', () => {
       }],
     });
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -447,7 +447,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -478,7 +478,7 @@ describe('App', () => {
   });
 
   it('renders an empty state without exiting the app', async () => {
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -510,7 +510,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="origin/development"
         branch="HEAD + worktree"
@@ -561,7 +561,7 @@ describe('App', () => {
       }],
     };
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -627,7 +627,7 @@ describe('App', () => {
       }],
     };
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -643,8 +643,11 @@ describe('App', () => {
     await moveFrameTreeFilename(instance.lastFrame() ?? '', '• stream-v3', 'stream-v3');
     await flush();
 
+    // The diff header has room for the whole name; the tree row does not, and
+    // its tooltip is not up yet.
     let frame = stripAnsi(instance.lastFrame() ?? '');
-    expect(frame).not.toContain(longName);
+    expect(frame).toMatch(/• stream-v3\S*…/);
+    expect(frame).not.toContain(`│ ${longName} │`);
     expect(frame).toContain('1 files • +1 • -0 • 1 changed');
 
     await waitForTreeTooltip();
@@ -681,7 +684,7 @@ describe('App', () => {
       }],
     };
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -717,7 +720,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -762,7 +765,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -799,7 +802,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -837,7 +840,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -883,7 +886,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -899,7 +902,7 @@ describe('App', () => {
     await emitMouseMoveAt(before.column + 1, before.row);
     await flush();
 
-    expect(instance.lastFrame() ?? '').toContain('\u001B[96m');
+    expect(instance.lastFrame() ?? '').toContain('\u001B[36m');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('┃');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('drag ↔ resize file tree');
 
@@ -927,7 +930,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -960,7 +963,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -1007,7 +1010,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -1110,7 +1113,7 @@ describe('App', () => {
       ],
     };
     const writes: string[] = [];
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1208,7 +1211,7 @@ describe('App', () => {
       }],
     };
     const writes: string[] = [];
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1301,7 +1304,7 @@ describe('App', () => {
       }],
     };
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1326,13 +1329,13 @@ describe('App', () => {
     expect(frame).toContain('Copy code');
     expect(frame).not.toContain('palette');
     expect(frame).not.toContain('copy menu');
-    expect(instance.lastFrame() ?? '').not.toContain('\u001B[96mCopy block');
+    expect(instance.lastFrame() ?? '').not.toMatch(/\u001B\[(?:36;1|36m\u001B\[1)mCopy block/);
     expect(frame).not.toContain('More');
-    expect(instance.lastFrame() ?? '').not.toContain('\u001B[96;1mCopy code');
+    expect(instance.lastFrame() ?? '').not.toMatch(/\u001B\[(?:36;1|36m\u001B\[1)mCopy code/);
 
     await moveFrameText(instance.lastFrame() ?? '', 'Copy code');
     await flush();
-    expect(instance.lastFrame() ?? '').toMatch(/\u001B\[(?:96;1|96m\u001B\[1)mCopy code/);
+    expect(instance.lastFrame() ?? '').toMatch(/\u001B\[(?:36;1|36m\u001B\[1)mCopy code/);
 
     instance.unmount();
   });
@@ -1360,7 +1363,7 @@ describe('App', () => {
       }],
     };
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1431,7 +1434,7 @@ describe('App', () => {
     };
     const writes: string[] = [];
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1489,7 +1492,7 @@ describe('App', () => {
     ]);
     const writes: string[] = [];
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"
@@ -1559,7 +1562,7 @@ describe('App', () => {
       },
     ]);
 
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="feature/example"
@@ -1626,7 +1629,7 @@ describe('App', () => {
       }],
     };
     const writes: string[] = [];
-    const instance = render(
+    const instance = renderSized(
       <App
         base="development"
         branch="HEAD + worktree"

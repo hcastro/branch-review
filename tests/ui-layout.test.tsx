@@ -69,6 +69,18 @@ describe('small terminals', () => {
     });
   }
 
+  for (const columns of [80, 120, 160]) {
+    it(`draws every row exactly ${columns} cells wide at ${columns} columns`, async () => {
+      const instance = renderFixture(sixFileFixture(), {columns, rows: 24});
+      await flush();
+
+      const widths = frameLines(instance.lastFrame()).map((line) => stringWidth(line));
+      expect(new Set(widths)).toEqual(new Set([columns]));
+
+      instance.unmount();
+    });
+  }
+
   it('uses the full height for the panes', async () => {
     const instance = renderFixture(sixFileFixture(), {columns: 120, rows: 30});
     await flush();
@@ -318,6 +330,41 @@ describe('refresh that removes the file in view', () => {
     expect(frame).toContain('file 2/2');
     expect(frame).toMatch(/│ c-1 +│/);
     expect(frame).not.toContain('c-31');
+
+    instance.unmount();
+  });
+
+  it('keeps the view within the scroll ceiling when lines move into an earlier file', async () => {
+    const files = [linesFile('src/a.ts', 2, 'a'), linesFile('src/b.ts', 40, 'b')];
+    const instance = renderFixture({sections: buildDiffSections(files)}, {columns: 120, rows: 20});
+    await flush();
+
+    instance.stdin.write('G');
+    await flush();
+    expect(frameLines(instance.lastFrame()).join('\n')).toContain('b-40');
+
+    // Same total line count, so the same ceiling, but b.ts starts 8 lines later.
+    instance.rerender(
+      <App
+        base="development"
+        branch="HEAD"
+        sections={buildDiffSections([linesFile('src/a.ts', 10, 'a'), linesFile('src/b.ts', 32, 'b')])}
+        branchMetrics={{filesChanged: 2, additions: 42, deletions: 0, changedLines: 42}}
+        dimensions={{columns: 120, rows: 20}}
+      />,
+    );
+    await flush(2);
+
+    const settled = frameLines(instance.lastFrame());
+    // The pane is full: the last diff row (above the pane's bottom border and
+    // the footer) is b.ts's trailing blank line, with its last line above it.
+    expect(settled.at(-6)).toMatch(/│ b-32 +│$/);
+    expect(settled.at(-5)).toMatch(/││ +│$/);
+
+    // The next scroll moves on from there instead of snapping back.
+    instance.stdin.write('k');
+    await flush();
+    expect(frameLines(instance.lastFrame()).at(-5)).toMatch(/│ b-32 +│$/);
 
     instance.unmount();
   });

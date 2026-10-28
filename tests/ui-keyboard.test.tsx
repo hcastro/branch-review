@@ -11,8 +11,7 @@ import {
   renderFixture,
   type FixtureFile,
 } from './ui-fixtures.js';
-import {render} from 'ink-testing-library';
-import {appElement, renderOnTerminal} from './ui-fixtures.js';
+import {appElement, renderOnTerminal, renderSized} from './ui-fixtures.js';
 
 // The focused block's header row is drawn with heavy side bars.
 const FOCUS_BAR = '┃';
@@ -230,7 +229,7 @@ describe('keyboard copy', () => {
 describe('collapse state across refreshes', () => {
   it('keeps a block collapsed when an edit above moves its start line', async () => {
     const writes: string[] = [];
-    const instance = render(appElement(keyboardFixture([multiBlockFile('src/one.ts', [10, 40], 6)]), {columns: 120, rows: 30}, recordingWriter(writes)));
+    const instance = renderSized(appElement(keyboardFixture([multiBlockFile('src/one.ts', [10, 40], 6)]), {columns: 120, rows: 30}, recordingWriter(writes)));
     await flush();
 
     await press(instance, ']');
@@ -254,7 +253,7 @@ describe('collapse state across refreshes', () => {
       rawDiff: '@@ -10,0 +10,1 @@\n+same line\n@@ -40,0 +40,1 @@\n+same line',
       rendered: ['• src/same.ts:10: ', '  10 ⋮  10 │same line', '• src/same.ts:40: ', '  40 ⋮  40 │same line'],
     };
-    const instance = render(appElement(keyboardFixture([identical]), {columns: 120, rows: 30}, recordingWriter([])));
+    const instance = renderSized(appElement(keyboardFixture([identical]), {columns: 120, rows: 30}, recordingWriter([])));
     await flush();
 
     await press(instance, ']');

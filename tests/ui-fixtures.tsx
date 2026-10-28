@@ -3,7 +3,6 @@ import {EventEmitter} from 'node:events';
 import stripAnsi from 'strip-ansi';
 import stringWidth from 'string-width';
 import {render as inkRender} from 'ink';
-import {render} from 'ink-testing-library';
 import {expect} from 'vitest';
 import {App} from '../src/ui/App.js';
 import {buildDiffSections, type DiffSection} from '../src/sections.js';
@@ -123,13 +122,90 @@ export function appElement(
   );
 }
 
+// Renders with `dimensions` on a fake terminal of the same size. Ink sizes its
+// root to stdout's columns, so a stdout narrower or wider than `dimensions`
+// would lay out a frame no real terminal shows.
 export function renderFixture(
   fixture: AppFixtureProps,
   dimensions: {columns: number; rows: number},
   writes: string[] = [],
   copyWriter: ClipboardWriter = recordingWriter(writes),
 ) {
-  return render(appElement(fixture, dimensions, copyWriter));
+  return renderSized(appElement(fixture, dimensions, copyWriter), dimensions);
+}
+
+class FrameStream extends EventEmitter {
+  frames: string[] = [];
+  constructor(public columns: number, public rows: number) {
+    super();
+  }
+
+  write = (frame: string) => {
+    this.frames.push(frame);
+    return true;
+  };
+
+  lastFrame = () => this.frames.at(-1);
+}
+
+// ink-testing-library's stdin: keys reach Ink through read() after a
+// 'readable' event, and listeners on 'data' see them too.
+class KeyStdin extends EventEmitter {
+  isTTY = true;
+  private data: string | null = null;
+  write = (data: string) => {
+    this.data = data;
+    this.emit('readable');
+    this.emit('data', data);
+  };
+
+  read = () => {
+    const {data} = this;
+    this.data = null;
+    return data;
+  };
+
+  setEncoding() {}
+  setRawMode() {}
+  resume() {}
+  pause() {}
+  ref() {}
+  unref() {}
+}
+
+// ink-testing-library's render, with stdout sized to `size` (by default the
+// element's `dimensions` prop) instead of its fixed 100 columns. Every render
+// writes the whole frame (debug mode).
+export function renderSized(
+  tree: React.ReactElement<{dimensions?: {columns: number; rows: number}}>,
+  size = tree.props.dimensions ?? {columns: 100, rows: 40},
+) {
+  const stdout = new FrameStream(size.columns, size.rows);
+  const stderr = new FrameStream(size.columns, size.rows);
+  const stdin = new KeyStdin();
+  const instance = inkRender(tree, {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    stdout: stdout as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    stderr: stderr as any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    stdin: stdin as any,
+    debug: true,
+    exitOnCtrlC: false,
+    patchConsole: false,
+  });
+
+  return {
+    rerender: instance.rerender,
+    unmount: instance.unmount,
+    cleanup: instance.cleanup,
+    waitUntilExit: instance.waitUntilExit,
+    stdout,
+    stderr,
+    stdin,
+    frames: stdout.frames,
+    lastFrame: stdout.lastFrame,
+  };
 }
 
 export function gutter(line: number) {
