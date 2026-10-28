@@ -2423,6 +2423,14 @@ function AppContent({
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
   const copyFileTree = useCallback(async () => {
+    // A name that is not UTF-8 is shown as an escaped stand-in that names no
+    // real file; refuse the whole tree, as Copy all changed paths does.
+    const unnamed = review?.files.find((file) => file.pathError !== undefined);
+    if (unnamed) {
+      showToast('Copy action unavailable.', `${unnamed.pathError}: ${unnamed.path}`, 'error');
+      return;
+    }
+
     const text = formatTreePayload(allTreeRows, repoRoot);
 
     try {
@@ -2436,7 +2444,7 @@ function AppContent({
     } catch (error) {
       showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
     }
-  }, [allTreeRows, copyWriter, files.length, repoRoot, showToast]);
+  }, [allTreeRows, copyWriter, files.length, repoRoot, review, showToast]);
 
   // The rendered lines that mouse selection reads, set on every render. React
   // re-subscribes the mouse handlers in an effect after each commit; reading

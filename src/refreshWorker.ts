@@ -1,8 +1,8 @@
 import fs from 'node:fs';
 import {Worker} from 'node:worker_threads';
-import {getCurrentBranchName, getReviewFingerprint, resolveRefs, type DiffRange} from './git.js';
-import * as build from './review/build.js';
-import type {ReviewModel} from './review/model.js';
+// The asynchronous refresh runs git and delta without blocking this process
+// and reports progress per file and per chunk of tool output.
+import {refreshReview} from './review/build.js';
 
 type RefreshRequest = {
   id: number;
@@ -12,39 +12,6 @@ type RefreshRequest = {
   width: number;
   previousFingerprint?: string | null;
 };
-
-type RefreshOptions = Omit<RefreshRequest, 'id' | 'previousFingerprint'> & {
-  previousFingerprint: string | null;
-  onProgress?: () => void;
-  signal?: AbortSignal;
-};
-
-type RefreshResult = {range: DiffRange; fingerprint: string; branchName: string | null; review?: ReviewModel};
-
-type RefreshReview = (options: RefreshOptions) => Promise<RefreshResult>;
-
-// `onFileBuilt` is called once after each file is built.
-type BuildOptions = Parameters<typeof build.buildReviewModel>[0] & {onFileBuilt?: () => void};
-
-// The synchronous refresh, used only when build.ts has no `refreshReview`.
-// It reports progress between steps and after each built file, so a phase
-// that loops over every file, or one long git or delta run, reports nothing.
-function refreshReviewSync({cwd, requestedBranch, requestedBase, width, previousFingerprint, onProgress}: RefreshOptions) {
-  const range = resolveRefs(cwd, requestedBranch, requestedBase);
-  onProgress?.();
-  const fingerprint = getReviewFingerprint(cwd, range);
-  onProgress?.();
-  const branchName = getCurrentBranchName(cwd);
-  if (fingerprint === previousFingerprint) return Promise.resolve({range, fingerprint, branchName});
-
-  const buildOptions: BuildOptions = {cwd, range, width, onFileBuilt: onProgress};
-  return Promise.resolve({range, fingerprint, branchName, review: build.buildReviewModel(buildOptions)});
-}
-
-// build.ts's asynchronous refresh runs git and delta without blocking this
-// process and reports progress per file and per chunk of tool output.
-const refreshReview: RefreshReview = (build as unknown as {refreshReview?: RefreshReview}).refreshReview
-  ?? refreshReviewSync;
 
 function errorStderr(error: unknown) {
   const stderr = (error as {stderr?: unknown} | null)?.stderr;
