@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import {isColorDisabled} from '../git.js';
 
 // Every colour the app adds goes through this palette, both the raw SGR codes
 // drawn into the diff pane and the colour props handed to Ink, so NO_COLOR
@@ -9,10 +10,10 @@ export type ArrivalKind = 'new' | 'changed';
 
 type Env = Record<string, string | undefined>;
 
-// Delta prints plain lines with +/- markers kept under the same condition, so
+// git.ts runs delta in plain mode, +/- markers kept, under this same rule, so
 // the diff parser and the chrome agree on when colour is off.
 export function isPlainDiffMode(env: Env = process.env) {
-  return Boolean(env.NO_COLOR) || env.FORCE_COLOR === '0';
+  return isColorDisabled(env);
 }
 
 // `terminalLevel` is chalk's level, which Ink colours with. A level of 0 with

@@ -244,7 +244,8 @@ describe('wide characters are measured in terminal cells', () => {
 
   it('copies the block under the pointer below wide lines', async () => {
     const writes: string[] = [];
-    const instance = renderFixture(wideFixture(), {columns: 120, rows: 40}, writes);
+    const fixture = wideFixture();
+    const instance = renderFixture(fixture, {columns: 120, rows: 40}, writes);
     await flush();
 
     const body = cellPosition(instance.lastFrame(), ['twenty(true);'], 'twenty(true);');
@@ -253,7 +254,10 @@ describe('wide characters are measured in terminal cells', () => {
     await emitMousePressAt(copyDiff.column, copyDiff.row);
     await flush();
 
-    expect(writes.at(-1)).toBe(parseUnifiedDiffBlocks(raw20, 'src/jp.ts')[0]!.rawDiff);
+    // The block is sliced from the whole file diff, so it keeps the newline
+    // that ends its last line, the way the model builds it.
+    expect(writes.at(-1)).toBe(`${raw20}\n`);
+    expect(writes.at(-1)).toBe(fixture.review.files[0]!.blocks[1]!.rawDiff);
 
     instance.unmount();
   });
