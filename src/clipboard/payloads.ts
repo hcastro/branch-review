@@ -8,8 +8,10 @@ function formatMetrics(model: ReviewModel) {
   return `${model.metrics.filesChanged} files · +${formatNumber(model.metrics.additions)} -${formatNumber(model.metrics.deletions)}`;
 }
 
+// The patch goes inside the fence untrimmed, so a trailing blank context line
+// survives and the fenced text still applies.
 function fencedDiff(rawDiff: string) {
-  return ['```diff', rawDiff.trimEnd(), '```'].join('\n');
+  return `\`\`\`diff\n${rawDiff}${rawDiff.endsWith('\n') ? '' : '\n'}\`\`\``;
 }
 
 export function buildPathPayload(file: Pick<ReviewFile, 'path'>) {

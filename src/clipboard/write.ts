@@ -26,7 +26,12 @@ type ResolveClipboardOptions = FindExecutableOptions & {
 type WriteClipboardOptions = ResolveClipboardOptions & {
   command?: ClipboardCommand | null;
   spawnProcess?: (command: ClipboardCommand, text: string) => Promise<ClipboardWriteResult>;
+  timeoutMs?: number;
 };
+
+const CLIPBOARD_TIMEOUT_MS = 5000;
+// After a failing tool exits, how long to wait for the rest of its stderr.
+const STDERR_GRACE_MS = 200;
 
 export const MISSING_CLIPBOARD_MESSAGE = 'No clipboard tool found. Install xclip or wl-clipboard.';
 
@@ -161,42 +166,79 @@ export function resetClipboardCommandCache() {
   cachedCommand = undefined;
 }
 
-function spawnClipboardProcess(command: ClipboardCommand, text: string): Promise<ClipboardWriteResult> {
+// Resolves on 'exit' rather than 'close': xclip and similar tools fork a child
+// that keeps serving the selection and holds the inherited stderr pipe open,
+// so 'close' can come seconds later or never.
+function spawnClipboardProcess(
+  command: ClipboardCommand,
+  text: string,
+  timeoutMs = CLIPBOARD_TIMEOUT_MS,
+): Promise<ClipboardWriteResult> {
   return new Promise((resolve) => {
     const child = spawn(command.command, command.args, {
       stdio: ['pipe', 'ignore', 'pipe'],
     });
     const stderr: Buffer[] = [];
+    let settled = false;
+
+    const finish = (result: ClipboardWriteResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      // Drop our end of stderr so a forked child holding it can't keep this
+      // process alive.
+      child.stderr?.destroy();
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish({
+        ok: false,
+        message: `Clipboard write failed using ${command.displayName}.`,
+        hint: `clipboard tool timed out after ${Math.round(timeoutMs / 100) / 10}s`,
+      });
+    }, timeoutMs);
 
     child.stderr?.on('data', (chunk: Buffer) => {
       stderr.push(chunk);
     });
 
     child.stdin.on('error', () => {
-      // The child may exit before consuming stdin. The close/error handlers
+      // The child may exit before consuming stdin. The exit/error handlers
       // below produce the user-facing result.
     });
 
     child.on('error', (error) => {
-      resolve({
+      finish({
         ok: false,
         message: `Clipboard write failed using ${command.displayName}.`,
         hint: error.message,
       });
     });
 
-    child.on('close', (code) => {
+    child.on('exit', (code) => {
       if (code === 0) {
-        resolve({ok: true, command});
+        finish({ok: true, command});
         return;
       }
 
-      const hint = Buffer.concat(stderr).toString('utf8').trim();
-      resolve({
-        ok: false,
-        message: `Clipboard write failed using ${command.displayName}.`,
-        hint: hint || `Process exited with code ${code ?? 'unknown'}.`,
-      });
+      const report = () => {
+        const hint = Buffer.concat(stderr).toString('utf8').trim();
+        finish({
+          ok: false,
+          message: `Clipboard write failed using ${command.displayName}.`,
+          hint: hint || `Process exited with code ${code ?? 'unknown'}.`,
+        });
+      };
+
+      // stderr can still be in flight when 'exit' fires.
+      if (!child.stderr || child.stderr.readableEnded) {
+        report();
+        return;
+      }
+      child.stderr.once('end', report);
+      setTimeout(report, STDERR_GRACE_MS);
     });
 
     child.stdin.end(text);
@@ -212,5 +254,9 @@ export async function writeClipboard(text: string, options: WriteClipboardOption
     };
   }
 
-  return (options.spawnProcess ?? spawnClipboardProcess)(command, text);
+  if (options.spawnProcess) {
+    return options.spawnProcess(command, text);
+  }
+
+  return spawnClipboardProcess(command, text, options.timeoutMs);
 }
