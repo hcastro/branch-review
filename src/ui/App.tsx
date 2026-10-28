@@ -5,7 +5,7 @@ import {
   useMouse,
   useOnMouseHover,
 } from '@zenobius/ink-mouse';
-import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload, type TreeRow} from '../tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionId, formatTreePayload, type TreeRow} from '../tree.js';
 import {writeClipboard} from '../clipboard/write.js';
 import {
   fitBlockHeaderLabel,
@@ -27,6 +27,7 @@ import {
 import {graphemes, toDisplayText, truncateEnd, truncateStart, type Grapheme} from './text.js';
 import {palette, plainDiffMode} from './palette.js';
 import {DiffErrorBoundary} from './DiffErrorBoundary.js';
+import {blockSourceLines, mapDrawnToRaw} from './rawText.js';
 import type {FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
@@ -74,7 +75,9 @@ const ARRIVAL_ANIMATION_DURATION_MS = 2600;
 const ARRIVAL_ANIMATION_TICK_MS = 130;
 const MAX_ANIMATED_ENTRIES = 120;
 const COPY_SUCCESS_LABEL = '✓ Copied';
-const KEY_HINTS = '↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • t tree • q quit';
+// Footer key hints in the order they are kept when the row is short.
+const KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'j/k scroll', '[/] block', '⏎ fold', 'y d f c p b copy', 't tree'];
+const KEY_HINT_SEPARATOR = ' • ';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
 const TREE_EXPAND_LABEL = '›';
@@ -131,6 +134,9 @@ type DiffRow = SectionRow & {
   sectionIndex: number;
   headerLine: number | null;
   target?: BlockTarget;
+  // On the first row of a code line: the line's raw text from the hunk, which
+  // selection copies from.
+  source?: string;
 };
 type ActionSpan = {id: string; start: number; end: number};
 type ToastKind = 'success' | 'error' | 'info';
@@ -946,19 +952,11 @@ function selectedCodeColumns(lineIndex: number, content: CodeContent, selection:
   return to > from ? {from, to} : null;
 }
 
-// Graphemes that overlap the cell range [from, to), so a wide character that
-// is partly selected is copied whole.
-function sliceColumns(parts: Grapheme[], from: number, to: number) {
-  let column = 0;
-  let text = '';
-  for (const part of parts) {
-    if (column < to && column + part.width > from) {
-      text += part.text;
-    }
-    column += part.width;
-  }
-
-  return text;
+// Whether a grapheme at `column` overlaps the cell range [from, to); a wide
+// character that is partly selected counts whole, and a zero-width one counts
+// when its column is selected.
+function overlapsColumns(column: number, width: number, from: number, to: number) {
+  return column < to && column + Math.max(width, 1) > from;
 }
 
 function highlightSelectedCode(line: string, row: SectionRow | undefined, lineIndex: number, selection: CodeSelection | null) {
@@ -983,33 +981,87 @@ function highlightSelectedCode(line: string, row: SectionRow | undefined, lineIn
   return renderStyledCells(cells);
 }
 
+type SelectableRow = SectionRow & {source?: string};
+
 export function getSelectedCodeText(
   lines: string[],
-  rows: ReadonlyArray<SectionRow | undefined>,
+  rows: ReadonlyArray<SelectableRow | undefined>,
   selection: Pick<CodeSelection, 'anchor' | 'focus'>,
 ) {
   const {start, end} = normalizeCodeSelection(selection);
   const selectedLines: string[] = [];
-  let previousLineIndex = -1;
+  // Walk whole source lines: a wrapped line's continuation rows belong to the
+  // line on the row above them.
+  let first = start.lineIndex;
+  while (first > 0 && rows[first]?.continuation) first -= 1;
 
-  for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
-    const row = rows[lineIndex];
-    const content = getCodeContent(lines[lineIndex] ?? '', row);
-    if (!content) continue;
-
-    const range = selectedCodeColumns(lineIndex, content, selection);
-    const text = range ? sliceColumns(content.parts, range.from, range.to) : '';
-    // A wrapped continuation row is the same source line, so it joins the
-    // previous row without a newline.
-    if (row?.continuation && previousLineIndex === lineIndex - 1 && selectedLines.length > 0) {
-      selectedLines[selectedLines.length - 1] += text;
-    } else {
-      selectedLines.push(text);
-    }
-    previousLineIndex = lineIndex;
+  while (first <= end.lineIndex) {
+    let last = first;
+    while (last + 1 < lines.length && rows[last + 1]?.continuation) last += 1;
+    const text = selectedSourceLineText(lines, rows, first, last, selection);
+    if (text !== null) selectedLines.push(text);
+    first = last + 1;
   }
 
   return selectedLines.join('\n');
+}
+
+// The selected part of one source line drawn on rows [first, last], or null
+// when none of those rows holds code. With the line's raw text known, the
+// selected cells map back to raw characters and a fully selected line copies
+// the raw line; without it, the drawn text is copied.
+function selectedSourceLineText(
+  lines: string[],
+  rows: ReadonlyArray<SelectableRow | undefined>,
+  first: number,
+  last: number,
+  selection: Pick<CodeSelection, 'anchor' | 'focus'>,
+) {
+  const {start, end} = normalizeCodeSelection(selection);
+  let drawn = '';
+  let drawnSelected = '';
+  // UTF-16 ranges of `drawn` that are selected.
+  const selectedUnits: Array<[number, number]> = [];
+  let hasCode = false;
+  let whole = true;
+
+  for (let lineIndex = first; lineIndex <= last; lineIndex += 1) {
+    const content = getCodeContent(lines[lineIndex] ?? '', rows[lineIndex]);
+    if (!content) continue;
+    hasCode = true;
+
+    const inSelection = lineIndex >= start.lineIndex && lineIndex <= end.lineIndex;
+    const range = inSelection ? selectedCodeColumns(lineIndex, content, selection) : null;
+    if (!range || range.from > 0 || range.to < content.width) whole = false;
+
+    let column = 0;
+    for (const part of content.parts) {
+      if (range && overlapsColumns(column, part.width, range.from, range.to)) {
+        selectedUnits.push([drawn.length, drawn.length + part.text.length]);
+        drawnSelected += part.text;
+      }
+      drawn += part.text;
+      column += part.width;
+    }
+  }
+
+  if (!hasCode) return null;
+
+  const raw = rows[first]?.source;
+  const map = raw === undefined ? null : mapDrawnToRaw(raw, drawn);
+  if (raw === undefined || !map) return drawnSelected;
+  if (whole) return raw;
+
+  let from = raw.length;
+  let to = 0;
+  for (const [unitStart, unitEnd] of selectedUnits) {
+    for (let unit = unitStart; unit < unitEnd; unit += 1) {
+      from = Math.min(from, map[unit]![0]);
+      to = Math.max(to, map[unit]![1]);
+    }
+  }
+
+  return to > from ? raw.slice(from, to) : '';
 }
 
 function blankCell(style: string): StyledCell {
@@ -1235,6 +1287,20 @@ function stripAnsi(line: string) {
   return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, '');
 }
 
+// The first row of a block header's frame: the blank and border rows drawn
+// above the header row belong to the same block.
+function blockFrameStart(rows: ReadonlyArray<DiffRow>, headerLine: number) {
+  const header = rows[headerLine]!;
+  let start = headerLine;
+  while (start > 0) {
+    const previous = rows[start - 1];
+    if (previous?.kind !== 'frame' || previous.block !== header.block || previous.sectionIndex !== header.sectionIndex) break;
+    start -= 1;
+  }
+
+  return start;
+}
+
 // Names a block header for keyboard focus: its collapse key, or its row when
 // the header has no parsed block behind it.
 function blockFocusKey(rows: ReadonlyArray<DiffRow>, lineIndex: number) {
@@ -1395,7 +1461,35 @@ function resolveBlockTargets(rows: ReadonlyArray<SectionRow>, file: ReviewFile |
 type ViewSection = DiffSection & {
   rows: SectionRow[];
   blockTargets: Array<BlockTarget | undefined>;
+  // Parallel to `rows`: the raw text of the code line a row starts.
+  sources: Array<string | undefined>;
 };
+
+// The raw text of each code line, on the row that starts it. delta draws one
+// row per hunk body line, in order; a block whose row count does not match its
+// hunk gets no sources, and its selections copy the drawn text.
+function resolveRowSources(rows: ReadonlyArray<SectionRow>, blockTargets: ReadonlyArray<BlockTarget | undefined>) {
+  const sources: Array<string | undefined> = new Array(rows.length);
+  const codeRows = new Map<number, number[]>();
+  for (const [index, row] of rows.entries()) {
+    if (row.kind !== 'body' || row.continuation || row.codeColumn === undefined || row.block < 0) continue;
+    const blockRows = codeRows.get(row.block) ?? [];
+    blockRows.push(index);
+    codeRows.set(row.block, blockRows);
+  }
+
+  for (const [block, indexes] of codeRows) {
+    const target = blockTargets[block];
+    if (!target) continue;
+    const sourceLines = blockSourceLines(target.block);
+    if (sourceLines.length !== indexes.length) continue;
+    for (const [ordinal, index] of indexes.entries()) {
+      sources[index] = sourceLines[ordinal];
+    }
+  }
+
+  return sources;
+}
 
 function applyCollapsedBlocks(
   sections: DiffSection[],
@@ -1408,12 +1502,14 @@ function applyCollapsedBlocks(
   return sections.map((section) => {
     const allRows = section.rows ?? section.lines.map((): SectionRow => ({block: -1, kind: 'body', continuation: false}));
     const blockTargets = resolveBlockTargets(allRows, fileByPath.get(section.path));
+    const allSources = resolveRowSources(allRows, blockTargets);
     const isHidden = (row: SectionRow) => row.kind === 'body'
       && row.block >= 0
       && collapsedBlockIds.has(blockTargets[row.block]?.key ?? '');
     const collapsing = collapsedBlockIds.size > 0 && allRows.some(isHidden);
     const lines = collapsing ? section.lines.filter((_, index) => !isHidden(allRows[index]!)) : section.lines;
     const rows = collapsing ? allRows.filter((row) => !isHidden(row)) : allRows;
+    const sources = collapsing ? allSources.filter((_, index) => !isHidden(allRows[index]!)) : allSources;
     const startLine = cursor;
     const endLineExclusive = cursor + lines.length;
     cursor = endLineExclusive;
@@ -1423,6 +1519,7 @@ function applyCollapsedBlocks(
       lines,
       rows,
       blockTargets,
+      sources,
       startLine,
       endLineExclusive,
     };
@@ -1437,12 +1534,14 @@ function buildDiffRows(sections: ViewSection[]): DiffRow[] {
       if (row.kind === 'header') headerLines.set(row.block, section.startLine + index);
     }
 
-    for (const row of section.rows) {
+    for (const [index, row] of section.rows.entries()) {
+      const source = section.sources[index];
       rows.push({
         ...row,
         sectionIndex,
         headerLine: row.block >= 0 ? headerLines.get(row.block) ?? null : null,
         target: row.block >= 0 ? section.blockTargets[row.block] : undefined,
+        ...(source === undefined ? {} : {source}),
       });
     }
   }
@@ -1502,6 +1601,19 @@ function addFileErrorRows(sections: DiffSection[], review: ReviewModel | undefin
       lines: [`${ANSI_RED}✗ Could not load diff: ${toDisplayText(error)}${ANSI_RESET}`, ...section.lines],
     };
   });
+}
+
+// The footer's left text for a row of `width` cells: the status in full, then
+// as many whole key hints as fit, always starting with `q quit`. When the
+// status leaves no room for `q quit`, the status alone is shown.
+function footerHintText(status: string | undefined, width: number) {
+  const prefix = status ? `${status}${KEY_HINT_SEPARATOR}` : '';
+  for (let count = KEY_HINT_ITEMS.length; count > 0; count -= 1) {
+    const text = `${prefix}${KEY_HINT_ITEMS.slice(0, count).join(KEY_HINT_SEPARATOR)}`;
+    if (visibleWidth(text) <= width) return text;
+  }
+
+  return status ?? KEY_HINT_ITEMS[0]!;
 }
 
 type BarPart = {text: string; style: string};
@@ -1639,7 +1751,11 @@ function DiffPaneBody({
 
     const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
     const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-    rows.push(frameLine(arrivalLine, inner, borderAnsi));
+    const paneRow = frameLine(arrivalLine, inner, borderAnsi);
+    // With the focused block's header scrolled off the top, the top row's
+    // pane border turns heavy, so the block that block keys act on stays marked.
+    const marksFocus = index === 0 && focusedBlockLineIndex !== null && focusedBlockLineIndex < diffOffset;
+    rows.push(marksFocus ? paneRow.replace('│', FOCUS_BAR) : paneRow);
   }
   rows.push(frameBottomBorder(paneWidth, borderAnsi));
 
@@ -1777,8 +1893,8 @@ function AppContent({
   const activeSectionIndex = topSectionIndex;
   const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
-  const activeTreePath = useMemo(() => findTreeSelectionPath(rows, activeFilePath), [activeFilePath, rows]);
-  const activeRowIndex = rows.findIndex((row) => row.path === activeTreePath);
+  const activeTreeId = useMemo(() => findTreeSelectionId(rows, activeFilePath), [activeFilePath, rows]);
+  const activeRowIndex = rows.findIndex((row) => row.id === activeTreeId);
   const activeFile = useMemo(
     () => review?.files.find((file) => file.path === activeFilePath),
     [activeFilePath, review],
@@ -1913,7 +2029,6 @@ function AppContent({
 
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const footerHints = watchStatus ? `${toDisplayText(watchStatus)} • ${KEY_HINTS}` : KEY_HINTS;
 
   useEffect(() => {
     const snapshot = viewSnapshotRef.current;
@@ -1990,15 +2105,7 @@ function AppContent({
       : [...headerLineIndexes].reverse().find((line) => line < current);
     if (target === undefined) return;
 
-    let start = target;
-    const header = allDiffRows[target]!;
-    while (start > 0) {
-      const previous = allDiffRows[start - 1];
-      if (previous?.kind !== 'frame' || previous.block !== header.block || previous.sectionIndex !== header.sectionIndex) break;
-      start -= 1;
-    }
-
-    const offset = clamp(start, 0, scrollCeiling);
+    const offset = clamp(blockFrameStart(allDiffRows, target), 0, scrollCeiling);
     setDiffOffset(offset);
     setBlockFocus({key: blockFocusKey(allDiffRows, target), offset});
   }, [allDiffRows, diffOffset, focusedBlockLineIndex, headerLineIndexes, scrollCeiling]);
@@ -2028,6 +2135,36 @@ function AppContent({
       return next;
     });
   }, []);
+
+  // Enter and Space: collapses or expands the focused block. A header that has
+  // scrolled off the top is brought back first, and the block stays focused
+  // where the view lands, so the next Enter acts on the same block.
+  const toggleFocusedBlock = useCallback(() => {
+    if (focusedBlockLineIndex === null) return;
+    const header = allDiffRows[focusedBlockLineIndex];
+    const target = header?.target;
+    const section = header ? sections[header.sectionIndex] : undefined;
+    if (!header || !target || !section) return;
+
+    let offset = focusedBlockLineIndex < diffOffset ? blockFrameStart(allDiffRows, focusedBlockLineIndex) : diffOffset;
+    if (!collapsedBlockIds.has(target.key)) {
+      // Collapsing removes the block's body rows, which can lower the scroll
+      // ceiling; land where the ceiling will hold the view.
+      const hidden = allDiffRows.filter((row) => row.sectionIndex === header.sectionIndex && row.block === header.block && row.kind === 'body').length;
+      const lastStart = (sections.at(-1)?.startLine ?? 0) - (header.sectionIndex < sections.length - 1 ? hidden : 0);
+      offset = clamp(offset, 0, Math.max(allDiffLines.length - hidden - visibleDiffRows, 0, lastStart));
+    }
+
+    // The rebuilt sections restore the view from this snapshot.
+    viewSnapshotRef.current = {
+      path: section.path,
+      sectionIndex: header.sectionIndex,
+      relativeOffset: Math.max(0, offset - section.startLine),
+    };
+    setDiffOffset(offset);
+    setBlockFocus({key: blockFocusKey(allDiffRows, focusedBlockLineIndex), offset});
+    toggleBlock(target.key);
+  }, [allDiffLines.length, allDiffRows, collapsedBlockIds, diffOffset, focusedBlockLineIndex, sections, toggleBlock, visibleDiffRows]);
 
   const getTreeRowHit = useCallback((x: number, y: number) => getTreeRowHitFromPanel(
     getBounds(treePanelRef),
@@ -2235,19 +2372,28 @@ function AppContent({
     }
   }, [allTreeRows, copyWriter, files.length, repoRoot, showToast]);
 
+  // The rendered lines that mouse selection reads, set on every render. React
+  // re-subscribes the mouse handlers in an effect after each commit; reading
+  // through this ref, a handler that runs before that still sees the lines on
+  // screen, so a selection always indexes the current lines and the layout
+  // effect below is the one place that moves or drops it when they change.
+  const selectionViewRef = useRef({lines: allDiffLines, rows: allDiffRows, offset: diffOffset});
+  selectionViewRef.current = {lines: allDiffLines, rows: allDiffRows, offset: diffOffset};
+
   const getCodeSelectionPoint = useCallback((mousePosition: {x: number; y: number}) => {
+    const {lines, rows, offset} = selectionViewRef.current;
     const diffBounds = getBounds(diffPanelRef);
     if (!isInside(diffBounds, mousePosition.x, mousePosition.y) || !diffBounds) return null;
 
     const relativeY = mousePosition.y - diffBounds.top;
     if (relativeY < 3) return null;
 
-    const lineIndex = diffOffset + relativeY - 3;
-    if (lineIndex < 0 || lineIndex >= allDiffLines.length) return null;
+    const lineIndex = offset + relativeY - 3;
+    if (lineIndex < 0 || lineIndex >= lines.length) return null;
 
     const innerColumn = mousePosition.x - diffBounds.left - 2;
-    const row = allDiffRows[lineIndex];
-    const code = getCodeContent(allDiffLines[lineIndex] ?? '', row);
+    const row = rows[lineIndex];
+    const code = getCodeContent(lines[lineIndex] ?? '', row);
     // A press on a +/- marker starts the selection at the code after it.
     if (!code || innerColumn < code.start - (row?.markerWidth ?? 0)) return null;
 
@@ -2255,7 +2401,7 @@ function AppContent({
       lineIndex,
       column: clamp(innerColumn - code.start, 0, code.width),
     };
-  }, [allDiffLines, allDiffRows, diffOffset]);
+  }, []);
 
   const cancelCodeSelection = useCallback((notify: boolean) => {
     setCodeSelection(null);
@@ -2285,17 +2431,13 @@ function AppContent({
   }, [allDiffLines, cancelCodeSelection, sections, setCodeSelection]);
 
   const copyCodeSelection = useCallback(async (selection: CodeSelection) => {
-    if (selection.lines !== allDiffLines) {
-      cancelCodeSelection(true);
-      return;
-    }
-
     if (compareSelectionPoints(selection.anchor, selection.focus) === 0) {
       setCodeSelection(null);
       return;
     }
 
-    const text = getSelectedCodeText(allDiffLines, allDiffRows, selection);
+    const {lines, rows} = selectionViewRef.current;
+    const text = getSelectedCodeText(lines, rows, selection);
     if (!text) {
       setCodeSelection(null);
       return;
@@ -2312,7 +2454,7 @@ function AppContent({
     } catch (error) {
       showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
     }
-  }, [allDiffLines, allDiffRows, cancelCodeSelection, copyWriter, setCodeSelection, showToast]);
+  }, [copyWriter, setCodeSelection, showToast]);
 
   // Spans of a header row laid out with its actions shown; hovering a header
   // shows them, so hover hit-tests against this layout.
@@ -2391,9 +2533,10 @@ function AppContent({
       } else if (nextTreeToggleHovered) {
         setHoveredTreeRow((current) => (current === null ? current : null));
         nextInfoTip = treeCollapsed ? 'expand file tree' : 'collapse file tree';
-      } else if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds) {
+      } else if (!isInside(treeBounds, mousePosition.x, mousePosition.y) || !treeBounds || treeCollapsed) {
+        // The collapsed rail draws no rows, so nothing on it has a row hint.
         setHoveredTreeRow((current) => (current === null ? current : null));
-      } else if (!treeCollapsed && isTreeHeaderCopyTarget(
+      } else if (isTreeHeaderCopyTarget(
         treeBounds,
         mousePosition.x,
         mousePosition.y,
@@ -2523,10 +2666,6 @@ function AppContent({
 
       const currentSelection = codeSelectionRef.current;
       if (!currentSelection) return;
-      if (currentSelection.lines !== allDiffLines) {
-        cancelCodeSelection(true);
-        return;
-      }
 
       const mousePosition = normalizeMousePosition(position);
       const point = getCodeSelectionPoint(mousePosition);
@@ -2549,8 +2688,6 @@ function AppContent({
     mouse.events.on('drag', handleDrag);
     return () => mouse.events.off('drag', handleDrag);
   }, [
-    allDiffLines,
-    cancelCodeSelection,
     copyCodeSelection,
     getCodeSelectionPoint,
     mouse,
@@ -2616,7 +2753,7 @@ function AppContent({
       const selectionPoint = getCodeSelectionPoint(mousePosition);
       if (selectionPoint) {
         setHoveredAction(null);
-        setCodeSelection({anchor: selectionPoint, focus: selectionPoint, active: true, lines: allDiffLines});
+        setCodeSelection({anchor: selectionPoint, focus: selectionPoint, active: true, lines: selectionViewRef.current.lines});
         return;
       }
 
@@ -2696,7 +2833,6 @@ function AppContent({
     return () => mouse.events.off('click', handleClick);
   }, [
     activeFile,
-    allDiffLines,
     allDiffRows,
     blockHeaderSpans,
     clearTreeTooltip,
@@ -2723,6 +2859,16 @@ function AppContent({
   ]);
 
   useInput((input, key) => {
+    // Ink reports Esc with `meta` set, so quitting is checked before the
+    // modifier guard below. Alt-q and Ctrl-q are not quit keys.
+    if (key.escape || (input === 'q' && !key.ctrl && !key.meta)) {
+      exit();
+      return;
+    }
+
+    // The too-small view shows no panes, so no other key acts on them.
+    if (tooSmall) return;
+
     if (key.downArrow) {
       jumpToSection(topSectionIndex + 1);
       return;
@@ -2767,7 +2913,7 @@ function AppContent({
 
     const focusedTarget = focusedBlockLineIndex === null ? undefined : allDiffRows[focusedBlockLineIndex]?.target;
     if (key.return || input === ' ') {
-      if (focusedTarget) toggleBlock(focusedTarget.key);
+      toggleFocusedBlock();
       return;
     }
 
@@ -2793,11 +2939,6 @@ function AppContent({
 
     if (input === 't') {
       toggleTree();
-      return;
-    }
-
-    if (input === 'q' || key.escape) {
-      exit();
     }
   });
 
@@ -2822,7 +2963,7 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHints, style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4)), style: ANSI_GRAY};
   const footerLine = composeBar(
     [footerStatus],
     {text: `${displayBase}...${displayBranch}`, style: ANSI_GRAY},
@@ -2883,9 +3024,9 @@ function AppContent({
             )
             : visibleRows.map((row, index) => (
               <TreeFileRow
-                key={row.path}
+                key={row.id}
                 row={row}
-                selected={row.path === activeTreePath}
+                selected={row.id === activeTreeId}
                 hovered={hoveredTreeRow !== null && hoveredTreeRow === treeOffset + index}
                 copyHovered={
                   hoveredAction?.kind === 'tree-copy'

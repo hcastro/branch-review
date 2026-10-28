@@ -132,6 +132,40 @@ describe('NO_COLOR', () => {
     instance.unmount();
   });
 
+  it('copies the raw bytes of CRLF and tab lines from real plain delta output', async () => {
+    const {renderDiffForDisplay} = await import('../src/git.js');
+    const lines = ['crlf line\r', '\tindented();'];
+    const rawDiff = ['@@ -0,0 +1,2 @@', ...lines.map((line) => `+${line}`)].join('\n');
+    const patch = `diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n${rawDiff}\n`;
+    // delta reads the colour rule when it runs; render it the way the app was set up.
+    const previous = process.env.NO_COLOR;
+    process.env.NO_COLOR = '1';
+    let rendered: string[];
+    try {
+      rendered = renderDiffForDisplay(process.cwd(), patch, 120).split('\n').filter(Boolean);
+    } finally {
+      if (previous === undefined) delete process.env.NO_COLOR;
+      else process.env.NO_COLOR = previous;
+    }
+    expect(rendered.join('\n')).toContain('│+crlf line^M');
+
+    const writes: string[] = [];
+    const instance = renderFixture(buildFixture([{path: 'src/x.ts', rawDiff, rendered}]), {columns: 150, rows: 30}, writes);
+    await flush();
+
+    const frame = instance.lastFrame();
+    const from = cellPosition(frame, ['crlf line^M'], 'crlf line^M');
+    const to = cellPosition(frame, ['indented();'], 'indented();', 'indented();'.length - 1);
+    await emitMousePressAt(from.column, from.row);
+    await emitMouseDragAt(to.column, to.row);
+    await emitMouseDragAt(to.column, to.row, true);
+    await flush(2);
+
+    expect(writes).toEqual(['crlf line\r\n\tindented();']);
+
+    instance.unmount();
+  });
+
   it('parses plain block headers so block copy still works', async () => {
     const writes: string[] = [];
     const fixture = plainFixture();

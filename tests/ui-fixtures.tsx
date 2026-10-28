@@ -179,8 +179,11 @@ function fakeStdout(columns: number, rows: number): FakeTerminal {
   return {stdout, lastFrame, writes: chunks};
 }
 
+// A readable stdin: Ink reads keys with read() after a 'readable' event, the
+// way it reads a real terminal.
 function fakeStdin() {
-  return Object.assign(new EventEmitter(), {
+  let pending: string | null = null;
+  const stdin = Object.assign(new EventEmitter(), {
     isTTY: true,
     setRawMode: () => undefined,
     setEncoding: () => undefined,
@@ -188,19 +191,29 @@ function fakeStdin() {
     unref: () => undefined,
     resume: () => undefined,
     pause: () => undefined,
-    read: () => null,
+    read: () => {
+      const chunk = pending;
+      pending = null;
+      return chunk;
+    },
+    write: (data: string) => {
+      pending = data;
+      stdin.emit('readable');
+    },
   });
+  return stdin;
 }
 
 // Renders on a fake terminal whose size the App reads from stdout itself, the
 // way it runs in a real terminal, so size changes arrive as 'resize' events.
 export function renderOnTerminal(fixture: AppFixtureProps, columns: number, rows: number, writes: string[] = []) {
   const terminal = fakeStdout(columns, rows);
+  const stdin = fakeStdin();
   const instance = inkRender(appElement(fixture, undefined, recordingWriter(writes)), {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     stdout: terminal.stdout as any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    stdin: fakeStdin() as any,
+    stdin: stdin as any,
     debug: true,
     patchConsole: false,
     exitOnCtrlC: false,
@@ -209,6 +222,7 @@ export function renderOnTerminal(fixture: AppFixtureProps, columns: number, rows
   return {
     ...instance,
     stdout: terminal.stdout,
+    stdin,
     lastFrame: terminal.lastFrame,
     resize(nextColumns: number, nextRows: number) {
       terminal.stdout.columns = nextColumns;

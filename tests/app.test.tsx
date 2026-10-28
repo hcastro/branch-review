@@ -496,7 +496,7 @@ describe('App', () => {
     expect(frame).toContain('0 files • +0 • -0 • 0 changed');
     expect(frame).toContain('No changes to review');
     expect(frame).toContain('Watching for repo updates...');
-    expect(frame).toContain('updated now • ↑/↓ jump file');
+    expect(frame).toContain('updated now • q quit • ↑/↓ jump file');
 
     instance.unmount();
   });
