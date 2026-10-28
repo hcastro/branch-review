@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest';
+import {escapeHiddenCharactersInLines} from '../src/controlChars.js';
 import {renderDiffForDisplay} from '../src/git.js';
 import {
   buildFixture,
@@ -24,20 +25,21 @@ const RAW_LINES = [
   'plain',
 ];
 
-// How delta draws a raw line: tabs as eight spaces, control characters as the
-// visible markers the CLI feeds it.
+// How delta draws a raw line: hidden characters as the visible markers the
+// CLI feeds it (^M, ␛, <U+200B>), then tabs as eight spaces.
 function drawn(line: string) {
-  return line
-    .replaceAll('\t', ' '.repeat(8))
-    .replaceAll('\r', '^M')
-    .replaceAll('\u001B', '␛');
+  return escapeHiddenCharactersInLines(line).replaceAll('\t', ' '.repeat(8));
 }
 
+// A hunk shaped the way git writes it: a trailing newline, and a
+// `\ No newline at end of file` line after the last line, which delta draws
+// as a row of its own with no gutter.
 function bytesFixture(lines = RAW_LINES): FixtureFile {
+  const noNewline = '\\ No newline at end of file';
   return {
     path: 'src/x.ts',
-    rawDiff: [`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join('\n'),
-    rendered: ['• src/x.ts:1: ', ...lines.map((line, index) => `${gutter(index + 1)}${drawn(line)}`)],
+    rawDiff: `${[`@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`), noNewline].join('\n')}\n`,
+    rendered: ['• src/x.ts:1: ', ...lines.map((line, index) => `${gutter(index + 1)}${drawn(line)}`), noNewline],
   };
 }
 
@@ -151,51 +153,57 @@ describe('drag-select copies exact bytes', () => {
     instance.unmount();
   });
 
-  it('copies a fully selected line whole, a trailing zero-width character included', async () => {
+  it('copies a trailing zero-width character drawn as its marker as the one character', async () => {
     const writes: string[] = [];
-    // drawn() leaves U+200B as it is, so it takes no cell at the end of the row.
     const instance = renderFixture(buildFixture([bytesFixture(['last word\u200B', 'next'])]), {columns: 150, rows: 30}, writes);
     await flush();
 
-    const from = cellPosition(instance.lastFrame(), ['last word'], 'last word');
-    await dragCopy(instance, from, {row: from.row, column: from.column + 'last word'.length - 1});
-
+    // The whole row, past the end of the marker into the empty cells after it.
+    const from = cellPosition(instance.lastFrame(), ['last word<U+200B>'], 'last word');
+    const marker = cellPosition(instance.lastFrame(), ['last word<U+200B>'], '<U+200B>');
+    await dragCopy(instance, from, {row: from.row, column: marker.column + '<U+200B>'.length + 4});
     expect(writes).toEqual(['last word\u200B']);
+
+    // Part of the marker alone.
+    await dragCopy(instance, {row: marker.row, column: marker.column + 1}, {row: marker.row, column: marker.column + 3});
+    expect(writes.at(-1)).toBe('\u200B');
 
     instance.unmount();
   });
 
-  it('maps a character delta drew as itself, even one the app would mark', async () => {
+  it('maps a bidi control drawn as its marker, then a tab, back to the raw line', async () => {
     const writes: string[] = [];
-    // U+202E (a bidi control the app marks on screen) drawn as itself, then
-    // a tab: the tab only lines up if the control was matched as drawn.
+    // The tab only lines up if the marker was matched as one character.
     const instance = renderFixture(buildFixture([bytesFixture(['a\u202Eb\tc', 'next'])]), {columns: 150, rows: 30}, writes);
     await flush();
 
-    const from = cellPosition(instance.lastFrame(), ['        c'], 'a');
-    const to = cellPosition(instance.lastFrame(), ['        c'], '        c', 8);
+    const from = cellPosition(instance.lastFrame(), ['a<U+202E>b        c'], 'a<U+202E>');
+    const to = cellPosition(instance.lastFrame(), ['a<U+202E>b        c'], '        c', 8);
     await dragCopy(instance, from, to);
-
     expect(writes).toEqual(['a\u202Eb\tc']);
+
+    await dragCopy(instance, {row: from.row, column: from.column + 1}, {row: from.row, column: from.column + 2});
+    expect(writes.at(-1)).toBe('\u202E');
 
     instance.unmount();
   });
 
   it('copies the drawn text when the drawn rows do not match the hunk', async () => {
     const writes: string[] = [];
-    // One raw line, two drawn rows: no row gets a raw line.
+    // One raw line, two drawn rows: no row gets a raw line, even the first,
+    // whose drawn text would line up with it.
     const mismatched: FixtureFile = {
       path: 'src/x.ts',
-      rawDiff: '@@ -0,0 +1,1 @@\n+only\tline',
-      rendered: ['• src/x.ts:1: ', `${gutter(1)}first row`, `${gutter(2)}second row`],
+      rawDiff: '@@ -0,0 +1,1 @@\n+first\trow\n',
+      rendered: ['• src/x.ts:1: ', `${gutter(1)}first        row`, `${gutter(2)}second row`],
     };
     const instance = renderFixture(buildFixture([mismatched]), {columns: 150, rows: 30}, writes);
     await flush();
 
-    const from = cellPosition(instance.lastFrame(), ['first row'], 'first row');
-    await dragCopy(instance, from, {row: from.row, column: from.column + 'first row'.length - 1});
+    const from = cellPosition(instance.lastFrame(), ['first        row'], 'first');
+    await dragCopy(instance, from, {row: from.row, column: from.column + 'first        row'.length - 1});
 
-    expect(writes).toEqual(['first row']);
+    expect(writes).toEqual(['first        row']);
 
     instance.unmount();
   });
@@ -217,6 +225,26 @@ describe('drag-select over real delta output', () => {
     await dragCopy(instance, from, to);
 
     expect(writes).toEqual(['crlf line\r\n\tindented();\nplain']);
+
+    instance.unmount();
+  });
+
+  it('copies CR, tab and no-newline lines as their raw bytes', async () => {
+    // A removed last line and a new last line, each without a final newline.
+    const rawDiff = '@@ -1 +1,3 @@\n-old\n\\ No newline at end of file\n+a\r\n+b\r\n+c\tx\r\n\\ No newline at end of file\n';
+    const patch = `diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n${rawDiff}`;
+    const rendered = renderDiffForDisplay(process.cwd(), patch, 120).split('\n').filter(Boolean);
+    expect(rendered.filter((line) => line.includes('No newline at end of file'))).toHaveLength(2);
+    const writes: string[] = [];
+    const instance = renderFixture(buildFixture([{path: 'src/x.ts', rawDiff, rendered}]), {columns: 150, rows: 30}, writes);
+    await flush();
+
+    const frame = instance.lastFrame();
+    const from = cellPosition(frame, ['│a^M'], 'a^M');
+    const to = cellPosition(frame, ['x^M'], 'x^M', 'x^M'.length - 1);
+    await dragCopy(instance, from, to);
+
+    expect(writes).toEqual(['a\r\nb\r\nc\tx\r']);
 
     instance.unmount();
   });

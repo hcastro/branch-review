@@ -1,3 +1,4 @@
+import stringWidth from 'string-width';
 import {describe, expect, it} from 'vitest';
 import {buildBlockPromptPayload} from '../src/clipboard/payloads.js';
 import {
@@ -388,13 +389,31 @@ describe('footer key hint', () => {
           expect(text.startsWith(`${status} • q quit`)).toBe(true);
           expectWholeHint(text.slice(status.length + ' • '.length));
         } else {
-          // No room for both: the status keeps its reason.
-          expect(text).toBe(status);
+          // No room for both: the status is cut and q quit stays.
+          expect(text.endsWith('… • q quit')).toBe(true);
+          expect(status.startsWith(text.slice(0, -'… • q quit'.length))).toBe(true);
         }
 
         instance.unmount();
       });
     }
+
+    it(`cuts a long status and keeps q quit at ${columns} columns`, async () => {
+      const status = `watch paused: fatal: ambiguous argument 'origin/${'very-long-branch-name/'.repeat(7)}x': unknown revision or path not in the working tree.`;
+      expect(status.length).toBeGreaterThan(190);
+      const instance = renderOnTerminal({...keyboardFixture(), watchStatus: status}, columns, 30);
+      await flush();
+
+      const footer = frameLines(instance.lastFrame()).at(-2) ?? '';
+      // One row, its border intact, the status cut before q quit.
+      expect(stringWidth(footer)).toBe(columns);
+      expect(footer).toMatch(/… • q quit *│$/);
+      const text = footerText(instance.lastFrame());
+      expect(status.startsWith(text.slice(0, -'… • q quit'.length))).toBe(true);
+      expect(text.length).toBeGreaterThan(columns / 2);
+
+      instance.unmount();
+    });
   }
 });
 

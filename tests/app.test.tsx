@@ -899,10 +899,15 @@ describe('App', () => {
     await flush();
 
     const before = getTreeRightBorderPosition(instance.lastFrame() ?? '');
+    const borderRow = () => (instance.lastFrame() ?? '').split('\n')[before.row] ?? '';
+    // The tree's right border, then the diff pane's left border.
+    expect(borderRow()).not.toContain('Copy tree │\u001B[36m│');
     await emitMouseMoveAt(before.column + 1, before.row);
     await flush();
 
-    expect(instance.lastFrame() ?? '').toContain('\u001B[36m');
+    // One cell right of the tree border is the diff pane: its border turns
+    // cyan and the tree border stays plain, with no resize highlight.
+    expect(borderRow()).toContain('Copy tree │\u001B[36m│');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('┃');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('drag ↔ resize file tree');
 

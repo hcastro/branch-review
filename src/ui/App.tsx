@@ -1029,6 +1029,29 @@ export function getSelectedCodeText(
   return selectedLines.join('\n');
 }
 
+// Why a selection can't be copied: the diff error of the first selected file
+// whose diff text failed to load or is not valid UTF-8.
+function selectionCopyError(
+  rows: ReadonlyArray<DiffRow | undefined>,
+  sections: ReadonlyArray<Pick<DiffSection, 'path'>>,
+  review: ReviewModel | undefined,
+  selection: Pick<CodeSelection, 'anchor' | 'focus'>,
+) {
+  const {start, end} = normalizeCodeSelection(selection);
+  const fileByPath = new Map(review?.files.map((file) => [file.path, file]) ?? []);
+  let previousSection = -1;
+  for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
+    const sectionIndex = rows[lineIndex]?.sectionIndex;
+    if (sectionIndex === undefined || sectionIndex === previousSection) continue;
+    previousSection = sectionIndex;
+    const path = sections[sectionIndex]?.path;
+    const reason = path === undefined ? undefined : fileByPath.get(path)?.rawDiffError;
+    if (reason !== undefined) return reason;
+  }
+
+  return undefined;
+}
+
 // The selected part of one source line drawn on rows [first, last], or null
 // when none of those rows holds code. With the line's raw text known, the
 // selected cells map back to raw characters and a fully selected line copies
@@ -1629,9 +1652,9 @@ function addFileErrorRows(sections: DiffSection[], review: ReviewModel | undefin
   });
 }
 
-// The footer's left text for a row of `width` cells: the status in full, then
-// as many whole key hints as fit, always starting with `q quit`. When the
-// status leaves no room for `q quit`, the status alone is shown.
+// The footer's left text for a row of `width` cells: the status, then as many
+// whole key hints as fit, always starting with `q quit`. A status too long to
+// leave room for `q quit` is cut to fit before it.
 function footerHintText(status: string | undefined, width: number) {
   const prefix = status ? `${status}${KEY_HINT_SEPARATOR}` : '';
   for (let count = KEY_HINT_ITEMS.length; count > 0; count -= 1) {
@@ -1639,7 +1662,8 @@ function footerHintText(status: string | undefined, width: number) {
     if (visibleWidth(text) <= width) return text;
   }
 
-  return status ?? KEY_HINT_ITEMS[0]!;
+  const quit = `${status ? KEY_HINT_SEPARATOR : ''}${KEY_HINT_ITEMS[0]!}`;
+  return `${truncateEnd(status ?? '', Math.max(0, width - visibleWidth(quit)))}${quit}`;
 }
 
 type BarPart = {text: string; style: string};
@@ -1878,8 +1902,10 @@ function AppContent({
   const diffPanelRef = useRef<DOMElement>(null);
   const [diffOffset, setDiffOffset] = useState(0);
   // Set by [ and ]: the block they moved to stays focused while the view
-  // stays where they put it, even when the ceiling kept its header off the top.
-  const [blockFocus, setBlockFocus] = useState<{key: string; offset: number} | null>(null);
+  // stays where they put it, even when the ceiling kept its header off the top,
+  // and while its header row is still at `line`. A refresh that moves the
+  // header hands focus back to the block at the top of the viewport.
+  const [blockFocus, setBlockFocus] = useState<{key: string; offset: number; line: number} | null>(null);
   const [treeOffset, setTreeOffset] = useState(0);
   const [treeHovered, setTreeHovered] = useState(false);
   const [diffHovered, setDiffHovered] = useState(false);
@@ -1938,13 +1964,17 @@ function AppContent({
     [allDiffRows],
   );
   const focusedBlockLineIndex = useMemo(() => {
-    if (blockFocus && blockFocus.offset === diffOffset) {
-      const index = headerLineIndexes.find((line) => blockFocusKey(allDiffRows, line) === blockFocus.key);
-      if (index !== undefined) return index;
+    if (
+      blockFocus
+      && blockFocus.offset === diffOffset
+      && allDiffRows[blockFocus.line]?.kind === 'header'
+      && blockFocusKey(allDiffRows, blockFocus.line) === blockFocus.key
+    ) {
+      return blockFocus.line;
     }
 
     return findFocusedBlockLineIndex(allDiffRows, activeSection, diffOffset);
-  }, [activeSection, allDiffRows, blockFocus, diffOffset, headerLineIndexes]);
+  }, [activeSection, allDiffRows, blockFocus, diffOffset]);
   const focusedBlock = focusedBlockLineIndex === null
     ? activeFile?.blocks[0]
     : allDiffRows[focusedBlockLineIndex]?.target?.block;
@@ -2143,7 +2173,7 @@ function AppContent({
 
     const offset = clamp(blockFrameStart(allDiffRows, target), 0, scrollCeiling);
     setDiffOffset(offset);
-    setBlockFocus({key: blockFocusKey(allDiffRows, target), offset});
+    setBlockFocus({key: blockFocusKey(allDiffRows, target), offset, line: target});
   }, [allDiffRows, diffOffset, focusedBlockLineIndex, headerLineIndexes, scrollCeiling]);
 
   const toggleTreeDirectory = useCallback((directoryPath: string) => {
@@ -2198,7 +2228,7 @@ function AppContent({
       relativeOffset: Math.max(0, offset - section.startLine),
     };
     setDiffOffset(offset);
-    setBlockFocus({key: blockFocusKey(allDiffRows, focusedBlockLineIndex), offset});
+    setBlockFocus({key: blockFocusKey(allDiffRows, focusedBlockLineIndex), offset, line: focusedBlockLineIndex});
     toggleBlock(target.key);
   }, [allDiffLines.length, allDiffRows, collapsedBlockIds, diffOffset, focusedBlockLineIndex, sections, toggleBlock, visibleDiffRows]);
 
@@ -2413,8 +2443,8 @@ function AppContent({
   // through this ref, a handler that runs before that still sees the lines on
   // screen, so a selection always indexes the current lines and the layout
   // effect below is the one place that moves or drops it when they change.
-  const selectionViewRef = useRef({lines: allDiffLines, rows: allDiffRows, offset: diffOffset});
-  selectionViewRef.current = {lines: allDiffLines, rows: allDiffRows, offset: diffOffset};
+  const selectionViewRef = useRef({lines: allDiffLines, rows: allDiffRows, offset: diffOffset, sections, review});
+  selectionViewRef.current = {lines: allDiffLines, rows: allDiffRows, offset: diffOffset, sections, review};
 
   const getCodeSelectionPoint = useCallback((mousePosition: {x: number; y: number}) => {
     const {lines, rows, offset} = selectionViewRef.current;
@@ -2472,10 +2502,18 @@ function AppContent({
       return;
     }
 
-    const {lines, rows} = selectionViewRef.current;
+    const {lines, rows, sections: viewSections, review: viewReview} = selectionViewRef.current;
     const text = getSelectedCodeText(lines, rows, selection);
     if (!text) {
       setCodeSelection(null);
+      return;
+    }
+
+    // The drawn text of a file whose diff is not exact (not UTF-8, or failed
+    // to load) is not its bytes; copy nothing, as the keyboard copies do.
+    const reason = selectionCopyError(rows, viewSections, viewReview, selection);
+    if (reason !== undefined) {
+      showToast('Copy action unavailable.', reason, 'error');
       return;
     }
 
