@@ -1,13 +1,13 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {getReviewFingerprint} from '../src/git.js';
-import {buildReviewModel} from '../src/review/build.js';
 import {prepareStartup} from '../src/startup.js';
 import {TERMINAL_RESTORE_SEQUENCE, createTerminalSession, runInkApp} from '../src/terminalSession.js';
-import {cleanupTempDirs, git, initRepo, makeTempDir, pathWithOnly, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, git, initRepo, makeTempDir, pathWithOnly, withEnvAsync, writeExecutable, writeFiles} from './core-helpers.js';
 
 // Each test builds real repos and runs git and delta many times.
 vi.setConfig({testTimeout: 30_000});
@@ -28,12 +28,12 @@ function runCli(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.en
 }
 
 describe('startup', () => {
-  it('reviews the whole repo when started from a subdirectory', () => {
+  it('reviews the whole repo when started from a subdirectory', async () => {
     const root = initRepo({'pkg/tracked.txt': 'one\n', 'top.txt': 'top\n'});
     git(root, 'checkout', '-q', '-b', 'feature');
     writeFiles(root, {'pkg/tracked.txt': 'one\ntwo\n', 'pkg/new.txt': 'new\n', 'outside.txt': 'outside\n'});
 
-    const startup = prepareStartup({
+    const startup = await prepareStartup({
       cwd: path.join(root, 'pkg'),
       options: {requestedBranch: 'HEAD', requestedBase: 'main', watch: false, watchPoll: false, animations: false},
       width: 100,
@@ -44,30 +44,36 @@ describe('startup', () => {
     expect(startup.review.files.find((file) => file.path === 'pkg/tracked.txt')?.blocks[0]?.addedCode).toBe('two');
   });
 
-  it('takes the fingerprint before the build so a write during the build is picked up', () => {
+  it('takes the fingerprint before the build so a write during the build is picked up', async () => {
     const root = initRepo({'a.txt': 'one\n'});
     writeFiles(root, {'a.txt': 'one\ntwo\n'});
+    // delta runs only during the build, after the fingerprint: this one
+    // writes to the reviewed file, then renders as the real delta.
+    const bin = makeTempDir('branch-review-writing-delta-');
+    const realDelta = spawnSync('/usr/bin/which', ['delta'], {encoding: 'utf8'}).stdout.trim();
+    writeExecutable(path.join(bin, 'delta'), [
+      '#!/bin/sh',
+      `printf 'one\\ntwo\\nthree\\n' > '${path.join(root, 'a.txt')}'`,
+      `exec '${realDelta}' "$@"`,
+      '',
+    ].join('\n'));
 
-    const startup = prepareStartup({
+    const startup = await withEnvAsync({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => prepareStartup({
       cwd: root,
       options: {requestedBranch: 'HEAD', requestedBase: 'main', watch: true, watchPoll: false, animations: false},
       width: 100,
-      buildReview: (options) => {
-        const review = buildReviewModel(options);
-        writeFiles(root, {'a.txt': 'one\ntwo\nthree\n'});
-        return review;
-      },
-    });
+    }));
 
+    expect(fs.readFileSync(path.join(root, 'a.txt'), 'utf8')).toBe('one\ntwo\nthree\n');
     expect(startup.initialFingerprint).toBeDefined();
     expect(startup.initialFingerprint).not.toBe(getReviewFingerprint(root, startup.range));
   });
 
-  it('keeps the fingerprint equal to a fresh one when nothing changes during the build', () => {
+  it('keeps the fingerprint equal to a fresh one when nothing changes during the build', async () => {
     const root = initRepo({'a.txt': 'one\n'});
     writeFiles(root, {'a.txt': 'one\ntwo\n'});
 
-    const startup = prepareStartup({
+    const startup = await prepareStartup({
       cwd: root,
       options: {requestedBranch: 'HEAD', requestedBase: 'main', watch: true, watchPoll: false, animations: false},
       width: 100,

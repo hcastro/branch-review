@@ -217,7 +217,7 @@ function spawnClipboardProcess(
       });
     });
 
-    child.on('exit', (code) => {
+    child.on('exit', (code, signal) => {
       if (code === 0) {
         finish({ok: true, command});
         return;
@@ -228,7 +228,7 @@ function spawnClipboardProcess(
         finish({
           ok: false,
           message: `Clipboard write failed using ${command.displayName}.`,
-          hint: hint || `Process exited with code ${code ?? 'unknown'}.`,
+          hint: hint || (signal ? `Process killed by ${signal}.` : `Process exited with code ${code ?? 'unknown'}.`),
         });
       };
 

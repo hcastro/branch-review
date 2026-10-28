@@ -92,6 +92,25 @@ export function withEnv<T>(overrides: Record<string, string | undefined>, fn: ()
   }
 }
 
+/** withEnv for an async `fn`: the variables stay set until it settles. */
+export async function withEnvAsync<T>(overrides: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 export type GitSpyCall = {optionalLocks: string; terminalPrompt: string; indexFile: string; args: string};
 
 // A PATH directory whose `git` logs the environment each call received, then

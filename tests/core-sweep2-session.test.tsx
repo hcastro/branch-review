@@ -8,7 +8,7 @@ import {render, Text} from 'ink';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {runCli} from '../src/startup.js';
 import {INK_RENDER_OPTIONS, TERMINAL_RESTORE_SEQUENCE, createTerminalSession, runInkApp} from '../src/terminalSession.js';
-import {cleanupTempDirs, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
 
 // Each test builds real repos or spawns the CLI.
 vi.setConfig({testTimeout: 30_000});
@@ -230,6 +230,50 @@ describe('console output during the Ink session', () => {
   }
 });
 
+// A render error after mount, in a child so React's production build can be
+// chosen. Prints every write the session sent to stderr.
+function runLateErrorProbe(nodeEnv: string) {
+  const sessionModule = fileURLToPath(new URL('../src/terminalSession.ts', import.meta.url));
+  const script = `
+    import React, {useEffect, useState} from 'react';
+    import {EventEmitter} from 'node:events';
+    import {render, Text} from 'ink';
+    import {INK_RENDER_OPTIONS, createTerminalSession, runInkApp} from ${JSON.stringify(sessionModule)};
+    function LateThrower() {
+      const [broken, setBroken] = useState(false);
+      useEffect(() => { const timer = setTimeout(() => setBroken(true), 20); return () => clearTimeout(timer); }, []);
+      if (broken) throw new Error('late failure');
+      return React.createElement(Text, null, 'fine');
+    }
+    const stream = Object.assign(new EventEmitter(), {isTTY: true, columns: 80, rows: 24, write() { return true; }});
+    const stdin = Object.assign(new EventEmitter(), {isTTY: false, setRawMode() {}, setEncoding() {}, ref() {}, unref() {}, read() { return null; }, resume() {}, pause() {}});
+    const errors = [];
+    const proc = Object.assign(new EventEmitter(), {exit() {}});
+    const session = createTerminalSession({stdout: stream, stderr: {write: (text) => { errors.push(text); return true; }}, proc});
+    await runInkApp(session, (guard) => render(guard(React.createElement(LateThrower)), {...INK_RENDER_OPTIONS, stdout: stream, stderr: stream, stdin, exitOnCtrlC: false}));
+    process.stdout.write(JSON.stringify({errors, exitCode: proc.exitCode}));
+  `;
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    encoding: 'utf8',
+    timeout: 20_000,
+    env: {...process.env, NODE_ENV: nodeEnv},
+  });
+  expect(child.error).toBeUndefined();
+  expect(child.status).toBe(0);
+  return JSON.parse(child.stdout) as {errors: string[]; exitCode: number};
+}
+
+describe('a render error after mount', () => {
+  for (const nodeEnv of ['development', 'production']) {
+    it(`leaves exactly one stderr line, without React's own report of the error (${nodeEnv})`, () => {
+      const {errors, exitCode} = runLateErrorProbe(nodeEnv);
+
+      expect(errors).toEqual(['branch-review: late failure\n']);
+      expect(exitCode).toBe(1);
+    }, 30_000);
+  }
+});
+
 describe('runCli', () => {
   it('installs the restore handlers before rendering and restores on SIGTERM after unmount', async () => {
     const cwd = initRepo({'a.txt': 'one\n'});
@@ -240,6 +284,11 @@ describe('runCli', () => {
     const proc = new FakeProcess();
     const listenersAtRender: Record<string, number> = {};
     let renderOptions: unknown;
+    let markRendered!: () => void;
+    // The startup build is asynchronous, so the render comes after runCli returns.
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
 
     const done = runCli({
       argv: ['HEAD', 'main', '--no-watch'],
@@ -253,9 +302,11 @@ describe('runCli', () => {
           listenersAtRender[event] = proc.listenerCount(event);
         }
         writes.push('RENDER');
+        markRendered();
         return {waitUntilExit: () => new Promise(() => {}), unmount: () => writes.push('UNMOUNT')};
       },
     });
+    await withTimeout(rendered, 20_000);
 
     for (const event of ['SIGTERM', 'SIGINT', 'SIGHUP', 'exit', 'uncaughtException']) {
       expect(listenersAtRender[event], event).toBeGreaterThanOrEqual(1);
@@ -267,6 +318,29 @@ describe('runCli', () => {
     expect(proc.exits).toEqual([143]);
     expect(errors).toEqual([]);
     void done;
+  });
+
+  it('escapes hidden characters in the ref names of the "No file changes" line', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    const branch = 'ev\u202Eil\u009Bx';
+    git(cwd, 'update-ref', `refs/remotes/origin/${branch}`, 'HEAD');
+    git(cwd, 'symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${branch}`);
+    const writes: string[] = [];
+    const proc = new FakeProcess();
+
+    await runCli({
+      argv: ['--no-watch'],
+      cwd,
+      proc,
+      stdout: {isTTY: true, columns: 120, write: (text: string) => writes.push(text)},
+      stderr: {write: () => true},
+      render: () => {
+        throw new Error('must not render');
+      },
+    });
+
+    expect(writes).toEqual(['No file changes between origin/ev<U+202E>il<U+009B>x and HEAD.\n']);
+    expect(proc.exits).toEqual([0]);
   });
 
   it('prints a startup error as one line and exits 1 without touching the terminal', async () => {
@@ -357,4 +431,121 @@ describe('signals during the startup build', () => {
     expect(exit).toEqual({code: 130, signal: null});
     expect(Date.now() - sentAt).toBeLessThan(3000);
   });
+
+  it('SIGTERM during a stalled git exits 143 within about a second, kills git, and never mounts the UI', async () => {
+    const {cwd, bin, pidLog, tmp, env} = stalledGitRepo();
+    const child = spawn(process.execPath, ['--import', tsxLoader, cliEntry, 'HEAD', 'main', '--no-watch'], {cwd, env, stdio: ['ignore', 'pipe', 'pipe']});
+    let output = '';
+    child.stdout!.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    child.stderr!.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    const exited = new Promise<{code: number | null; signal: NodeJS.Signals | null}>((resolve) => {
+      child.once('exit', (code, signal) => resolve({code, signal}));
+    });
+
+    const gitPid = await waitForPid(pidLog, 30_000);
+    expect(leakedIndexDirs(tmp)).toHaveLength(1);
+    const sentAt = Date.now();
+    child.kill('SIGTERM');
+    const exit = await exited;
+    const elapsed = Date.now() - sentAt;
+
+    expect(exit).toEqual({code: 143, signal: null});
+    expect(elapsed).toBeLessThan(1500);
+    expect(output).toBe('');
+    expect(leakedIndexDirs(tmp)).toEqual([]);
+    await waitFor(() => !isAlive(gitPid), 2000);
+    void bin;
+  });
+
+  it('a signal during the startup build in-process exits, writes nothing to the terminal and never renders', async () => {
+    const {cwd, pidLog, tmp, env} = stalledGitRepo();
+    const writes: string[] = [];
+    const proc = new FakeProcess();
+    let rendered = false;
+
+    const previous = {PATH: process.env.PATH, BRANCH_REVIEW_TMPDIR: process.env.BRANCH_REVIEW_TMPDIR};
+    process.env.PATH = env.PATH;
+    process.env.BRANCH_REVIEW_TMPDIR = tmp;
+    let done: Promise<void>;
+    let gitPid: number;
+    try {
+      done = runCli({
+        argv: ['HEAD', 'main', '--no-watch'],
+        cwd,
+        proc,
+        stdout: {isTTY: true, columns: 120, write: (text: string) => writes.push(text)},
+        stderr: {write: (text: string) => writes.push(text)},
+        render: () => {
+          rendered = true;
+          return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+        },
+      });
+      gitPid = await waitForPid(pidLog, 30_000);
+    } finally {
+      process.env.PATH = previous.PATH;
+      if (previous.BRANCH_REVIEW_TMPDIR === undefined) delete process.env.BRANCH_REVIEW_TMPDIR;
+      else process.env.BRANCH_REVIEW_TMPDIR = previous.BRANCH_REVIEW_TMPDIR;
+    }
+    expect(leakedIndexDirs(tmp)).toHaveLength(1);
+
+    proc.emit('SIGTERM');
+    await withTimeout(done, 2000);
+
+    expect(proc.exits).toEqual([143]);
+    expect(rendered).toBe(false);
+    expect(writes).toEqual([]);
+    expect(leakedIndexDirs(tmp)).toEqual([]);
+    await waitFor(() => !isAlive(gitPid), 2000);
+  });
 });
+
+const recordedPids: number[] = [];
+
+afterEach(() => {
+  // Only processes the fake git recorded itself.
+  for (const pid of recordedPids.splice(0)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+});
+
+function isAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// A git whose numstat call inside the startup build never returns. It logs
+// its pid (the sleep it becomes) so the test can check it was killed.
+function stalledGitRepo() {
+  const cwd = initRepo({'a.txt': 'one\n'});
+  writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+  const bin = makeTempDir('branch-review-stalledgit-');
+  const pidLog = path.join(bin, 'pids.log');
+  const realGit = spawnSync('/usr/bin/which', ['git'], {encoding: 'utf8'}).stdout.trim();
+  writeExecutable(path.join(bin, 'git'), [
+    '#!/bin/sh',
+    `case "$*" in *--numstat*) echo $$ >> '${pidLog}'; exec sleep 60;; esac`,
+    `exec '${realGit}' "$@"`,
+    '',
+  ].join('\n'));
+  const tmp = makeTempDir('branch-review-clitmp-');
+  return {cwd, bin, pidLog, tmp, env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, TMPDIR: tmp}};
+}
+
+async function waitForPid(pidLog: string, ms: number) {
+  await waitFor(() => fs.existsSync(pidLog) && fs.readFileSync(pidLog, 'utf8').trim() !== '', ms);
+  const pid = Number(fs.readFileSync(pidLog, 'utf8').trim().split('\n')[0]);
+  recordedPids.push(pid);
+  return pid;
+}
