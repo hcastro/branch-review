@@ -20,7 +20,7 @@
   <img alt="branch-review showing a changed-file tree next to a syntax-highlighted diff of src/middleware/rateLimit.ts" src="assets/review-ui.png" width="100%">
 </p>
 
-Run `branch-review` in any Git repo. You get a changed-file tree, syntax-highlighted diffs from [`git-delta`](https://github.com/dandavison/delta), and per-file and branch-wide stats. The view updates live while files change on disk.
+Run `branch-review` in any Git repo, from the root or any folder inside it. You get a changed-file tree, syntax-highlighted diffs from [`git-delta`](https://github.com/dandavison/delta), and per-file and branch-wide stats. The view updates live while files change on disk.
 
 Every file and diff block has copy buttons. They hand a path, a diff, or an agent-ready block of context to Claude Code, Codex, Cursor, or a Slack thread in one click.
 
@@ -36,7 +36,7 @@ By default the review covers `HEAD` plus your worktree against the base branch. 
 
 ## Install
 
-You need Node.js 20+, Git, and `git-delta` on your `PATH`.
+You need Node.js 20+, Git, and `git-delta` on your `PATH`. CI runs on Node 20 and 22.
 
 ```sh
 brew install git-delta          # macOS. See the delta docs for other platforms.
@@ -66,6 +66,8 @@ branch-review my-feature main      # my-feature vs main
 branch-review HEAD HEAD            # uncommitted changes only
 ```
 
+From a subdirectory, the review still covers the whole repo, with paths relative to the repo root.
+
 The base comes from `origin/HEAD` when the remote has one. Otherwise it falls back to the first of `development`, `main`, `master`, and `trunk` that exists.
 
 Refs resolve locally first and then as `origin/<ref>`. That lets you review against a remote base you never checked out:
@@ -83,6 +85,8 @@ branch-review my-feature release/2026.04
 | `--watch-poll` | Poll instead of using filesystem events. Use it on network mounts and container bind mounts. |
 | `--no-animations` | Skip the arrival highlights. Useful on slow or remote terminals. |
 
+Set `NO_COLOR` (to any non-empty value) or `FORCE_COLOR=0` to turn off the colour the app adds. Diffs keep their `+` and `-` markers.
+
 ## Reviewing
 
 ### Keys
@@ -92,7 +96,25 @@ branch-review my-feature release/2026.04
 | `↑` / `↓` | Previous / next file |
 | `j` / `k` | Scroll the diff down / up |
 | `g` / `G` | Jump to the top / bottom |
+| `[` / `]` | Previous / next diff block |
+| `Enter` / `Space` | Collapse or expand the focused block |
+| `t` | Show or hide the file tree |
 | `q` / `Esc` | Quit |
+
+The focused block is the one at the top of the diff pane, and it's marked. The footer keeps a short hint of these keys.
+
+Every copy action works from the keyboard too. File keys copy from the current file, and block keys copy from the focused block.
+
+| Key | Copies |
+| --- | --- |
+| `y` | Path relative to the repo root |
+| `Y` | Absolute path |
+| `d` | The file's diff |
+| `f` | The file's current contents |
+| `c` | The block's code |
+| `p` | The block's diff |
+| `b` | The block as agent-ready context |
+| `T` | The changed-file tree |
 
 ### Mouse
 
@@ -143,6 +165,10 @@ Lines: 1-8
 
 When Git can name the enclosing function, the snippet adds a `Function:` line too.
 
+### Small terminals
+
+When the terminal is too narrow for both panes, the file tree collapses and the diff takes the full width. Below a minimum size, the app shows "Terminal too small" until you make the window bigger.
+
 ## Agent skill
 
 The repo ships an agent skill in [`skills/branch-review`](skills/branch-review). It teaches Claude Code, or any tool that reads `SKILL.md`, to hand you a ready-to-run `branch-review` command.
@@ -173,7 +199,7 @@ Watch mode follows the tracked directories plus the Git state that moves on a co
 
 ```sh
 pnpm install      # also builds dist/
-pnpm dev          # run from source with tsx
+pnpm dev          # run from source with tsx, watch mode included
 pnpm test
 pnpm typecheck
 pnpm build
