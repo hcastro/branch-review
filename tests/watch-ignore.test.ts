@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import {afterEach, describe, expect, it} from 'vitest';
-import {createWatchIgnoreMatcher, listIgnoredPaths} from '../src/watch/repoWatcher.js';
+import {checkIgnored, createWatchIgnoreMatcher, listIgnoredPaths} from '../src/watch/repoWatcher.js';
 import {formatRefreshError} from '../src/ui/ReviewController.js';
 
 const tempDirs: string[] = [];
@@ -54,6 +54,46 @@ describe('watch ignore matcher', () => {
     expect(matcher.isIgnored(path.join(cwd, 'lib', 'index.js'))).toBe(false);
     expect(matcher.isIgnored(path.join(cwd, 'dist', 'keep.js'))).toBe(false);
     expect(matcher.isIgnored(cwd)).toBe(false);
+  });
+});
+
+describe('checkIgnored', () => {
+  function createIgnoreRepo() {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-check-ignore-'));
+    tempDirs.push(cwd);
+    runGit(cwd, 'init', '-q', '-b', 'main');
+    writeFile(cwd, '.gitignore', '*.log\n!keep.log\n');
+    writeFile(cwd, 'src/a.ts', 'a\n');
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-q', '-m', 'initial');
+    return cwd;
+  }
+
+  it('answers every path around ones git refuses, and counts the refused ones as not ignored', async () => {
+    const cwd = createIgnoreRepo();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-check-ignore-out-'));
+    tempDirs.push(outside);
+    fs.symlinkSync(outside, path.join(cwd, 'linkdir'));
+
+    const ignored = await checkIgnored(cwd, [
+      'a.log',
+      'linkdir/bin.log',
+      ':!x.log',
+      'keep.log',
+      'linkdir/other.log',
+      'src/b.ts',
+      'c.log',
+    ]);
+
+    expect([...ignored].sort()).toEqual([':!x.log', 'a.log', 'c.log']);
+  });
+
+  it('still rejects when git fails for the whole batch', async () => {
+    const notARepo = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-check-ignore-none-'));
+    tempDirs.push(notARepo);
+    fs.mkdirSync(path.join(notARepo, '.git'));
+
+    await expect(checkIgnored(notARepo, ['a.log', 'b.log'])).rejects.toThrow(/check-ignore exited with code/);
   });
 });
 

@@ -1,10 +1,17 @@
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {fork, type ChildProcess} from 'node:child_process';
 import {createRequire} from 'node:module';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import type {DiffRange} from '../git.js';
 import type {ReviewModel} from './model.js';
 
+/**
+ * How long a refresh may go without reporting progress. The refresh process
+ * reports after each step and each file, so a large review that keeps
+ * moving is never cut off; a hung git or delta is.
+ */
 export const REFRESH_TIMEOUT_MS = 30_000;
 
 type WorkerRefreshOptions = {
@@ -25,6 +32,7 @@ export type WorkerRefreshResult = {
 };
 
 type WorkerRefreshMessage =
+  | {id: number; progress: true}
   | ({id: number; ok: true} & WorkerRefreshResult)
   | {id: number; ok: false; error: string; stderr?: string};
 
@@ -32,7 +40,8 @@ export type WorkerRefreshError = Error & {stderr?: string};
 
 const STDERR_TAIL_LIMIT = 8192;
 const killsProcessGroup = process.platform !== 'win32';
-const activeChildren = new Set<ChildProcess>();
+// Each live refresh process and the temp dir it was given.
+const activeChildren = new Map<ChildProcess, string>();
 let requestId = 0;
 let exitHookInstalled = false;
 
@@ -60,10 +69,17 @@ function workerExecArgv(modulePath: string) {
   return execArgv;
 }
 
+function removeTempDir(dir: string) {
+  try {
+    fs.rmSync(dir, {recursive: true, force: true});
+  } catch {
+    // Best effort: the OS temp dir is cleaned eventually.
+  }
+}
+
 // The child runs in its own process group so killing the group also stops
 // the git and delta processes it is blocked on.
 function killChild(child: ChildProcess) {
-  activeChildren.delete(child);
   if (child.exitCode !== null || child.signalCode !== null) return;
 
   try {
@@ -77,16 +93,27 @@ function killChild(child: ChildProcess) {
   }
 }
 
+// A killed child never runs its own cleanup, so the parent removes what it
+// left in its temp dir. On exit there is no later event to wait for.
 function installExitHook() {
   if (exitHookInstalled) return;
   exitHookInstalled = true;
   process.once('exit', () => {
-    for (const child of [...activeChildren]) killChild(child);
+    for (const [child, tempDir] of [...activeChildren]) {
+      killChild(child);
+      removeTempDir(tempDir);
+    }
+    activeChildren.clear();
   });
 }
 
 function firstErrorLine(stderr: string) {
   return stderr.split('\n').map((line) => line.trim()).find((line) => /^[A-Za-z]*Error\b/.test(line));
+}
+
+// V8 prints this, then aborts, when the heap limit is reached.
+function ranOutOfMemory(stderr: string) {
+  return /^FATAL ERROR:.*(heap limit|out of memory)/im.test(stderr);
 }
 
 function refreshError(message: string, stderr?: string): WorkerRefreshError {
@@ -97,8 +124,10 @@ function refreshError(message: string, stderr?: string): WorkerRefreshError {
 
 /**
  * Builds the review in a separate process so a slow or stuck git call never
- * blocks the UI. Rejects on timeout, on abort, or when the process dies
- * without answering; in each case the process and its children are killed.
+ * blocks the UI. Rejects when the process reports no progress for
+ * `timeoutMs`, on abort, or when the process dies without answering; in each
+ * case the process and its children are killed. The process gets its own
+ * temp dir, removed once it has exited however it ended.
  */
 export function refreshReviewInWorker({
   timeoutMs = REFRESH_TIMEOUT_MS,
@@ -114,14 +143,28 @@ export function refreshReviewInWorker({
     }
 
     const modulePath = resolveWorkerModule();
-    const child = fork(modulePath, [], {
-      execArgv: workerExecArgv(modulePath),
-      serialization: 'advanced',
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-      detached: killsProcessGroup,
-    });
-    activeChildren.add(child);
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-refresh-'));
+    let child: ChildProcess;
+    try {
+      child = fork(modulePath, [], {
+        execArgv: workerExecArgv(modulePath),
+        // BRANCH_REVIEW_TMPDIR is where the private index copy goes; TMPDIR
+        // sends anything else the process tree writes to temp there too.
+        env: {...process.env, BRANCH_REVIEW_TMPDIR: tempDir, TMPDIR: tempDir},
+        serialization: 'advanced',
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+        detached: killsProcessGroup,
+      });
+    } catch (error) {
+      removeTempDir(tempDir);
+      throw error;
+    }
+    activeChildren.set(child, tempDir);
     installExitHook();
+    child.once('exit', () => {
+      activeChildren.delete(child);
+      removeTempDir(tempDir);
+    });
 
     let settled = false;
     let stderrTail = '';
@@ -130,23 +173,35 @@ export function refreshReviewInWorker({
       stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
     });
 
+    let idleTimer: NodeJS.Timeout | undefined;
     const finish = (settle: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
+      clearTimeout(idleTimer);
       signal?.removeEventListener('abort', handleAbort);
       killChild(child);
       settle();
     };
+    const restartIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        finish(() => reject(refreshError(
+          `refresh timed out: no progress for ${Math.round(timeoutMs / 1000)}s`,
+        )));
+      }, timeoutMs);
+    };
 
     const handleAbort = () => finish(() => reject(refreshError('refresh aborted')));
-    const timeout = setTimeout(() => {
-      finish(() => reject(refreshError(`refresh timed out after ${Math.round(timeoutMs / 1000)}s`)));
-    }, timeoutMs);
+    restartIdleTimer();
     signal?.addEventListener('abort', handleAbort, {once: true});
 
     child.on('message', (message: WorkerRefreshMessage) => {
-      if (message.id !== id) return;
+      if (message.id !== id || settled) return;
+
+      if ('progress' in message) {
+        restartIdleTimer();
+        return;
+      }
 
       if (message.ok) {
         finish(() => resolve({
@@ -167,6 +222,11 @@ export function refreshReviewInWorker({
     // result sent just before exiting is never mistaken for a crash.
     child.on('close', (code, exitSignal) => {
       const reason = exitSignal ? `signal ${exitSignal}` : `code ${code}`;
+      if (ranOutOfMemory(stderrTail)) {
+        finish(() => reject(refreshError(`refresh ran out of memory (worker exited with ${reason})`, stderrTail)));
+        return;
+      }
+
       const detail = firstErrorLine(stderrTail);
       finish(() => reject(refreshError(
         `refresh worker exited with ${reason}${detail ? `: ${detail}` : ''}`,
