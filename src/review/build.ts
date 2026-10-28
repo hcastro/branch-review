@@ -1,13 +1,14 @@
 import {
-  MissingToolError,
   getChangedFileEntries,
-  getFileMetricsMap,
-  getRawFileDiff,
+  isFatalToolError,
+  readFileMetrics,
+  readRawFileDiff,
   renderDiffForDisplay,
   withPrivateIndex,
   type ChangedFileEntry,
   type DiffRange,
 } from '../git.js';
+import {escapeHiddenCharacters} from '../controlChars.js';
 import {buildDiffSections, type BranchMetrics, type DiffSection, type FileMetrics} from '../sections.js';
 import {parseUnifiedDiffBlocks} from '../blocks/parse.js';
 import type {ReviewFile, ReviewModel} from './model.js';
@@ -16,6 +17,8 @@ type BuildReviewModelOptions = {
   cwd: string;
   range: DiffRange;
   width: number;
+  /** Called after each file is built, error rows included, before the next starts. */
+  onFileBuilt?: () => void;
 };
 
 function emptyMetrics(path: string): FileMetrics {
@@ -40,6 +43,34 @@ function splitRenderedLines(diff: string) {
   return diff.trimEnd().split('\n').filter(Boolean);
 }
 
+// delta prints nothing for a file whose diff has no hunks, which would leave
+// the file without a line to show or make active. This builds one line from
+// the patch header instead: `renamed from a.txt`, `new empty file`,
+// `mode 100644 → 100755`, `binary file changed`.
+function describeNoTextChange(rawDiff: string) {
+  let renamedFrom: string | undefined;
+  let oldMode: string | undefined;
+  let newMode: string | undefined;
+  let kind: string | undefined;
+
+  for (const line of rawDiff.split('\n')) {
+    if (line.startsWith('rename from ')) renamedFrom = line.slice('rename from '.length);
+    else if (line.startsWith('old mode ')) oldMode = line.slice('old mode '.length);
+    else if (line.startsWith('new mode ')) newMode = line.slice('new mode '.length);
+    else if (line.startsWith('Binary files ') || line === 'GIT binary patch') kind = 'binary file changed';
+    else if (line.startsWith('new file mode ')) kind ??= 'new empty file';
+    else if (line.startsWith('deleted file mode ')) kind ??= 'deleted empty file';
+  }
+
+  const parts = [
+    renamedFrom === undefined ? undefined : `renamed from ${renamedFrom}`,
+    kind,
+    oldMode && newMode ? `mode ${oldMode} → ${newMode}` : undefined,
+  ].filter((part): part is string => part !== undefined);
+
+  return escapeHiddenCharacters(parts.join(', ') || 'no text changes');
+}
+
 function hashText(text: string) {
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
@@ -57,23 +88,36 @@ function errorMessage(error: unknown) {
 
 // One file that can't be diffed or rendered becomes a file with `error` set
 // instead of failing the whole review. A missing git or delta affects every
-// file, so it still fails the build.
+// file, and an interrupt stops the build, so those still throw.
 function buildReviewFile(
   {cwd, range, width}: BuildReviewModelOptions,
   entry: ChangedFileEntry,
   metrics: FileMetrics,
+  metricsError: string | undefined,
   untrackedFiles: ReadonlySet<string>,
 ): ReviewFile {
   let rawDiff = '';
   let renderedLines: string[] = [];
   let error: string | undefined;
+  let rawDiffError: string | undefined;
+  let loaded = false;
 
   try {
-    rawDiff = getRawFileDiff(cwd, range, entry.path, untrackedFiles, entry.oldPath);
+    const diff = readRawFileDiff(cwd, range, entry.path, untrackedFiles, entry.oldPath);
+    rawDiff = diff.text;
+    loaded = true;
+    if (!diff.utf8) rawDiffError = 'not UTF-8 text';
     renderedLines = splitRenderedLines(renderDiffForDisplay(cwd, rawDiff, width));
+    if (renderedLines.length === 0) renderedLines = [describeNoTextChange(rawDiff)];
   } catch (caught) {
-    if (caught instanceof MissingToolError) throw caught;
+    if (isFatalToolError(caught)) throw caught;
     error = errorMessage(caught);
+    if (!loaded) rawDiffError = error;
+    renderedLines = [];
+  }
+
+  if (error === undefined && metricsError !== undefined) {
+    error = metricsError;
     renderedLines = [];
   }
 
@@ -87,6 +131,7 @@ function buildReviewFile(
     renderedLines,
     blocks: parseUnifiedDiffBlocks(rawDiff, entry.path),
     ...(error === undefined ? {} : {error}),
+    ...(rawDiffError === undefined ? {} : {rawDiffError}),
   };
 }
 
@@ -95,17 +140,22 @@ export function buildReviewModel(options: BuildReviewModelOptions): ReviewModel 
 
   return withPrivateIndex(cwd, () => {
     const entries = getChangedFileEntries(cwd, range);
-    const metricsMap = getFileMetricsMap(cwd, range);
+    const {metrics: metricsMap, errors: metricsErrors} = readFileMetrics(cwd, range);
     const untrackedFiles = new Set(
       entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
     );
 
-    const files = entries.map((entry) => buildReviewFile(
-      options,
-      entry,
-      metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
-      untrackedFiles,
-    ));
+    const files = entries.map((entry) => {
+      const file = buildReviewFile(
+        options,
+        entry,
+        metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
+        metricsErrors.get(entry.path),
+        untrackedFiles,
+      );
+      options.onFileBuilt?.();
+      return file;
+    });
 
     const branch = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
 

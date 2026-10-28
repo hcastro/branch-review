@@ -31,6 +31,12 @@ export type ReviewFile = {
    * renderedLines is empty.
    */
   error?: string;
+  /**
+   * Set when rawDiff can't be copied: the diff failed to load (rawDiff is
+   * empty), or git printed it as bytes that are not valid UTF-8. Every copy
+   * of this file's diff, blocks or contents fails with this reason.
+   */
+  rawDiffError?: string;
 };
 
 export type ReviewModel = {

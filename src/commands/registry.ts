@@ -52,6 +52,17 @@ function fileAndBlock(context: CommandContext) {
   return file && block ? {file, block} : null;
 }
 
+// A copy of a file's diff text fails, with the reason as the message, when
+// that text failed to load or is not valid UTF-8. A thrown error becomes a
+// failed copy that names the reason.
+function assertDiffCopyable(file: Pick<ReviewFile, 'rawDiffError'> | undefined) {
+  if (file?.rawDiffError !== undefined) throw new Error(file.rawDiffError);
+}
+
+function blockFile(context: CommandContext, block: ReviewBlock) {
+  return context.model.files.find((file) => file.path === block.filePath) ?? context.activeFile;
+}
+
 export const copyCommands: CommandDefinition[] = [
   {
     id: 'copy.filePrompt',
@@ -62,6 +73,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file) return null;
+      assertDiffCopyable(file);
       return {
         text: buildFilePromptPayload(file),
         toast: 'Copied file context',
@@ -99,6 +111,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const target = fileAndBlock(context);
       if (!target) return null;
+      assertDiffCopyable(blockFile(context, target.block));
       return {
         text: buildBlockPromptPayload(target.file, target.block),
         toast: 'Copied block',
@@ -177,6 +190,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const block = focusedBlock(context);
       if (!block) return null;
+      assertDiffCopyable(blockFile(context, block));
       return {
         text: buildCodePayload(block),
         toast: 'Copied block code',
@@ -193,6 +207,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const block = focusedBlock(context);
       if (!block) return null;
+      assertDiffCopyable(blockFile(context, block));
       return {
         text: buildBlockDiffPayload(block),
         toast: 'Copied block diff',
@@ -209,6 +224,7 @@ export const copyCommands: CommandDefinition[] = [
     buildPayload: (context) => {
       const file = activeFile(context);
       if (!file) return null;
+      assertDiffCopyable(file);
       return {
         text: buildFileDiffPayload(file),
         toast: 'Copied file diff',

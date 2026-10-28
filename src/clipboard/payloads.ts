@@ -9,9 +9,19 @@ function formatMetrics(model: ReviewModel) {
 }
 
 // The patch goes inside the fence untrimmed, so a trailing blank context line
-// survives and the fenced text still applies.
+// survives and the fenced text still applies. The fence is longer than any
+// run of backticks in the patch, so no patch line can close it early.
 function fencedDiff(rawDiff: string) {
-  return `\`\`\`diff\n${rawDiff}${rawDiff.endsWith('\n') ? '' : '\n'}\`\`\``;
+  let longestRun = 0;
+  for (const match of rawDiff.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
+  const fence = '`'.repeat(Math.max(3, longestRun + 1));
+  return `${fence}diff\n${rawDiff}${rawDiff.endsWith('\n') ? '' : '\n'}${fence}`;
+}
+
+// A path on a heading or list line, with CR and LF escaped so a file name
+// can't end the line and forge another one.
+function linePath(filePath: string) {
+  return filePath.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
 }
 
 export function buildPathPayload(file: Pick<ReviewFile, 'path'>) {
@@ -27,7 +37,7 @@ export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, block: Pick
 }
 
 export function buildAllChangedPathsPayload(model: Pick<ReviewModel, 'files'>) {
-  return model.files.map((file) => file.path).join('\n');
+  return model.files.map((file) => linePath(file.path)).join('\n');
 }
 
 export function buildCodePayload(block: Pick<ReviewBlock, 'addedCode'>) {
@@ -48,7 +58,7 @@ export function buildFileContentsPayload(contents: string) {
 
 export function buildBlockPromptPayload(file: Pick<ReviewFile, 'path'>, block: ReviewBlock) {
   const lines = [
-    `File: ${file.path}`,
+    `File: ${linePath(file.path)}`,
     `Lines: ${block.lineStart}-${block.lineEnd}`,
   ];
 
@@ -61,7 +71,7 @@ export function buildBlockPromptPayload(file: Pick<ReviewFile, 'path'>, block: R
 }
 
 export function buildFilePromptPayload(file: Pick<ReviewFile, 'path' | 'rawDiff'>) {
-  return [`File: ${file.path}`, '', fencedDiff(file.rawDiff)].join('\n');
+  return [`File: ${linePath(file.path)}`, '', fencedDiff(file.rawDiff)].join('\n');
 }
 
 export function buildBranchPromptPayload(model: ReviewModel) {
@@ -72,7 +82,8 @@ export function buildBranchPromptPayload(model: ReviewModel) {
   ];
 
   for (const file of model.files) {
-    lines.push(`## ${file.path}`, '', fencedDiff(file.rawDiff), '');
+    const body = file.rawDiffError === undefined ? fencedDiff(file.rawDiff) : `Diff unavailable: ${file.rawDiffError}`;
+    lines.push(`## ${linePath(file.path)}`, '', body, '');
   }
 
   return lines.join('\n').trimEnd();

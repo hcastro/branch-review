@@ -12,7 +12,7 @@ vi.setConfig({testTimeout: 30_000});
 afterEach(cleanupTempDirs);
 
 const SGR = /\x1B\[[0-9;]*m/;
-const COLOR_ENV = {NO_COLOR: undefined, FORCE_COLOR: undefined};
+const COLOR_ENV = {NO_COLOR: undefined, FORCE_COLOR: undefined, TERM: 'xterm-256color'};
 
 function changedRepo() {
   const cwd = initRepo({'a.txt': 'one\n'});
@@ -110,7 +110,7 @@ describe('NO_COLOR', () => {
     const cwd = changedRepo();
     const range = resolveRefs(cwd, 'HEAD', 'main');
 
-    withEnv({NO_COLOR: '', FORCE_COLOR: undefined}, () => {
+    withEnv({NO_COLOR: '', FORCE_COLOR: undefined, TERM: 'xterm-256color'}, () => {
       expect(getColoredFileDiff(cwd, range, 'a.txt', 100)).toMatch(SGR);
     });
   });
