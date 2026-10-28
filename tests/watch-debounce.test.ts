@@ -142,3 +142,58 @@ describe('watch event deduper', () => {
     expect(changedAfterStart(path.join(path.dirname(filePath), 'missing.txt'))).toBe(true);
   });
 });
+
+describe('watch event deduper with whole-second and future timestamps', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // lstat answers for one path; each call returns the current fields.
+  function fakeLstat(state: {mtimeMs: number; ctimeMs: number; size: number; ino: number}) {
+    vi.spyOn(fs, 'lstatSync').mockImplementation((() => ({...state})) as unknown as typeof fs.lstatSync);
+    return state;
+  }
+
+  const wholeSecond = (ms: number) => Math.floor(ms / 1000) * 1000;
+
+  it('passes a second same-size write made within the same whole second', () => {
+    const second = wholeSecond(Date.now());
+    fakeLstat({mtimeMs: second, ctimeMs: second, size: 13, ino: 7});
+    const isNew = createEventDeduper(0);
+
+    expect(isNew('/repo/a.ts')).toBe(true);
+    // `const x = 2;\n` over `const x = 1;\n`: no field lstat reports moves.
+    expect(isNew('/repo/a.ts')).toBe(true);
+  });
+
+  it('drops a repeat on a whole-second file system once the ctime is well past', () => {
+    const second = wholeSecond(Date.now()) - 10_000;
+    fakeLstat({mtimeMs: second, ctimeMs: second, size: 13, ino: 7});
+    const isNew = createEventDeduper(0);
+
+    expect(isNew('/repo/a.ts')).toBe(true);
+    expect(isNew('/repo/a.ts')).toBe(false);
+  });
+
+  it('drops reads of a file with a future mtime, even right after a write', () => {
+    const future = Date.now() + 60 * 60 * 1000;
+    // A real write sets ctime to now, with sub-second precision.
+    fakeLstat({mtimeMs: future, ctimeMs: Date.now() - 300.25, size: 13, ino: 7});
+    const isNew = createEventDeduper(0);
+
+    expect(isNew('/repo/future.ts')).toBe(true);
+    expect(isNew('/repo/future.ts')).toBe(false);
+    expect(isNew('/repo/future.ts')).toBe(false);
+  });
+
+  it('passes an event when only the inode changed', () => {
+    const state = fakeLstat({mtimeMs: 1_000.5, ctimeMs: 1_000.5, size: 13, ino: 7});
+    const isNew = createEventDeduper(0);
+
+    expect(isNew('/repo/a.ts')).toBe(true);
+    // Replaced by a rename with the same times and size.
+    state.ino = 8;
+    expect(isNew('/repo/a.ts')).toBe(true);
+    expect(isNew('/repo/a.ts')).toBe(false);
+  });
+});

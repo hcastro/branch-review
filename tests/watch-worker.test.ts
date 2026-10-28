@@ -5,7 +5,6 @@ import {execFileSync, spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it} from 'vitest';
 import {getReviewFingerprint, resolveRefs} from '../src/git.js';
-import {buildReviewModel} from '../src/review/build.js';
 import {refreshReviewInWorker} from '../src/review/workerRefresh.js';
 import {formatRefreshError} from '../src/ui/ReviewController.js';
 
@@ -113,36 +112,6 @@ function listTree(root: string): string[] {
 function refreshLeftovers(root: string) {
   return listTree(root).filter((entry) => /^branch-review-(refresh|index)-/.test(path.basename(entry)));
 }
-
-// True once the build calls onFileBuilt; until then a build cannot report
-// per-file progress and the tests that need it are skipped.
-function buildReportsFileProgress() {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-progress-probe-'));
-  try {
-    runGit(cwd, 'init', '-q', '-b', 'development');
-    fs.writeFileSync(path.join(cwd, 'a.txt'), 'a\n');
-    runGit(cwd, 'add', '.');
-    runGit(cwd, 'commit', '-q', '-m', 'initial');
-    fs.writeFileSync(path.join(cwd, 'a.txt'), 'b\n');
-    let calls = 0;
-    const options = {
-      cwd,
-      range: resolveRefs(cwd, 'HEAD', 'development'),
-      width: 100,
-      onFileBuilt: () => {
-        calls += 1;
-      },
-    };
-    buildReviewModel(options);
-    return calls > 0;
-  } catch {
-    return false;
-  } finally {
-    fs.rmSync(cwd, {recursive: true, force: true});
-  }
-}
-
-const fileProgressAvailable = buildReportsFileProgress();
 
 async function settleWithin<T>(promise: Promise<T>, ms: number) {
   return Promise.race([
@@ -329,6 +298,13 @@ describe('refreshReviewInWorker', () => {
   }, 40_000);
 });
 
+// The progress tests use a 5 s limit with 3 s steps: one step and the git
+// calls around it fit in the limit on a loaded machine, two in a row do not.
+// The limit counts from the refresh process's first report, so its start-up
+// is not part of any window.
+const PROGRESS_LIMIT_MS = 5000;
+const SLOW_STEP_SECONDS = 3;
+
 describe('refreshReviewInWorker progress limit', () => {
   it('lets a refresh longer than the limit land while it keeps reporting progress', async () => {
     const cwd = createRepo();
@@ -336,7 +312,7 @@ describe('refreshReviewInWorker progress limit', () => {
     // One slow git call in each step: every step is under the limit, the
     // whole refresh is well over it.
     const binDir = fakeGitBinDir([
-      'case "$*" in *merge-base*|*"diff --raw"*|*"branch --show-current"*) sleep 1.5;; esac',
+      `case "$*" in *merge-base*|*"diff --raw"*|*"branch --show-current"*) sleep ${SLOW_STEP_SECONDS};; esac`,
       'exec "$REAL_GIT" "$@"',
     ].join('\n'));
 
@@ -347,16 +323,16 @@ describe('refreshReviewInWorker progress limit', () => {
       requestedBase: 'development',
       width: 100,
       previousFingerprint: fingerprint,
-      timeoutMs: 2500,
-    })), 30_000);
+      timeoutMs: PROGRESS_LIMIT_MS,
+    })), 50_000);
 
     expect(result.state === 'rejected' ? result.error.message : result.state).toBe('resolved');
     if (result.state !== 'resolved') return;
     expect(result.value.fingerprint).toBe(fingerprint);
-    expect(Date.now() - startedAt).toBeGreaterThan(2500);
-  }, 40_000);
+    expect(Date.now() - startedAt).toBeGreaterThan(PROGRESS_LIMIT_MS);
+  }, 60_000);
 
-  it.skipIf(!fileProgressAvailable)('lets a build longer than the limit land while each file reports progress', async () => {
+  it('lets a build longer than the limit land while each file reports progress', async () => {
     const cwd = createRepo();
     for (let index = 0; index < 4; index += 1) {
       fs.writeFileSync(path.join(cwd, 'src', `extra${index}.ts`), `export const extra = ${index};\n`);
@@ -364,20 +340,102 @@ describe('refreshReviewInWorker progress limit', () => {
     runGit(cwd, 'add', '.');
     runGit(cwd, 'commit', '-q', '-m', 'more files');
     // Only the per-file diffs are slow.
-    const binDir = fakeGitBinDir('case "$*" in *" -- "*) sleep 0.8;; esac\nexec "$REAL_GIT" "$@"');
+    const binDir = fakeGitBinDir(`case "$*" in *" -- "*) sleep ${SLOW_STEP_SECONDS};; esac\nexec "$REAL_GIT" "$@"`);
 
+    const startedAt = Date.now();
     const result = await settleWithin(withPath(binDir, () => refreshReviewInWorker({
       cwd,
       requestedBranch: 'HEAD',
       requestedBase: 'development',
       width: 100,
-      timeoutMs: 2000,
-    })), 30_000);
+      timeoutMs: PROGRESS_LIMIT_MS,
+    })), 80_000);
 
     expect(result.state === 'rejected' ? result.error.message : result.state).toBe('resolved');
     if (result.state !== 'resolved') return;
     expect(result.value.review?.files.length).toBe(5);
-  }, 40_000);
+    // Five slow diffs: far longer than the limit, so per-file progress is
+    // what kept it alive.
+    expect(Date.now() - startedAt).toBeGreaterThan(2 * PROGRESS_LIMIT_MS);
+  }, 90_000);
+
+  // A limit well under the time these refreshes take, so only progress from
+  // inside the per-file loops and from tool output keeps them alive.
+  it('keeps reporting progress through 300 changed files with one unreadable', async () => {
+    const cwd = createRepo();
+    fs.mkdirSync(path.join(cwd, 'f'));
+    for (let index = 0; index < 300; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `a${index}\n`);
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-q', '-m', 'many files');
+    for (let index = 0; index < 300; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `b${index}\n`);
+    const locked = path.join(cwd, 'f', '0.txt');
+    fs.chmodSync(locked, 0o000);
+
+    try {
+      const result = await settleWithin(refreshReviewInWorker({
+        cwd,
+        requestedBranch: 'HEAD',
+        requestedBase: 'development',
+        width: 100,
+        previousFingerprint: null,
+        timeoutMs: PROGRESS_LIMIT_MS,
+      }), 240_000);
+
+      expect(result.state === 'rejected' ? result.error.message : result.state).toBe('resolved');
+      if (result.state !== 'resolved') return;
+      expect(result.value.review?.files.length).toBe(301);
+    } finally {
+      fs.chmodSync(locked, 0o644);
+    }
+  }, 300_000);
+
+  it('keeps reporting progress through the delta run of one 20 MB added file', async () => {
+    const cwd = createRepo();
+    let body = '';
+    for (let index = 0; index < 250_000; index += 1) {
+      body += `export const value${index} = { id: ${index}, name: "item ${index}", tags: ["a", "b"] };\n`;
+    }
+    fs.writeFileSync(path.join(cwd, 'big.ts'), body);
+
+    const result = await settleWithin(refreshReviewInWorker({
+      cwd,
+      requestedBranch: 'HEAD',
+      requestedBase: 'development',
+      width: 100,
+      previousFingerprint: null,
+      timeoutMs: 15_000,
+    }), 240_000);
+
+    expect(result.state === 'rejected' ? result.error.message : result.state).toBe('resolved');
+    if (result.state !== 'resolved') return;
+    expect(result.value.review?.files.map((file) => file.path)).toContain('big.ts');
+  }, 300_000);
+
+  it('times a short limit from the first report, and still kills a process that never reports at the default limit', async () => {
+    const cwd = createRepo();
+    const preload = path.join(makeTempDir('branch-review-preload-'), 'stall.cjs');
+    // Stalls before the worker loads, so it never sends a message.
+    fs.writeFileSync(preload, "require('node:child_process').execFileSync('sleep', ['60']);\n");
+
+    process.env.NODE_OPTIONS = `--require ${preload}`;
+    let pending: Promise<unknown>;
+    const startedAt = Date.now();
+    try {
+      pending = refreshReviewInWorker({cwd, requestedBranch: 'HEAD', requestedBase: 'development', width: 100, timeoutMs: 1000});
+    } finally {
+      if (originalNodeOptions === undefined) {
+        delete process.env.NODE_OPTIONS;
+      } else {
+        process.env.NODE_OPTIONS = originalNodeOptions;
+      }
+    }
+
+    const result = await settleWithin(pending, 45_000);
+    expect(result.state).toBe('rejected');
+    if (result.state !== 'rejected') return;
+    expect(result.error.message).toBe('refresh timed out: no progress for 30s');
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(30_000);
+  }, 60_000);
 
   it('kills a refresh stuck on one git call at the limit, git included', async () => {
     const cwd = createRepo();
@@ -389,13 +447,13 @@ describe('refreshReviewInWorker progress limit', () => {
       requestedBranch: 'HEAD',
       requestedBase: 'development',
       width: 100,
-      timeoutMs: 1500,
-    })), 15_000);
+      timeoutMs: PROGRESS_LIMIT_MS,
+    })), 25_000);
 
     expect(result.state).toBe('rejected');
     if (result.state !== 'rejected') return;
-    expect(result.error.message).toMatch(/refresh timed out: no progress for 2s/);
-    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(result.error.message).toMatch(/refresh timed out: no progress for 5s/);
+    expect(Date.now() - startedAt).toBeLessThan(20_000);
     const pids = readPids();
     expect(pids).not.toBeNull();
     expect(await waitFor(() => !isAlive(pids!.gitPid) && !isAlive(pids!.refreshPid), 3000)).toBe(true);
@@ -422,6 +480,32 @@ describe('refreshReviewInWorker progress limit', () => {
     expect(result.error.message).toMatch(/refresh aborted/);
     const pids = readPids()!;
     expect(await waitFor(() => !isAlive(pids.gitPid) && !isAlive(pids.refreshPid), 3000)).toBe(true);
+  }, 30_000);
+
+  it('kills the git of a refresh process that died on its own', async () => {
+    const cwd = createRepo();
+    const {binDir, readPids} = hangingGit();
+
+    const pending = withPath(binDir, () => refreshReviewInWorker({
+      cwd,
+      requestedBranch: 'HEAD',
+      requestedBase: 'development',
+      width: 100,
+    }));
+    expect(await waitFor(() => readPids() !== null, 15_000)).toBe(true);
+    const pids = readPids()!;
+    try {
+      // Only the refresh process dies; its git is left waiting.
+      process.kill(pids.refreshPid, 'SIGKILL');
+
+      const result = await settleWithin(pending, 5000);
+      expect(result.state).toBe('rejected');
+      if (result.state !== 'rejected') return;
+      expect(result.error.message).toMatch(/refresh worker exited with signal SIGKILL/);
+      expect(await waitFor(() => !isAlive(pids.gitPid), 3000)).toBe(true);
+    } finally {
+      if (isAlive(pids.gitPid)) process.kill(pids.gitPid, 'SIGKILL');
+    }
   }, 30_000);
 });
 
@@ -528,6 +612,47 @@ describe('refreshReviewInWorker when its parent goes away', () => {
       expect(await waitFor(() => !isAlive(pids.gitPid) && !isAlive(pids.refreshPid), 3000)).toBe(true);
     } finally {
       parent.kill('SIGKILL');
+    }
+  }, 40_000);
+
+  it('removes the refresh temp dir, index copy included, soon after the parent is killed outright', async () => {
+    const cwd = createRepo();
+    const tmp = makeTempDir('branch-review-parent-tmp-');
+    const pidFile = path.join(makeTempDir('branch-review-pids-'), 'git.pid');
+    // Hangs once the private index copy is in the refresh temp dir.
+    const binDir = fakeGitBinDir(`if [ -n "$GIT_INDEX_FILE" ]; then echo "$$ $PPID" > '${pidFile}'; exec sleep 30; fi\nexec "$REAL_GIT" "$@"`);
+    const probe = writeProbe([
+      `refreshReviewInWorker({cwd: ${JSON.stringify(cwd)}, requestedBranch: 'HEAD', requestedBase: 'development', width: 100}).catch(() => undefined);`,
+      'setInterval(() => undefined, 1000);',
+    ]);
+
+    const parent = spawn(process.execPath, ['--import', 'tsx', probe], {
+      cwd: projectRoot,
+      env: {...process.env, TMPDIR: tmp, PATH: `${binDir}${path.delimiter}${originalPath ?? ''}`},
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    const readPids = () => {
+      try {
+        const [gitPid, refreshPid] = fs.readFileSync(pidFile, 'utf8').trim().split(' ').map(Number);
+        return gitPid && refreshPid ? {gitPid, refreshPid} : null;
+      } catch {
+        return null;
+      }
+    };
+    try {
+      expect(await waitFor(() => readPids() !== null, 20_000)).toBe(true);
+      expect(listTree(tmp).some((entry) => path.basename(entry).startsWith('branch-review-index-'))).toBe(true);
+      parent.kill('SIGKILL');
+
+      const pids = readPids()!;
+      expect(await waitFor(() => !isAlive(pids.gitPid) && !isAlive(pids.refreshPid), 3000)).toBe(true);
+      expect(await waitFor(() => refreshLeftovers(tmp).length === 0, 3000)).toBe(true);
+    } finally {
+      parent.kill('SIGKILL');
+      const pids = readPids();
+      for (const pid of pids ? [pids.gitPid, pids.refreshPid] : []) {
+        if (isAlive(pid)) process.kill(pid, 'SIGKILL');
+      }
     }
   }, 40_000);
 
