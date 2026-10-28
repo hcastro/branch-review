@@ -177,23 +177,32 @@ function treePrefix(rows: TreeRow[], rowIndex: number, depth: number) {
   return prefix;
 }
 
-export function formatTreePayload(rows: TreeRow[], rootPath = '.') {
-  if (rows.length === 0) {
-    return [
-      '```',
-      rootPath,
-      '└── (no selected files)',
-      '```',
-    ].join('\n');
-  }
+// A label on its own tree line, with CR and LF escaped so a file name can't
+// end the line and forge another one.
+function lineLabel(label: string) {
+  return label.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+}
 
-  return [
-    '```',
-    rootPath,
-    ...rows.map((row, index) => {
-      const connector = hasLaterSibling(rows, index, row.depth) ? '├──' : '└──';
-      return `${treePrefix(rows, index, row.depth)}${connector} ${row.label}`;
-    }),
-    '```',
-  ].join('\n');
+// A fence longer than any run of backticks in the lines, so no file name can
+// close it early.
+function fenceFor(lines: ReadonlyArray<string>) {
+  let longestRun = 0;
+  for (const line of lines) {
+    for (const match of line.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
+  }
+  return '`'.repeat(Math.max(3, longestRun + 1));
+}
+
+export function formatTreePayload(rows: TreeRow[], rootPath = '.') {
+  const body = rows.length === 0
+    ? [lineLabel(rootPath), '└── (no selected files)']
+    : [
+      lineLabel(rootPath),
+      ...rows.map((row, index) => {
+        const connector = hasLaterSibling(rows, index, row.depth) ? '├──' : '└──';
+        return `${treePrefix(rows, index, row.depth)}${connector} ${lineLabel(row.label)}`;
+      }),
+    ];
+  const fence = fenceFor(body);
+  return [fence, ...body, fence].join('\n');
 }
