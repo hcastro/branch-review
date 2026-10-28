@@ -145,7 +145,9 @@ function runGit(cwd: string, args: string[], options: RunGitOptions = {}) {
   }
 
   const reason = firstLine(result.stderr) || `exit code ${result.status ?? 'unknown'}`;
-  throw new Error(`git ${args[0]} failed: ${reason}`);
+  // The full stderr rides along so callers can show git's fatal:/error: line
+  // when it is not the first line.
+  throw Object.assign(new Error(`git ${args[0]} failed: ${reason}`), {stderr: result.stderr});
 }
 
 /** For commands that print one value: drops only the final newline. */

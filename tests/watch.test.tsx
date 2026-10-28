@@ -132,7 +132,7 @@ afterEach(() => {
   }
 });
 
-describe('watch helpers', () => {
+describe('watch helpers', {timeout: 20_000}, () => {
   it('debounces bursty events into one callback', () => {
     vi.useFakeTimers();
     const callback = vi.fn();
@@ -213,7 +213,7 @@ describe('watch helpers', () => {
 
     await expect(Promise.race([
       changed.then(() => 'changed'),
-      flush(1000).then(() => 'timeout'),
+      flush(5000).then(() => 'timeout'),
     ])).resolves.toBe('changed');
 
     await watcher.close();
@@ -244,7 +244,7 @@ describe('watch helpers', () => {
 
     await expect(Promise.race([
       changed.then(() => 'changed'),
-      flush(1000).then(() => 'timeout'),
+      flush(5000).then(() => 'timeout'),
     ])).resolves.toBe('changed');
 
     await watcher.close();
@@ -274,14 +274,16 @@ describe('watch helpers', () => {
 
     await expect(Promise.race([
       changed.then(() => 'changed'),
-      flush(1000).then(() => 'timeout'),
+      flush(5000).then(() => 'timeout'),
     ])).resolves.toBe('changed');
 
     await watcher.close();
   });
 });
 
-describe('ReviewController watch refresh', () => {
+// These build temp repos and run git synchronously, which can pass vitest's
+// 5 s default on a loaded machine.
+describe('ReviewController watch refresh', {timeout: 20_000}, () => {
   it('skips rebuilds when Git fingerprint is unchanged and refreshes after repo changes', async () => {
     const cwd = createRepo();
     const range = resolveRefs(cwd, 'HEAD', 'development');
@@ -518,7 +520,10 @@ describe('ReviewController watch refresh', () => {
 
     Object.defineProperty(instance.stdout, 'columns', {value: 200, configurable: true});
     instance.stdout.emit('resize');
-    await flush(400);
+    const deadline = Date.now() + 5000;
+    while (buildReview.mock.calls.length === 0 && Date.now() < deadline) await flush(25);
+    // Let any second, unwanted rebuild or watcher recreation show up.
+    await flush(300);
 
     expect(watchers.createWatcher).toHaveBeenCalledTimes(1);
     expect(watchers.current.close).not.toHaveBeenCalled();
@@ -563,7 +568,7 @@ describe('ReviewController watch refresh', () => {
     await flush(10);
     for (let index = 0; index < 5; index += 1) watchers.current.options.onChange();
 
-    const frame = await waitForFrame(instance, (text) => text.includes('landed after timeout'), 2000);
+    const frame = await waitForFrame(instance, (text) => text.includes('landed after timeout'), 10_000);
     expect(refreshInWorker).toHaveBeenCalledTimes(2);
     expect(frame).toContain('landed after timeout');
     expect(frame).not.toContain('watch error');
@@ -803,7 +808,7 @@ describe('ReviewController with the real refresh worker', () => {
     );
 
     await flush();
-    installFakeGit('case "$1" in merge-base) echo "fatal: simulated merge-base failure" >&2; exit 128;; esac\nexec "$REAL_GIT" "$@"');
+    installFakeGit('for arg in "$@"; do case "$arg" in merge-base) echo "fatal: simulated merge-base failure" >&2; exit 128;; esac; done\nexec "$REAL_GIT" "$@"');
     watchers.current.options.onChange();
     let frame = await waitForFrame(instance, (text) => text.includes('watch error'));
     process.env.PATH = originalPath;

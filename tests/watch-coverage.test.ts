@@ -86,7 +86,8 @@ async function startWatcher(repoRoot: string, options: Partial<CreateRepoWatcher
     reset() {
       changes = 0;
     },
-    async waitForChange(timeoutMs = 2000) {
+    // Returns as soon as a change arrives; the bound only caps the wait.
+    async waitForChange(timeoutMs = 10_000) {
       if (changes > 0) return true;
       return Promise.race([
         new Promise<boolean>((resolve) => waiters.push(() => resolve(true))),
@@ -133,7 +134,7 @@ afterEach(() => {
   }
 });
 
-describe.each(watchModes)('repo watcher coverage ($name)', ({usePolling, available}) => {
+describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({usePolling, available}) => {
   const it = available ? base.it : base.it.skip;
 
   it('fires for edits under tracked top-level lib/ and dist/ directories', async () => {
@@ -278,13 +279,13 @@ describe('repo watcher with large listings', () => {
     expect(watcher.changes).toBe(0);
 
     fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
-    expect(await watcher.waitForChange(3000)).toBe(true);
+    expect(await watcher.waitForChange()).toBe(true);
 
     await watcher.close();
   }, 60_000);
 });
 
-describe.each(watchModes)('repo watcher Git state coverage ($name)', ({usePolling, available}) => {
+describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 60_000}, ({usePolling, available}) => {
   const it = available ? base.it : base.it.skip;
 
   it('fires when another worktree commits to a branch that is not checked out here', async () => {

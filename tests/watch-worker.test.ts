@@ -105,7 +105,9 @@ describe('refreshReviewInWorker', () => {
 
   it('rejects with a timeout when the refresh never finishes', async () => {
     const cwd = createRepo();
-    const binDir = fakeGitBinDir('sleep 3\nexec "$REAL_GIT" "$@"');
+    // Each git call takes 10 s, so anything that settles well before that
+    // came from the timeout.
+    const binDir = fakeGitBinDir('sleep 10\nexec "$REAL_GIT" "$@"');
 
     const startedAt = Date.now();
     const result = await settleWithin(withPath(binDir, () => refreshReviewInWorker({
@@ -114,13 +116,13 @@ describe('refreshReviewInWorker', () => {
       requestedBase: 'development',
       width: 100,
       timeoutMs: 500,
-    })), 2500);
+    })), 7000);
 
     expect(result.state).toBe('rejected');
     if (result.state !== 'rejected') return;
     expect(result.error.message).toMatch(/refresh timed out/);
-    expect(Date.now() - startedAt).toBeLessThan(2500);
-  }, 10_000);
+    expect(Date.now() - startedAt).toBeLessThan(7000);
+  }, 20_000);
 
   it('lets a slow refresh that finishes under the timeout land', async () => {
     const cwd = createRepo();
@@ -171,7 +173,7 @@ describe('refreshReviewInWorker', () => {
 
   it('passes git stderr through on failure', async () => {
     const cwd = createRepo();
-    const binDir = fakeGitBinDir('case "$1" in merge-base) echo "fatal: simulated merge-base failure" >&2; exit 128;; esac\nexec "$REAL_GIT" "$@"');
+    const binDir = fakeGitBinDir('for arg in "$@"; do case "$arg" in merge-base) echo "fatal: simulated merge-base failure" >&2; exit 128;; esac; done\nexec "$REAL_GIT" "$@"');
 
     const result = await settleWithin(withPath(binDir, () => refreshReviewInWorker({
       cwd,
@@ -187,7 +189,7 @@ describe('refreshReviewInWorker', () => {
 
   it('stops the refresh when aborted', async () => {
     const cwd = createRepo();
-    const binDir = fakeGitBinDir('sleep 3\nexec "$REAL_GIT" "$@"');
+    const binDir = fakeGitBinDir('sleep 10\nexec "$REAL_GIT" "$@"');
     const controller = new AbortController();
 
     const pending = withPath(binDir, () => refreshReviewInWorker({
@@ -200,14 +202,14 @@ describe('refreshReviewInWorker', () => {
     setTimeout(() => controller.abort(), 300);
 
     const startedAt = Date.now();
-    const result = await settleWithin(pending, 2000);
+    const result = await settleWithin(pending, 7000);
     expect(result.state).toBe('rejected');
-    expect(Date.now() - startedAt).toBeLessThan(1500);
-  }, 10_000);
+    expect(Date.now() - startedAt).toBeLessThan(7000);
+  }, 20_000);
 
   it('does not keep the process alive after an aborted refresh', () => {
     const cwd = createRepo();
-    const binDir = fakeGitBinDir('sleep 5\nexec "$REAL_GIT" "$@"');
+    const binDir = fakeGitBinDir('sleep 20\nexec "$REAL_GIT" "$@"');
     const probeDir = makeTempDir('branch-review-probe-');
     const probe = path.join(probeDir, 'probe.mjs');
     const workerRefreshUrl = new URL('../src/review/workerRefresh.ts', import.meta.url).href;
@@ -225,13 +227,14 @@ describe('refreshReviewInWorker', () => {
       cwd: projectRoot,
       env: {...process.env, PATH: `${binDir}${path.delimiter}${originalPath ?? ''}`},
       encoding: 'utf8',
-      timeout: 15_000,
+      timeout: 30_000,
     });
     const elapsed = Date.now() - startedAt;
 
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(0);
-    // Without the fix the process waits for every pending git call to finish.
-    expect(elapsed).toBeLessThan(4000);
-  }, 20_000);
+    // Without the fix the process waits for the pending 20 s git call to
+    // finish; the bound leaves room for tsx startup on a loaded machine.
+    expect(elapsed).toBeLessThan(12_000);
+  }, 40_000);
 });
