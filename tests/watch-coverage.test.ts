@@ -4,7 +4,7 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import * as base from 'vitest';
 import {afterEach, describe, expect} from 'vitest';
-import {createRepoWatcher, type CreateRepoWatcherOptions} from '../src/watch/repoWatcher.js';
+import {createRepoWatcher, defaultNativeWatchMode, type CreateRepoWatcherOptions, type NativeWatchMode} from '../src/watch/repoWatcher.js';
 
 const tempDirs: string[] = [];
 const originalPath = process.env.PATH;
@@ -47,6 +47,17 @@ function installFakeGit(script: string) {
   const binDir = makeTempDir('branch-review-fake-git-');
   fs.writeFileSync(path.join(binDir, 'git'), `#!/bin/sh\n${script.replaceAll('$REAL_GIT', realGit)}\n`, {mode: 0o755});
   process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ''}`;
+}
+
+function openFdCount() {
+  for (const fdDir of ['/proc/self/fd', '/dev/fd']) {
+    try {
+      return fs.readdirSync(fdDir).length;
+    } catch {
+      // Not on this platform.
+    }
+  }
+  return null;
 }
 
 async function flush(ms = 0) {
@@ -104,28 +115,41 @@ async function startWatcher(repoRoot: string, options: Partial<CreateRepoWatcher
 }
 
 // Some sandboxes refuse fs.watch on directories (EMFILE) while polling still
-// works; the native variant only runs where fs.watch is usable.
-async function nativeDirectoryWatchWorks() {
+// works; there the native variants are skipped. CI must have native watching,
+// so a failing probe fails the run there instead of skipping.
+async function nativeWatchProbe() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-watch-probe-'));
   try {
-    const watcher = fs.watch(dir);
-    const failed = await new Promise<boolean>((resolve) => {
-      watcher.once('error', () => resolve(true));
-      setTimeout(() => resolve(false), 100);
+    const watchers = [fs.watch(dir), fs.watch(dir, {recursive: defaultNativeWatchMode() === 'recursive'})];
+    const failure = await new Promise<Error | null>((resolve) => {
+      for (const watcher of watchers) watcher.once('error', resolve);
+      setTimeout(() => resolve(null), 100);
     });
-    watcher.close();
-    return !failed;
-  } catch {
-    return false;
+    for (const watcher of watchers) watcher.close();
+    return failure;
+  } catch (error) {
+    return error as Error;
   } finally {
     fs.rmSync(dir, {recursive: true, force: true});
   }
 }
 
+const nativeProbeFailure = await nativeWatchProbe();
+const requireNative = Boolean(process.env.CI);
+const nativeModes: NativeWatchMode[] = [...new Set<NativeWatchMode>([defaultNativeWatchMode(), 'directories'])];
 const watchModes = [
-  {name: 'fs.watch', usePolling: false, available: await nativeDirectoryWatchWorks()},
-  {name: 'polling', usePolling: true, available: true},
+  ...nativeModes.map((nativeMode) => ({
+    name: `fs.watch ${nativeMode}`,
+    usePolling: false,
+    nativeMode,
+    available: requireNative || nativeProbeFailure === null,
+  })),
+  {name: 'polling', usePolling: true, nativeMode: undefined, available: true},
 ];
+
+base.it.runIf(requireNative)('can watch natively in CI', () => {
+  expect(nativeProbeFailure?.message ?? null).toBeNull();
+});
 
 afterEach(() => {
   process.env.PATH = originalPath;
@@ -134,12 +158,12 @@ afterEach(() => {
   }
 });
 
-describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({usePolling, available}) => {
+describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({usePolling, nativeMode, available}) => {
   const it = available ? base.it : base.it.skip;
 
   it('fires for edits under tracked top-level lib/ and dist/ directories', async () => {
     const cwd = createRepo({'lib/index.js': 'module.exports = 1;\n', 'dist/keep.js': 'keep\n'});
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     fs.writeFileSync(path.join(cwd, 'lib', 'index.js'), 'module.exports = 2;\n');
     expect(await watcher.waitForChange()).toBe(true);
@@ -153,7 +177,7 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
 
   it('fires for edits inside directories created after the watcher started', async () => {
     const cwd = createRepo();
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     fs.mkdirSync(path.join(cwd, 'src', 'feature', 'deep'), {recursive: true});
     await flush(300);
@@ -178,7 +202,7 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
     writeFile(cwd, 'pkg/x.ts', 'export const x = 1;\n');
     runGit(cwd, 'add', '.');
     runGit(cwd, 'commit', '-q', '-m', 'add pkg');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     runGit(cwd, 'checkout', '-q', 'main');
     expect(fs.existsSync(path.join(cwd, 'pkg'))).toBe(false);
@@ -198,7 +222,7 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
   it('does not fire for writes to gitignored files, but still fires for a tracked file beside them', async () => {
     const cwd = createRepo({'.gitignore': '*.log\nout/\n'});
     fs.writeFileSync(path.join(cwd, 'dev.log'), 'start\n');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     for (let index = 0; index < 5; index += 1) {
       fs.appendFileSync(path.join(cwd, 'dev.log'), `line ${index}\n`);
@@ -224,14 +248,174 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
   it('starts watching a file once .gitignore stops ignoring it', async () => {
     const cwd = createRepo({'.gitignore': '*.log\n'});
     fs.writeFileSync(path.join(cwd, 'dev.log'), 'start\n');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     fs.writeFileSync(path.join(cwd, '.gitignore'), '# nothing ignored\n');
     expect(await watcher.waitForChange()).toBe(true);
-    await watcher.settle(800);
+    watcher.reset();
 
+    // Written whether or not the re-listing has finished: either the write
+    // is seen, or the re-listing refreshes once dev.log counts.
     fs.appendFileSync(path.join(cwd, 'dev.log'), 'now visible\n');
     expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('refreshes after a re-listing un-ignores a path that was written while it ran', async () => {
+    const cwd = createRepo({'.gitignore': '*.log\n'});
+    fs.writeFileSync(path.join(cwd, 'dev.log'), 'start\n');
+    const slowFlag = path.join(makeTempDir('branch-review-slow-flag-'), 'on');
+    installFakeGit(`case "$*" in *ls-files*) [ -f '${slowFlag}' ] && sleep 1.5;; esac\nexec "$REAL_GIT" "$@"`);
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    fs.writeFileSync(slowFlag, '');
+    fs.writeFileSync(path.join(cwd, '.gitignore'), '# nothing ignored\n');
+    expect(await watcher.waitForChange()).toBe(true);
+    // The .gitignore refresh has fired; the re-listing is still asleep.
+    await watcher.settle(usePolling ? 700 : 300);
+
+    fs.appendFileSync(path.join(cwd, 'dev.log'), 'written while git was listing\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('fires for tracked files with editor backup and swap names', async () => {
+    const cwd = createRepo({'notes~': 'one\n', '.session.vim.swp': 'one\n'});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    fs.writeFileSync(path.join(cwd, 'notes~'), 'two\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.settle();
+    fs.writeFileSync(path.join(cwd, '.session.vim.swp'), 'two\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('fires for a new file whose name starts with pathspec magic, without a watch error', async () => {
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    fs.writeFileSync(path.join(cwd, ':!x.ts'), 'export const x = 1;\n');
+    expect(await watcher.waitForChange()).toBe(true);
+    await flush(300);
+    expect(watcher.errors.map((error) => error.message)).toEqual([]);
+
+    await watcher.close();
+  });
+
+  it('does not go into a submodule, and writes to its ignored files raise no error', async () => {
+    const subSource = createRepo({'.gitignore': 'node_modules/\n'});
+    const cwd = createRepo();
+    runGit(cwd, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    runGit(cwd, 'commit', '-q', '-m', 'add submodule');
+    writeFile(cwd, 'sub/node_modules/dep/index.js', 'dep\n');
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    for (let index = 0; index < 3; index += 1) {
+      fs.appendFileSync(path.join(cwd, 'sub', 'node_modules', 'dep', 'index.js'), `line ${index}\n`);
+      writeFile(cwd, `sub/node_modules/dep/new${index}.js`, 'new\n');
+      await flush(150);
+    }
+    await flush(600);
+    expect(watcher.changes).toBe(0);
+    expect(watcher.errors.map((error) => error.message)).toEqual([]);
+
+    fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('does not follow tracked symlinks out of the repo or into a loop', async () => {
+    const outside = makeTempDir('branch-review-watch-outside-');
+    writeFile(outside, 'deep/file.txt', 'outside\n');
+    const cwd = createRepo();
+    fs.symlinkSync(outside, path.join(cwd, 'linkout'));
+    fs.symlinkSync('..', path.join(cwd, 'src', 'up'));
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-q', '-m', 'add links');
+    const fdsBefore = openFdCount();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+    const fdsAfter = openFdCount();
+
+    if (fdsBefore !== null && fdsAfter !== null) expect(fdsAfter - fdsBefore).toBeLessThan(100);
+    expect(watcher.errors.map((error) => error.message)).toEqual([]);
+
+    fs.writeFileSync(path.join(outside, 'deep', 'file.txt'), 'outside 2\n');
+    fs.writeFileSync(path.join(outside, 'new.txt'), 'new\n');
+    await flush(900);
+    expect(watcher.changes).toBe(0);
+
+    fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  // Reading a file only moves its atime; with an mtime in the future some
+  // watchers report every read as a change.
+  (usePolling ? base.it.skip : it)('does not fire when a file with a future mtime is only read', async () => {
+    const cwd = createRepo({'future.ts': 'export const f = 1;\n'});
+    const filePath = path.join(cwd, 'future.ts');
+    const future = new Date(Date.now() + 60 * 60 * 1000);
+    fs.utimesSync(filePath, future, future);
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    fs.writeFileSync(filePath, 'export const f = 2;\n');
+    fs.utimesSync(filePath, future, future);
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle();
+
+    // What a refresh does: other processes read the file.
+    for (let index = 0; index < 8; index += 1) {
+      execFileSync('cat', [filePath]);
+      runGit(cwd, 'diff', 'HEAD');
+      await flush(400);
+    }
+    await flush(500);
+    expect(watcher.changes).toBe(0);
+
+    await watcher.close();
+  });
+
+  (usePolling ? base.it.skip : it)('refreshes at least once a second during a continuous write stream', async () => {
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode, debounceMs: 200});
+
+    const startedAt = Date.now();
+    let firstChangeAt: number | null = null;
+    for (let index = 0; index < 40; index += 1) {
+      fs.appendFileSync(path.join(cwd, 'src', 'one.ts'), `// ${index}\n`);
+      await flush(60);
+      if (firstChangeAt === null && watcher.changes > 0) firstChangeAt = Date.now() - startedAt;
+    }
+
+    expect(firstChangeAt).not.toBeNull();
+    expect(firstChangeAt!).toBeLessThan(1800);
+
+    await watcher.close();
+  });
+
+  it('stops refreshing for a file once .git/info/exclude ignores it', async () => {
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    // Seen once while visible, so the watcher remembers it as visible.
+    fs.writeFileSync(path.join(cwd, 'scratch.tmp'), 'one\n');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle();
+
+    fs.appendFileSync(path.join(cwd, '.git', 'info', 'exclude'), '*.tmp\n');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(800);
+
+    fs.appendFileSync(path.join(cwd, 'scratch.tmp'), 'two\n');
+    await flush(900);
+    expect(watcher.changes).toBe(0);
 
     await watcher.close();
   });
@@ -239,7 +423,7 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
   it('reports a failed ignore listing through onError and still watches the repo', async () => {
     const cwd = createRepo();
     installFakeGit('case "$*" in *ls-files*) echo "fatal: simulated ls-files failure" >&2; exit 128;; esac\nexec "$REAL_GIT" "$@"');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
     process.env.PATH = originalPath;
 
     expect(watcher.errors.map((error) => error.message).join('\n')).toContain('fatal: simulated ls-files failure');
@@ -285,7 +469,7 @@ describe('repo watcher with large listings', () => {
   }, 60_000);
 });
 
-describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 60_000}, ({usePolling, available}) => {
+describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 60_000}, ({usePolling, nativeMode, available}) => {
   const it = available ? base.it : base.it.skip;
 
   it('fires when another worktree commits to a branch that is not checked out here', async () => {
@@ -294,7 +478,7 @@ describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 6
     runGit(cwd, 'checkout', '-q', '-b', 'hc/wip');
     const agentWorktree = path.join(makeTempDir('branch-review-agent-'), 'wt');
     runGit(cwd, 'worktree', 'add', '-q', agentWorktree, 'feature/agent');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     fs.writeFileSync(path.join(agentWorktree, 'agent.txt'), 'agent\n');
     runGit(agentWorktree, 'add', 'agent.txt');
@@ -310,7 +494,7 @@ describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 6
     runGit(cwd, 'checkout', '-q', '--detach');
     fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
     runGit(cwd, 'commit', '-q', '-am', 'detached work');
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     runGit(cwd, 'update-ref', 'refs/heads/side', 'HEAD');
     expect(await watcher.waitForChange()).toBe(true);
@@ -322,7 +506,7 @@ describe.each(watchModes)('repo watcher Git state coverage ($name)', {timeout: 6
     const upstream = createRepo();
     const cwd = createRepo();
     expect(fs.existsSync(path.join(cwd, '.git', 'FETCH_HEAD'))).toBe(false);
-    const watcher = await startWatcher(cwd, {usePolling});
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
 
     runGit(cwd, 'fetch', '-q', upstream, 'main');
     expect(fs.existsSync(path.join(cwd, '.git', 'FETCH_HEAD'))).toBe(true);

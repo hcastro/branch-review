@@ -126,7 +126,7 @@ export function ReviewController({
   const [review, setReview] = useState(initialReview);
   const [activeRange, setActiveRange] = useState(range);
   const [watchStatus, setWatchStatus] = useState<WatchState>(watch ? {state: 'watching'} : {state: 'off'});
-  // Watcher errors stay up until the watcher is recreated: chokidar keeps the
+  // Watcher errors stay up until the watcher is recreated: the watcher keeps the
   // rest of the tree watched, so a later good refresh does not mean coverage
   // is back.
   const [watcherError, setWatcherError] = useState<string | null>(null);
@@ -161,20 +161,27 @@ export function ReviewController({
 
     const run = async (): Promise<void> => {
       refreshInFlightRef.current = true;
+      // Registered before the yield below, so an unmount during it aborts
+      // this run before anything is started.
+      const abort = new AbortController();
+      refreshAbortRef.current = abort;
       setWatchStatus((current) => ({
         state: 'refreshing',
         lastUpdatedAt: 'lastUpdatedAt' in current ? current.lastUpdatedAt : undefined,
       }));
 
       await new Promise((resolve) => setTimeout(resolve, 0));
+      if (abort.signal.aborted || !mountedRef.current) {
+        if (refreshAbortRef.current === abort) refreshAbortRef.current = null;
+        refreshInFlightRef.current = false;
+        return;
+      }
 
       const latest = latestRef.current;
       const width = latest.modelWidth;
       const forceRebuild = forceRebuildRef.current;
       forceRebuildRef.current = false;
       const previousFingerprint = forceRebuild ? null : fingerprintRef.current;
-      const abort = new AbortController();
-      refreshAbortRef.current = abort;
 
       try {
         const workerRefreshAvailable = latest.requestedBranch

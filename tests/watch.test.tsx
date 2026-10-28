@@ -612,6 +612,91 @@ describe('ReviewController watch refresh', {timeout: 20_000}, () => {
     expect(refreshSignal?.aborted).toBe(true);
   });
 
+  it('starts no refresh process when unmounted right after a change', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const refreshInWorker = vi.fn(() => new Promise<never>(() => {}));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    // Unmount inside the refresh's start-up yield.
+    watchers.current.options.onChange();
+    instance.unmount();
+    await flush(50);
+
+    expect(refreshInWorker).not.toHaveBeenCalled();
+  });
+
+  it('keeps asking for a full rebuild after a resize refresh fails, and stops once one lands', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const fingerprint = getReviewFingerprint(cwd, range);
+    const calls: Array<string | null | undefined> = [];
+    let failNext = true;
+    const refreshInWorker = vi.fn(async (options: {previousFingerprint?: string | null}) => {
+      calls.push(options.previousFingerprint);
+      if (failNext) {
+        failNext = false;
+        throw new Error('refresh timed out: no progress for 30s');
+      }
+      return {
+        range,
+        fingerprint,
+        branchName: 'feature/watch',
+        review: reviewModel([{path: 'src/one.ts', text: 'rebuilt one'}]),
+      };
+    });
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={fingerprint}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+      />,
+    );
+
+    await flush();
+    Object.defineProperty(instance.stdout, 'columns', {value: 200, configurable: true});
+    instance.stdout.emit('resize');
+    await waitForFrame(instance, (text) => text.includes('refresh timed out'), 5000);
+    expect(calls).toEqual([null]);
+
+    // The width still differs from the last build, so the next refresh must
+    // rebuild rather than trust the fingerprint.
+    watchers.current.options.onChange();
+    await waitForFrame(instance, (text) => text.includes('rebuilt one'), 5000);
+    expect(calls).toEqual([null, null]);
+
+    watchers.current.options.onChange();
+    const deadline = Date.now() + 5000;
+    while (calls.length < 3 && Date.now() < deadline) await flush(25);
+    expect(calls).toEqual([null, null, fingerprint]);
+
+    instance.unmount();
+  });
+
   it("shows git's reason when a refresh fails", async () => {
     const cwd = createRepo();
     const range = resolveRefs(cwd, 'HEAD', 'development');
