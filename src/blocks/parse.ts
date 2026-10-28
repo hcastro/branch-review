@@ -16,7 +16,13 @@ function parseLineCount(value: string | undefined) {
   return value === undefined ? 1 : Number(value);
 }
 
-function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlock | null {
+// `text` is the hunk exactly as it appears in the file diff, from its @@
+// header up to the next hunk, line terminators included, so a copied block
+// keeps a trailing blank context line and its final newline.
+function buildBlock(filePath: string, index: number, text: string): ReviewBlock | null {
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+
   const header = lines[0];
   const match = header?.match(BLOCK_HEADER_PATTERN);
   if (!match) return null;
@@ -28,13 +34,15 @@ function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlo
   const functionHeader = match[5]?.trim() || undefined;
   const lineStart = newStart;
   const lineEnd = newStart + Math.max(newLines, 1) - 1;
+  // Hunk bodies hold no file headers, so every `+` line is an added line,
+  // including code such as `++i;`.
   const addedCode = lines
     .slice(1)
-    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+    .filter((line) => line.startsWith('+'))
     .map((line) => line.slice(1))
     .join('\n');
 
-  const rawDiff = lines.join('\n').trimEnd();
+  const rawDiff = text;
 
   return {
     id: `${filePath}:${newStart}:${index}`,
@@ -54,28 +62,25 @@ function buildBlock(filePath: string, index: number, lines: string[]): ReviewBlo
 
 export function parseUnifiedDiffBlocks(rawDiff: string, filePath: string): ReviewBlock[] {
   const blocks: ReviewBlock[] = [];
-  let current: string[] = [];
+  let blockStart = -1;
+  let offset = 0;
 
-  for (const line of rawDiff.split('\n')) {
-    if (BLOCK_HEADER_PATTERN.test(line)) {
-      if (current.length > 0) {
-        const block = buildBlock(filePath, blocks.length, current);
-        if (block) blocks.push(block);
-      }
-
-      current = [line];
-      continue;
-    }
-
-    if (current.length > 0) {
-      current.push(line);
-    }
-  }
-
-  if (current.length > 0) {
-    const block = buildBlock(filePath, blocks.length, current);
+  const closeBlock = (end: number) => {
+    if (blockStart < 0) return;
+    const block = buildBlock(filePath, blocks.length, rawDiff.slice(blockStart, end));
     if (block) blocks.push(block);
+  };
+
+  while (offset < rawDiff.length) {
+    const newline = rawDiff.indexOf('\n', offset);
+    const lineEnd = newline < 0 ? rawDiff.length : newline;
+    if (BLOCK_HEADER_PATTERN.test(rawDiff.slice(offset, lineEnd))) {
+      closeBlock(offset);
+      blockStart = offset;
+    }
+    offset = newline < 0 ? rawDiff.length : newline + 1;
   }
 
+  closeBlock(rawDiff.length);
   return blocks;
 }

@@ -25,6 +25,12 @@ export type ReviewFile = {
   rawDiff: string;
   renderedLines: string[];
   blocks: ReviewBlock[];
+  /**
+   * Set when this file's diff could not be read or rendered. rawDiff and
+   * blocks are kept when only rendering failed, so copy actions still work;
+   * renderedLines is empty.
+   */
+  error?: string;
 };
 
 export type ReviewModel = {

@@ -2,6 +2,23 @@ import {describe, expect, it} from 'vitest';
 import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload} from '../src/tree.js';
 
 describe('buildTreeRows', () => {
+  it('keeps a file and a directory with the same path apart', () => {
+    const shape = (files: string[]) => buildTreeRows(files).map((row) => `${row.depth}:${row.kind}:${row.path}`);
+
+    expect(shape(['docs', 'docs/README.md', 'README.md'])).toEqual([
+      '0:file:docs',
+      '0:file:README.md',
+      '0:dir:docs',
+      '1:file:docs/README.md',
+    ]);
+    expect(shape(['bin/tool', 'bin/tool/index.js'])).toEqual([
+      '0:dir:bin',
+      '1:dir:bin/tool',
+      '2:file:bin/tool/index.js',
+      '1:file:bin/tool',
+    ]);
+  });
+
   it('expands changed file paths into a stable directory tree', () => {
     const rows = buildTreeRows([
       '.cursor/planning/stream-feeds-v2-to-v3-mobile-migration-execplan.md',

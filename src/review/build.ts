@@ -1,8 +1,11 @@
 import {
+  MissingToolError,
   getChangedFileEntries,
-  getColoredFileDiff,
   getFileMetricsMap,
   getRawFileDiff,
+  renderDiffForDisplay,
+  withPrivateIndex,
+  type ChangedFileEntry,
   type DiffRange,
 } from '../git.js';
 import {buildDiffSections, type BranchMetrics, type DiffSection, type FileMetrics} from '../sections.js';
@@ -47,38 +50,73 @@ function hashText(text: string) {
   return (hash >>> 0).toString(36);
 }
 
-export function buildReviewModel({cwd, range, width}: BuildReviewModelOptions): ReviewModel {
-  const entries = getChangedFileEntries(cwd, range);
-  const metricsMap = getFileMetricsMap(cwd, range);
-  const untrackedFiles = new Set(
-    entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
-  );
+function errorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.split('\n')[0] || 'unknown error';
+}
 
-  const files = entries.map((entry): ReviewFile => {
-    const rawDiff = getRawFileDiff(cwd, range, entry.path, untrackedFiles);
-    const renderedDiff = getColoredFileDiff(cwd, range, entry.path, width, untrackedFiles);
+// One file that can't be diffed or rendered becomes a file with `error` set
+// instead of failing the whole review. A missing git or delta affects every
+// file, so it still fails the build.
+function buildReviewFile(
+  {cwd, range, width}: BuildReviewModelOptions,
+  entry: ChangedFileEntry,
+  metrics: FileMetrics,
+  untrackedFiles: ReadonlySet<string>,
+): ReviewFile {
+  let rawDiff = '';
+  let renderedLines: string[] = [];
+  let error: string | undefined;
 
-    return {
-      path: entry.path,
-      oldPath: entry.oldPath,
-      status: entry.status,
-      signature: hashText(`${entry.status}:${rawDiff}`),
-      metrics: metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
-      rawDiff,
-      renderedLines: splitRenderedLines(renderedDiff),
-      blocks: parseUnifiedDiffBlocks(rawDiff, entry.path),
-    };
-  });
-
-  const branch = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
+  try {
+    rawDiff = getRawFileDiff(cwd, range, entry.path, untrackedFiles, entry.oldPath);
+    renderedLines = splitRenderedLines(renderDiffForDisplay(cwd, rawDiff, width));
+  } catch (caught) {
+    if (caught instanceof MissingToolError) throw caught;
+    error = errorMessage(caught);
+    renderedLines = [];
+  }
 
   return {
-    base: range.base,
-    branch,
-    label: `${range.base}...${branch}`,
-    metrics: calculateBranchMetrics(files),
-    files,
+    path: entry.path,
+    oldPath: entry.oldPath,
+    status: entry.status,
+    signature: hashText(`${entry.status}:${error ?? ''}:${rawDiff}`),
+    metrics,
+    rawDiff,
+    renderedLines,
+    blocks: parseUnifiedDiffBlocks(rawDiff, entry.path),
+    ...(error === undefined ? {} : {error}),
   };
+}
+
+export function buildReviewModel(options: BuildReviewModelOptions): ReviewModel {
+  const {cwd, range} = options;
+
+  return withPrivateIndex(cwd, () => {
+    const entries = getChangedFileEntries(cwd, range);
+    const metricsMap = getFileMetricsMap(cwd, range);
+    const untrackedFiles = new Set(
+      entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
+    );
+
+    const files = entries.map((entry) => buildReviewFile(
+      options,
+      entry,
+      metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
+      untrackedFiles,
+    ));
+
+    const branch = range.includeWorktree ? `${range.branch} + worktree` : range.branch;
+
+    return {
+      base: range.base,
+      branch,
+      label: `${range.base}...${branch}`,
+      metrics: calculateBranchMetrics(files),
+      files,
+    };
+  });
 }
 
 export function buildReviewSections(review: Pick<ReviewModel, 'files'>): DiffSection[] {

@@ -223,4 +223,29 @@ describe('copy command registry', () => {
       reason: 'not-found',
     });
   });
+
+  it('shows why file contents could not be read', async () => {
+    const writes: string[] = [];
+    const result = await executeCopyCommand('copy.fileContents', {
+      model,
+      activeFile: file,
+      readFileContent: () => {
+        throw new Error('src/example.ts is not a regular file');
+      },
+    }, {
+      write: (text) => {
+        writes.push(text);
+        return {ok: true, command: {command: 'fake', args: [], displayName: 'fake'}};
+      },
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      commandId: 'copy.fileContents',
+      toast: 'Copy action unavailable.',
+      hint: 'src/example.ts is not a regular file',
+      reason: 'disabled',
+    });
+    expect(writes).toEqual([]);
+  });
 });

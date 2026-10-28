@@ -43,6 +43,13 @@ function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
   rows.push({kind: 'file', label: node.name, depth, path: node.path, status: node.status});
 }
 
+// Children are keyed by kind and name, so a path that is a file on one side
+// of the diff and a directory on the other (`docs` and `docs/README.md`)
+// keeps both nodes.
+function childKey(kind: TreeNode['kind'], name: string) {
+  return `${kind}:${name}`;
+}
+
 export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string, FileStatus>): TreeRow[] {
   const roots = new Map<string, TreeNode>();
 
@@ -50,35 +57,24 @@ export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string
     const status = statusByPath?.get(filePath);
     const parts = filePath.split('/');
 
-    if (parts.length === 1) {
-      roots.set(filePath, {
-        name: filePath,
-        path: filePath,
-        kind: 'file',
-        status,
-      });
-      continue;
-    }
-
     let currentMap = roots;
     let currentPath = '';
 
     for (const [index, part] of parts.entries()) {
       currentPath = currentPath ? `${currentPath}/${part}` : part;
-      const isFile = index === parts.length - 1;
-      const existing = currentMap.get(part);
 
-      if (!existing) {
-        const node: TreeNode = isFile
-          ? {name: part, path: currentPath, kind: 'file', status}
-          : {name: part, path: currentPath, kind: 'dir', children: new Map()};
-        currentMap.set(part, node);
+      if (index === parts.length - 1) {
+        currentMap.set(childKey('file', part), {name: part, path: currentPath, kind: 'file', status});
+        break;
       }
 
-      const next = currentMap.get(part)!;
-      if (next.kind === 'dir') {
-        currentMap = next.children!;
+      const key = childKey('dir', part);
+      let directory = currentMap.get(key);
+      if (!directory) {
+        directory = {name: part, path: currentPath, kind: 'dir', children: new Map()};
+        currentMap.set(key, directory);
       }
+      currentMap = directory.children!;
     }
   }
 

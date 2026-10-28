@@ -2,6 +2,29 @@ import {describe, expect, it} from 'vitest';
 import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
 
 describe('parseUnifiedDiffBlocks', () => {
+  it('keeps added lines that start with ++ in the block code', () => {
+    const rawDiff = [
+      'diff --git a/loop.c b/loop.c',
+      '--- a/loop.c',
+      '+++ b/loop.c',
+      '@@ -1 +1,3 @@',
+      ' int i = 0;',
+      '+++i;',
+      '+++ not a header',
+      '',
+    ].join('\n');
+
+    const [block] = parseUnifiedDiffBlocks(rawDiff, 'loop.c');
+    expect(block?.addedCode).toBe('++i;\n++ not a header');
+  });
+
+  it('slices each block exactly, keeping line terminators', () => {
+    const rawDiff = 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-a\n+b\n \n@@ -9 +9 @@\n-c\n+d\n';
+    const blocks = parseUnifiedDiffBlocks(rawDiff, 'x');
+
+    expect(blocks.map((block) => block.rawDiff)).toEqual(['@@ -1,2 +1,2 @@\n-a\n+b\n \n', '@@ -9 +9 @@\n-c\n+d\n']);
+  });
+
   it('extracts block ranges, function headers, raw diff, and added code', () => {
     const rawDiff = [
       'diff --git a/src/example.ts b/src/example.ts',
@@ -37,7 +60,8 @@ describe('parseUnifiedDiffBlocks', () => {
        const before = true;
       -const value = 1;
       +const value = 2;
-      +const next = 3;"
+      +const next = 3;
+      "
     `);
     expect(blocks[1]).toMatchObject({
       id: 'src/example.ts:11:1',
