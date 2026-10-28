@@ -171,7 +171,8 @@ Some copies fail on purpose, and the toast names the reason:
 
 - A file that isn't valid UTF-8 text can't be copied as text. The copy reports "not UTF-8 text".
 - Copying contents (`Copy file` or `f`) fails for a file over 16 MB.
-- When a file's diff failed to load, its copy actions report that failure as the reason.
+- When a file's diff failed to load, its diff and block copies report that failure as the reason. `Copy file` and `f` still work, since they read the file itself.
+- A file whose name isn't valid UTF-8 can't be copied at all, its path included. Every copy of it reports "file name is not UTF-8".
 
 ### Small terminals
 
@@ -189,6 +190,8 @@ cd '/Users/me/code/app' && branch-review
 
 Ask for it with "let me review this", "/branch-review", or "show me the diff before you continue". Paste, review, and quit with `q`.
 
+The command is written for POSIX shells and zsh. The script refuses a repo path or ref name that holds control or invisible characters, such as a newline, an escape, or a bidi control, because a pasted command can't carry those safely. Its own report shows them escaped, like `\x1b` or `\u202e`.
+
 Link the skill into your user skills directory so it tracks the repo:
 
 ```sh
@@ -203,7 +206,7 @@ To pin a version, copy it with `cp -R` instead. For one project only, put it in 
 
 Watch mode follows the work tree plus the Git state that moves on a commit, push, or fetch: `HEAD`, the index, the current branch ref, and remote refs. On macOS and Windows it uses one native recursive watch on the repo root. On Linux it watches directories only, so the number of handles grows with directories and never with files. Either way it skips what Git ignores, never follows symlinks, and doesn't descend into submodules or nested repos. `--watch-poll` is the fallback when filesystem events don't arrive.
 
-A cheap fingerprint decides whether anything changed. When it did, a background process rebuilds the review so the UI stays responsive while delta runs. The process reports progress after each file, and it's stopped only after 30 seconds with no progress. A slow refresh of a large repo finishes, and a hung `git` or `delta` still gets killed.
+A cheap fingerprint decides whether anything changed. When it did, a background process rebuilds the review so the UI stays responsive while delta runs. Each file it finishes counts as progress, and so does each chunk of output from `git` or `delta`. The process is stopped only when `git` or `delta` produces nothing for 30 seconds. A slow refresh of a large repo finishes, and a hung `git` or `delta` still gets killed.
 
 ### What branch-review touches
 
@@ -213,7 +216,7 @@ A few things happen the same way they do for `git status` or `git diff`:
 
 - Configured clean filters such as git-lfs run on worktree files, and git-lfs may store objects under `.git/lfs`.
 - In a split-index repo, Git refreshes the shared index file's mtime on every read. Its content stays the same.
-- A partial clone may fetch missing objects on demand. Git is never allowed to prompt, so a fetch that needs credentials shows up as an error on that file.
+- A partial clone may fetch missing objects on demand, and Git writes what it fetches into `.git/objects` as new pack files. Git is never allowed to prompt, so a fetch that needs credentials shows up as an error on that file.
 
 ## Development
 

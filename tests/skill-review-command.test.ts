@@ -64,10 +64,15 @@ type SandboxOptions = {
   // Put a git on PATH that logs GIT_OPTIONAL_LOCKS and GIT_TERMINAL_PROMPT
   // for every call to `gitEnvLog`, then runs the real git.
   logGitEnv?: boolean;
+  // Put a git on PATH that runs the real git, except that it fails any call
+  // with an argument equal to $FAIL_GIT, and logs `ls -ld` of $GIT_INDEX_FILE
+  // and its directory to $INDEX_MODE_LOG. Set those variables in `env` after
+  // the repo is built, since the test's own git calls share `env`.
+  wrapGit?: boolean;
 };
 
 function createSandbox(options: SandboxOptions = {}) {
-  const {clipboard = 'pbcopy', cli = true, logGitEnv = false} = options;
+  const {clipboard = 'pbcopy', cli = true, logGitEnv = false, wrapGit = false} = options;
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-skill-')));
   tempDirs.push(root);
 
@@ -85,6 +90,25 @@ function createSandbox(options: SandboxOptions = {}) {
       writeExecutable(
         path.join(tools, 'git'),
         `#!/bin/sh\nprintf '%s %s\\n' "\${GIT_OPTIONAL_LOCKS-unset}" "\${GIT_TERMINAL_PROMPT-unset}" >> "$GIT_ENV_LOG"\nexec '${found}' "$@"\n`,
+      );
+    } else if (tool === 'git' && wrapGit) {
+      const ls = which('ls')!;
+      writeExecutable(
+        path.join(tools, 'git'),
+        [
+          '#!/bin/sh',
+          'if [ -n "$FAIL_GIT" ]; then',
+          '  for arg in "$@"; do',
+          '    if [ "$arg" = "$FAIL_GIT" ]; then echo "fatal: simulated failure of $arg" >&2; exit 128; fi',
+          '  done',
+          'fi',
+          'if [ -n "$INDEX_MODE_LOG" ] && [ -n "$GIT_INDEX_FILE" ]; then',
+          `  '${ls}' -ld "$GIT_INDEX_FILE" >> "$INDEX_MODE_LOG" 2>&1`,
+          `  '${ls}' -ld "\${GIT_INDEX_FILE%/*}" >> "$INDEX_MODE_LOG" 2>&1`,
+          'fi',
+          `exec '${found}' "$@"`,
+          '',
+        ].join('\n'),
       );
     } else {
       fs.symlinkSync(found, path.join(tools, tool));
@@ -233,6 +257,29 @@ function snapshotFiles(dir: string, prefix = ''): Record<string, string> {
 // Sets a file's atime and mtime to a whole second, so git sees no sub-second part.
 function setMtime(file: string, seconds: number) {
   fs.utimesSync(file, seconds, seconds);
+}
+
+// The characters a terminal acts on or hides: C0 (newline and tab included),
+// DEL, C1, bidi controls and invisible format characters.
+const rawHidden =
+  /[\x00-\x1f\x7f\u0080-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u2069\ufeff\u{e0000}-\u{e007f}]/u;
+
+// stderr split into lines, each checked for raw hidden characters. Only the
+// line terminators may be newlines.
+function stderrLines(stderr: string) {
+  expect(stderr.endsWith('\n')).toBe(true);
+  const lines = stderr.slice(0, -1).split('\n');
+  for (const line of lines) expect(line, JSON.stringify(line)).not.toMatch(rawHidden);
+  return lines;
+}
+
+// ls -l permission string, e.g. "drwx------". True when a user other than the
+// owner could read the file: it is group/other readable and every listed
+// directory lets them through.
+function readableByOthers(fileMode: string, dirMode: string) {
+  const fileOpen = fileMode[4] === 'r' || fileMode[7] === 'r';
+  const dirOpen = dirMode[6] === 'x' || dirMode[9] === 'x';
+  return fileOpen && dirOpen;
 }
 
 it('runs the script under the macOS system bash when on macOS', () => {
@@ -620,6 +667,238 @@ describe.each(scriptShells)('review-command.sh under %s', (shell) => {
       );
       expect(run.stderr).not.toMatch(/pnpm add -g branch-review/);
     });
+
+    it('refuses a named-branch review with no merge base', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      git(sandbox, repo, 'checkout', '-q', '--orphan', 'lonely');
+      git(sandbox, repo, 'commit', '-q', '-m', 'unrelated history');
+
+      for (const args of [[repo, 'lonely', 'main'], [repo]]) {
+        const run = runScript(sandbox, shell, args);
+        expect(run.status, run.stderr).toBe(1);
+        expect(run.stdout).toBe('');
+        expect(run.stderr).toMatch(/error: no merge base for main and (lonely|HEAD)/);
+        expect(run.stderr).not.toContain('no changes in this range');
+        expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+      }
+    });
+
+    it('reports a count as unknown when the git call behind it fails', {timeout: 60_000}, () => {
+      const sandbox = createSandbox({wrapGit: true});
+      const repo = createRepo(sandbox);
+      const cases: Array<{fail: string; args: string[]; label: string; expected: string}> = [
+        {fail: 'diff', args: [repo], label: 'in review', expected: 'unknown (tracked count unknown, 0 untracked)'},
+        {
+          fail: 'diff',
+          args: [repo, 'feat', 'main'],
+          label: 'in review',
+          expected: 'unknown (tracked count unknown, 0 untracked)',
+        },
+        {fail: 'ls-files', args: [repo], label: 'in review', expected: 'unknown (1 tracked, untracked count unknown)'},
+        {fail: 'status', args: [repo], label: 'uncommitted', expected: 'unknown (git status failed)'},
+        {fail: 'rev-list', args: [repo], label: 'commits', expected: 'unknown (git rev-list failed)'},
+      ];
+
+      for (const {fail, args, label, expected} of cases) {
+        sandbox.env.FAIL_GIT = fail;
+        const run = runScript(sandbox, shell, args);
+        expect(run.status, run.stderr).toBe(0);
+        expect(report(run.stderr, label), `${fail} ${args.length}`).toBe(expected);
+        expect(run.stderr).not.toContain('no changes in this range');
+        if (fail === 'diff') expect(run.stderr).toContain('warning: git diff failed, so the tracked count is unknown');
+        expect(fs.readFileSync(sandbox.clipOut, 'utf8')).toBe(run.command);
+      }
+    });
+
+    it('makes a relative TMPDIR absolute before git reads the index copy', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      const relative = path.join(sandbox.root, 'reltmp');
+      fs.mkdirSync(relative);
+      sandbox.env.TMPDIR = 'reltmp';
+
+      const run = runScript(sandbox, shell, [repo], sandbox.root);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+      expect(fs.readdirSync(relative)).toEqual([]);
+    });
+
+    it('keeps the private index copy unreadable by other users', () => {
+      const sandbox = createSandbox({wrapGit: true});
+      const repo = createRepo(sandbox);
+      fs.writeFileSync(path.join(repo, 'b.txt'), 'two changed\n');
+      // A repo index readable by everyone, as git writes it under umask 022.
+      fs.chmodSync(path.join(repo, '.git', 'index'), 0o644);
+      const log = path.join(sandbox.root, 'index-mode.log');
+      sandbox.env.INDEX_MODE_LOG = log;
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('2 files (2 tracked, 0 untracked)');
+      const lines = fs.readFileSync(log, 'utf8').split('\n').filter(Boolean);
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+      expect(lines.length % 2).toBe(0);
+      for (let i = 0; i + 1 < lines.length; i += 2) {
+        const [fileLine, dirLine] = [lines[i], lines[i + 1]];
+        expect(fileLine.startsWith('-'), fileLine).toBe(true);
+        expect(dirLine.startsWith('d'), dirLine).toBe(true);
+        expect(readableByOthers(fileLine, dirLine), `${fileLine}\n${dirLine}`).toBe(false);
+      }
+      expect(fs.readdirSync(sandbox.tmp)).toEqual([]);
+    });
+
+    it('names the step that failed when git cannot locate the index', () => {
+      const sandbox = createSandbox({wrapGit: true});
+      const repo = createRepo(sandbox);
+      sandbox.env.FAIL_GIT = '--git-path';
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('unknown (tracked count unknown, 0 untracked)');
+      expect(run.stderr).toContain(
+        'warning: cannot locate the index (git rev-parse --git-path index failed), so the tracked count is unknown',
+      );
+      expect(run.stderr).not.toContain(sandbox.tmp);
+      expect(fs.readdirSync(sandbox.tmp)).toEqual([]);
+    });
+
+    it.skipIf(process.getuid?.() === 0)('names the index, not TMPDIR, when the index cannot be copied', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      const index = path.join(repo, '.git', 'index');
+      fs.chmodSync(index, 0o000);
+      try {
+        const run = runScript(sandbox, shell, [repo]);
+        expect(run.status, run.stderr).toBe(0);
+        expect(report(run.stderr, 'in review')).toMatch(/^unknown \(tracked count unknown, /);
+        expect(run.stderr).toContain('warning: cannot copy the index: cp: ');
+        expect(run.stderr).toContain(index);
+        expect(run.stderr).not.toContain('to a temp file');
+        expect(run.stderr).not.toContain(sandbox.tmp);
+        expect(fs.readdirSync(sandbox.tmp)).toEqual([]);
+      } finally {
+        fs.chmodSync(index, 0o644);
+      }
+    });
+  });
+
+  describe('hidden characters', () => {
+    // An empty repo is enough: the script must refuse before it looks for a base.
+    function emptyRepo(sandbox: Sandbox, name: string) {
+      const dir = path.join(sandbox.root, name);
+      fs.mkdirSync(dir);
+      git(sandbox, dir, 'init', '-q', '-b', 'main');
+      return fs.realpathSync(dir);
+    }
+
+    it('refuses a repo path holding a paste-ending escape and copies nothing', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox, path.join(sandbox.root, 'evil\x1b[201~\x15\nname', 'app'));
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(1);
+      expect(run.stdout).toBe('');
+      expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+      const lines = stderrLines(run.stderr);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/^error: repo path contains control or invisible characters/);
+      expect(lines[0]).toContain('evil\\x1b[201~\\x15\\x0aname/app');
+    });
+
+    const hidden: Array<[string, string]> = [
+      ['tab\tname', 'tab\\x09name'],
+      ['del\x7fname', 'del\\x7fname'],
+      ['c1\u009bname', 'c1\\u009bname'],
+      ['nel\u0085name', 'nel\\u0085name'],
+      ['shy\u00adname', 'shy\\u00adname'],
+      ['alm\u061cname', 'alm\\u061cname'],
+      ['zwsp\u200bname', 'zwsp\\u200bname'],
+      ['lrm\u200ename', 'lrm\\u200ename'],
+      ['ls\u2028name', 'ls\\u2028name'],
+      ['rlo\u202ename', 'rlo\\u202ename'],
+      ['wj\u2060name', 'wj\\u2060name'],
+      ['lri\u2066name', 'lri\\u2066name'],
+      ['pdi\u2069name', 'pdi\\u2069name'],
+      ['bom\ufeffname', 'bom\\ufeffname'],
+      ['tag\u{e0001}name', 'tag\\U000e0001name'],
+      ['tag\u{e007f}name', 'tag\\U000e007fname'],
+      ['trailing-newline\n', 'trailing-newline\\x0a'],
+    ];
+
+    it('refuses every kind of hidden character in the repo path', {timeout: 60_000}, () => {
+      const sandbox = createSandbox();
+      for (const [name, escaped] of hidden) {
+        const repo = emptyRepo(sandbox, name);
+        const run = runScript(sandbox, shell, [repo]);
+        expect(run.status, JSON.stringify(name)).toBe(1);
+        expect(run.stdout).toBe('');
+        const lines = stderrLines(run.stderr);
+        expect(lines, JSON.stringify(name)).toHaveLength(1);
+        expect(lines[0]).toContain('repo path contains control or invisible characters');
+        expect(lines[0]).toContain(`${sandbox.root}/${escaped}`);
+      }
+      expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+    });
+
+    it('refuses hidden characters in the branch and base arguments', {timeout: 30_000}, () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      git(sandbox, repo, 'branch', 'feat\u202erev', 'feat');
+      git(sandbox, repo, 'branch', 'ma\u0085in', 'main');
+      const cases: Array<{args: string[]; label: string; escaped: string}> = [
+        {args: [repo, 'feat\u202erev', 'main'], label: 'branch', escaped: 'feat\\u202erev'},
+        {args: [repo, 'feat', 'ma\u0085in'], label: 'base', escaped: 'ma\\u0085in'},
+        {args: [repo, 'x\x1b[201~y'], label: 'branch', escaped: 'x\\x1b[201~y'},
+        {args: [repo, 'HEAD', 'ma\nin'], label: 'base', escaped: 'ma\\x0ain'},
+      ];
+
+      for (const {args, label, escaped} of cases) {
+        const run = runScript(sandbox, shell, args);
+        expect(run.status, run.stderr).toBe(1);
+        expect(run.stdout).toBe('');
+        const lines = stderrLines(run.stderr);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain(`${label} contains control or invisible characters`);
+        expect(lines[0]).toContain(escaped);
+      }
+      expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+    });
+
+    it('escapes hidden characters in every line it prints', {timeout: 30_000}, () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      // Git refuses C0 and DEL in ref names but allows bidi controls.
+      git(sandbox, repo, 'checkout', '-q', '-b', 'topic\u202eevil');
+      git(sandbox, repo, 'branch', 'ma\u2066in', 'main');
+      git(sandbox, repo, 'update-ref', 'refs/remotes/origin/ma\u2066in', 'main');
+      git(sandbox, repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/ma\u2066in');
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      stderrLines(run.stderr);
+      expect(report(run.stderr, 'branch')).toBe('topic\\u202eevil  (reviewing: HEAD)');
+      expect(report(run.stderr, 'base')).toBe('origin/ma\\u2066in (auto-detected)');
+      expect(run.command).toBe(`cd '${repo}' && branch-review`);
+
+      const missing = runScript(sandbox, shell, [path.join(repo, 'gone\x1b]0;title\x07')]);
+      expect(missing.status).toBe(1);
+      expect(stderrLines(missing.stderr)).toEqual([`error: path does not exist: ${repo}/gone\\x1b]0;title\\x07`]);
+    });
+
+    it('accepts visible non-ASCII in the repo path and ref names', {timeout: 30_000}, () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox, path.join(sandbox.root, 'café 日本 😀 a\u00a0b — ü', 'app'));
+      git(sandbox, repo, 'branch', 'feat-ü—😀', 'feat');
+
+      const run = runScript(sandbox, shell, [repo, 'feat-ü—😀', 'main']);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'repo')).toBe(repo);
+      expect(report(run.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+      for (const pasteShell of pasteShells(shell)) {
+        expect(paste(sandbox, pasteShell, run.command)).toEqual({cwd: repo, argv: ['feat-ü—😀', 'main']});
+      }
+    });
   });
 });
 
@@ -638,6 +917,14 @@ describe('SKILL.md', () => {
     }
     for (const line of lines) {
       expect(line).not.toMatch(/(^|[\s`(])scripts\/review-command\.sh/);
+    }
+  });
+
+  it('says which shells the command is for and that hidden characters are refused', () => {
+    const readme = fs.readFileSync(path.resolve(__dirname, '../README.md'), 'utf8');
+    for (const doc of [fs.readFileSync(skillDocPath, 'utf8'), readme]) {
+      expect(doc).toContain('POSIX shells and zsh');
+      expect(doc.replace(/\s+/g, ' ')).toMatch(/refuses .*repo path or ref name that holds control or invisible characters/);
     }
   });
 
