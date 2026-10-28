@@ -1,6 +1,6 @@
 import React from 'react';
 import stripAnsi from 'strip-ansi';
-import {render} from 'ink-testing-library';
+import {renderSized} from './ui-fixtures.js';
 import {describe, expect, it, vi} from 'vitest';
 
 // Ink colours through chalk, which picks its colour level when first
@@ -30,7 +30,7 @@ async function flush() {
 function renderWithWriter(write: () => Promise<{ok: true; command: {command: string; args: string[]; displayName: string}} | {ok: false; message: string; hint?: string}>) {
   const rawDiff = '@@ -1 +1 @@\n-a\n+b';
   const metrics = {path: 'src/a.ts', additions: 1, deletions: 1, changedLines: 2};
-  return render(
+  return renderSized(
     <App
       base="development"
       branch="HEAD"
@@ -49,7 +49,7 @@ function renderWithWriter(write: () => Promise<{ok: true; command: {command: str
   );
 }
 
-async function clickCopyPath(instance: ReturnType<typeof render>) {
+async function clickCopyPath(instance: ReturnType<typeof renderSized>) {
   const lines = stripAnsi(instance.lastFrame() ?? '').split('\n');
   const row = lines.findIndex((line) => line.includes('Copy path'));
   const column = lines[row]!.indexOf('Copy path');

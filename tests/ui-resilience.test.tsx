@@ -2,15 +2,19 @@ import React from 'react';
 import {Text} from 'ink';
 import {render} from 'ink-testing-library';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {DiffErrorBoundary} from '../src/ui/DiffErrorBoundary.js';
+import {DiffErrorBoundary, renderFailureText} from '../src/ui/DiffErrorBoundary.js';
 import {buildDiffSections} from '../src/sections.js';
+import stringWidth from 'string-width';
 import {
+  appElement,
   buildFixture,
   cellPosition,
   emitMousePressAt,
   flush,
   frameLines,
+  recordingWriter,
   renderFixture,
+  renderSized,
 } from './ui-fixtures.js';
 
 // The app draws every diff pane row through frameLine; make it throw for one
@@ -62,6 +66,57 @@ describe('diff error boundary', () => {
   });
 });
 
+describe('the render failure row', () => {
+  const deepPath = 'packages/server/src/features/notifications/delivery/channels/push/provider.ts';
+
+  it('cuts a long path from its start and keeps the reason whole', () => {
+    const text = renderFailureText(deepPath, 'bad row', 40);
+    expect(stringWidth(text)).toBeLessThanOrEqual(40);
+    expect(text).toMatch(/^✗ could not render …\S*provider\.ts: bad row$/);
+  });
+
+  it('leads with the reason when the reason alone fills the row', () => {
+    const reason = 'Cannot read properties of undefined (reading replace)';
+    const text = renderFailureText(deepPath, reason, 40);
+    expect(stringWidth(text)).toBeLessThanOrEqual(40);
+    expect(text.startsWith('✗ Cannot read properties of')).toBe(true);
+  });
+
+  it('keeps the reason in a narrow pane when the pane itself fails to draw', async () => {
+    const instance = renderSized(
+      <DiffErrorBoundary filePath={deepPath} resetKey="1" width={44}>
+        <Thrower fail />
+      </DiffErrorBoundary>,
+      {columns: 44, rows: 10},
+    );
+    await flush();
+
+    const frame = frameLines(instance.lastFrame()).join('\n');
+    expect(frame).toContain('provider.ts: bad row');
+
+    instance.unmount();
+  });
+
+  it('keeps the reason when a file with a long path cannot be wrapped in a narrow terminal', async () => {
+    const sections = buildDiffSections([
+      {path: 'src/good.ts', metrics: {path: 'src/good.ts', additions: 1, deletions: 0, changedLines: 1}, diff: 'good line'},
+      {path: deepPath, metrics: {path: deepPath, additions: 1, deletions: 0, changedLines: 1}, diff: 'x'},
+    ]);
+    // A malformed line makes wrapping this one section throw.
+    sections[1]!.lines = [undefined as unknown as string];
+    const instance = renderFixture({sections}, {columns: 80, rows: 24});
+    await flush();
+    instance.stdin.write('\u001B[B');
+    await flush(2);
+
+    // The reason alone is wider than the pane, so it leads the row.
+    const row = frameLines(instance.lastFrame()).find((line) => line.includes('✗'));
+    expect(row).toMatch(/│ ✗ Cannot read properties of undefined/);
+
+    instance.unmount();
+  });
+});
+
 describe('a diff that fails to render', () => {
   const fixture = () => buildFixture([
     {path: 'src/bad.ts', rawDiff: '@@ -1 +1 @@\n-a\n+BOOM', rendered: ['• src/bad.ts:1: ', '   1 ⋮   1 │BOOM']},
@@ -93,6 +148,24 @@ describe('a diff that fails to render', () => {
     instance.unmount();
   });
 
+  it('draws the pane again when a refresh fixes the file, at the same offset', async () => {
+    const broken = buildFixture([{path: 'src/bad.ts', rawDiff: '@@ -1 +1 @@\n-a\n+BOOM', rendered: ['• src/bad.ts:1: ', '   1 ⋮   1 │BOOM']}]);
+    const instance = renderFixture(broken, {columns: 120, rows: 24});
+    await flush();
+    expect(frameLines(instance.lastFrame()).join('\n')).toContain('could not render src/bad.ts');
+
+    // Same file, same offset and width: only the refresh changed.
+    const fixed = buildFixture([{path: 'src/bad.ts', rawDiff: '@@ -1 +1 @@\n-a\n+fixed', rendered: ['• src/bad.ts:1: ', '   1 ⋮   1 │fixed now']}]);
+    instance.rerender(appElement(fixed, {columns: 120, rows: 24}, recordingWriter([])));
+    await flush(2);
+
+    const frame = frameLines(instance.lastFrame()).join('\n');
+    expect(frame).toContain('fixed now');
+    expect(frame).not.toContain('could not render');
+
+    instance.unmount();
+  });
+
   it('isolates a file whose lines cannot be wrapped', async () => {
     const sections = buildDiffSections([
       {path: 'src/good.ts', metrics: {path: 'src/good.ts', additions: 1, deletions: 0, changedLines: 1}, diff: 'good line'},
@@ -108,7 +181,9 @@ describe('a diff that fails to render', () => {
     await flush(2);
     const frame = frameLines(instance.lastFrame()).join('\n');
     expect(frame).toContain('file 2/2');
-    expect(frame).toContain('could not render src/broken.ts');
+    // The path gives way so the whole reason fits; the file header names it.
+    expect(frameLines(instance.lastFrame())[4]).toContain('src/broken.ts');
+    expect(frame).toMatch(/could not render …\S*\.ts: Cannot read properties of undefined \(reading 'replace'\)/);
 
     instance.unmount();
   });

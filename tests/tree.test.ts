@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload} from '../src/tree.js';
+import {applyTreeCollapse, buildTreeRows, findTreeSelectionId, formatTreePayload} from '../src/tree.js';
 
 describe('buildTreeRows', () => {
   it('keeps a file and a directory with the same path apart', () => {
@@ -104,8 +104,27 @@ describe('buildTreeRows', () => {
       new Set(['apps/web']),
     );
 
-    expect(findTreeSelectionPath(rows, 'apps/web/src/App.tsx')).toBe('apps/web');
-    expect(findTreeSelectionPath(rows, 'apps/api/src/server.ts')).toBe('apps/api/src/server.ts');
+    expect(findTreeSelectionId(rows, 'apps/web/src/App.tsx')).toBe('dir:apps/web');
+    expect(findTreeSelectionId(rows, 'apps/api/src/server.ts')).toBe('file:apps/api/src/server.ts');
+  });
+
+  it('gives every row a unique id, even a file and a directory with the same path', () => {
+    const rows = buildTreeRows(['bin/tool', 'bin/tool/index.js', 'docs', 'docs/README.md']);
+    const ids = rows.map((row) => row.id);
+
+    expect(new Set(ids).size).toBe(rows.length);
+    expect(ids).toContain('file:bin/tool');
+    expect(ids).toContain('dir:bin/tool');
+    expect(applyTreeCollapse(rows, new Set(['docs'])).map((row) => row.id)).toEqual(
+      ids.filter((id) => id !== 'file:docs/README.md'),
+    );
+  });
+
+  it('selects the file row, not the directory with the same path', () => {
+    const rows = buildTreeRows(['bin/tool', 'bin/tool/index.js']);
+
+    expect(findTreeSelectionId(rows, 'bin/tool')).toBe('file:bin/tool');
+    expect(findTreeSelectionId(applyTreeCollapse(rows, new Set(['bin/tool'])), 'bin/tool/index.js')).toBe('dir:bin/tool');
   });
 
   it('formats the full changed-file tree for copy payloads', () => {

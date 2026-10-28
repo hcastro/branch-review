@@ -1,6 +1,9 @@
 import type {FileStatus} from './git.js';
 
 export type TreeRow = {
+  // Unique per row: a file and a directory can share a path (`bin/tool` and
+  // `bin/tool/index.js`), so the id is `${kind}:${path}`.
+  id: string;
   kind: 'dir' | 'file';
   label: string;
   depth: number;
@@ -23,7 +26,7 @@ function compareNames(a: string, b: string) {
 
 function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
   if (node.kind === 'dir') {
-    rows.push({kind: 'dir', label: node.name, depth, path: node.path});
+    rows.push({id: rowId('dir', node.path), kind: 'dir', label: node.name, depth, path: node.path});
 
     const children = [...(node.children?.values() ?? [])].sort((left, right) => {
       if (left.kind !== right.kind) {
@@ -40,7 +43,11 @@ function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
     return;
   }
 
-  rows.push({kind: 'file', label: node.name, depth, path: node.path, status: node.status});
+  rows.push({id: rowId('file', node.path), kind: 'file', label: node.name, depth, path: node.path, status: node.status});
+}
+
+function rowId(kind: TreeRow['kind'], path: string) {
+  return `${kind}:${path}`;
 }
 
 // Children are keyed by kind and name, so a path that is a file on one side
@@ -127,10 +134,13 @@ export function applyTreeCollapse(rows: TreeRow[], collapsedPaths: ReadonlySet<s
   return visibleRows;
 }
 
-export function findTreeSelectionPath(rows: TreeRow[], activeFilePath: string) {
+// The id of the row that shows the active file: its own row, or the deepest
+// collapsed directory that hides it.
+export function findTreeSelectionId(rows: TreeRow[], activeFilePath: string) {
   if (!activeFilePath) return '';
-  if (rows.some((row) => row.kind === 'file' && row.path === activeFilePath)) {
-    return activeFilePath;
+  const fileId = rowId('file', activeFilePath);
+  if (rows.some((row) => row.id === fileId)) {
+    return fileId;
   }
 
   let collapsedParent: TreeRow | undefined;
@@ -145,7 +155,7 @@ export function findTreeSelectionPath(rows: TreeRow[], activeFilePath: string) {
     }
   }
 
-  return collapsedParent?.path ?? activeFilePath;
+  return collapsedParent?.id ?? fileId;
 }
 
 function hasLaterSibling(rows: TreeRow[], rowIndex: number, depth: number) {

@@ -1,8 +1,8 @@
 import React from 'react';
 import stripAnsi from 'strip-ansi';
 import stringWidth from 'string-width';
-import {render} from 'ink-testing-library';
-import {describe, expect, it} from 'vitest';
+import {renderSized} from './ui-fixtures.js';
+import {describe, expect, it, vi} from 'vitest';
 import {App} from '../src/ui/App.js';
 import {buildDiffSections, type DiffSection} from '../src/sections.js';
 import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
@@ -89,7 +89,7 @@ function renderFixture(
   writes: string[] = [],
   copyWriter: ClipboardWriter = recordingWriter(writes),
 ) {
-  return render(
+  return renderSized(
     <App
       base="development"
       branch="HEAD"
@@ -136,7 +136,8 @@ describe('block identity comes from structure, not rendered text', () => {
 
   it('copies a long-path block from its own header and keeps it visible when the block above collapses', async () => {
     const writes: string[] = [];
-    const instance = renderFixture(longPathFixture(), {columns: 100, rows: 40}, writes);
+    // Wide enough for all three block actions beside `…PreferencesPanel.tsx:147:`.
+    const instance = renderFixture(longPathFixture(), {columns: 110, rows: 40}, writes);
     await flush();
 
     const header = cellPosition(instance.lastFrame(), ['Panel.tsx:147:'], 'Panel.tsx:147:');
@@ -238,6 +239,13 @@ describe('wide characters are measured in terminal cells', () => {
     expect(lines.some((line) => line.includes('src/jp.ts:40:'))).toBe(true);
     const wideRows = lines.filter((line) => line.includes(wideText));
     expect(wideRows).toHaveLength(6);
+    // Padding measured in cells fills each wide row exactly to the pane's
+    // right border; measured in code units it overflows, and the row is cut
+    // before the border.
+    for (const line of wideRows) {
+      expect(stringWidth(line)).toBe(120);
+      expect(line.endsWith(' │')).toBe(true);
+    }
 
     instance.unmount();
   });
@@ -374,7 +382,7 @@ describe('drag-selection across a live refresh', () => {
 
   it('copies the lines that were selected when a file appears above them mid-drag', async () => {
     const writes: string[] = [];
-    const instance = render(renderSections(buildDiffSections([zSection()]), writes));
+    const instance = renderSized(renderSections(buildDiffSections([zSection()]), writes));
     await flush();
 
     const start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
@@ -397,7 +405,7 @@ describe('drag-selection across a live refresh', () => {
 
   it('cancels the selection and says so when the selected lines change', async () => {
     const writes: string[] = [];
-    const instance = render(renderSections(buildDiffSections([zSection()]), writes));
+    const instance = renderSized(renderSections(buildDiffSections([zSection()]), writes));
     await flush();
 
     const start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
@@ -417,9 +425,125 @@ describe('drag-selection across a live refresh', () => {
     instance.unmount();
   });
 
+  // Rows the selection highlight is drawn on, as plain text.
+  const highlightedRows = (frame: string) => frame
+    .split('\n')
+    .filter((line) => line.includes('\u001B[48;2;28;68;76m'))
+    .map((line) => stripAnsi(line));
+
+  it('never draws the highlight on lines outside the selection while a refresh moves them', async () => {
+    const writes: string[] = [];
+    const instance = renderSized(renderSections(buildDiffSections([zSection()]), writes));
+    await flush();
+
+    const start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
+    const end = cellPosition(instance.lastFrame(), ['zeta11'], 'zeta11', 'zeta11'.length - 1);
+    await emitMousePressAt(start.column, start.row);
+    await emitMouseDragAt(end.column, end.row);
+    // Drag highlights are drawn at most every 33 ms.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(highlightedRows(instance.lastFrame() ?? '')).toHaveLength(3);
+
+    const before = instance.frames.length;
+    instance.rerender(renderSections(buildDiffSections([aSection, zSection()]), writes));
+    await flush();
+    await flush();
+
+    const frames = instance.frames.slice(before);
+    expect(frames.length).toBeGreaterThan(0);
+    for (const frame of frames) {
+      for (const line of highlightedRows(frame)) {
+        expect(line).toMatch(/zeta(9|10|11)\b/);
+      }
+    }
+    expect(highlightedRows(instance.lastFrame() ?? '')).toHaveLength(3);
+
+    instance.unmount();
+  });
+
+  // A resize commits re-wrapped lines; the long line above wraps onto two
+  // rows, so every zeta line moves down one row. A press sent in the same tick
+  // as the resize selects what the screen shows at that row now.
+  const resizeFixture = () => buildFixture([
+    {path: 'src/a.ts', rawDiff: `@@ -1,0 +1,1 @@\n+${'long '.repeat(18)}`, rendered: ['• src/a.ts:1: ', `${gutter(1)}${'long '.repeat(18)}`]},
+    {
+      path: 'src/z.ts',
+      rawDiff: `@@ -1,0 +1,12 @@\n${Array.from({length: 12}, (_, index) => `+zeta${index + 1}`).join('\n')}`,
+      rendered: ['• src/z.ts:1: ', ...zetaLines()],
+    },
+  ]);
+  const appAt = (fixture: ReturnType<typeof resizeFixture>, columns: number, writes: string[]) => (
+    <App
+      base="development"
+      branch="HEAD"
+      sections={fixture.sections}
+      branchMetrics={fixture.review.metrics}
+      review={fixture.review}
+      copyWriter={recordingWriter(writes)}
+      dimensions={{columns, rows: 40}}
+    />
+  );
+
+  it('maps a press sent in the same tick as a resize against the lines on screen', async () => {
+    const writes: string[] = [];
+    const fixture = resizeFixture();
+    const instance = renderSized(appAt(fixture, 150, writes));
+    await flush();
+    const before = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
+    await emitMouseMoveAt(before.column, before.row);
+
+    // The pane re-wraps for a new width once the width has settled. Fire that
+    // settle timer and send the press in the same tick, before React has
+    // re-subscribed the mouse handlers to the re-wrapped lines.
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    let start: {row: number; column: number};
+    try {
+      instance.rerender(appAt(fixture, 120, writes));
+      await new Promise((resolve) => setImmediate(resolve));
+      vi.advanceTimersByTime(1000);
+      start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
+      expect(start.row).toBe(before.row + 1);
+      process.stdin.emit('data', `\u001B[<0;${start.column + 1};${start.row + 1}M`);
+    } finally {
+      vi.useRealTimers();
+    }
+    await flush();
+
+    const end = cellPosition(instance.lastFrame(), ['zeta11'], 'zeta11', 'zeta11'.length - 1);
+    await emitMouseDragAt(end.column, end.row);
+    await emitMouseDragAt(end.column, end.row, true);
+    await flush();
+
+    expect(writes).toEqual(['zeta9\nzeta10\nzeta11']);
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('Selection cancelled');
+
+    instance.unmount();
+  });
+
+  it('still copies a selection started after the refresh settled', async () => {
+    const writes: string[] = [];
+    const instance = renderSized(renderSections(buildDiffSections([zSection()]), writes));
+    await flush();
+
+    instance.rerender(renderSections(buildDiffSections([aSection, zSection()]), writes));
+    await flush();
+    await flush();
+
+    const start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
+    const end = cellPosition(instance.lastFrame(), ['zeta11'], 'zeta11', 'zeta11'.length - 1);
+    await emitMousePressAt(start.column, start.row);
+    process.stdin.emit('data', `\u001B[<0;${end.column + 1};${end.row + 1}m`);
+    await flush();
+    await flush();
+
+    expect(writes).toEqual(['zeta9\nzeta10\nzeta11']);
+
+    instance.unmount();
+  });
+
   it('keeps a finished selection highlight on the lines it covered', async () => {
     const writes: string[] = [];
-    const instance = render(renderSections(buildDiffSections([zSection()]), writes));
+    const instance = renderSized(renderSections(buildDiffSections([zSection()]), writes));
     await flush();
 
     const start = cellPosition(instance.lastFrame(), ['zeta9'], 'zeta9');
@@ -537,7 +661,7 @@ describe('control characters in repo-derived text', () => {
     const fixture = buildFixture([
       {path: evilPath, rawDiff: '@@ -1 +1 @@\n-a\n+b', rendered: [`• ${evilPath}:1: `, `${gutter(1)}b`]},
     ]);
-    const instance = render(
+    const instance = renderSized(
       <App
         base={'main\u001B[2J'}
         branch={'feature\rHEAD'}
