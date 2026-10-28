@@ -15,6 +15,12 @@ target="${1:-$PWD}"
 branch="${2:-HEAD}"
 base="${3:-}"
 
+# Inherited by every git call, submodule children included. Optional locks off
+# keeps a submodule status check from rewriting the submodule's index, and a
+# git that needs credentials (a partial clone fetching a missing object) fails
+# instead of prompting.
+export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0
+
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 note() { printf '%s\n' "$1" >&2; }
 
@@ -24,8 +30,9 @@ note() { printf '%s\n' "$1" >&2; }
 root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) \
   || die "not inside a git repository: $target"
 
-# Read-only access to the repo. fsmonitor is off so no hook or daemon runs.
-git_root() { git -C "$root" -c core.fsmonitor=false "$@"; }
+# Read-only access to the repo. fsmonitor is off so no hook or daemon runs,
+# and a split index stays off so git never writes a shared index into .git.
+git_root() { git -C "$root" -c core.fsmonitor=false -c core.splitIndex=false "$@"; }
 
 # Resolve a ref the way the CLI does: local ref first, then origin/<ref>.
 resolve_ref() {
@@ -83,14 +90,28 @@ tmp_index=
 cleanup() { if [[ -n $tmp_index ]]; then rm -f "$tmp_index" "$tmp_index.lock"; fi; }
 trap cleanup EXIT
 
+# Returns non-zero when no private copy could be made.
 make_private_index() {
   local index
-  index=$(git_root rev-parse --git-path index) || die "cannot locate the index in $root"
+  index=$(git_root rev-parse --git-path index) || return 1
   [[ $index == /* ]] || index="$root/$index"
-  tmp_index=$(mktemp "${TMPDIR:-/tmp}/branch-review-index.XXXXXX") \
-    || die "cannot create a temporary index"
+  tmp_index=$(mktemp "${TMPDIR:-/tmp}/branch-review-index.XXXXXX" 2>/dev/null) || { tmp_index=; return 1; }
   # A repo with no index file yet has an empty index; a missing file reads that way.
-  cp "$index" "$tmp_index" 2>/dev/null || rm -f "$tmp_index"
+  [[ -e $index ]] || { rm -f "$tmp_index"; return 0; }
+  # -p keeps the index's mtime. Git rechecks the content of any entry modified
+  # in the same second the index was written; a fresh mtime on the copy would
+  # make it trust the stat data and miss that edit.
+  cp -p "$index" "$tmp_index" 2>/dev/null
+}
+
+# Counts NUL-terminated paths on stdin. A trailing slash marks an untracked
+# nested repository, which the CLI leaves out because it has no diff.
+count_paths() {
+  local path count=0
+  while IFS= read -r -d '' path; do
+    [[ -n $path && $path != */ ]] && count=$((count + 1))
+  done
+  printf '%s' "$count"
 }
 
 effective_base=${base:-$(infer_base)}
@@ -114,19 +135,28 @@ fi
 
 current_branch=$(git_root branch --show-current 2>/dev/null)
 untracked=0
+# -M counts a rename as one file, as the CLI lists it, whatever diff.renames says.
 if [[ $includes_worktree == yes ]]; then
-  make_private_index
-  tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff --name-only "$diff_arg" | grep -c . || true)
-  untracked=$(git_root ls-files --others --exclude-standard | grep -c . || true)
+  if make_private_index; then
+    tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths)
+  else
+    tracked=unknown
+  fi
+  untracked=$(git_root ls-files -z --others --exclude-standard | count_paths)
   dirty=$(git_root --no-optional-locks status --porcelain | grep -c . || true)
   uncommitted="$dirty entries"
   reviewed_tip=HEAD
 else
-  tracked=$(git_root diff --no-ext-diff --name-only "$diff_arg" | grep -c . || true)
+  tracked=$(git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths)
   uncommitted="not in this review (reviewing $branch, not the worktree)"
   reviewed_tip=$resolved_branch
 fi
-changed=$((tracked + untracked))
+if [[ $tracked == unknown ]]; then
+  in_review="unknown (tracked count unknown, $untracked untracked)"
+else
+  changed=$((tracked + untracked))
+  in_review="$changed files ($tracked tracked, $untracked untracked)"
+fi
 ahead=$(git_root rev-list --count "$resolved_base..$reviewed_tip" 2>/dev/null || echo 0)
 
 # A linked worktree has its own git dir inside the main repo's common dir. A
@@ -145,13 +175,15 @@ note "branch:      ${current_branch:-<detached>}  (reviewing: $branch)"
 note "base:        $resolved_base$([[ -z $base ]] && printf ' (auto-detected)')"
 note "commits:     $ahead ahead of base"
 note "uncommitted: $uncommitted"
-note "in review:   $changed files ($tracked tracked, $untracked untracked)"
+note "in review:   $in_review"
 
 command -v branch-review >/dev/null 2>&1 \
   || note "warning: branch-review is not on PATH — install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review"
 command -v delta >/dev/null 2>&1 \
   || note "warning: git-delta is not on PATH — diffs need it: brew install git-delta"
-[[ $changed -eq 0 ]] \
+[[ $tracked == unknown ]] \
+  && note "warning: cannot copy the index to a temp file in ${TMPDIR:-/tmp}, so the tracked count is unknown"
+[[ $tracked != unknown && $changed -eq 0 ]] \
   && note "warning: no changes in this range — the CLI will report nothing to review"
 
 # --- command ----------------------------------------------------------------

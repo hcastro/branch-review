@@ -85,7 +85,7 @@ branch-review my-feature release/2026.04
 | `--watch-poll` | Poll instead of using filesystem events. Use it on network mounts and container bind mounts. |
 | `--no-animations` | Skip the arrival highlights. Useful on slow or remote terminals. |
 
-Set `NO_COLOR` (to any non-empty value) or `FORCE_COLOR=0` to turn off the colour the app adds. Diffs keep their `+` and `-` markers.
+Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` is `0` or `false`, or when `TERM=dumb`. The same rule covers delta's diffs and the app's own chrome. Diffs keep their `+` and `-` markers.
 
 ## Reviewing
 
@@ -99,7 +99,7 @@ Set `NO_COLOR` (to any non-empty value) or `FORCE_COLOR=0` to turn off the colou
 | `[` / `]` | Previous / next diff block |
 | `Enter` / `Space` | Collapse or expand the focused block |
 | `t` | Show or hide the file tree |
-| `q` / `Esc` | Quit |
+| `q` / `Esc` / `Ctrl-C` | Quit |
 
 The focused block is the one at the top of the diff pane, and it's marked. The footer keeps a short hint of these keys.
 
@@ -165,9 +165,17 @@ Lines: 1-8
 
 When Git can name the enclosing function, the snippet adds a `Function:` line too.
 
+Copies keep the file's exact bytes, from the buttons, the keys, and a drag-select alike. Tabs stay tabs and control characters stay as they are, even though the screen shows them as visible markers.
+
+Some copies fail on purpose, and the toast names the reason:
+
+- A file that isn't valid UTF-8 text can't be copied as text. The copy reports "not UTF-8 text".
+- Copying contents (`Copy file` or `f`) fails for a file over 16 MB.
+- When a file's diff failed to load, its copy actions report that failure as the reason.
+
 ### Small terminals
 
-When the terminal is too narrow for both panes, the file tree collapses and the diff takes the full width. Below a minimum size, the app shows "Terminal too small" until you make the window bigger.
+When the terminal is too narrow for both panes, the file tree collapses to a narrow rail beside the diff. Below a minimum size, the app shows "Terminal too small" until you make the window bigger. While it does, only `q`, `Esc` and `Ctrl-C` do anything.
 
 ## Agent skill
 
@@ -193,7 +201,19 @@ To pin a version, copy it with `cp -R` instead. For one project only, put it in 
 
 `branch-review` asks Git for the changed files in the range, pipes each file's diff through `delta` with a fixed theme, and lays out the result with [Ink](https://github.com/vadimdemedes/ink). Untracked files are diffed against `/dev/null`, so new files show up before anyone stages them.
 
-Watch mode follows the tracked directories plus the Git state that moves on a commit, push, or fetch: `HEAD`, the index, the current branch ref, and remote refs. A cheap fingerprint decides whether anything changed. When it did, a worker thread rebuilds the review so the UI stays responsive while delta runs.
+Watch mode follows the work tree plus the Git state that moves on a commit, push, or fetch: `HEAD`, the index, the current branch ref, and remote refs. On macOS and Windows it uses one native recursive watch on the repo root. On Linux it watches directories only, so the number of handles grows with directories and never with files. Either way it skips what Git ignores, never follows symlinks, and doesn't descend into submodules or nested repos. `--watch-poll` is the fallback when filesystem events don't arrive.
+
+A cheap fingerprint decides whether anything changed. When it did, a background process rebuilds the review so the UI stays responsive while delta runs. The process reports progress after each file, and it's stopped only after 30 seconds with no progress. A slow refresh of a large repo finishes, and a hung `git` or `delta` still gets killed.
+
+### What branch-review touches
+
+`branch-review` never writes to the repo it reviews. It leaves the index, the work tree, refs, the stash, config, and hooks alone. Worktree diffs read a private copy of the index with Git's optional locks off, so a stat-dirty file never makes Git rewrite `.git/index` or a submodule's index.
+
+A few things happen the same way they do for `git status` or `git diff`:
+
+- Configured clean filters such as git-lfs run on worktree files, and git-lfs may store objects under `.git/lfs`.
+- In a split-index repo, Git refreshes the shared index file's mtime on every read. Its content stays the same.
+- A partial clone may fetch missing objects on demand. Git is never allowed to prompt, so a fetch that needs credentials shows up as an error on that file.
 
 ## Development
 

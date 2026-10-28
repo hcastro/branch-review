@@ -33,10 +33,13 @@ const zsh = which('zsh');
 
 const tempDirs: string[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, {recursive: true, force: true});
   }
+  // Every test blocks in spawnSync. Yielding one macrotask between tests lets
+  // the worker answer vitest's RPC, which times out after 60 s of blocking.
+  await new Promise((resolve) => setTimeout(resolve, 0));
 });
 
 type Sandbox = {
@@ -47,6 +50,7 @@ type Sandbox = {
   tmp: string;
   clipOut: string;
   cliOut: string;
+  gitEnvLog: string;
   env: NodeJS.ProcessEnv;
 };
 
@@ -54,8 +58,16 @@ function writeExecutable(file: string, body: string) {
   fs.writeFileSync(file, body, {mode: 0o755});
 }
 
-function createSandbox(options: {clipboard?: 'pbcopy' | 'forking-xclip' | 'failing-pbcopy' | 'none'; cli?: boolean} = {}) {
-  const {clipboard = 'pbcopy', cli = true} = options;
+type SandboxOptions = {
+  clipboard?: 'pbcopy' | 'forking-xclip' | 'failing-pbcopy' | 'none';
+  cli?: boolean;
+  // Put a git on PATH that logs GIT_OPTIONAL_LOCKS and GIT_TERMINAL_PROMPT
+  // for every call to `gitEnvLog`, then runs the real git.
+  logGitEnv?: boolean;
+};
+
+function createSandbox(options: SandboxOptions = {}) {
+  const {clipboard = 'pbcopy', cli = true, logGitEnv = false} = options;
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-skill-')));
   tempDirs.push(root);
 
@@ -65,9 +77,18 @@ function createSandbox(options: {clipboard?: 'pbcopy' | 'forking-xclip' | 'faili
   const tmp = path.join(root, 'tmp');
   for (const dir of [bin, tools, home, tmp]) fs.mkdirSync(dir);
 
+  const gitEnvLog = path.join(root, 'git-env.log');
   for (const tool of realTools) {
     const found = which(tool);
-    if (found) fs.symlinkSync(found, path.join(tools, tool));
+    if (!found) continue;
+    if (tool === 'git' && logGitEnv) {
+      writeExecutable(
+        path.join(tools, 'git'),
+        `#!/bin/sh\nprintf '%s %s\\n' "\${GIT_OPTIONAL_LOCKS-unset}" "\${GIT_TERMINAL_PROMPT-unset}" >> "$GIT_ENV_LOG"\nexec '${found}' "$@"\n`,
+      );
+    } else {
+      fs.symlinkSync(found, path.join(tools, tool));
+    }
   }
 
   const clipOut = path.join(root, 'clipboard.txt');
@@ -96,12 +117,13 @@ function createSandbox(options: {clipboard?: 'pbcopy' | 'forking-xclip' | 'faili
     TMPDIR: tmp,
     CLIP_OUT: clipOut,
     CLI_OUT: cliOut,
+    GIT_ENV_LOG: gitEnvLog,
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
     LC_ALL: 'C',
   };
 
-  return {root, bin, tools, home, tmp, clipOut, cliOut, env} satisfies Sandbox;
+  return {root, bin, tools, home, tmp, clipOut, cliOut, gitEnvLog, env} satisfies Sandbox;
 }
 
 function git(sandbox: Sandbox, cwd: string, ...args: string[]) {
@@ -192,6 +214,25 @@ function report(stderr: string, label: string) {
 
 function sha256(file: string) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+// Every file under `dir`, keyed by relative path, valued by content hash. A
+// new, removed or rewritten file changes the snapshot; a refreshed mtime
+// alone does not.
+function snapshotFiles(dir: string, prefix = ''): Record<string, string> {
+  const snapshot: Record<string, string> = {};
+  for (const entry of fs.readdirSync(dir, {withFileTypes: true})) {
+    const relative = path.join(prefix, entry.name);
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) Object.assign(snapshot, snapshotFiles(full, relative));
+    else if (entry.isFile()) snapshot[relative] = sha256(full);
+  }
+  return snapshot;
+}
+
+// Sets a file's atime and mtime to a whole second, so git sees no sub-second part.
+function setMtime(file: string, seconds: number) {
+  fs.utimesSync(file, seconds, seconds);
 }
 
 it('runs the script under the macOS system bash when on macOS', () => {
@@ -352,6 +393,99 @@ describe.each(scriptShells)('review-command.sh under %s', (shell) => {
       expect(report(run.stderr, 'in review')).toBe('3 files (2 tracked, 1 untracked)');
       expect(report(run.stderr, 'uncommitted')).toBe('2 entries');
     });
+
+    it('leaves a submodule index alone when a file inside the submodule is stat-dirty', {timeout: 30_000}, () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      const source = path.join(sandbox.root, 'sub-source');
+      fs.mkdirSync(source);
+      git(sandbox, source, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(source, 'inner.txt'), 'inner\n');
+      git(sandbox, source, 'add', '.');
+      git(sandbox, source, '-c', 'user.name=Test User', '-c', 'user.email=test@example.com', 'commit', '-q', '-m', 'sub');
+      git(sandbox, repo, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', source, 'sub');
+      git(sandbox, repo, 'commit', '-q', '-m', 'add submodule');
+
+      const future = new Date(Date.now() + 3_600_000);
+      fs.utimesSync(path.join(repo, 'sub', 'inner.txt'), future, future);
+      expect(git(sandbox, path.join(repo, 'sub'), 'diff-files', '--name-only')).toBe('inner.txt');
+      expect(fs.existsSync(path.join(repo, '.git', 'modules', 'sub', 'index'))).toBe(true);
+
+      const before = snapshotFiles(path.join(repo, '.git'));
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(snapshotFiles(path.join(repo, '.git'))).toEqual(before);
+      expect(git(sandbox, path.join(repo, 'sub'), 'diff-files', '--name-only')).toBe('inner.txt');
+    });
+
+    it('writes no shared index into .git when the repo uses a split index', {timeout: 30_000}, () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      const names = Array.from({length: 50}, (_, i) => `split-${i}.txt`);
+      for (const name of names) fs.writeFileSync(path.join(repo, name), `${name}\n`);
+      git(sandbox, repo, 'add', '.');
+      git(sandbox, repo, 'commit', '-q', '-m', 'many files');
+      // The files must match the base: git refreshes the index only after it
+      // finds stat-dirty files whose content is unchanged.
+      git(sandbox, repo, 'branch', '-f', 'main', 'HEAD');
+      fs.writeFileSync(path.join(repo, 'a.txt'), 'edited\n');
+      git(sandbox, repo, 'config', 'core.splitIndex', 'true');
+      git(sandbox, repo, 'config', 'splitIndex.maxPercentChange', '0');
+      git(sandbox, repo, 'update-index', '--split-index');
+      expect(fs.readdirSync(path.join(repo, '.git')).some((name) => name.startsWith('sharedindex.'))).toBe(true);
+
+      const future = new Date(Date.now() + 3_600_000);
+      for (const name of names) fs.utimesSync(path.join(repo, name), future, future);
+
+      const before = snapshotFiles(path.join(repo, '.git'));
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(Object.keys(snapshotFiles(path.join(repo, '.git'))).sort()).toEqual(Object.keys(before).sort());
+      expect(snapshotFiles(path.join(repo, '.git'))).toEqual(before);
+      expect(report(run.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+    });
+
+    it('sees a same-size edit made in the same second the index was written', () => {
+      const sandbox = createSandbox();
+      const repo = path.join(sandbox.root, 'racy');
+      fs.mkdirSync(repo);
+      git(sandbox, repo, 'init', '-q', '-b', 'main');
+      git(sandbox, repo, 'config', 'user.name', 'Test User');
+      git(sandbox, repo, 'config', 'user.email', 'test@example.com');
+      // ctime can't be set from a test; with it out of the stat check, the
+      // file and the index sharing one mtime second is the whole race.
+      git(sandbox, repo, 'config', 'core.trustctime', 'false');
+      const file = path.join(repo, 'f');
+      const second = Math.floor(Date.now() / 1000) - 100;
+      fs.writeFileSync(file, 'aaa\n');
+      setMtime(file, second);
+      git(sandbox, repo, 'add', 'f');
+      git(sandbox, repo, 'commit', '-q', '-m', 'base');
+      fs.writeFileSync(file, 'bbb\n');
+      setMtime(file, second);
+      setMtime(path.join(repo, '.git', 'index'), second);
+      expect(git(sandbox, repo, 'diff', '--name-only', 'HEAD')).toBe('f');
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+      expect(run.stderr).not.toContain('no changes in this range');
+    });
+
+    it('runs every git call with optional locks off and prompts disabled', () => {
+      const sandbox = createSandbox({logGitEnv: true});
+      const repo = createRepo(sandbox);
+      fs.writeFileSync(path.join(repo, 'b.txt'), 'two changed\n');
+
+      for (const args of [[repo], [repo, 'feat', 'main']]) {
+        fs.rmSync(sandbox.gitEnvLog, {force: true});
+        const run = runScript(sandbox, shell, args);
+        expect(run.status, run.stderr).toBe(0);
+        const calls = fs.readFileSync(sandbox.gitEnvLog, 'utf8').split('\n').filter(Boolean);
+        expect(calls.length).toBeGreaterThan(3);
+        expect(new Set(calls)).toEqual(new Set(['0 0']));
+      }
+    });
   });
 
   describe('the state report', () => {
@@ -414,6 +548,67 @@ describe.each(scriptShells)('review-command.sh under %s', (shell) => {
       expect(report(run.stderr, 'worktree')).toBe('no');
     });
 
+    it('still prints and copies the command when TMPDIR is unusable', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      fs.writeFileSync(path.join(repo, 'new.txt'), 'new\n');
+      const missing = path.join(sandbox.root, 'no-such-dir');
+      sandbox.env.TMPDIR = missing;
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(run.command).toBe(`cd '${repo}' && branch-review`);
+      expect(fs.readFileSync(sandbox.clipOut, 'utf8')).toBe(run.command);
+      expect(report(run.stderr, 'in review')).toBe('unknown (tracked count unknown, 1 untracked)');
+      expect(run.stderr).toContain('warning: cannot copy the index to a temp file');
+      expect(run.stderr).not.toContain('no changes in this range');
+      expect(fs.existsSync(missing)).toBe(false);
+    });
+
+    it('leaves an untracked nested repo out of the count, as the CLI does', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      const nested = path.join(repo, 'nested');
+      fs.mkdirSync(nested);
+      git(sandbox, nested, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(nested, 'inside.txt'), 'inside\n');
+      fs.writeFileSync(path.join(repo, 'new.txt'), 'new\n');
+      expect(git(sandbox, repo, 'ls-files', '--others', '--exclude-standard').split('\n')).toEqual(['nested/', 'new.txt']);
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('2 files (1 tracked, 1 untracked)');
+    });
+
+    it('counts a rename as one file even with diff.renames=false', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      git(sandbox, repo, 'config', 'diff.renames', 'false');
+      git(sandbox, repo, 'mv', 'b.txt', 'renamed.txt');
+
+      const head = runScript(sandbox, shell, [repo]);
+      expect(head.status, head.stderr).toBe(0);
+      expect(report(head.stderr, 'in review')).toBe('2 files (2 tracked, 0 untracked)');
+
+      git(sandbox, repo, 'commit', '-q', '-m', 'rename');
+      const branch = runScript(sandbox, shell, [repo, 'feat', 'main']);
+      expect(branch.status, branch.stderr).toBe(0);
+      expect(report(branch.stderr, 'in review')).toBe('2 files (2 tracked, 0 untracked)');
+    });
+
+    it('counts a file whose name holds a newline once', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      fs.writeFileSync(path.join(repo, 'two\nlines.txt'), 'tracked\n');
+      git(sandbox, repo, 'add', '.');
+      git(sandbox, repo, 'commit', '-q', '-m', 'odd name');
+      fs.writeFileSync(path.join(repo, 'new\nline.txt'), 'untracked\n');
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('3 files (2 tracked, 1 untracked)');
+    });
+
     it('points at the GitHub install when branch-review is missing', () => {
       const sandbox = createSandbox({cli: false});
       const repo = createRepo(sandbox);
@@ -443,6 +638,16 @@ describe('SKILL.md', () => {
     }
     for (const line of lines) {
       expect(line).not.toMatch(/(^|[\s`(])scripts\/review-command\.sh/);
+    }
+  });
+
+  it('names every quit key wherever it says how the UI exits', () => {
+    const paragraphs = fs.readFileSync(skillDocPath, 'utf8').split(/\n\s*\n/);
+    const quitting = paragraphs.filter((paragraph) => /`q`/.test(paragraph));
+    expect(quitting.length).toBeGreaterThan(0);
+    for (const paragraph of quitting) {
+      expect(paragraph).toContain('`Esc`');
+      expect(paragraph).toContain('Ctrl-C');
     }
   });
 });
