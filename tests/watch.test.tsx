@@ -12,13 +12,12 @@ import {debounce} from '../src/watch/debounce.js';
 import {
   createRepoWatcher,
   getGitStateWatchPaths,
-  getRepoWatchPaths,
-  isIgnoredWatchPath,
   type CreateRepoWatcherOptions,
 } from '../src/watch/repoWatcher.js';
-import {formatWatchFooterStatus, ReviewController} from '../src/ui/ReviewController.js';
+import {formatWatchFooterStatus, getModelWidth, ReviewController} from '../src/ui/ReviewController.js';
 
 const tempDirs: string[] = [];
+const originalPath = process.env.PATH;
 
 function runGit(cwd: string, ...args: string[]) {
   return execFileSync('git', args, {
@@ -76,8 +75,58 @@ async function flush(ms = 0) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitForFrame(instance: {lastFrame: () => string | undefined}, predicate: (frame: string) => boolean, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let frame = stripAnsi(instance.lastFrame() ?? '');
+  while (!predicate(frame) && Date.now() < deadline) {
+    await flush(25);
+    frame = stripAnsi(instance.lastFrame() ?? '');
+  }
+  return frame;
+}
+
+function fakeWatcherFactory() {
+  const watchers: Array<{options: CreateRepoWatcherOptions; close: ReturnType<typeof vi.fn>}> = [];
+  const createWatcher = vi.fn((options: CreateRepoWatcherOptions) => {
+    const close = vi.fn(async () => undefined);
+    watchers.push({options, close});
+    return {close};
+  });
+  return {
+    createWatcher,
+    watchers,
+    get current() {
+      const latest = watchers.at(-1);
+      if (!latest) throw new Error('no watcher created');
+      return latest;
+    },
+  };
+}
+
+function installFakeGit(script: string) {
+  const realGit = execFileSync('sh', ['-c', 'command -v git'], {encoding: 'utf8'}).trim();
+  const binDir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-fake-git-'));
+  tempDirs.push(binDir);
+  fs.writeFileSync(path.join(binDir, 'git'), `#!/bin/sh\n${script.replaceAll('$REAL_GIT', realGit)}\n`, {mode: 0o755});
+  process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ''}`;
+}
+
+async function hoverFrameText(frame: string, text: string) {
+  const lines = frame.split('\n');
+  const row = lines.findIndex((line) => line.includes(text));
+  expect(row).toBeGreaterThanOrEqual(0);
+  const column = lines[row]?.indexOf(text) ?? -1;
+  expect(column).toBeGreaterThanOrEqual(0);
+
+  for (const delta of [-1, 1, 2, 0]) {
+    process.stdin.emit('data', `\u001B[<35;${column + delta + 1};${row + 1}M`);
+    await flush();
+  }
+}
+
 afterEach(() => {
   vi.useRealTimers();
+  process.env.PATH = originalPath;
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, {recursive: true, force: true});
   }
@@ -99,24 +148,6 @@ describe('watch helpers', () => {
     expect(callback).toHaveBeenCalledTimes(1);
   });
 
-  it('ignores generated and dependency paths', () => {
-    expect(isIgnoredWatchPath('/repo/.git/index', '/repo')).toBe(true);
-    expect(isIgnoredWatchPath('/repo/node_modules/react/index.js', '/repo')).toBe(true);
-    expect(isIgnoredWatchPath('/repo/dist/cli.js', '/repo')).toBe(true);
-    expect(isIgnoredWatchPath('/repo/src/cli.tsx', '/repo')).toBe(false);
-    expect(isIgnoredWatchPath('/repo/packages/app/lib/source.ts', '/repo')).toBe(false);
-  });
-
-  it('builds shallow watch paths from tracked repo directories', () => {
-    const cwd = createRepo();
-
-    expect(getRepoWatchPaths(cwd)).toEqual(expect.arrayContaining([
-      cwd,
-      path.join(cwd, 'src'),
-      path.join(cwd, 'packages', 'app', 'lib'),
-    ]));
-  });
-
   it('includes narrow Git state paths for commit and index refreshes', () => {
     const cwd = createRepo();
 
@@ -131,9 +162,11 @@ describe('watch helpers', () => {
     const cwd = createRepo();
     runGit(cwd, 'update-ref', 'refs/remotes/origin/development', 'development');
 
+    // The whole refs and logs/refs trees are watched, which covers
+    // refs/remotes and logs/refs/remotes along with every local branch.
     expect(getGitStateWatchPaths(cwd)).toEqual(expect.arrayContaining([
-      path.join(cwd, '.git', 'refs', 'remotes'),
-      path.join(cwd, '.git', 'logs', 'refs', 'remotes'),
+      path.join(cwd, '.git', 'refs'),
+      path.join(cwd, '.git', 'logs', 'refs'),
     ]));
   });
 
@@ -278,7 +311,7 @@ describe('ReviewController watch refresh', () => {
     );
 
     await flush();
-    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('watching');
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toMatch(/refreshing|updated|watch error/);
 
     triggerChange?.();
     await flush(10);
@@ -293,7 +326,7 @@ describe('ReviewController watch refresh', () => {
     expect(frame).toContain('two.ts');
     expect(frame).toContain('refreshed two');
     expect(frame).toContain('updated');
-    expect(frame).not.toContain('watching');
+    expect(frame).not.toContain('refreshing...');
 
     instance.unmount();
   });
@@ -390,4 +423,399 @@ describe('ReviewController watch refresh', () => {
 
     instance.unmount();
   });
+
+  it('runs one refresh when the watcher is ready, to catch changes made before it was listening', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const initialFingerprint = getReviewFingerprint(cwd, range);
+    fs.writeFileSync(path.join(cwd, 'src', 'two.ts'), 'export const two = true;\n');
+    const buildReview = vi.fn(() => reviewModel([
+      {path: 'src/one.ts', text: 'initial one'},
+      {path: 'src/two.ts', text: 'written before ready'},
+    ]));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={initialFingerprint}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    expect(buildReview).not.toHaveBeenCalled();
+
+    watchers.current.options.onReady?.();
+    await flush(10);
+
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('written before ready');
+
+    instance.unmount();
+  });
+
+  it('rebuilds on the first change when started without a fingerprint', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    // The initial review was built before this file appeared.
+    fs.writeFileSync(path.join(cwd, 'src', 'two.ts'), 'export const two = true;\n');
+    const buildReview = vi.fn(() => reviewModel([
+      {path: 'src/one.ts', text: 'initial one'},
+      {path: 'src/two.ts', text: 'written during startup'},
+    ]));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    watchers.current.options.onChange();
+    await flush(10);
+
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('written during startup');
+
+    instance.unmount();
+  });
+
+  it('keeps the watcher and rebuilds at the new width when the terminal resizes', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const buildReview = vi.fn((_options: {cwd: string; range: DiffRange; width: number}) => reviewModel([
+      {path: 'src/one.ts', text: 'rebuilt one'},
+    ]));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+      />,
+    );
+
+    await flush();
+    expect(watchers.createWatcher).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(instance.stdout, 'columns', {value: 200, configurable: true});
+    instance.stdout.emit('resize');
+    await flush(400);
+
+    expect(watchers.createWatcher).toHaveBeenCalledTimes(1);
+    expect(watchers.current.close).not.toHaveBeenCalled();
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(buildReview.mock.calls[0]?.[0].width).toBe(getModelWidth(200));
+
+    instance.unmount();
+  });
+
+  it('starts a fresh refresh for a change that arrived while a refresh failed', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const refreshInWorker = vi.fn()
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('refresh timed out after 30s')), 50);
+      }))
+      .mockImplementationOnce(async () => ({
+        range,
+        fingerprint: 'after-timeout',
+        branchName: 'feature/watch',
+        review: reviewModel([{path: 'src/two.ts', text: 'landed after timeout'}]),
+      }));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    watchers.current.options.onChange();
+    await flush(10);
+    for (let index = 0; index < 5; index += 1) watchers.current.options.onChange();
+
+    const frame = await waitForFrame(instance, (text) => text.includes('landed after timeout'), 2000);
+    expect(refreshInWorker).toHaveBeenCalledTimes(2);
+    expect(frame).toContain('landed after timeout');
+    expect(frame).not.toContain('watch error');
+
+    instance.unmount();
+  });
+
+  it('aborts the in-flight refresh on unmount', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    let refreshSignal: AbortSignal | undefined;
+    const refreshInWorker = vi.fn((options: {signal?: AbortSignal}) => {
+      refreshSignal = options.signal;
+      return new Promise<never>(() => {});
+    });
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    watchers.current.options.onChange();
+    await flush(10);
+    expect(refreshInWorker).toHaveBeenCalledTimes(1);
+    expect(refreshSignal?.aborted).toBe(false);
+
+    instance.unmount();
+    await flush();
+    expect(refreshSignal?.aborted).toBe(true);
+  });
+
+  it("shows git's reason when a refresh fails", async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const buildReview = vi.fn(() => {
+      runGit(cwd, 'rev-parse', '--verify', 'no-such-ref');
+      return reviewModel([]);
+    });
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    fs.writeFileSync(path.join(cwd, 'src', 'two.ts'), 'export const two = true;\n');
+    watchers.current.options.onChange();
+    await flush(10);
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('watch error: fatal: Needed a single revision');
+    expect(frame).toContain('initial one');
+
+    instance.unmount();
+  });
+
+  it('keeps the last view on a failed refresh and recovers on the next change', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const buildReview = vi.fn()
+      .mockImplementationOnce(() => {
+        throw new Error('delta: simulated failure');
+      })
+      .mockImplementationOnce(() => reviewModel([{path: 'src/two.ts', text: 'recovered two'}]));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    fs.writeFileSync(path.join(cwd, 'src', 'two.ts'), 'export const two = true;\n');
+    watchers.current.options.onChange();
+    await flush(10);
+
+    let frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(frame).toContain('watch error: delta: simulated failure');
+    expect(frame).toContain('initial one');
+
+    watchers.current.options.onChange();
+    await flush(10);
+
+    frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(buildReview).toHaveBeenCalledTimes(2);
+    expect(frame).toContain('recovered two');
+    expect(frame).not.toContain('watch error');
+
+    instance.unmount();
+  });
+
+  it('keeps a watcher error on screen after a successful refresh', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const buildReview = vi.fn(() => reviewModel([{path: 'src/two.ts', text: 'refreshed two'}]));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        buildReview={buildReview}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    watchers.current.options.onError?.(new Error('EMFILE: attach failed'));
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('watch error: EMFILE: attach failed');
+
+    fs.writeFileSync(path.join(cwd, 'src', 'two.ts'), 'export const two = true;\n');
+    watchers.current.options.onChange();
+    await flush(10);
+
+    const frame = stripAnsi(instance.lastFrame() ?? '');
+    expect(buildReview).toHaveBeenCalledTimes(1);
+    expect(frame).toContain('refreshed two');
+    expect(frame).toContain('watch error: EMFILE: attach failed');
+
+    instance.unmount();
+  });
+
+  it('updates the current-branch tooltip after a checkout', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        buildReview={vi.fn(() => reviewModel([{path: 'src/one.ts', text: 'initial one'}]))}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 160, rows: 16}}
+      />,
+    );
+
+    await flush();
+    runGit(cwd, 'checkout', '-b', 'feature/renamed');
+    watchers.current.options.onChange();
+    await flush(10);
+
+    await hoverFrameText(stripAnsi(instance.lastFrame() ?? ''), 'worktree');
+    await flush();
+    expect(stripAnsi(instance.lastFrame() ?? '')).toContain('current branch feature/renamed');
+
+    instance.unmount();
+  });
+});
+
+describe('ReviewController with the real refresh worker', () => {
+  it('refreshes through the worker process against a real repo', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 30}}
+      />,
+    );
+
+    await flush();
+    fs.writeFileSync(path.join(cwd, 'src', 'worker-made.ts'), 'export const fromWorker = true;\n');
+    watchers.current.options.onChange();
+
+    const frame = await waitForFrame(instance, (text) => text.includes('worker-made.ts') && !text.includes('refreshing'));
+    expect(frame).toContain('worker-made.ts');
+    expect(frame).toContain('fromWorker');
+    expect(frame).not.toContain('watch error');
+
+    instance.unmount();
+  }, 30_000);
+
+  it('keeps the last view when the worker fails and recovers on the next change', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={getReviewFingerprint(cwd, range)}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 30}}
+      />,
+    );
+
+    await flush();
+    installFakeGit('case "$1" in merge-base) echo "fatal: simulated merge-base failure" >&2; exit 128;; esac\nexec "$REAL_GIT" "$@"');
+    watchers.current.options.onChange();
+    let frame = await waitForFrame(instance, (text) => text.includes('watch error'));
+    process.env.PATH = originalPath;
+    expect(frame).toContain('watch error: fatal: simulated merge-base failure');
+    expect(frame).toContain('initial one');
+
+    fs.writeFileSync(path.join(cwd, 'src', 'worker-made.ts'), 'export const fromWorker = true;\n');
+    watchers.current.options.onChange();
+    frame = await waitForFrame(instance, (text) => text.includes('worker-made.ts') && !text.includes('refreshing'));
+    expect(frame).toContain('worker-made.ts');
+    expect(frame).not.toContain('watch error');
+
+    instance.unmount();
+  }, 30_000);
 });

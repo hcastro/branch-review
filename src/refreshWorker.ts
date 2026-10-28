@@ -1,5 +1,4 @@
-import {parentPort} from 'node:worker_threads';
-import {getReviewFingerprint, resolveRefs} from './git.js';
+import {getCurrentBranchName, getReviewFingerprint, resolveRefs} from './git.js';
 import {buildReviewModel} from './review/build.js';
 
 type RefreshRequest = {
@@ -11,42 +10,44 @@ type RefreshRequest = {
   previousFingerprint?: string | null;
 };
 
-if (!parentPort) {
-  throw new Error('refreshWorker must run inside a worker thread');
+function errorStderr(error: unknown) {
+  const stderr = (error as {stderr?: unknown} | null)?.stderr;
+  if (typeof stderr === 'string') return stderr;
+  if (Buffer.isBuffer(stderr)) return stderr.toString('utf8');
+  return undefined;
 }
 
-parentPort.on('message', (request: RefreshRequest) => {
+const send = process.send?.bind(process);
+if (!send) {
+  throw new Error('refreshWorker must run as a forked child process');
+}
+
+// One request per process: answer, then drop the IPC channel so the process
+// exits on its own.
+process.once('message', (request: RefreshRequest) => {
+  let message: object;
   try {
     const range = resolveRefs(request.cwd, request.requestedBranch, request.requestedBase);
     const fingerprint = getReviewFingerprint(request.cwd, range);
-    if (fingerprint === request.previousFingerprint) {
-      parentPort?.postMessage({
+    const branchName = getCurrentBranchName(request.cwd);
+    message = fingerprint === request.previousFingerprint
+      ? {id: request.id, ok: true, range, fingerprint, branchName}
+      : {
         id: request.id,
         ok: true,
         range,
         fingerprint,
-      });
-      return;
-    }
-
-    const review = buildReviewModel({
-      cwd: request.cwd,
-      range,
-      width: request.width,
-    });
-
-    parentPort?.postMessage({
-      id: request.id,
-      ok: true,
-      range,
-      fingerprint,
-      review,
-    });
+        branchName,
+        review: buildReviewModel({cwd: request.cwd, range, width: request.width}),
+      };
   } catch (error) {
-    parentPort?.postMessage({
+    message = {
       id: request.id,
       ok: false,
       error: error instanceof Error ? error.message : String(error),
-    });
+      stderr: errorStderr(error),
+    };
   }
+
+  send(message, undefined, {}, () => process.disconnect());
 });
