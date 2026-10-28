@@ -26,6 +26,9 @@ export type SectionRow = {
   // Cell column where code starts after delta's line-number gutter, when the
   // row has one.
   codeColumn?: number;
+  // Width of the +/- marker delta keeps between the gutter and the code in
+  // plain (NO_COLOR) output; the marker is not part of the code.
+  markerWidth?: number;
   // Header rows: the full display label (`• path:line:`) and its line number.
   label?: string;
   lineNumber?: number;
@@ -49,10 +52,11 @@ export const BLOCK_ACTION_LABELS = {
 } as const;
 
 import {cellWidth, graphemes, toDisplayText, truncateStart} from './ui/text.js';
+import {palette} from './ui/palette.js';
 
 const ANSI_CSI_TOKEN = /(\[[0-9;:]*[A-Za-z])/;
 const RESET = '[0m';
-const SECTION_BORDER = '[36m';
+const SECTION_BORDER = palette.sgr.cyan;
 
 type StyledCell = {
   char: string;
@@ -460,7 +464,13 @@ export function frameBottomBorder(paneWidth: number, borderAnsi: string): string
   return `${borderAnsi}\u2570${'\u2500'.repeat(inner)}\u256F${RESET}`;
 }
 
-export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
+export type WrapOptions = {
+  // Delta's plain output keeps a one-cell `+`, `-` or space marker after the
+  // gutter bar; it is skipped when finding where code starts.
+  plusMinusMarkers?: boolean;
+};
+
+export function wrapSections(sections: DiffSection[], maxWidth: number, options: WrapOptions = {}): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {
     const lines: string[] = [];
@@ -481,7 +491,12 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
 
       const plain = stripAnsi(line);
       const gutterIndex = plain.indexOf('│');
-      const wrapped = wrapAnsiRows(line, maxWidth, getContinuationPrefix(line));
+      const markerWidth = options.plusMinusMarkers && gutterIndex > 0 && /^[+\- ]/.test(plain.slice(gutterIndex + 1)) ? 1 : 0;
+      // With markers, continuation rows hang one cell further in, under the code.
+      const continuationPrefix = markerWidth
+        ? `${' '.repeat(cellWidth(plain.slice(0, gutterIndex)))}│ `
+        : getContinuationPrefix(line);
+      const wrapped = wrapAnsiRows(line, maxWidth, continuationPrefix);
       for (const [index, row] of wrapped.rows.entries()) {
         lines.push(row);
         rows.push({
@@ -489,7 +504,7 @@ export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSec
           kind: 'body',
           continuation: index > 0,
           ...(index === 0 && gutterIndex > 0
-            ? {codeColumn: cellWidth(plain.slice(0, gutterIndex + 1))}
+            ? {codeColumn: cellWidth(plain.slice(0, gutterIndex + 1)) + markerWidth, ...(markerWidth ? {markerWidth} : {})}
             : index > 0 && wrapped.prefix.includes('│')
               ? {codeColumn: cellWidth(wrapped.prefix)}
               : {}),
@@ -560,15 +575,15 @@ function stripAnsi(line: string) {
 }
 
 function yellow(text: string) {
-  return `\u001B[33m${text}\u001B[0m`;
+  return `${palette.sgr.yellow}${text}${RESET}`;
 }
 
 function green(text: string) {
-  return `\u001B[32m${text}\u001B[0m`;
+  return `${palette.sgr.green}${text}${RESET}`;
 }
 
 function red(text: string) {
-  return `\u001B[31m${text}\u001B[0m`;
+  return `${palette.sgr.red}${text}${RESET}`;
 }
 
 export function formatMetrics(metrics: Pick<FileMetrics, 'additions' | 'deletions' | 'changedLines'>) {

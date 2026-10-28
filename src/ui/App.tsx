@@ -24,7 +24,9 @@ import {
   type DiffSection,
   type SectionRow,
 } from '../sections.js';
-import {graphemes, toDisplayText, truncateStart, type Grapheme} from './text.js';
+import {graphemes, toDisplayText, truncateEnd, truncateStart, type Grapheme} from './text.js';
+import {palette, plainDiffMode} from './palette.js';
+import {DiffErrorBoundary} from './DiffErrorBoundary.js';
 import type {FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
@@ -53,6 +55,17 @@ const MAX_TREE_WIDTH_RATIO = 0.75;
 const MIN_TREE_WIDTH = 34;
 const COLLAPSED_TREE_WIDTH = 18;
 const MIN_DIFF_WIDTH = 40;
+// Rows outside the panes: the top bar and footer (three rows each with their
+// borders) and one spare row, because Ink clears the screen before drawing a
+// frame as tall as the terminal.
+const CHROME_ROWS = 7;
+const MIN_DIFF_ROWS = 3;
+// Pane overhead: tree has 2 borders + 1 header row; diff has 2 borders + 2.
+const DIFF_PANE_OVERHEAD = 4;
+const MIN_TERMINAL_ROWS = CHROME_ROWS + DIFF_PANE_OVERHEAD + MIN_DIFF_ROWS;
+const MIN_TERMINAL_COLUMNS = COLLAPSED_TREE_WIDTH + MIN_DIFF_WIDTH;
+// Narrowest right-hand label worth showing in the top bar or footer.
+const MIN_BAR_RIGHT_WIDTH = 10;
 const TOAST_TIMEOUT_MS = 2200;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
@@ -61,6 +74,7 @@ const ARRIVAL_ANIMATION_DURATION_MS = 2600;
 const ARRIVAL_ANIMATION_TICK_MS = 130;
 const MAX_ANIMATED_ENTRIES = 120;
 const COPY_SUCCESS_LABEL = '✓ Copied';
+const KEY_HINTS = '↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • t tree • q quit';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
 const TREE_EXPAND_LABEL = '›';
@@ -70,6 +84,19 @@ const FILE_ACTIONS = [
   {id: 'copy.fileContents', label: 'Copy file'},
 ] as const;
 const ABSOLUTE_PATH_ACTION = {id: 'copy.absolutePath', label: 'Copy absolute path'} as const;
+// Keyboard copy: file commands act on the file in view, block commands on the
+// focused block.
+const FILE_KEY_COMMANDS: Record<string, string | undefined> = {
+  y: 'copy.path',
+  Y: 'copy.absolutePath',
+  d: 'copy.fileDiff',
+  f: 'copy.fileContents',
+};
+const BLOCK_KEY_COMMANDS: Record<string, string | undefined> = {
+  c: 'copy.blockCode',
+  p: 'copy.blockDiff',
+  b: 'copy.blockPrompt',
+};
 const BLOCK_ACTIONS = [
   {id: 'copy.blockCode', label: BLOCK_ACTION_LABELS.code},
   {id: 'copy.blockDiff', label: BLOCK_ACTION_LABELS.diff},
@@ -95,7 +122,9 @@ type WrappedSectionCacheEntry = {
   rows: SectionRow[];
 };
 
-type BlockTarget = {file: ReviewFile; block: ReviewBlock};
+// `key` names the block for collapse state; it survives edits elsewhere in
+// the file that move the block's line numbers.
+type BlockTarget = {file: ReviewFile; block: ReviewBlock; key: string};
 // One rendered diff row with its place in the review: the section it belongs
 // to, the absolute index of its block's header row, and the block it maps to.
 type DiffRow = SectionRow & {
@@ -222,6 +251,30 @@ function sectionWrapCacheKey(section: DiffSection, maxWidth: number) {
   return `${maxWidth}\0${section.path}\0${signature}`;
 }
 
+function errorText(error: unknown) {
+  return error instanceof Error && error.message ? error.message.split('\n')[0]! : String(error);
+}
+
+// One unselectable row in the error colour, for a file whose diff can't be shown.
+function errorRow(text: string, maxWidth: number) {
+  return {
+    line: `${ANSI_RED}${truncateEnd(text, Math.max(1, maxWidth))}${ANSI_RESET}`,
+    row: {block: -1, kind: 'body', continuation: false} as SectionRow,
+  };
+}
+
+// Wraps one section; a section that fails to wrap becomes a single error row
+// so one bad file never takes down the rest of the review.
+function wrapSectionSafely(section: DiffSection, maxWidth: number): WrappedSectionCacheEntry {
+  try {
+    const wrappedSection = wrapSections([section], maxWidth, {plusMinusMarkers: plainDiffMode})[0];
+    return {lines: wrappedSection?.lines ?? [], rows: wrappedSection?.rows ?? []};
+  } catch (error) {
+    const failure = errorRow(`✗ could not render ${toDisplayText(section.path)}: ${toDisplayText(errorText(error))}`, maxWidth);
+    return {lines: [failure.line], rows: [failure.row]};
+  }
+}
+
 function wrapSectionsWithCache(
   sections: DiffSection[],
   maxWidth: number,
@@ -234,8 +287,7 @@ function wrapSectionsWithCache(
     const key = sectionWrapCacheKey(section, maxWidth);
     let entry = cache.get(key);
     if (!entry) {
-      const wrappedSection = wrapSections([section], maxWidth)[0];
-      entry = {lines: wrappedSection?.lines ?? [], rows: wrappedSection?.rows ?? []};
+      entry = wrapSectionSafely(section, maxWidth);
     }
 
     nextCache.set(key, entry);
@@ -354,39 +406,7 @@ function arrivalProgress(entry: ArrivalEntry, now: number) {
 }
 
 function arrivalBackgroundStyle(entry: ArrivalEntry, now: number) {
-  const progress = arrivalProgress(entry, now);
-  if (progress >= 1) return null;
-
-  const ramp = entry.kind === 'new'
-    ? [
-      '[48;2;18;72;38m',
-      '[48;2;17;68;37m',
-      '[48;2;15;60;34m',
-      '[48;2;13;52;31m',
-      '[48;2;11;44;28m',
-      '[48;2;9;36;25m',
-      '[48;2;7;28;22m',
-      '[48;2;5;20;18m',
-    ]
-    : [
-      '[48;2;17;64;72m',
-      '[48;2;16;60;69m',
-      '[48;2;14;54;63m',
-      '[48;2;12;47;57m',
-      '[48;2;10;39;49m',
-      '[48;2;8;32;41m',
-      '[48;2;6;25;33m',
-      '[48;2;4;19;27m',
-    ];
-
-  if (progress < 0.08) return ramp[0]!;
-  if (progress < 0.18) return ramp[1]!;
-  if (progress < 0.31) return ramp[2]!;
-  if (progress < 0.46) return ramp[3]!;
-  if (progress < 0.62) return ramp[4]!;
-  if (progress < 0.78) return ramp[5]!;
-  if (progress < 0.92) return ramp[6]!;
-  return ramp[7]!;
+  return palette.arrivalBackground(entry.kind, arrivalProgress(entry, now));
 }
 
 function applyArrivalWash(line: string, entry: ArrivalEntry | undefined, now: number) {
@@ -408,10 +428,10 @@ function treeArrivalColor(entry: ArrivalEntry | undefined, now: number) {
   if (progress >= 1) return null;
 
   if (entry.kind === 'new') {
-    return progress < 0.4 ? 'greenBright' : 'green';
+    return palette.ink(progress < 0.4 ? 'greenBright' : 'green');
   }
 
-  return progress < 0.4 ? 'cyanBright' : 'cyan';
+  return palette.ink(progress < 0.4 ? 'cyanBright' : 'cyan');
 }
 
 function getTreeWidthLimits(columns: number) {
@@ -502,10 +522,10 @@ function isBaseLabelTarget(bounds: Bounds | null, x: number, y: number, branch: 
 }
 
 function statusColor(status: FileStatus | undefined) {
-  if (status === 'added' || status === 'untracked') return 'green';
-  if (status === 'deleted') return 'red';
-  if (status === 'renamed') return 'magenta';
-  return 'yellow';
+  if (status === 'added' || status === 'untracked') return palette.ink('green');
+  if (status === 'deleted') return palette.ink('red');
+  if (status === 'renamed') return palette.ink('magenta');
+  return palette.ink('yellow');
 }
 
 function statusLabel(status: FileStatus | undefined) {
@@ -579,7 +599,11 @@ const TreeFileRow = memo(function TreeFileRow({
   width: number;
 }) {
   const arrivalColor = treeArrivalColor(arrivalEntry, arrivalNow);
-  const accent = selected ? 'cyanBright' : arrivalColor ?? (row.kind === 'dir' ? 'yellow' : hovered ? 'cyan' : 'white');
+  // File names use the terminal's default foreground, which reads on light
+  // and dark themes alike.
+  const accent = selected
+    ? palette.ink('cyanBright')
+    : arrivalColor ?? (row.kind === 'dir' ? palette.ink('yellow') : hovered ? palette.ink('cyan') : undefined);
   const copyVisible = shouldShowTreeCopy(row.kind, hovered, selected, copySucceeded);
   const copyLabel = copySucceeded ? successLabel('Copy') : 'Copy';
   const copySlotWidth = getTreeCopySlotWidth(copySucceeded);
@@ -600,7 +624,7 @@ const TreeFileRow = memo(function TreeFileRow({
           <Text color={statusColor(row.status)} bold={Boolean(row.status)}>
             {statusLabel(row.status)}
           </Text>
-          <Text color={copySucceeded ? 'greenBright' : copyHovered ? 'cyanBright' : 'gray'} bold={copySucceeded || copyHovered}>
+          <Text color={palette.ink(copySucceeded ? 'greenBright' : copyHovered ? 'cyanBright' : 'gray')} bold={copySucceeded || copyHovered}>
             {copyVisible ? ` ${copyLabel}` : ' '.repeat(copySlotWidth)}
           </Text>
         </Box>
@@ -649,8 +673,8 @@ function TreePane({
       flexDirection="column"
       flexShrink={0}
       borderStyle="round"
-      borderColor={resizeActive ? 'gray' : hovered ? 'cyan' : 'gray'}
-      borderRightColor={resizeActive ? 'cyanBright' : hovered ? 'cyan' : 'gray'}
+      borderColor={palette.ink(resizeActive ? 'gray' : hovered ? 'cyan' : 'gray')}
+      borderRightColor={palette.ink(resizeActive ? 'cyanBright' : hovered ? 'cyan' : 'gray')}
       paddingX={1}
     >
       {children}
@@ -671,13 +695,13 @@ function TreeTooltipOverlay({tooltip}: {tooltip: TreeTooltip}) {
       width={tooltip.width}
       flexDirection="column"
     >
-      <Text color="gray">{`╭${horizontal}╮`}</Text>
+      <Text color={palette.ink('gray')}>{`╭${horizontal}╮`}</Text>
       <Box width={tooltip.width}>
-        <Text color="gray">│ </Text>
-        <Text color="white">{text}</Text>
-        <Text color="gray"> │</Text>
+        <Text color={palette.ink('gray')}>│ </Text>
+        <Text>{text}</Text>
+        <Text color={palette.ink('gray')}> │</Text>
       </Box>
-      <Text color="gray">{`╰${horizontal}╯`}</Text>
+      <Text color={palette.ink('gray')}>{`╰${horizontal}╯`}</Text>
     </Box>
   );
 }
@@ -712,17 +736,18 @@ function DiffPane({
   );
 }
 
-const ANSI_CYAN_BRIGHT_BOLD = '[96;1m';
-const ANSI_CYAN_BRIGHT = '[96m';
-const ANSI_CYAN = '[36m';
-const ANSI_GRAY = '[90m';
-const ANSI_GREEN_BOLD = '[32;1m';
-const ANSI_GREEN = '[32m';
-const ANSI_RED = '[31m';
-const ANSI_YELLOW = '[33m';
-const ANSI_MAGENTA = '[35m';
-const ANSI_RESET = '[0m';
-const ANSI_SELECTION = '[48;2;28;68;76m[97;1m';
+const ANSI_CYAN_BRIGHT_BOLD = palette.sgr.cyanBrightBold;
+const ANSI_CYAN_BRIGHT = palette.sgr.cyanBright;
+const ANSI_CYAN = palette.sgr.cyan;
+const ANSI_GRAY = palette.sgr.gray;
+const ANSI_GREEN_BOLD = palette.sgr.greenBold;
+const ANSI_GREEN = palette.sgr.green;
+const ANSI_RED = palette.sgr.red;
+const ANSI_YELLOW = palette.sgr.yellow;
+const ANSI_MAGENTA = palette.sgr.magenta;
+const ANSI_MAGENTA_BRIGHT = palette.sgr.magentaBright;
+const ANSI_RESET = palette.sgr.reset;
+const ANSI_SELECTION = palette.sgr.selection;
 
 type HoveredAction =
   | {kind: 'file-header'; id: string}
@@ -1106,6 +1131,7 @@ function spanAt(spans: ReadonlyArray<ActionSpan>, column: number) {
 }
 
 const BLOCK_ACTION_SEPARATOR = '  ';
+const FOCUS_BAR = '┃';
 
 function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
   return BLOCK_ACTIONS
@@ -1131,6 +1157,14 @@ export function findFocusedBlockLineIndex(
   }
 
   const clampedTop = clamp(visibleTopLine, section.startLine, section.endLineExclusive - 1);
+  // A block whose frame opens the viewport is the one at the top, even
+  // before its header row.
+  for (let candidate = clampedTop; candidate < section.endLineExclusive; candidate += 1) {
+    const kind = rows[candidate]?.kind;
+    if (kind === 'header') return candidate;
+    if (kind !== 'frame') break;
+  }
+
   for (let candidate = clampedTop; candidate >= section.startLine; candidate -= 1) {
     if (rows[candidate]?.kind === 'header') {
       return candidate;
@@ -1155,6 +1189,7 @@ function renderBlockHeaderRow(
   collapsed: boolean,
   width: number,
   actions: {hovered?: string; copied?: string} | null,
+  focused = false,
 ): {line: string; spans: ActionSpan[]} {
   const baseLabel = row.label ?? '•';
   const label = row.target ? `${collapsed ? '▸' : '▾'}${baseLabel.slice(1)}` : baseLabel;
@@ -1167,7 +1202,7 @@ function renderBlockHeaderRow(
   const rightWidth = visibleWidth(right);
   const fittedLabel = fitBlockHeaderLabel(label, Math.max(1, inner - rightWidth - 1));
   if (!actions) {
-    return {line: frameLine(fittedLabel, inner, ANSI_CYAN), spans: []};
+    return {line: markFocusedHeader(frameLine(fittedLabel, inner, ANSI_CYAN), focused), spans: []};
   }
 
   const left = `${ANSI_CYAN}${fittedLabel}${ANSI_RESET}`;
@@ -1183,11 +1218,27 @@ function renderBlockHeaderRow(
     column += labelWidth + BLOCK_ACTION_SEPARATOR.length;
   }
 
-  return {line: frameLine(content, inner, ANSI_CYAN), spans};
+  return {line: markFocusedHeader(frameLine(content, inner, ANSI_CYAN), focused), spans};
+}
+
+// The focused block's header row swaps its side bars for heavy ones, a mark
+// that needs no colour and keeps every column in place.
+function markFocusedHeader(line: string, focused: boolean) {
+  if (!focused) return line;
+  const left = line.indexOf('│');
+  const right = line.lastIndexOf('│');
+  if (left < 0 || right <= left) return line;
+  return `${line.slice(0, left)}${FOCUS_BAR}${line.slice(left + 1, right)}${FOCUS_BAR}${line.slice(right + 1)}`;
 }
 
 function stripAnsi(line: string) {
   return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, '');
+}
+
+// Names a block header for keyboard focus: its collapse key, or its row when
+// the header has no parsed block behind it.
+function blockFocusKey(rows: ReadonlyArray<DiffRow>, lineIndex: number) {
+  return rows[lineIndex]?.target?.key ?? `row:${lineIndex}`;
 }
 
 function makeToast(message: string, hint?: string) {
@@ -1311,14 +1362,31 @@ function remapCodeSelection(selection: CodeSelection, previous: SelectionSource,
   };
 }
 
+// Collapse keys for a file's blocks: the hunk's content without its line
+// numbers, plus how many earlier blocks in the file have the same content, so
+// a block keeps its key when an edit above it shifts its start line.
+function blockCollapseKeys(file: ReviewFile) {
+  const seen = new Map<string, number>();
+  return file.blocks.map((block) => {
+    const [header = '', ...body] = block.rawDiff.split('\n');
+    const content = hashText(`${header.replace(/^@@ [^@]* @@/, '')}\n${body.join('\n')}`);
+    const occurrence = seen.get(content) ?? 0;
+    seen.set(content, occurrence + 1);
+    return `${file.path}\0${content}\0${occurrence}`;
+  });
+}
+
 function resolveBlockTargets(rows: ReadonlyArray<SectionRow>, file: ReviewFile | undefined) {
   const targets: Array<BlockTarget | undefined> = [];
+  const keys = file ? blockCollapseKeys(file) : [];
   for (const row of rows) {
     if (row.kind !== 'header') continue;
     // Delta's hunk headers and the parsed blocks come from the same diff in
     // the same order; the line-number check guards against a mismatch.
     const block = file?.blocks[row.block];
-    targets[row.block] = file && block && block.lineStart === row.lineNumber ? {file, block} : undefined;
+    targets[row.block] = file && block && block.lineStart === row.lineNumber
+      ? {file, block, key: keys[row.block]!}
+      : undefined;
   }
 
   return targets;
@@ -1342,7 +1410,7 @@ function applyCollapsedBlocks(
     const blockTargets = resolveBlockTargets(allRows, fileByPath.get(section.path));
     const isHidden = (row: SectionRow) => row.kind === 'body'
       && row.block >= 0
-      && collapsedBlockIds.has(blockTargets[row.block]?.block.id ?? '');
+      && collapsedBlockIds.has(blockTargets[row.block]?.key ?? '');
     const collapsing = collapsedBlockIds.size > 0 && allRows.some(isHidden);
     const lines = collapsing ? section.lines.filter((_, index) => !isHidden(allRows[index]!)) : section.lines;
     const rows = collapsing ? allRows.filter((row) => !isHidden(row)) : allRows;
@@ -1382,6 +1450,204 @@ function buildDiffRows(sections: ViewSection[]): DiffRow[] {
   return rows;
 }
 
+type TerminalSize = {columns: number; rows: number};
+
+function readTerminalSize(stdout: NodeJS.WriteStream | undefined): TerminalSize {
+  return {columns: stdout?.columns ?? 120, rows: stdout?.rows ?? 40};
+}
+
+// The terminal size, updated on every 'resize' so the layout follows it. Ink
+// only re-lays out the last output on resize; it does not re-render.
+function useTerminalSize(stdout: NodeJS.WriteStream | undefined) {
+  const [size, setSize] = useState(() => readTerminalSize(stdout));
+  useEffect(() => {
+    if (!stdout) return undefined;
+    const update = () => setSize((current) => {
+      const next = readTerminalSize(stdout);
+      return next.columns === current.columns && next.rows === current.rows ? current : next;
+    });
+    update();
+    stdout.on('resize', update);
+    return () => {
+      stdout.off('resize', update);
+    };
+  }, [stdout]);
+
+  return size;
+}
+
+// A file whose diff could not be built carries an `error` message. Read it
+// without relying on the field being declared on ReviewFile.
+function fileError(file: ReviewFile) {
+  const error = (file as ReviewFile & {error?: unknown}).error;
+  return typeof error === 'string' && error ? error : undefined;
+}
+
+// Puts an error row at the top of each section whose file failed to build,
+// directly under the file header when the file is in view.
+function addFileErrorRows(sections: DiffSection[], review: ReviewModel | undefined) {
+  const errors = new Map<string, string>();
+  for (const file of review?.files ?? []) {
+    const error = fileError(file);
+    if (error) errors.set(file.path, error);
+  }
+  if (errors.size === 0) return sections;
+
+  return sections.map((section) => {
+    const error = errors.get(section.path);
+    if (!error) return section;
+    return {
+      ...section,
+      signature: `${section.signature ?? ''}\0${hashText(error)}`,
+      lines: [`${ANSI_RED}✗ Could not load diff: ${toDisplayText(error)}${ANSI_RESET}`, ...section.lines],
+    };
+  });
+}
+
+type BarPart = {text: string; style: string};
+
+function renderBarParts(parts: ReadonlyArray<BarPart>) {
+  return parts.map((part) => (part.style && part.text ? `${part.style}${part.text}${ANSI_RESET}` : part.text)).join('');
+}
+
+function fitBarParts(parts: ReadonlyArray<BarPart>, width: number): BarPart[] {
+  if (cellWidthOf(parts) <= width) return [...parts];
+
+  // Cut the joined text once, then hand each part its slice of the result,
+  // so the ellipsis lands where the text stops whichever part that is in.
+  const cut = truncateEnd(parts.map((part) => part.text).join(''), width);
+  const fitted: BarPart[] = [];
+  let offset = 0;
+  for (const part of parts) {
+    if (offset >= cut.length) break;
+    fitted.push({...part, text: cut.slice(offset, offset + part.text.length)});
+    offset += part.text.length;
+  }
+
+  return fitted;
+}
+
+function cellWidthOf(parts: ReadonlyArray<BarPart>) {
+  return parts.reduce((sum, part) => sum + visibleWidth(part.text), 0);
+}
+
+// Lays out one bar row (top bar or footer) in exactly `width` cells: the left
+// parts first, the right label flush right when there is room for it, and
+// everything truncated so the row can never wrap.
+function composeBar(
+  left: ReadonlyArray<BarPart>,
+  right: BarPart | null,
+  width: number,
+  truncateRight: (text: string, width: number) => string,
+) {
+  const leftWidth = cellWidthOf(left);
+  if (right?.text) {
+    const rightWidth = visibleWidth(right.text);
+    if (leftWidth + 1 + rightWidth <= width) {
+      return `${renderBarParts(left)}${' '.repeat(width - leftWidth - rightWidth)}${renderBarParts([right])}`;
+    }
+
+    const budget = width - leftWidth - 1;
+    if (budget >= MIN_BAR_RIGHT_WIDTH) {
+      const fittedRight = truncateRight(right.text, budget);
+      return `${renderBarParts(left)}${' '.repeat(width - leftWidth - visibleWidth(fittedRight))}${renderBarParts([{...right, text: fittedRight}])}`;
+    }
+  }
+
+  return renderBarParts(fitBarParts(left, width));
+}
+
+type DiffPaneBodyProps = {
+  paneWidth: number;
+  contentWidth: number;
+  borderAnsi: string;
+  fileRow: string;
+  metricsRow: string;
+  hasChanges: boolean;
+  emptyStateHint?: string;
+  visibleDiffLines: string[];
+  diffOffset: number;
+  allDiffRows: DiffRow[];
+  collapsedBlockIds: ReadonlySet<string>;
+  arrivalAnimations: ArrivalAnimations;
+  arrivalNow: number;
+  fileArrival?: ArrivalEntry;
+  actionBlockLineIndex: number | null;
+  focusedBlockLineIndex: number | null;
+  hoveredAction: HoveredAction;
+  copiedAction: CopiedAction | null;
+  selection: CodeSelection | null;
+};
+
+// The diff pane's rows. It renders inside DiffErrorBoundary, so a throw while
+// drawing one file's diff stays in the pane.
+function DiffPaneBody({
+  paneWidth,
+  contentWidth,
+  borderAnsi,
+  fileRow,
+  metricsRow,
+  hasChanges,
+  emptyStateHint,
+  visibleDiffLines,
+  diffOffset,
+  allDiffRows,
+  collapsedBlockIds,
+  arrivalAnimations,
+  arrivalNow,
+  fileArrival,
+  actionBlockLineIndex,
+  focusedBlockLineIndex,
+  hoveredAction,
+  copiedAction,
+  selection,
+}: DiffPaneBodyProps) {
+  const inner = Math.max(1, paneWidth - 4);
+  const rows: string[] = [
+    frameTopBorder(paneWidth, borderAnsi),
+    frameLine(applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
+    frameLine(metricsRow, inner, borderAnsi),
+  ];
+  if (!hasChanges) {
+    rows.push(frameLine(`${ANSI_CYAN_BRIGHT_BOLD}No changes to review${ANSI_RESET}`, inner, borderAnsi));
+    rows.push(frameLine(`${ANSI_GRAY}${toDisplayText(emptyStateHint ?? 'Run again after making changes.')}${ANSI_RESET}`, inner, borderAnsi));
+  }
+
+  for (const [index, line] of visibleDiffLines.entries()) {
+    const absoluteLineIndex = diffOffset + index;
+    const row = allDiffRows[absoluteLineIndex];
+    const blockTarget = row?.target;
+    const blockArrival = blockTarget
+      ? arrivalAnimations.blocks.get(blockAnimationKey(blockTarget.file.path, blockTarget.block))
+      : undefined;
+    let visibleLine = line || ' ';
+    if (row?.kind === 'header') {
+      const showActions = actionBlockLineIndex === absoluteLineIndex;
+      visibleLine = renderBlockHeaderRow(
+        row,
+        Boolean(blockTarget && collapsedBlockIds.has(blockTarget.key)),
+        contentWidth,
+        showActions
+          ? {
+            hovered: hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex ? hoveredAction.id : undefined,
+            copied: copiedAction?.kind === 'block' && copiedAction.lineIndex === absoluteLineIndex ? copiedAction.id : undefined,
+          }
+          : null,
+        focusedBlockLineIndex === absoluteLineIndex,
+      ).line;
+    }
+
+    const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
+    const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
+    rows.push(frameLine(arrivalLine, inner, borderAnsi));
+  }
+  rows.push(frameBottomBorder(paneWidth, borderAnsi));
+
+  // Every row is padded to the pane width in terminal cells; truncate so a
+  // row can never soft-wrap and push later rows out of the pane.
+  return <>{rows.map((row, i) => <Text key={`diff-${i}`} wrap="truncate">{row}</Text>)}</>;
+}
+
 function AppContent({
   base,
   branch,
@@ -1402,11 +1668,16 @@ function AppContent({
   const {stdout} = useStdout();
   const mouse = useMouse();
   const topBarRef = useRef<DOMElement>(null);
-  const columns = dimensions?.columns ?? stdout?.columns ?? 120;
-  const terminalRows = dimensions?.rows ?? stdout?.rows ?? 40;
+  const terminalSize = useTerminalSize(stdout);
+  const columns = dimensions?.columns ?? terminalSize.columns;
+  const terminalRows = dimensions?.rows ?? terminalSize.rows;
+  const tooSmall = columns < MIN_TERMINAL_COLUMNS || terminalRows < MIN_TERMINAL_ROWS;
+  // Below the width both panes need, the tree stays collapsed.
+  const treeAutoCollapsed = columns < MIN_TREE_WIDTH + MIN_DIFF_WIDTH;
 
   const [treeWidthOverride, setTreeWidthOverride] = useState<number | null>(null);
-  const [treeCollapsed, setTreeCollapsed] = useState(false);
+  const [treeCollapsedByUser, setTreeCollapsed] = useState(false);
+  const treeCollapsed = treeCollapsedByUser || treeAutoCollapsed;
   const treeWidthLimits = useMemo(() => getTreeWidthLimits(columns), [columns]);
   const leftWidth = treeCollapsed
     ? COLLAPSED_TREE_WIDTH
@@ -1414,17 +1685,17 @@ function AppContent({
   const rightWidth = Math.max(MIN_DIFF_WIDTH, columns - leftWidth);
   const diffContentWidth = Math.max(1, rightWidth - 4);
   const treeContentWidth = Math.max(1, leftWidth - 4);
-  const contentHeight = Math.max(terminalRows - 9, 10);
-  // Pane overhead: 2 borders + header rows.
-  // Tree has 1 header row; diff has 2 (filename + metrics).
-  const visibleTreeRows = Math.max(contentHeight - 3, 4);
-  const visibleDiffRows = Math.max(contentHeight - 4, 6);
+  const contentHeight = Math.max(terminalRows - CHROME_ROWS, DIFF_PANE_OVERHEAD + MIN_DIFF_ROWS);
+  // Tree has 2 borders + 1 header row; diff has 2 borders + 2 (filename + metrics).
+  const visibleTreeRows = contentHeight - 3;
+  const visibleDiffRows = contentHeight - DIFF_PANE_OVERHEAD;
 
   const [collapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
   const wrappedSectionCacheRef = useRef<Map<string, WrappedSectionCacheEntry>>(new Map());
+  const displaySections = useMemo(() => addFileErrorRows(rawSections, review), [rawSections, review]);
   const wrappedSections = useMemo(
-    () => wrapSectionsWithCache(rawSections, diffContentWidth, wrappedSectionCacheRef.current),
-    [rawSections, diffContentWidth],
+    () => wrapSectionsWithCache(displaySections, diffContentWidth, wrappedSectionCacheRef.current),
+    [displaySections, diffContentWidth],
   );
   const sections = useMemo(
     () => applyCollapsedBlocks(wrappedSections, review, collapsedBlockIds),
@@ -1438,13 +1709,27 @@ function AppContent({
   const rows = useMemo(() => applyTreeCollapse(allTreeRows, collapsedTreePaths), [allTreeRows, collapsedTreePaths]);
   const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
   const allDiffRows = useMemo(() => buildDiffRows(sections), [sections]);
+  // Counts rebuilds of the rendered sections, so a render failure in the diff
+  // pane is retried after every refresh.
+  const sectionsRevisionRef = useRef(0);
+  const sectionsRevision = useMemo(() => {
+    sectionsRevisionRef.current += 1;
+    return sectionsRevisionRef.current;
+  }, [sections]);
 
   const maxDiffOffset = Math.max(allDiffLines.length - visibleDiffRows, 0);
+  // A jump puts a file's first line at the top even when the rest of the diff
+  // is shorter than the viewport. Every scroll uses this one ceiling, so the
+  // next scroll after such a jump doesn't snap the view back up.
+  const scrollCeiling = Math.max(maxDiffOffset, sections.at(-1)?.startLine ?? 0);
   const maxTreeOffset = Math.max(rows.length - visibleTreeRows, 0);
 
   const treePanelRef = useRef<DOMElement>(null);
   const diffPanelRef = useRef<DOMElement>(null);
   const [diffOffset, setDiffOffset] = useState(0);
+  // Set by [ and ]: the block they moved to stays focused while the view
+  // stays where they put it, even when the ceiling kept its header off the top.
+  const [blockFocus, setBlockFocus] = useState<{key: string; offset: number} | null>(null);
   const [treeOffset, setTreeOffset] = useState(0);
   const [treeHovered, setTreeHovered] = useState(false);
   const [diffHovered, setDiffHovered] = useState(false);
@@ -1498,10 +1783,18 @@ function AppContent({
     () => review?.files.find((file) => file.path === activeFilePath),
     [activeFilePath, review],
   );
-  const focusedBlockLineIndex = useMemo(
-    () => findFocusedBlockLineIndex(allDiffRows, activeSection, diffOffset),
-    [activeSection, allDiffRows, diffOffset],
+  const headerLineIndexes = useMemo(
+    () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
+    [allDiffRows],
   );
+  const focusedBlockLineIndex = useMemo(() => {
+    if (blockFocus && blockFocus.offset === diffOffset) {
+      const index = headerLineIndexes.find((line) => blockFocusKey(allDiffRows, line) === blockFocus.key);
+      if (index !== undefined) return index;
+    }
+
+    return findFocusedBlockLineIndex(allDiffRows, activeSection, diffOffset);
+  }, [activeSection, allDiffRows, blockFocus, diffOffset, headerLineIndexes]);
   const focusedBlock = focusedBlockLineIndex === null
     ? activeFile?.blocks[0]
     : allDiffRows[focusedBlockLineIndex]?.target?.block;
@@ -1527,12 +1820,12 @@ function AppContent({
   const stateRef = useRef({
     treeOffset,
     maxTreeOffset,
-    maxDiffOffset,
+    scrollCeiling,
     visibleTreeRows,
     rows,
     treeContentWidth,
   });
-  stateRef.current = {treeOffset, maxTreeOffset, maxDiffOffset, visibleTreeRows, rows, treeContentWidth};
+  stateRef.current = {treeOffset, maxTreeOffset, scrollCeiling, visibleTreeRows, rows, treeContentWidth};
 
   useEffect(() => {
     treeTooltipRef.current = treeTooltip;
@@ -1602,7 +1895,7 @@ function AppContent({
   }, [allTreeRows]);
 
   useEffect(() => {
-    const availableBlockIds = new Set(review?.files.flatMap((file) => file.blocks.map((block) => block.id)) ?? []);
+    const availableBlockIds = new Set(review?.files.flatMap(blockCollapseKeys) ?? []);
     setCollapsedBlockIds((current) => {
       let changed = false;
       const next = new Set<string>();
@@ -1620,14 +1913,12 @@ function AppContent({
 
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
-  const footerHints = watchStatus
-    ? `${toDisplayText(watchStatus)} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
-    : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
+  const footerHints = watchStatus ? `${toDisplayText(watchStatus)} • ${KEY_HINTS}` : KEY_HINTS;
 
   useEffect(() => {
     const snapshot = viewSnapshotRef.current;
     if (!snapshot.path || sections.length === 0) {
-      setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
+      setDiffOffset((current) => clamp(current, 0, scrollCeiling));
       return;
     }
 
@@ -1639,14 +1930,17 @@ function AppContent({
       return;
     }
 
+    // The offset into the old file means nothing in another file, so a file
+    // that replaces a removed one opens at its top.
+    const relativeOffset = preservedSection ? snapshot.relativeOffset : 0;
     const nextOffset = clamp(
-      nextSection.startLine + snapshot.relativeOffset,
+      nextSection.startLine + relativeOffset,
       nextSection.startLine,
       Math.max(nextSection.startLine, nextSection.endLineExclusive - 1),
     );
 
     setDiffOffset((current) => current === nextOffset ? current : nextOffset);
-  }, [sections, maxDiffOffset]);
+  }, [sections, scrollCeiling]);
 
   useEffect(() => {
     viewSnapshotRef.current = {
@@ -1657,8 +1951,8 @@ function AppContent({
   }, [activeFilePath, activeSection, activeSectionIndex, diffOffset]);
 
   useEffect(() => {
-    setDiffOffset((current) => clamp(current, 0, maxDiffOffset));
-  }, [maxDiffOffset]);
+    setDiffOffset((current) => clamp(current, 0, scrollCeiling));
+  }, [scrollCeiling]);
 
   useEffect(() => {
     setTreeOffset((current) => {
@@ -1667,19 +1961,47 @@ function AppContent({
     });
   }, [activeRowIndex, maxTreeOffset, visibleTreeRows]);
 
+  // Every scroll except [ and ] hands focus back to the block at the top.
+  const scrollDiffTo = useCallback((offset: number | ((current: number) => number)) => {
+    setBlockFocus(null);
+    setDiffOffset(offset);
+  }, []);
+
   const jumpToFile = useCallback((filePath: string) => {
     const section = sections.find((entry) => entry.path === filePath);
     if (section) {
-      setDiffOffset(section.startLine);
+      scrollDiffTo(section.startLine);
     }
-  }, [sections]);
+  }, [scrollDiffTo, sections]);
 
   const jumpToSection = useCallback((sectionIndex: number) => {
     const section = sections[clamp(sectionIndex, 0, sections.length - 1)];
     if (section) {
-      setDiffOffset(section.startLine);
+      scrollDiffTo(section.startLine);
     }
-  }, [sections]);
+  }, [scrollDiffTo, sections]);
+
+  // Moves to the next or previous block header and puts its frame at the top
+  // of the viewport, as far as the scroll ceiling allows.
+  const moveBlockFocus = useCallback((direction: 1 | -1) => {
+    const current = focusedBlockLineIndex ?? (direction > 0 ? diffOffset - 1 : diffOffset);
+    const target = direction > 0
+      ? headerLineIndexes.find((line) => line > current)
+      : [...headerLineIndexes].reverse().find((line) => line < current);
+    if (target === undefined) return;
+
+    let start = target;
+    const header = allDiffRows[target]!;
+    while (start > 0) {
+      const previous = allDiffRows[start - 1];
+      if (previous?.kind !== 'frame' || previous.block !== header.block || previous.sectionIndex !== header.sectionIndex) break;
+      start -= 1;
+    }
+
+    const offset = clamp(start, 0, scrollCeiling);
+    setDiffOffset(offset);
+    setBlockFocus({key: blockFocusKey(allDiffRows, target), offset});
+  }, [allDiffRows, diffOffset, focusedBlockLineIndex, headerLineIndexes, scrollCeiling]);
 
   const toggleTreeDirectory = useCallback((directoryPath: string) => {
     setCollapsedTreePaths((current) => {
@@ -1722,6 +2044,15 @@ function AppContent({
   const showToast = useCallback((message: string, hint?: string, kind: ToastKind = 'success') => {
     setToast({text: toDisplayText(makeToast(message, hint)), kind});
   }, []);
+
+  const toggleTree = useCallback(() => {
+    if (treeAutoCollapsed) {
+      showToast('The file tree needs a wider terminal', `at least ${MIN_TREE_WIDTH + MIN_DIFF_WIDTH} columns`, 'info');
+      return;
+    }
+
+    setTreeCollapsed((current) => !current);
+  }, [showToast, treeAutoCollapsed]);
 
   const resizeTreeToMouse = useCallback((mouseX: number) => {
     const start = treeResizeStartRef.current;
@@ -1915,8 +2246,10 @@ function AppContent({
     if (lineIndex < 0 || lineIndex >= allDiffLines.length) return null;
 
     const innerColumn = mousePosition.x - diffBounds.left - 2;
-    const code = getCodeContent(allDiffLines[lineIndex] ?? '', allDiffRows[lineIndex]);
-    if (!code || innerColumn < code.start) return null;
+    const row = allDiffRows[lineIndex];
+    const code = getCodeContent(allDiffLines[lineIndex] ?? '', row);
+    // A press on a +/- marker starts the selection at the code after it.
+    if (!code || innerColumn < code.start - (row?.markerWidth ?? 0)) return null;
 
     return {
       lineIndex,
@@ -2003,13 +2336,13 @@ function AppContent({
 
       const diffBounds = getBounds(diffPanelRef);
       if (isInside(diffBounds, mousePosition.x, mousePosition.y)) {
-        setDiffOffset((current) => applyScrollDelta(current, stateRef.current.maxDiffOffset, delta));
+        scrollDiffTo((current) => applyScrollDelta(current, stateRef.current.scrollCeiling, delta));
       }
     };
 
     mouse.events.on('scroll', handleScroll);
     return () => mouse.events.off('scroll', handleScroll);
-  }, [mouse]);
+  }, [mouse, scrollDiffTo]);
 
   useEffect(() => {
     const handlePosition = (position: {x: number; y: number}) => {
@@ -2263,7 +2596,7 @@ function AppContent({
         treeCollapsed,
         treeHeaderCopied,
       )) {
-        setTreeCollapsed((current) => !current);
+        toggleTree();
         setHoveredAction(null);
         clearTreeTooltip();
         return;
@@ -2356,7 +2689,7 @@ function AppContent({
         return;
       }
 
-      toggleBlock(blockTarget.block.id);
+      toggleBlock(blockTarget.key);
     };
 
     mouse.events.on('click', handleClick);
@@ -2384,6 +2717,7 @@ function AppContent({
     runCopyCommand,
     setCodeSelection,
     toggleBlock,
+    toggleTree,
     toggleTreeDirectory,
     treeCollapsed,
   ]);
@@ -2399,28 +2733,66 @@ function AppContent({
       return;
     }
 
-    if (input === 'j') {
-      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, 1));
+    if ((key.ctrl || key.meta) && input.toLowerCase() === 'k') {
+      showToast('Palette is not available yet.', undefined, 'info');
       return;
     }
 
-    if ((key.ctrl || key.meta) && input.toLowerCase() === 'k') {
-      showToast('Palette is not available yet.');
+    if (key.ctrl || key.meta) return;
+
+    if (input === 'j') {
+      scrollDiffTo(applyScrollDelta(diffOffset, scrollCeiling, 1));
       return;
     }
 
     if (input === 'k') {
-      setDiffOffset(applyScrollDelta(diffOffset, maxDiffOffset, -1));
+      scrollDiffTo(applyScrollDelta(diffOffset, scrollCeiling, -1));
       return;
     }
 
     if (input === 'g') {
-      setDiffOffset(0);
+      scrollDiffTo(0);
       return;
     }
 
     if (input === 'G') {
-      setDiffOffset(maxDiffOffset);
+      scrollDiffTo(scrollCeiling);
+      return;
+    }
+
+    if (input === ']' || input === '[') {
+      moveBlockFocus(input === ']' ? 1 : -1);
+      return;
+    }
+
+    const focusedTarget = focusedBlockLineIndex === null ? undefined : allDiffRows[focusedBlockLineIndex]?.target;
+    if (key.return || input === ' ') {
+      if (focusedTarget) toggleBlock(focusedTarget.key);
+      return;
+    }
+
+    const fileCommand = FILE_KEY_COMMANDS[input];
+    if (fileCommand) {
+      void runCopyCommand(fileCommand, activeFile, focusedBlock, {kind: 'file-header', id: fileCommand});
+      return;
+    }
+
+    const blockCommand = BLOCK_KEY_COMMANDS[input];
+    if (blockCommand) {
+      const successAction: CopiedAction | undefined = focusedBlockLineIndex === null
+        ? undefined
+        : {kind: 'block', id: blockCommand, lineIndex: focusedBlockLineIndex};
+      void runCopyCommand(blockCommand, focusedTarget?.file ?? activeFile, focusedTarget?.block ?? focusedBlock, successAction);
+      return;
+    }
+
+    if (input === 'T') {
+      void copyFileTree();
+      return;
+    }
+
+    if (input === 't') {
+      toggleTree();
       return;
     }
 
@@ -2429,27 +2801,49 @@ function AppContent({
     }
   });
 
+  const topBarLine = composeBar(
+    [
+      {text: 'branch-review', style: ANSI_CYAN_BRIGHT_BOLD},
+      {text: ' ', style: ''},
+      {text: displayBranch, style: ''},
+      {text: ' against ', style: ANSI_GRAY},
+      {text: displayBase, style: ANSI_YELLOW},
+    ],
+    infoTip
+      ? {text: infoTip, style: ANSI_CYAN_BRIGHT_BOLD}
+      : {
+        text: `${branchMetrics.filesChanged} files • +${branchMetrics.additions} • -${branchMetrics.deletions} • ${branchMetrics.changedLines} changed`,
+        style: ANSI_MAGENTA_BRIGHT,
+      },
+    Math.max(1, columns - 4),
+    infoTip ? truncateStart : truncateEnd,
+  );
+  const footerStatus: BarPart = toast
+    ? toast.kind === 'error'
+      ? {text: `✗ ${toast.text}`, style: ANSI_RED}
+      : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
+    : {text: footerHints, style: ANSI_GRAY};
+  const footerLine = composeBar(
+    [footerStatus],
+    {text: `${displayBase}...${displayBranch}`, style: ANSI_GRAY},
+    Math.max(1, columns - 4),
+    truncateStart,
+  );
+
+  if (tooSmall) {
+    return (
+      <Box width={columns}>
+        <Text wrap="truncate">
+          {truncateEnd(`Terminal too small: ${columns}×${terminalRows}, needs ${MIN_TERMINAL_COLUMNS}×${MIN_TERMINAL_ROWS} · q quit`, Math.max(1, columns))}
+        </Text>
+      </Box>
+    );
+  }
+
   return (
-    <Box flexDirection="column">
-      <Box ref={topBarRef} borderStyle="round" borderColor="cyan" paddingX={1} justifyContent="space-between">
-        <Box>
-          <Text color="cyanBright" bold>branch-review</Text>
-          <Text color="gray"> </Text>
-          <Text color="white">{displayBranch}</Text>
-          <Text color="gray"> against </Text>
-          <Text color="yellow">{displayBase}</Text>
-        </Box>
-        {infoTip
-          ? (
-            <Text color="cyanBright" bold wrap="truncate-end">
-              {truncateStart(infoTip, Math.max(18, columns - visibleWidth('branch-review ') - visibleWidth(displayBranch) - visibleWidth(' against ') - visibleWidth(displayBase) - 8))}
-            </Text>
-          )
-          : (
-            <Text color="magentaBright">
-              {branchMetrics.filesChanged} files • +{branchMetrics.additions} • -{branchMetrics.deletions} • {branchMetrics.changedLines} changed
-            </Text>
-          )}
+    <Box flexDirection="column" width={columns}>
+      <Box ref={topBarRef} width={columns} borderStyle="round" borderColor={palette.ink('cyan')} paddingX={1}>
+        <Text wrap="truncate">{topBarLine}</Text>
       </Box>
 
       <Box>
@@ -2462,17 +2856,17 @@ function AppContent({
           setHovered={setTreeHovered}
         >
           <Box width={treeContentWidth} justifyContent="space-between">
-            <Text color="cyan">{treeCollapsed ? 'Files' : 'Changed files'}</Text>
+            <Text color={palette.ink('cyan')}>{treeCollapsed ? 'Files' : 'Changed files'}</Text>
             <Text
-              color={
+              color={palette.ink(
                 treeToggleHovered
                   ? 'cyanBright'
                   : copiedAction?.kind === 'tree-header'
                     ? 'greenBright'
                     : hoveredAction?.kind === 'tree-header'
                       ? 'cyanBright'
-                      : 'gray'
-              }
+                      : 'gray',
+              )}
               bold={treeToggleHovered || copiedAction?.kind === 'tree-header' || hoveredAction?.kind === 'tree-header'}
             >
               {treeHeaderActionLabel(treeCollapsed, copiedAction?.kind === 'tree-header')}
@@ -2482,8 +2876,8 @@ function AppContent({
             ? (
               <>
                 <Box width={treeContentWidth}>
-                  <Text color="magentaBright" bold>{files.length}</Text>
-                  <Text color="gray"> files</Text>
+                  <Text color={palette.ink('magentaBright')} bold>{files.length}</Text>
+                  <Text color={palette.ink('gray')}> files</Text>
                 </Box>
               </>
             )
@@ -2515,71 +2909,38 @@ function AppContent({
           hovered={diffHovered}
           setHovered={setDiffHovered}
         >
-          {(() => {
-            const borderAnsi = diffHovered ? ANSI_CYAN : ANSI_GRAY;
-            const inner = Math.max(1, rightWidth - 4);
-            const hasChanges = sections.length > 0;
-            const fileLabelWithActions = applyArrivalWash(
-              diffHeader.fileRow,
-              arrivalAnimations.files.get(activeFilePath),
-              arrivalNow,
-            );
-
-            const rows: string[] = [
-              frameTopBorder(rightWidth, borderAnsi),
-              frameLine(fileLabelWithActions, inner, borderAnsi),
-              frameLine(diffHeader.metricsRow, inner, borderAnsi),
-            ];
-            if (!hasChanges) {
-              rows.push(frameLine(`${ANSI_CYAN_BRIGHT_BOLD}No changes to review${ANSI_RESET}`, inner, borderAnsi));
-              rows.push(frameLine(`${ANSI_GRAY}${toDisplayText(emptyStateHint ?? 'Run again after making changes.')}${ANSI_RESET}`, inner, borderAnsi));
-            }
-
-            const visibleSelection = codeSelection?.lines === allDiffLines ? codeSelection : null;
-            const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
-            for (const [index, line] of visibleDiffLines.entries()) {
-              const absoluteLineIndex = diffOffset + index;
-              const row = allDiffRows[absoluteLineIndex];
-              const blockTarget = row?.target;
-              const blockArrival = blockTarget
-                ? arrivalAnimations.blocks.get(blockAnimationKey(blockTarget.file.path, blockTarget.block))
-                : undefined;
-              let visibleLine = line || ' ';
-              if (row?.kind === 'header') {
-                const showActions = visibleActionBlockLineIndex === absoluteLineIndex;
-                visibleLine = renderBlockHeaderRow(
-                  row,
-                  Boolean(blockTarget && collapsedBlockIds.has(blockTarget.block.id)),
-                  diffContentWidth,
-                  showActions
-                    ? {
-                      hovered: hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex ? hoveredAction.id : undefined,
-                      copied: copiedAction?.kind === 'block' && copiedAction.lineIndex === absoluteLineIndex ? copiedAction.id : undefined,
-                    }
-                    : null,
-                ).line;
-              }
-
-              const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, visibleSelection);
-              const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-              rows.push(frameLine(arrivalLine, inner, borderAnsi));
-            }
-            rows.push(frameBottomBorder(rightWidth, borderAnsi));
-
-            // Every row is padded to the pane width in terminal cells; truncate
-            // so a row can never soft-wrap and push later rows out of the pane.
-            return rows.map((row, i) => <Text key={`diff-${i}`} wrap="truncate">{row}</Text>);
-          })()}
+          <DiffErrorBoundary
+            filePath={activeFilePath}
+            resetKey={`${sectionsRevision}\0${activeFilePath}\0${diffOffset}\0${rightWidth}`}
+            width={rightWidth}
+          >
+            <DiffPaneBody
+              paneWidth={rightWidth}
+              contentWidth={diffContentWidth}
+              borderAnsi={diffHovered ? ANSI_CYAN : ANSI_GRAY}
+              fileRow={diffHeader.fileRow}
+              metricsRow={diffHeader.metricsRow}
+              hasChanges={sections.length > 0}
+              emptyStateHint={emptyStateHint}
+              visibleDiffLines={visibleDiffLines}
+              diffOffset={diffOffset}
+              allDiffRows={allDiffRows}
+              collapsedBlockIds={collapsedBlockIds}
+              arrivalAnimations={arrivalAnimations}
+              arrivalNow={arrivalNow}
+              fileArrival={arrivalAnimations.files.get(activeFilePath)}
+              actionBlockLineIndex={hoveredBlockLineIndex ?? focusedBlockLineIndex}
+              focusedBlockLineIndex={focusedBlockLineIndex}
+              hoveredAction={hoveredAction}
+              copiedAction={copiedAction}
+              selection={codeSelection?.lines === allDiffLines ? codeSelection : null}
+            />
+          </DiffErrorBoundary>
         </DiffPane>
       </Box>
 
-      <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
-        {toast
-          ? toast.kind === 'error'
-            ? <Text color="red">✗ {toast.text}</Text>
-            : <Text color="cyan">{toast.kind === 'success' ? '✓ ' : ''}{toast.text}</Text>
-          : <Text color="gray">{footerHints}</Text>}
-        <Text color="gray">{displayBase}...{displayBranch}</Text>
+      <Box width={columns} borderStyle="round" borderColor={palette.ink('gray')} paddingX={1}>
+        <Text wrap="truncate">{footerLine}</Text>
       </Box>
       {treeTooltip ? <TreeTooltipOverlay tooltip={treeTooltip} /> : null}
     </Box>

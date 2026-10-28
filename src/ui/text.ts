@@ -42,6 +42,23 @@ export function truncateStart(text: string, maxWidth: number): string {
   return `…${kept}`;
 }
 
+// Keeps the start of `text`, followed by an ellipsis, within `maxWidth` cells.
+export function truncateEnd(text: string, maxWidth: number): string {
+  if (cellWidth(text) <= maxWidth) return text;
+  if (maxWidth <= 0) return '';
+  if (maxWidth === 1) return '…';
+
+  let kept = '';
+  let width = 0;
+  for (const part of graphemes(text)) {
+    if (width + part.width > maxWidth - 1) break;
+    kept += part.text;
+    width += part.width;
+  }
+
+  return `${kept}…`;
+}
+
 const ESCAPE_MARKER = '␛';
 // C0 controls, DEL, C1 controls, and the bidirectional formatting characters
 // that can reorder or hide neighbouring text on screen.
