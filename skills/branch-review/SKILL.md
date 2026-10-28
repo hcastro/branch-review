@@ -11,9 +11,9 @@ diff before it reaches GitHub. This skill hands the user one command to run.
 ## Never run the CLI yourself
 
 It is a full-screen TTY app: it takes over the alternate screen buffer, captures
-mouse and key input, and only exits on `q`. Running it from a tool call hangs the
-turn and returns ANSI garbage. **The deliverable is the command text, not its
-output.** The user runs it in their own terminal.
+mouse and key input, and only exits on `q`, `Esc` or Ctrl-C. Running it from a
+tool call hangs the turn and returns ANSI garbage. **The deliverable is the
+command text, not its output.** The user runs it in their own terminal.
 
 The same applies to "just checking" — to inspect a diff directly, use `git diff`.
 
@@ -103,6 +103,9 @@ Copied to your clipboard. Reviews 7 changed files on `feat/login` — 2 commits
 plus 4 uncommitted edits — against `origin/main`.
 ````
 
+If the report says the tracked count is unknown (the script could not make a
+temporary copy of the index), say so instead of giving a file count.
+
 Keep it to that. No key-bindings table, no feature tour; the UI is
 self-documenting.
 
@@ -110,8 +113,8 @@ self-documenting.
 
 Emit the command for the repo with the most changed files and copy that one.
 List the other repos with their paths underneath so the user can ask for those
-next. Do not chain multiple `cd`s into one command — the UI runs until `q`, so
-only the first would ever open.
+next. Do not chain multiple `cd`s into one command — the UI runs until the user
+quits it (`q`, `Esc` or Ctrl-C), so only the first would ever open.
 
 ## Flags worth knowing
 
@@ -120,7 +123,7 @@ Rarely needed, but available when the default misbehaves:
 - `--no-watch` — disable live refresh, for a frozen snapshot or when an agent is
   still writing files and the view would churn.
 - `--watch-poll` — poll instead of using filesystem events, for network mounts
-  and container bind mounts where `chokidar` misses changes.
+  and container bind mounts where those events never arrive.
 - `--no-animations` — drop transitions on slow or remote terminals.
 
 Watch mode is on by default in an interactive terminal, which is what makes a
