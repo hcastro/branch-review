@@ -7,7 +7,8 @@
 #   BRANCH  Ref to review. Default: HEAD (includes uncommitted changes).
 #   BASE    Ref to diff against. Default: let branch-review detect it.
 #
-# Prints a state report on stderr and the command on stdout.
+# Prints a state report on stderr and the command on stdout. Refuses a repo
+# path or ref name that holds control or invisible characters.
 
 set -uo pipefail
 
@@ -21,14 +22,77 @@ base="${3:-}"
 # instead of prompting.
 export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0
 
-die() { printf 'error: %s\n' "$1" >&2; exit 1; }
-note() { printf '%s\n' "$1" >&2; }
+# Escapes the characters a terminal acts on or hides: C0 controls (newline
+# and tab included), DEL, C1 controls, bidi controls and invisible format
+# characters. They come out as \xHH, \uHHHH or \UHHHHHHHH, the way bash's
+# $'...' writes them; everything else, invalid UTF-8 included, is unchanged.
+# Works on bytes, so it behaves the same in any locale and in bash 3.2.
+escape_hidden() {
+  local LC_ALL=C s=$1 out= i=0 len k b cp
+  # Every escaped character starts with one of these bytes.
+  if [[ $s != *[$'\x01'-$'\x1f'$'\x7f'$'\xc2'$'\xd8'$'\xe2'$'\xef'$'\xf3']* ]]; then
+    printf '%s' "$s"
+    return
+  fi
+  while (( i < ${#s} )); do
+    case ${s:i:4} in
+      [$'\x01'-$'\x1f'$'\x7f']*) len=1 ;;
+      # U+0080-009F, U+00AD, U+061C
+      $'\xc2'[$'\x80'-$'\x9f'$'\xad']* | $'\xd8\x9c'*) len=2 ;;
+      # U+200B-200F, U+2028-202E, U+2060-2064, U+2066-2069, U+FEFF
+      $'\xe2\x80'[$'\x8b'-$'\x8f'$'\xa8'-$'\xae']* \
+        | $'\xe2\x81'[$'\xa0'-$'\xa4'$'\xa6'-$'\xa9']* \
+        | $'\xef\xbb\xbf'*) len=3 ;;
+      # U+E0000-E007F
+      $'\xf3\xa0'[$'\x80'$'\x81'][$'\x80'-$'\xbf']*) len=4 ;;
+      *) out+=${s:i:1}; i=$((i + 1)); continue ;;
+    esac
+    cp=0
+    for ((k = 0; k < len; k++)); do
+      # bash 3.2 reads bytes above 0x7f as negative.
+      printf -v b '%d' "'${s:i+k:1}"
+      b=$(((b + 256) % 256))
+      if ((k == 0)); then
+        cp=$((len == 1 ? b : b & (0xff >> (len + 1))))
+      else
+        cp=$(((cp << 6) | (b & 0x3f)))
+      fi
+    done
+    if ((len == 1)); then
+      printf -v b '\\x%02x' "$cp"
+    elif ((cp <= 0xffff)); then
+      printf -v b '\\u%04x' "$cp"
+    else
+      printf -v b '\\U%08x' "$cp"
+    fi
+    out+=$b
+    i=$((i + len))
+  done
+  printf '%s' "$out"
+}
+
+die() { printf 'error: %s\n' "$(escape_hidden "$1")" >&2; exit 1; }
+note() { printf '%s\n' "$(escape_hidden "$1")" >&2; }
+
+# The pasted command can't carry these safely: the terminal would act on them
+# or hide them (ESC[201~ ends a bracketed paste early).
+refuse_hidden() {
+  [[ $(escape_hidden "$2") == "$2" ]] \
+    || die "$1 contains control or invisible characters: $2"
+}
+
+refuse_hidden branch "$branch"
+refuse_hidden base "$base"
 
 [[ -e $target ]] || die "path does not exist: $target"
 [[ -d $target ]] || target=$(dirname "$target")
 
-root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) \
+# The x keeps $(...) from stripping newlines that belong to the path.
+root=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null && printf x) \
   || die "not inside a git repository: $target"
+root=${root%x}
+root=${root%$'\n'}
+refuse_hidden "repo path" "$root"
 
 # Read-only access to the repo. fsmonitor is off so no hook or daemon runs,
 # and a split index stays off so git never writes a shared index into .git.
@@ -85,23 +149,38 @@ shell_quote() {
 
 # Worktree diffs refresh stat info in the index they read. They run against a
 # private copy so the repo's own index is never rewritten. Call this in the
-# main shell, not in $(...), so the EXIT trap sees the file to remove.
+# main shell, not in $(...), so the EXIT trap sees the directory to remove.
+tmp_dir=
 tmp_index=
-cleanup() { if [[ -n $tmp_index ]]; then rm -f "$tmp_index" "$tmp_index.lock"; fi; }
+index_error=
+cleanup() { if [[ -n $tmp_dir ]]; then rm -rf "$tmp_dir"; fi; }
 trap cleanup EXIT
 
-# Returns non-zero when no private copy could be made.
+# Returns non-zero, with index_error saying which step failed, when no private
+# copy could be made.
 make_private_index() {
-  local index
-  index=$(git_root rev-parse --git-path index) || return 1
+  local index parent=${TMPDIR:-/tmp} cp_error
+  index=$(git_root rev-parse --git-path index) \
+    || { index_error="cannot locate the index (git rev-parse --git-path index failed)"; return 1; }
   [[ $index == /* ]] || index="$root/$index"
-  tmp_index=$(mktemp "${TMPDIR:-/tmp}/branch-review-index.XXXXXX" 2>/dev/null) || { tmp_index=; return 1; }
+  # Git runs in $root, so a relative TMPDIR would point it at a missing file,
+  # which reads as an empty index.
+  [[ $parent == /* ]] || parent="$PWD/$parent"
+  # mktemp -d makes the directory 0700, which keeps the copy private whatever
+  # mode cp -p carries over from the index.
+  tmp_dir=$(mktemp -d "${parent%/}/branch-review.XXXXXX" 2>/dev/null) || {
+    tmp_dir=
+    index_error="cannot copy the index to a temp file in ${TMPDIR:-/tmp}"
+    return 1
+  }
+  tmp_index="$tmp_dir/index"
   # A repo with no index file yet has an empty index; a missing file reads that way.
-  [[ -e $index ]] || { rm -f "$tmp_index"; return 0; }
+  [[ -e $index ]] || return 0
   # -p keeps the index's mtime. Git rechecks the content of any entry modified
   # in the same second the index was written; a fresh mtime on the copy would
   # make it trust the stat data and miss that edit.
-  cp -p "$index" "$tmp_index" 2>/dev/null
+  cp_error=$(cp -p "$index" "$tmp_index" 2>&1) \
+    || { index_error="cannot copy the index: ${cp_error:-cp failed}"; return 1; }
 }
 
 # Counts NUL-terminated paths on stdin. A trailing slash marks an untracked
@@ -127,6 +206,9 @@ if [[ $branch == HEAD ]]; then
 else
   resolved_branch=$(resolve_ref "$branch")
   [[ -n $resolved_branch ]] || die "branch ref not found: $branch"
+  # The CLI diffs base...branch, which needs a merge base.
+  git_root merge-base "$resolved_base" "$resolved_branch" >/dev/null \
+    || die "no merge base for $resolved_base and $resolved_branch"
   diff_arg="$resolved_base...$resolved_branch"
   includes_worktree=no
 fi
@@ -135,29 +217,42 @@ fi
 
 current_branch=$(git_root branch --show-current 2>/dev/null)
 untracked=0
+# A git failure makes a count unknown, never 0: pipefail gives each count the
+# status of the git call feeding it.
+tracked_error=
 # -M counts a rename as one file, as the CLI lists it, whatever diff.renames says.
 if [[ $includes_worktree == yes ]]; then
   if make_private_index; then
-    tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths)
+    tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths) \
+      || tracked_error="git diff failed"
   else
-    tracked=unknown
+    tracked_error=$index_error
   fi
-  untracked=$(git_root ls-files -z --others --exclude-standard | count_paths)
-  dirty=$(git_root --no-optional-locks status --porcelain | grep -c . || true)
-  uncommitted="$dirty entries"
+  untracked=$(git_root ls-files -z --others --exclude-standard | count_paths) || untracked=unknown
+  if porcelain=$(git_root --no-optional-locks status --porcelain); then
+    uncommitted="$(printf '%s' "$porcelain" | grep -c . || true) entries"
+  else
+    uncommitted="unknown (git status failed)"
+  fi
   reviewed_tip=HEAD
 else
-  tracked=$(git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths)
+  tracked=$(git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths) \
+    || tracked_error="git diff failed"
   uncommitted="not in this review (reviewing $branch, not the worktree)"
   reviewed_tip=$resolved_branch
 fi
-if [[ $tracked == unknown ]]; then
-  in_review="unknown (tracked count unknown, $untracked untracked)"
-else
+[[ -z $tracked_error ]] || tracked=unknown
+if [[ $tracked != unknown && $untracked != unknown ]]; then
   changed=$((tracked + untracked))
   in_review="$changed files ($tracked tracked, $untracked untracked)"
+else
+  [[ $tracked == unknown ]] && tracked_part="tracked count unknown" || tracked_part="$tracked tracked"
+  [[ $untracked == unknown ]] && untracked_part="untracked count unknown" || untracked_part="$untracked untracked"
+  in_review="unknown ($tracked_part, $untracked_part)"
 fi
-ahead=$(git_root rev-list --count "$resolved_base..$reviewed_tip" 2>/dev/null || echo 0)
+ahead=$(git_root rev-list --count "$resolved_base..$reviewed_tip" 2>/dev/null) \
+  && ahead="$ahead ahead of base" \
+  || ahead="unknown (git rev-list failed)"
 
 # A linked worktree has its own git dir inside the main repo's common dir. A
 # submodule or --separate-git-dir checkout also has a .git file, but its git
@@ -173,7 +268,7 @@ note "repo:        $root"
 note "worktree:    $is_worktree"
 note "branch:      ${current_branch:-<detached>}  (reviewing: $branch)"
 note "base:        $resolved_base$([[ -z $base ]] && printf ' (auto-detected)')"
-note "commits:     $ahead ahead of base"
+note "commits:     $ahead"
 note "uncommitted: $uncommitted"
 note "in review:   $in_review"
 
@@ -181,9 +276,9 @@ command -v branch-review >/dev/null 2>&1 \
   || note "warning: branch-review is not on PATH — install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review"
 command -v delta >/dev/null 2>&1 \
   || note "warning: git-delta is not on PATH — diffs need it: brew install git-delta"
-[[ $tracked == unknown ]] \
-  && note "warning: cannot copy the index to a temp file in ${TMPDIR:-/tmp}, so the tracked count is unknown"
-[[ $tracked != unknown && $changed -eq 0 ]] \
+[[ -n $tracked_error ]] \
+  && note "warning: $tracked_error, so the tracked count is unknown"
+[[ -n ${changed:-} && $changed -eq 0 ]] \
   && note "warning: no changes in this range — the CLI will report nothing to review"
 
 # --- command ----------------------------------------------------------------

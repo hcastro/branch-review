@@ -73,7 +73,13 @@ same relative path.
 The script resolves the git root, reports repo state on stderr, prints the
 command on stdout, and copies it to the clipboard (`pbcopy`, `wl-copy`, `xclip`,
 or `clip.exe`). It warns when the range is empty or when `branch-review` or
-`git-delta` is missing from `PATH`.
+`git-delta` is missing from `PATH`. The command is for POSIX shells and zsh.
+
+The script refuses (exit 1) a repo path or ref name that holds control or
+invisible characters: newlines, tabs, escapes, bidi controls, zero-width
+characters. Its messages show them escaped, as `\x1b` or `\u202e`. Tell the
+user which name is the problem; don't rename anything or build the command by
+hand.
 
 Arguments are positional — pass `HEAD` as `branch` when overriding only `base`:
 
@@ -103,8 +109,8 @@ Copied to your clipboard. Reviews 7 changed files on `feat/login` — 2 commits
 plus 4 uncommitted edits — against `origin/main`.
 ````
 
-If the report says the tracked count is unknown (the script could not make a
-temporary copy of the index), say so instead of giving a file count.
+If the report says a count is unknown (the script could not copy the index,
+or a git call failed), say so instead of giving a number.
 
 Keep it to that. No key-bindings table, no feature tour; the UI is
 self-documenting.
