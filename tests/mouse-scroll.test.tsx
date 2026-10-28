@@ -50,12 +50,13 @@ describe('wheel helpers', () => {
       '│ • src/two.ts:20:                                     │',
       'code',
     ];
+    const rows = lines.map((line) => ({kind: line.includes('•') ? 'header' as const : 'body' as const}));
     const section = {startLine: 3, endLineExclusive: 9};
 
-    expect(findFocusedBlockLineIndex(lines, section, 3)).toBe(5);
-    expect(findFocusedBlockLineIndex(lines, section, 6)).toBe(5);
-    expect(findFocusedBlockLineIndex(lines, section, 8)).toBe(7);
-    expect(findFocusedBlockLineIndex(lines, {startLine: 0, endLineExclusive: 3}, 8)).toBe(1);
+    expect(findFocusedBlockLineIndex(rows, section, 3)).toBe(5);
+    expect(findFocusedBlockLineIndex(rows, section, 6)).toBe(5);
+    expect(findFocusedBlockLineIndex(rows, section, 8)).toBe(7);
+    expect(findFocusedBlockLineIndex(rows, {startLine: 0, endLineExclusive: 3}, 8)).toBe(1);
   });
 
   it('maps tree clicks from panel coordinates without row refs', () => {

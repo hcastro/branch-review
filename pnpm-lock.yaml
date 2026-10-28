@@ -11,6 +11,9 @@ importers:
       '@zenobius/ink-mouse':
         specifier: ^1.0.3
         version: 1.0.3(ink@5.2.1(@types/react@18.3.20)(react@18.3.1))(react@18.3.1)
+      chalk:
+        specifier: ^5.6.2
+        version: 5.6.2
       chokidar:
         specifier: ^4.0.3
         version: 4.0.3
@@ -20,6 +23,9 @@ importers:
       react:
         specifier: ^18.3.1
         version: 18.3.1
+      string-width:
+        specifier: ^7.2.0
+        version: 7.2.0
     devDependencies:
       '@types/node':
         specifier: ^22.15.3

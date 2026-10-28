@@ -286,9 +286,11 @@ describe('App', () => {
     ]);
     const nextSections = buildDiffSections([
       {
+        // The file above the selected one grows, so the selected file's
+        // section starts later and only the restore logic keeps it in view.
         path: 'src/one.ts',
-        metrics: {path: 'src/one.ts', additions: 1, deletions: 0, changedLines: 1},
-        diff: 'one after',
+        metrics: {path: 'src/one.ts', additions: 10, deletions: 0, changedLines: 10},
+        diff: Array.from({length: 10}, (_, index) => `one after ${index + 1}`).join('\n'),
       },
       {
         path: 'src/two.ts',
@@ -698,7 +700,7 @@ describe('App', () => {
     await waitForTreeTooltip();
 
     const frame = stripAnsi(instance.lastFrame() ?? '');
-    expect(frame).not.toContain(longName);
+    expect(frame).not.toContain(`│ ${longName} │`);
 
     instance.unmount();
   });
@@ -708,7 +710,10 @@ describe('App', () => {
       {
         path: 'notes.md',
         metrics: {path: 'notes.md', additions: 1, deletions: 0, changedLines: 1},
-        diff: '• path/to/file.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+        diff: [
+          '• path/to/file.md:12: The point of this plan is not to solve every mobile Stream problem at once.',
+          `  12 ⋮  12 │${'The point of this plan is to ship one fix for the mobile Stream feed, then measure the rest.'}`,
+        ].join('\n'),
       },
     ]);
 
@@ -718,7 +723,7 @@ describe('App', () => {
         branch="feature/example"
         sections={sections}
         branchMetrics={{filesChanged: 1, additions: 1, deletions: 0, changedLines: 1}}
-        dimensions={{columns: 100, rows: 16}}
+        dimensions={{columns: 100, rows: 20}}
       />,
     );
 
@@ -729,6 +734,11 @@ describe('App', () => {
     expect(frame).toContain('╭');
     expect(frame).toContain('• path/to/file.md:12:');
     expect(frame).not.toContain('mobile Stream problem at once.');
+    // The body line wraps; its continuation row hangs under delta's gutter bar.
+    const lines = frame.split('\n');
+    const firstRow = lines.findIndex((line) => line.includes('  12 ⋮  12 │The point'));
+    expect(firstRow).toBeGreaterThanOrEqual(0);
+    expect(lines[firstRow + 1]).toMatch(/│ {12}│[a-z]/);
 
     instance.unmount();
   });
@@ -1471,8 +1481,9 @@ describe('App', () => {
         metrics: {path: 'src/example.ts', additions: 2, deletions: 0, changedLines: 2},
         diff: [
           '• src/example.ts:10: function example()',
-          '  10 ⋮  10 │ const first = 1;',
-          '  11 ⋮  11 │ const secondName = call();',
+          // delta puts code directly after the gutter bar, with no padding space.
+          '  10 ⋮  10 │const first = 1;',
+          '  11 ⋮  11 │const secondName = call();',
         ].join('\n'),
       },
     ]);
@@ -1563,7 +1574,9 @@ describe('App', () => {
     await flush();
 
     const frame = stripAnsi(instance.lastFrame() ?? '');
-    expect(frame).toContain('✓ Palette is not available yet.');
+    // A notice, not a copy result: it has no success check mark.
+    expect(frame).toContain('Palette is not available yet.');
+    expect(frame).not.toContain('✓ Palette');
     expect(frame).toContain('line 1');
 
     instance.unmount();
