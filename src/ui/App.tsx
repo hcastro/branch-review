@@ -8,6 +8,7 @@ import {
 import {applyTreeCollapse, buildTreeRows, findTreeSelectionPath, formatTreePayload, type TreeRow} from '../tree.js';
 import {writeClipboard} from '../clipboard/write.js';
 import {
+  fitBlockHeaderLabel,
   flattenSectionLines,
   formatMetrics,
   frameBottomBorder,
@@ -21,7 +22,9 @@ import {
   wrapSections,
   type BranchMetrics,
   type DiffSection,
+  type SectionRow,
 } from '../sections.js';
+import {graphemes, toDisplayText, truncateStart, type Grapheme} from './text.js';
 import type {FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
@@ -89,7 +92,20 @@ type ArrivalSnapshot = {
 
 type WrappedSectionCacheEntry = {
   lines: string[];
+  rows: SectionRow[];
 };
+
+type BlockTarget = {file: ReviewFile; block: ReviewBlock};
+// One rendered diff row with its place in the review: the section it belongs
+// to, the absolute index of its block's header row, and the block it maps to.
+type DiffRow = SectionRow & {
+  sectionIndex: number;
+  headerLine: number | null;
+  target?: BlockTarget;
+};
+type ActionSpan = {id: string; start: number; end: number};
+type ToastKind = 'success' | 'error' | 'info';
+type Toast = {text: string; kind: ToastKind};
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(value, max));
@@ -219,7 +235,7 @@ function wrapSectionsWithCache(
     let entry = cache.get(key);
     if (!entry) {
       const wrappedSection = wrapSections([section], maxWidth)[0];
-      entry = {lines: wrappedSection?.lines ?? []};
+      entry = {lines: wrappedSection?.lines ?? [], rows: wrappedSection?.rows ?? []};
     }
 
     nextCache.set(key, entry);
@@ -230,6 +246,7 @@ function wrapSectionsWithCache(
     return {
       ...section,
       lines: entry.lines,
+      rows: entry.rows,
       startLine,
       endLineExclusive,
     };
@@ -470,7 +487,7 @@ function isWorktreeLabelTarget(bounds: Bounds | null, x: number, y: number, bran
   if (!bounds || worktreeStart < 0) return false;
   if (y !== bounds.top + 1) return false;
 
-  const labelStart = bounds.left + 2 + visibleWidth('branch-review ') + worktreeStart;
+  const labelStart = bounds.left + 2 + visibleWidth('branch-review ') + visibleWidth(branch.slice(0, worktreeStart));
   const labelEnd = labelStart + visibleWidth('worktree');
   return x >= labelStart && x < labelEnd;
 }
@@ -529,7 +546,7 @@ function treeRowGlyph(row: Pick<TreeRow, 'kind' | 'expanded'>) {
 }
 
 function treeRowLabelText(row: Pick<TreeRow, 'depth' | 'expanded' | 'kind' | 'label'>) {
-  return `${' '.repeat(row.depth * 2)}${treeRowGlyph(row)} ${row.label}`;
+  return `${' '.repeat(row.depth * 2)}${treeRowGlyph(row)} ${toDisplayText(row.label)}`;
 }
 
 function treeRowLabelWidth(row: Pick<TreeRow, 'kind'>, width: number, copied = false) {
@@ -719,6 +736,9 @@ type CodeSelection = {
   anchor: CodeSelectionPoint;
   focus: CodeSelectionPoint;
   active: boolean;
+  // The rendered lines the points index into. A selection is only drawn or
+  // copied against these exact lines; after a refresh it is remapped or dropped.
+  lines: string[];
 };
 
 function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
@@ -742,12 +762,6 @@ function hoveredActionsEqual(current: HoveredAction, next: HoveredAction) {
   }
 
   return false;
-}
-
-function truncateStart(text: string, maxWidth: number): string {
-  if (text.length <= maxWidth) return text;
-  if (maxWidth <= 1) return '…'.slice(0, maxWidth);
-  return '…' + text.slice(text.length - maxWidth + 1);
 }
 
 function ansiStatus(status: FileStatus | undefined) {
@@ -801,23 +815,14 @@ function shouldRevealAbsolutePathAction(hoveredAction?: string, copiedAction?: s
     || copiedAction === ABSOLUTE_PATH_ACTION.id;
 }
 
-function highlightActionLabel(line: string, actionId: string | undefined) {
-  if (!actionId) return line;
-
-  const action = [...FILE_ACTIONS, ABSOLUTE_PATH_ACTION, ...BLOCK_ACTIONS].find((entry) => entry.id === actionId);
-  if (!action) return line;
-
-  return line.replace(
-    action.label,
-    `${ANSI_CYAN_BRIGHT_BOLD}${action.label}${ANSI_RESET}`,
-  );
-}
-
 type StyledCell = {
   char: string;
+  width: number;
   style: string;
 };
 
+// Splits an ANSI line into one cell per grapheme, each carrying its terminal
+// width and the SGR style active at that point.
 function toStyledCells(line: string) {
   const parts = line.split(/(\x1B\[[0-9;:]*[A-Za-z])/);
   const cells: StyledCell[] = [];
@@ -830,8 +835,8 @@ function toStyledCells(line: string) {
       continue;
     }
 
-    for (const char of part) {
-      cells.push({char, style});
+    for (const grapheme of graphemes(part)) {
+      cells.push({char: grapheme.text, width: grapheme.width, style});
     }
   }
 
@@ -870,126 +875,157 @@ function codeSelectionsEqual(a: CodeSelection | null, b: CodeSelection | null) {
   if (a === b) return true;
   if (!a || !b) return false;
   return a.active === b.active
+    && a.lines === b.lines
     && selectionPointsEqual(a.anchor, b.anchor)
     && selectionPointsEqual(a.focus, b.focus);
 }
 
-function normalizeCodeSelection(selection: CodeSelection) {
+function normalizeCodeSelection(selection: Pick<CodeSelection, 'anchor' | 'focus'>) {
   return compareSelectionPoints(selection.anchor, selection.focus) <= 0
     ? {start: selection.anchor, end: selection.focus}
     : {start: selection.focus, end: selection.anchor};
 }
 
-function getCodeContentRange(line: string) {
-  const plain = stripAnsi(line);
-  const separatorIndex = plain.indexOf('│');
-  if (separatorIndex <= 0 || plain.startsWith('│')) {
-    return null;
+type CodeContent = {
+  // Cell column where the code starts on the rendered row.
+  start: number;
+  parts: Grapheme[];
+  width: number;
+};
+
+// The selectable code on a body row: everything right of delta's gutter.
+// Selection columns are terminal cells counted from `start`.
+function getCodeContent(line: string, row: SectionRow | undefined): CodeContent | null {
+  if (!row || row.kind !== 'body' || row.codeColumn === undefined) return null;
+
+  const parts = graphemes(stripAnsi(line));
+  let column = 0;
+  let index = 0;
+  while (index < parts.length && column < row.codeColumn) {
+    column += parts[index]!.width;
+    index += 1;
   }
 
-  let start = separatorIndex + 1;
-  if (plain[start] === ' ') {
-    start += 1;
-  }
-
-  return {
-    start,
-    text: plain.slice(start),
-  };
+  const code = parts.slice(index);
+  return {start: column, parts: code, width: code.reduce((sum, part) => sum + part.width, 0)};
 }
 
-function selectedColumnRangeForLine(lineIndex: number, lineText: string, selection: CodeSelection) {
-  const code = getCodeContentRange(lineText);
-  if (!code) return null;
-
+function selectedCodeColumns(lineIndex: number, content: CodeContent, selection: Pick<CodeSelection, 'anchor' | 'focus'>) {
   const {start, end} = normalizeCodeSelection(selection);
   if (lineIndex < start.lineIndex || lineIndex > end.lineIndex) {
     return null;
   }
 
-  const textLength = code.text.length;
-  const selectionStart = lineIndex === start.lineIndex ? clamp(start.column, 0, textLength) : 0;
-  const selectionEnd = lineIndex === end.lineIndex ? clamp(end.column + 1, 0, textLength) : textLength;
-  if (selectionEnd <= selectionStart) {
-    return null;
-  }
-
-  return {
-    start: code.start + selectionStart,
-    end: code.start + selectionEnd,
-  };
+  const from = lineIndex === start.lineIndex ? clamp(start.column, 0, content.width) : 0;
+  const to = lineIndex === end.lineIndex ? clamp(end.column + 1, 0, content.width) : content.width;
+  return to > from ? {from, to} : null;
 }
 
-function highlightSelectedCode(line: string, lineIndex: number, selection: CodeSelection | null) {
+// Graphemes that overlap the cell range [from, to), so a wide character that
+// is partly selected is copied whole.
+function sliceColumns(parts: Grapheme[], from: number, to: number) {
+  let column = 0;
+  let text = '';
+  for (const part of parts) {
+    if (column < to && column + part.width > from) {
+      text += part.text;
+    }
+    column += part.width;
+  }
+
+  return text;
+}
+
+function highlightSelectedCode(line: string, row: SectionRow | undefined, lineIndex: number, selection: CodeSelection | null) {
   if (!selection) return line;
 
-  const range = selectedColumnRangeForLine(lineIndex, line, selection);
+  const content = getCodeContent(line, row);
+  if (!content) return line;
+  const range = selectedCodeColumns(lineIndex, content, selection);
   if (!range) return line;
 
+  const from = content.start + range.from;
+  const to = content.start + range.to;
   const cells = toStyledCells(line);
-  for (let index = range.start; index < range.end && index < cells.length; index += 1) {
-    const cell = cells[index];
-    if (cell) {
+  let column = 0;
+  for (const cell of cells) {
+    if (column < to && column + cell.width > from) {
       cell.style = `${cell.style}${ANSI_SELECTION}`;
     }
+    column += cell.width;
   }
 
   return renderStyledCells(cells);
 }
 
-export function getSelectedCodeText(lines: string[], selection: CodeSelection) {
+export function getSelectedCodeText(
+  lines: string[],
+  rows: ReadonlyArray<SectionRow | undefined>,
+  selection: Pick<CodeSelection, 'anchor' | 'focus'>,
+) {
   const {start, end} = normalizeCodeSelection(selection);
   const selectedLines: string[] = [];
+  let previousLineIndex = -1;
 
   for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
-    const code = getCodeContentRange(lines[lineIndex] ?? '');
-    if (!code) continue;
+    const row = rows[lineIndex];
+    const content = getCodeContent(lines[lineIndex] ?? '', row);
+    if (!content) continue;
 
-    const textLength = code.text.length;
-    const selectionStart = lineIndex === start.lineIndex ? clamp(start.column, 0, textLength) : 0;
-    const selectionEnd = lineIndex === end.lineIndex ? clamp(end.column + 1, 0, textLength) : textLength;
-    selectedLines.push(code.text.slice(selectionStart, Math.max(selectionStart, selectionEnd)));
+    const range = selectedCodeColumns(lineIndex, content, selection);
+    const text = range ? sliceColumns(content.parts, range.from, range.to) : '';
+    // A wrapped continuation row is the same source line, so it joins the
+    // previous row without a newline.
+    if (row?.continuation && previousLineIndex === lineIndex - 1 && selectedLines.length > 0) {
+      selectedLines[selectedLines.length - 1] += text;
+    } else {
+      selectedLines.push(text);
+    }
+    previousLineIndex = lineIndex;
   }
 
   return selectedLines.join('\n');
 }
 
+function blankCell(style: string): StyledCell {
+  return {char: ' ', width: 1, style};
+}
+
+// Draws `overlay` over `baseLine` starting at cell column `start`. A wide
+// character cut by either edge of the overlay is replaced with spaces.
 function overlayAnsiAt(baseLine: string, overlay: string, start: number, width: number) {
-  const baseCells = toStyledCells(padToWidth(truncateAnsi(baseLine, width), width)).slice(0, width);
+  const baseCells = toStyledCells(padToWidth(truncateAnsi(baseLine, width), width));
   const overlayCells = toStyledCells(overlay);
   const overlayWidth = visibleWidth(overlay);
   if (overlayWidth <= 0 || overlayWidth > width) return baseLine;
 
   const safeStart = clamp(start, 0, Math.max(0, width - overlayWidth));
-  for (let index = 0; index < overlayCells.length && safeStart + index < baseCells.length; index += 1) {
-    baseCells[safeStart + index] = overlayCells[index]!;
+  const safeEnd = safeStart + overlayWidth;
+  const output: StyledCell[] = [];
+  let column = 0;
+  let placed = false;
+
+  for (const cell of baseCells) {
+    const cellEnd = column + cell.width;
+    if (cellEnd <= safeStart || column >= safeEnd) {
+      if (column >= safeEnd && !placed) {
+        output.push(...overlayCells);
+        placed = true;
+      }
+      output.push(cell);
+    } else {
+      for (let pad = column; pad < safeStart; pad += 1) output.push(blankCell(cell.style));
+      if (!placed) {
+        output.push(...overlayCells);
+        placed = true;
+      }
+      for (let pad = Math.max(column, safeEnd); pad < cellEnd; pad += 1) output.push(blankCell(cell.style));
+    }
+    column = cellEnd;
   }
 
-  return renderStyledCells(baseCells);
-}
-
-function filePathActionTextStart(fileHeaderLine: string) {
-  const plain = stripAnsi(fileHeaderLine);
-  const pathStart = plain.indexOf(FILE_ACTIONS[0].label);
-  if (pathStart >= 0) return pathStart;
-
-  const copiedStart = plain.indexOf(COPY_SUCCESS_LABEL);
-  return copiedStart >= 0 ? copiedStart : null;
-}
-
-function filePathActionCenterStart(fileHeaderLine: string, labelWidth: number) {
-  const plain = stripAnsi(fileHeaderLine);
-  const textStart = filePathActionTextStart(fileHeaderLine);
-  if (textStart === null) return null;
-
-  const frameStart = plain.lastIndexOf('╭', textStart);
-  const frameEnd = plain.indexOf('╮', textStart);
-  if (frameStart < 0 || frameEnd < 0 || frameEnd <= frameStart) {
-    return textStart;
-  }
-
-  const frameWidth = frameEnd - frameStart + 1;
-  return frameStart + Math.floor((frameWidth - labelWidth) / 2);
+  if (!placed) output.push(...overlayCells);
+  return renderStyledCells(output);
 }
 
 function secondaryPathActionLabel(hoveredAction?: string, copiedAction?: string) {
@@ -998,21 +1034,78 @@ function secondaryPathActionLabel(hoveredAction?: string, copiedAction?: string)
   return `${color}${ABSOLUTE_PATH_ACTION.label}${ANSI_RESET}`;
 }
 
-function addAbsolutePathActionToMetricsRow(
-  metricsRow: string,
-  fileHeaderLine: string,
-  hoveredAction: string | undefined,
-  copiedAction: string | undefined,
-  width: number,
-) {
-  if (!shouldRevealAbsolutePathAction(hoveredAction, copiedAction)) return metricsRow;
+type DiffHeader = {
+  fileRow: string;
+  metricsRow: string;
+  // Clickable labels, in columns inside the pane border.
+  fileSpans: ActionSpan[];
+  metricsSpans: ActionSpan[];
+};
 
-  const label = secondaryPathActionLabel(hoveredAction, copiedAction);
-  const start = filePathActionCenterStart(fileHeaderLine, visibleWidth(label));
-  if (start === null) return metricsRow;
+// Builds the two diff header rows and the spans of every action drawn on
+// them. Render, hover and click all use this one result, so a hit can only
+// land on an action that is on screen.
+function buildDiffHeader({
+  path,
+  status,
+  showActions,
+  hoveredAction,
+  copiedAction,
+  metricsCore,
+  width,
+}: {
+  path: string;
+  status: FileStatus | undefined;
+  showActions: boolean;
+  hoveredAction?: string;
+  copiedAction?: string;
+  metricsCore: string;
+  width: number;
+}): DiffHeader {
+  const statusText = ansiStatus(status);
+  const statusWidth = statusText ? visibleWidth(statusText) + 1 : 0;
+  const right = showActions ? fileActions(hoveredAction, copiedAction) : '';
+  const rightWidth = visibleWidth(right);
+  const pathWidth = Math.max(1, width - statusWidth - (right ? rightWidth + 1 : 0));
+  const fileLabel = `${statusText}${statusText ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(toDisplayText(path || ' '), pathWidth)}${ANSI_RESET}`;
+  const fileRow = composeLeftRight(fileLabel, right, width);
 
-  return overlayAnsiAt(metricsRow, label, start, width);
+  const fileSpans: ActionSpan[] = [];
+  let pathButton: {start: number; width: number} | null = null;
+  if (right) {
+    let column = visibleWidth(fileRow) - rightWidth;
+    for (const action of FILE_ACTIONS) {
+      const copied = action.id === copiedAction || (action.id === 'copy.path' && copiedAction === ABSOLUTE_PATH_ACTION.id);
+      const labelWidth = visibleWidth(copied ? successLabel(action.label) : action.label);
+      const buttonWidth = labelWidth + 4;
+      fileSpans.push({id: action.id, start: column + 2, end: column + 2 + labelWidth});
+      if (action.id === 'copy.path') pathButton = {start: column, width: buttonWidth};
+      column += buttonWidth + 1;
+    }
+  }
+
+  let metricsRow = metricsCore;
+  const metricsSpans: ActionSpan[] = [];
+  if (pathButton && shouldRevealAbsolutePathAction(hoveredAction, copiedAction)) {
+    const label = secondaryPathActionLabel(hoveredAction, copiedAction);
+    const labelWidth = visibleWidth(label);
+    if (labelWidth <= width) {
+      const start = clamp(pathButton.start + Math.floor((pathButton.width - labelWidth) / 2), 0, width - labelWidth);
+      metricsRow = overlayAnsiAt(metricsCore, label, start, width);
+      if (copiedAction !== ABSOLUTE_PATH_ACTION.id) {
+        metricsSpans.push({id: ABSOLUTE_PATH_ACTION.id, start, end: start + labelWidth});
+      }
+    }
+  }
+
+  return {fileRow, metricsRow, fileSpans, metricsSpans};
 }
+
+function spanAt(spans: ReadonlyArray<ActionSpan>, column: number) {
+  return spans.find((span) => column >= span.start && column < span.end)?.id ?? null;
+}
+
+const BLOCK_ACTION_SEPARATOR = '  ';
 
 function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
   return BLOCK_ACTIONS
@@ -1021,41 +1114,15 @@ function blockActionsLine(hoveredAction?: string, copiedAction?: string) {
       const color = copied
         ? ANSI_GREEN_BOLD
         : action.id === hoveredAction
-        ? ANSI_CYAN_BRIGHT
+        ? ANSI_CYAN_BRIGHT_BOLD
         : ANSI_GRAY;
       return `${color}${copied ? successLabel(action.label) : action.label}${ANSI_RESET}`;
     })
-    .join('  ');
-}
-
-function isBlockContentLine(line: string) {
-  return /^│\s+[•▾▸] .+:\d+:/.test(stripAnsi(line));
-}
-
-function findBlockContentLineIndex(lines: string[], index: number) {
-  for (const candidate of [index, index - 1, index + 1, index - 2, index + 2]) {
-    if (candidate >= 0 && candidate < lines.length && isBlockContentLine(lines[candidate] ?? '')) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
-function findHoveredBlockLineIndex(lines: string[], index: number) {
-  const scanFloor = Math.max(0, index - 500);
-  for (let candidate = index; candidate >= scanFloor; candidate -= 1) {
-    const line = lines[candidate] ?? '';
-    if (isBlockContentLine(line)) {
-      return candidate;
-    }
-  }
-
-  return findBlockContentLineIndex(lines, index);
+    .join(BLOCK_ACTION_SEPARATOR);
 }
 
 export function findFocusedBlockLineIndex(
-  lines: string[],
+  rows: ReadonlyArray<Pick<SectionRow, 'kind'> | undefined>,
   section: Pick<DiffSection, 'startLine' | 'endLineExclusive'> | null,
   visibleTopLine: number,
 ) {
@@ -1065,13 +1132,13 @@ export function findFocusedBlockLineIndex(
 
   const clampedTop = clamp(visibleTopLine, section.startLine, section.endLineExclusive - 1);
   for (let candidate = clampedTop; candidate >= section.startLine; candidate -= 1) {
-    if (isBlockContentLine(lines[candidate] ?? '')) {
+    if (rows[candidate]?.kind === 'header') {
       return candidate;
     }
   }
 
   for (let candidate = section.startLine; candidate < section.endLineExclusive; candidate += 1) {
-    if (isBlockContentLine(lines[candidate] ?? '')) {
+    if (rows[candidate]?.kind === 'header') {
       return candidate;
     }
   }
@@ -1079,19 +1146,44 @@ export function findFocusedBlockLineIndex(
   return null;
 }
 
-function addBlockActionsToLine(line: string, hoveredAction?: string, copiedAction?: string) {
-  const plain = stripAnsi(line);
-  if (!isBlockContentLine(line)) return line;
+// Draws a block header row from its structured label: the collapse glyph, the
+// path truncated from the start, and, when shown, the block actions with
+// their spans in section-line columns. The label always leaves room for the
+// actions so it does not move under the pointer when they appear on hover.
+function renderBlockHeaderRow(
+  row: DiffRow,
+  collapsed: boolean,
+  width: number,
+  actions: {hovered?: string; copied?: string} | null,
+): {line: string; spans: ActionSpan[]} {
+  const baseLabel = row.label ?? '•';
+  const label = row.target ? `${collapsed ? '▸' : '▾'}${baseLabel.slice(1)}` : baseLabel;
+  if (width < 4) {
+    return {line: truncateAnsi(label, Math.max(width, 0)), spans: []};
+  }
 
-  const contentStart = plain.indexOf('│ ') + 2;
-  const contentEnd = plain.lastIndexOf(' │');
-  if (contentStart < 2 || contentEnd <= contentStart) return line;
+  const inner = width - 4;
+  const right = blockActionsLine(actions?.hovered, actions?.copied);
+  const rightWidth = visibleWidth(right);
+  const fittedLabel = fitBlockHeaderLabel(label, Math.max(1, inner - rightWidth - 1));
+  if (!actions) {
+    return {line: frameLine(fittedLabel, inner, ANSI_CYAN), spans: []};
+  }
 
-  const contentWidth = contentEnd - contentStart;
-  const leftText = plain.slice(contentStart, contentEnd).trimEnd();
-  const content = composeLeftRight(`${ANSI_CYAN}${leftText}${ANSI_RESET}`, blockActionsLine(hoveredAction, copiedAction), contentWidth);
+  const left = `${ANSI_CYAN}${fittedLabel}${ANSI_RESET}`;
+  const content = composeLeftRight(left, right, inner);
+  const spans: ActionSpan[] = [];
+  // The section line is `│ content │`, so content starts at column 2.
+  let column = 2 + visibleWidth(content) - rightWidth;
+  for (const action of BLOCK_ACTIONS) {
+    const labelWidth = visibleWidth(action.id === actions.copied ? successLabel(action.label) : action.label);
+    if (column + labelWidth <= 2 + inner) {
+      spans.push({id: action.id, start: column, end: column + labelWidth});
+    }
+    column += labelWidth + BLOCK_ACTION_SEPARATOR.length;
+  }
 
-  return `${ANSI_CYAN}│${ANSI_RESET} ${content} ${ANSI_CYAN}│${ANSI_RESET}`;
+  return {line: frameLine(content, inner, ANSI_CYAN), spans};
 }
 
 function stripAnsi(line: string) {
@@ -1181,83 +1273,79 @@ export function getActionFromRenderedLine<T extends ReadonlyArray<{id: string; l
   return null;
 }
 
-function parseBlockLineTarget(line: string) {
-  const plain = stripAnsi(line);
-  const match = plain.match(/[•▾▸]\s+(.+):(\d+):/);
-  if (!match) return null;
+type SelectionSource = {
+  lines: string[];
+  sections: ReadonlyArray<Pick<DiffSection, 'path' | 'startLine' | 'endLineExclusive'>>;
+};
+
+function remapLineIndex(lineIndex: number, previous: SelectionSource, next: SelectionSource) {
+  const section = previous.sections[getSectionIndexForLine(previous.sections, lineIndex)];
+  if (!section || lineIndex < section.startLine || lineIndex >= section.endLineExclusive) return null;
+
+  const target = next.sections.find((entry) => entry.path === section.path);
+  if (!target) return null;
+
+  const mapped = target.startLine + lineIndex - section.startLine;
+  return mapped < target.endLineExclusive ? mapped : null;
+}
+
+// Moves a selection to where its lines went after the rendered lines were
+// rebuilt, or returns null when any selected line changed or moved apart.
+function remapCodeSelection(selection: CodeSelection, previous: SelectionSource, next: SelectionSource): CodeSelection | null {
+  const {start, end} = normalizeCodeSelection(selection);
+  const mappedStart = remapLineIndex(start.lineIndex, previous, next);
+  const mappedEnd = remapLineIndex(end.lineIndex, previous, next);
+  if (mappedStart === null || mappedEnd === null) return null;
+
+  const shift = mappedStart - start.lineIndex;
+  if (mappedEnd - end.lineIndex !== shift) return null;
+  for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
+    if (previous.lines[lineIndex] !== next.lines[lineIndex + shift]) return null;
+  }
 
   return {
-    path: match[1]!,
-    lineStart: Number(match[2]),
+    ...selection,
+    anchor: {...selection.anchor, lineIndex: selection.anchor.lineIndex + shift},
+    focus: {...selection.focus, lineIndex: selection.focus.lineIndex + shift},
+    lines: next.lines,
   };
 }
 
-function findBlockTargetFromLine(
-  line: string,
-  review: ReviewModel | undefined,
-): {file: ReviewFile; block: ReviewBlock} | undefined {
-  const target = parseBlockLineTarget(line);
-  if (!target || !review) return undefined;
-
-  const file = review.files.find((entry) => entry.path === target.path);
-  const block = file?.blocks.find((entry) => entry.lineStart === target.lineStart);
-  return file && block ? {file, block} : undefined;
-}
-
-function decorateBlockHeaderLine(line: string, review: ReviewModel | undefined, collapsedBlockIds: ReadonlySet<string>) {
-  if (!isBlockContentLine(line)) return line;
-
-  const target = findBlockTargetFromLine(line, review);
-  if (!target) return line;
-
-  const glyph = collapsedBlockIds.has(target.block.id) ? '▸' : '▾';
-  return line.replace(/[•▾▸](?=\s+)/, glyph);
-}
-
-function collapseSectionLines(
-  lines: string[],
-  review: ReviewModel | undefined,
-  collapsedBlockIds: ReadonlySet<string>,
-) {
-  if (!review || collapsedBlockIds.size === 0) return lines;
-
-  const headerIndices = lines
-    .map((line, index) => isBlockContentLine(line) ? index : -1)
-    .filter((index) => index >= 0);
-  if (headerIndices.length === 0) return lines;
-
-  const output: string[] = [];
-  let cursor = 0;
-
-  for (const [index, headerIndex] of headerIndices.entries()) {
-    const nextHeaderIndex = headerIndices[index + 1];
-    const headerBodyStart = Math.min(lines.length, headerIndex + 3);
-    const nextHeaderStart = nextHeaderIndex === undefined
-      ? lines.length
-      : Math.max(headerBodyStart, nextHeaderIndex - 2);
-
-    output.push(...lines.slice(cursor, headerBodyStart));
-
-    const target = findBlockTargetFromLine(lines[headerIndex] ?? '', review);
-    if (target && collapsedBlockIds.has(target.block.id)) {
-      cursor = nextHeaderStart;
-    } else {
-      cursor = headerBodyStart;
-    }
+function resolveBlockTargets(rows: ReadonlyArray<SectionRow>, file: ReviewFile | undefined) {
+  const targets: Array<BlockTarget | undefined> = [];
+  for (const row of rows) {
+    if (row.kind !== 'header') continue;
+    // Delta's hunk headers and the parsed blocks come from the same diff in
+    // the same order; the line-number check guards against a mismatch.
+    const block = file?.blocks[row.block];
+    targets[row.block] = file && block && block.lineStart === row.lineNumber ? {file, block} : undefined;
   }
 
-  output.push(...lines.slice(cursor));
-  return output;
+  return targets;
 }
+
+type ViewSection = DiffSection & {
+  rows: SectionRow[];
+  blockTargets: Array<BlockTarget | undefined>;
+};
 
 function applyCollapsedBlocks(
   sections: DiffSection[],
   review: ReviewModel | undefined,
   collapsedBlockIds: ReadonlySet<string>,
-) {
+): ViewSection[] {
+  const fileByPath = new Map(review?.files.map((file) => [file.path, file]) ?? []);
   let cursor = 0;
+
   return sections.map((section) => {
-    const lines = collapseSectionLines(section.lines, review, collapsedBlockIds);
+    const allRows = section.rows ?? section.lines.map((): SectionRow => ({block: -1, kind: 'body', continuation: false}));
+    const blockTargets = resolveBlockTargets(allRows, fileByPath.get(section.path));
+    const isHidden = (row: SectionRow) => row.kind === 'body'
+      && row.block >= 0
+      && collapsedBlockIds.has(blockTargets[row.block]?.block.id ?? '');
+    const collapsing = collapsedBlockIds.size > 0 && allRows.some(isHidden);
+    const lines = collapsing ? section.lines.filter((_, index) => !isHidden(allRows[index]!)) : section.lines;
+    const rows = collapsing ? allRows.filter((row) => !isHidden(row)) : allRows;
     const startLine = cursor;
     const endLineExclusive = cursor + lines.length;
     cursor = endLineExclusive;
@@ -1265,10 +1353,33 @@ function applyCollapsedBlocks(
     return {
       ...section,
       lines,
+      rows,
+      blockTargets,
       startLine,
       endLineExclusive,
     };
   });
+}
+
+function buildDiffRows(sections: ViewSection[]): DiffRow[] {
+  const rows: DiffRow[] = [];
+  for (const [sectionIndex, section] of sections.entries()) {
+    const headerLines = new Map<number, number>();
+    for (const [index, row] of section.rows.entries()) {
+      if (row.kind === 'header') headerLines.set(row.block, section.startLine + index);
+    }
+
+    for (const row of section.rows) {
+      rows.push({
+        ...row,
+        sectionIndex,
+        headerLine: row.block >= 0 ? headerLines.get(row.block) ?? null : null,
+        target: row.block >= 0 ? section.blockTargets[row.block] : undefined,
+      });
+    }
+  }
+
+  return rows;
 }
 
 function AppContent({
@@ -1326,6 +1437,7 @@ function AppContent({
   const allTreeRows = useMemo(() => buildTreeRows(files, statusByPath), [files, statusByPath]);
   const rows = useMemo(() => applyTreeCollapse(allTreeRows, collapsedTreePaths), [allTreeRows, collapsedTreePaths]);
   const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
+  const allDiffRows = useMemo(() => buildDiffRows(sections), [sections]);
 
   const maxDiffOffset = Math.max(allDiffLines.length - visibleDiffRows, 0);
   const maxTreeOffset = Math.max(rows.length - visibleTreeRows, 0);
@@ -1357,7 +1469,7 @@ function AppContent({
   const pendingCodeSelectionRef = useRef<CodeSelection | null>(null);
   const codeSelectionRenderTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastCodeSelectionRenderAtRef = useRef(0);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<Toast | null>(null);
   const viewSnapshotRef = useRef({
     path: '',
     sectionIndex: 0,
@@ -1387,13 +1499,30 @@ function AppContent({
     [activeFilePath, review],
   );
   const focusedBlockLineIndex = useMemo(
-    () => findFocusedBlockLineIndex(allDiffLines, activeSection, diffOffset),
-    [activeSection, allDiffLines, diffOffset],
+    () => findFocusedBlockLineIndex(allDiffRows, activeSection, diffOffset),
+    [activeSection, allDiffRows, diffOffset],
   );
-  const focusedBlock = useMemo(() => {
-    const focusedLine = focusedBlockLineIndex === null ? undefined : allDiffLines[focusedBlockLineIndex];
-    return focusedLine ? findBlockTargetFromLine(focusedLine, review)?.block : activeFile?.blocks[0];
-  }, [activeFile, allDiffLines, focusedBlockLineIndex, review]);
+  const focusedBlock = focusedBlockLineIndex === null
+    ? activeFile?.blocks[0]
+    : allDiffRows[focusedBlockLineIndex]?.target?.block;
+  const displayBranch = toDisplayText(branch);
+  const displayBase = toDisplayText(base);
+
+  const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
+  const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+  const diffHeader = buildDiffHeader({
+    path: activeFilePath,
+    status: activeFile?.status,
+    showActions: Boolean(review) && sections.length > 0,
+    hoveredAction: fileHover,
+    copiedAction: fileCopied,
+    metricsCore: activeSection
+      ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+      : `${ANSI_GRAY}No changes to review${ANSI_RESET}`,
+    width: diffContentWidth,
+  });
+  const diffHeaderRef = useRef(diffHeader);
+  diffHeaderRef.current = diffHeader;
 
   const stateRef = useRef({
     treeOffset,
@@ -1492,7 +1621,7 @@ function AppContent({
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
   const footerHints = watchStatus
-    ? `${watchStatus} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
+    ? `${toDisplayText(watchStatus)} • ↑/↓ jump file • j/k scroll • g/G top-bottom • q quit`
     : '↑/↓ jump file • j/k scroll • g/G top-bottom • q quit';
 
   useEffect(() => {
@@ -1590,8 +1719,8 @@ function AppContent({
     },
   ), []);
 
-  const showToast = useCallback((message: string, hint?: string) => {
-    setToast(makeToast(message, hint));
+  const showToast = useCallback((message: string, hint?: string, kind: ToastKind = 'success') => {
+    setToast({text: toDisplayText(makeToast(message, hint)), kind});
   }, []);
 
   const resizeTreeToMouse = useCallback((mouseX: number) => {
@@ -1740,7 +1869,7 @@ function AppContent({
     successAction?: CopiedAction,
   ) => {
     if (!review || !commandFile) {
-      showToast('Copy action unavailable.');
+      showToast('Copy action unavailable.', undefined, 'error');
       return;
     }
 
@@ -1756,7 +1885,7 @@ function AppContent({
       setCopiedAction(successAction);
     }
 
-    showToast(result.toast, result.hint);
+    showToast(result.toast, result.hint, result.ok ? 'success' : 'error');
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
 
   const copyFileTree = useCallback(async () => {
@@ -1768,10 +1897,10 @@ function AppContent({
         setCopiedAction({kind: 'tree-header', id: 'copy.tree'});
         showToast('Copied file tree', `${files.length} files`);
       } else {
-        showToast(result.message, result.hint);
+        showToast(result.message, result.hint, 'error');
       }
     } catch (error) {
-      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined);
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
     }
   }, [allTreeRows, copyWriter, files.length, repoRoot, showToast]);
 
@@ -1786,22 +1915,54 @@ function AppContent({
     if (lineIndex < 0 || lineIndex >= allDiffLines.length) return null;
 
     const innerColumn = mousePosition.x - diffBounds.left - 2;
-    const code = getCodeContentRange(allDiffLines[lineIndex] ?? '');
+    const code = getCodeContent(allDiffLines[lineIndex] ?? '', allDiffRows[lineIndex]);
     if (!code || innerColumn < code.start) return null;
 
     return {
       lineIndex,
-      column: clamp(innerColumn - code.start, 0, code.text.length),
+      column: clamp(innerColumn - code.start, 0, code.width),
     };
-  }, [allDiffLines, diffOffset]);
+  }, [allDiffLines, allDiffRows, diffOffset]);
+
+  const cancelCodeSelection = useCallback((notify: boolean) => {
+    setCodeSelection(null);
+    if (notify) {
+      showToast('Selection cancelled', 'the diff changed while selecting', 'info');
+    }
+  }, [setCodeSelection, showToast]);
+
+  // A refresh, collapse or resize rebuilds the rendered lines. Keep the
+  // selection on the same lines when they moved unchanged, otherwise drop it,
+  // so a highlight or copy never lands on lines that were not selected.
+  const selectionSourceRef = useRef({lines: allDiffLines, sections});
+  useLayoutEffect(() => {
+    const previous = selectionSourceRef.current;
+    const next = {lines: allDiffLines, sections};
+    selectionSourceRef.current = next;
+
+    const selection = codeSelectionRef.current;
+    if (!selection || selection.lines === allDiffLines) return;
+
+    const remapped = selection.lines === previous.lines ? remapCodeSelection(selection, previous, next) : null;
+    if (remapped) {
+      setCodeSelection(remapped);
+    } else {
+      cancelCodeSelection(selection.active);
+    }
+  }, [allDiffLines, cancelCodeSelection, sections, setCodeSelection]);
 
   const copyCodeSelection = useCallback(async (selection: CodeSelection) => {
+    if (selection.lines !== allDiffLines) {
+      cancelCodeSelection(true);
+      return;
+    }
+
     if (compareSelectionPoints(selection.anchor, selection.focus) === 0) {
       setCodeSelection(null);
       return;
     }
 
-    const text = getSelectedCodeText(allDiffLines, selection);
+    const text = getSelectedCodeText(allDiffLines, allDiffRows, selection);
     if (!text) {
       setCodeSelection(null);
       return;
@@ -1813,12 +1974,20 @@ function AppContent({
         const lineCount = text.split('\n').length;
         showToast('Copied selection', lineCount === 1 ? `${text.length} chars` : `${lineCount} lines`);
       } else {
-        showToast(result.message, result.hint);
+        showToast(result.message, result.hint, 'error');
       }
     } catch (error) {
-      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined);
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
     }
-  }, [allDiffLines, copyWriter, setCodeSelection, showToast]);
+  }, [allDiffLines, allDiffRows, cancelCodeSelection, copyWriter, setCodeSelection, showToast]);
+
+  // Spans of a header row laid out with its actions shown; hovering a header
+  // shows them, so hover hit-tests against this layout.
+  const blockHeaderSpans = useCallback((lineIndex: number) => {
+    const row = allDiffRows[lineIndex];
+    if (row?.kind !== 'header') return [];
+    return renderBlockHeaderRow(row, false, diffContentWidth, {}).spans;
+  }, [allDiffRows, diffContentWidth]);
 
   useEffect(() => {
     const handleScroll = (position: {x: number; y: number}, direction: 'scrollup' | 'scrolldown' | null) => {
@@ -1863,11 +2032,11 @@ function AppContent({
       let nextInfoTip: string | null = null;
       if (
         worktreeBranchName
-        && isWorktreeLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, branch)
+        && isWorktreeLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, displayBranch)
       ) {
-        nextInfoTip = `current branch ${worktreeBranchName}`;
-      } else if (isBaseLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, branch, base)) {
-        nextInfoTip = `comparison base ${base}`;
+        nextInfoTip = `current branch ${toDisplayText(worktreeBranchName)}`;
+      } else if (isBaseLabelTarget(topBarBounds, mousePosition.x, mousePosition.y, displayBranch, displayBase)) {
+        nextInfoTip = `comparison base ${displayBase}`;
       }
 
       let nextHoveredAction: HoveredAction = null;
@@ -1931,7 +2100,7 @@ function AppContent({
               && relativeX < treeRowLabelWidth(row, bounds.width, treeCopySucceeded)
               && isTreeRowLabelTruncated(row, bounds.width, treeCopySucceeded)
             ) {
-              nextTreeTooltip = buildTreeTooltip(row.label, bounds, columns, terminalRows);
+              nextTreeTooltip = buildTreeTooltip(toDisplayText(row.label), bounds, columns, terminalRows);
             }
           }
         }
@@ -1941,46 +2110,19 @@ function AppContent({
       if (isInside(diffBounds, mousePosition.x, mousePosition.y) && diffBounds) {
         const relativeY = mousePosition.y - diffBounds.top;
         const relativeX = mousePosition.x - diffBounds.left;
-        if (relativeY === 1) {
-          const activeStatus = activeFile?.status;
-          const status = ansiStatus(activeStatus);
-          const inner = Math.max(1, rightWidth - 4);
-          const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-          const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-          const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-          const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
-          const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
-          if (actionId) {
-            nextHoveredAction = {kind: 'file-header', id: actionId};
-            nextInfoTip = copyActionHint(actionId);
-          }
-        } else if (relativeY === 2) {
-          const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-          const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-          const activeStatus = activeFile?.status;
-          const status = ansiStatus(activeStatus);
-          const inner = Math.max(1, rightWidth - 4);
-          const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-          const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
-          const metricsCore = activeSection
-            ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
-            : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-          const actionId = getActionFromRenderedLine(
-            relativeX - 2,
-            addAbsolutePathActionToMetricsRow(metricsCore, fileHeaderLine, currentFileHover, currentFileCopied, inner),
-            currentFileCopied === ABSOLUTE_PATH_ACTION.id ? [] : [ABSOLUTE_PATH_ACTION],
-          );
+        if (relativeY === 1 || relativeY === 2) {
+          const header = diffHeaderRef.current;
+          const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
             nextInfoTip = copyActionHint(actionId);
           }
         } else {
           const diffLineIndex = diffOffset + relativeY - 3;
-          const blockLineIndex = findHoveredBlockLineIndex(allDiffLines, diffLineIndex);
+          const blockLineIndex = allDiffRows[diffLineIndex]?.headerLine ?? null;
           nextHoveredBlockLineIndex = blockLineIndex;
-          const line = blockLineIndex === null ? undefined : allDiffLines[blockLineIndex];
-          if (line && blockLineIndex !== null && diffLineIndex === blockLineIndex) {
-            const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
+          if (blockLineIndex !== null && diffLineIndex === blockLineIndex) {
+            const actionId = spanAt(blockHeaderSpans(blockLineIndex), relativeX - 2);
             if (actionId) {
               nextHoveredAction = {kind: 'block', id: actionId, lineIndex: blockLineIndex};
               nextInfoTip = copyActionHint(actionId);
@@ -2007,23 +2149,18 @@ function AppContent({
     mouse.events.on('position', handlePosition);
     return () => mouse.events.off('position', handlePosition);
   }, [
-    activeFile,
-    activeFilePath,
-    activeSection,
-    activeSectionIndex,
-    allDiffLines,
-    base,
-    branch,
+    allDiffRows,
+    blockHeaderSpans,
     clearTreeTooltip,
     columns,
     copiedAction,
     diffOffset,
+    displayBase,
+    displayBranch,
     getTreeRowHit,
     hoveredAction,
     hoveredBlockLineIndex,
     mouse,
-    rightWidth,
-    sections.length,
     scheduleTreeTooltip,
     terminalRows,
     treeCollapsed,
@@ -2053,6 +2190,10 @@ function AppContent({
 
       const currentSelection = codeSelectionRef.current;
       if (!currentSelection) return;
+      if (currentSelection.lines !== allDiffLines) {
+        cancelCodeSelection(true);
+        return;
+      }
 
       const mousePosition = normalizeMousePosition(position);
       const point = getCodeSelectionPoint(mousePosition);
@@ -2074,7 +2215,16 @@ function AppContent({
 
     mouse.events.on('drag', handleDrag);
     return () => mouse.events.off('drag', handleDrag);
-  }, [copyCodeSelection, getCodeSelectionPoint, mouse, resizeTreeToMouse, scheduleCodeSelection, setCodeSelection]);
+  }, [
+    allDiffLines,
+    cancelCodeSelection,
+    copyCodeSelection,
+    getCodeSelectionPoint,
+    mouse,
+    resizeTreeToMouse,
+    scheduleCodeSelection,
+    setCodeSelection,
+  ]);
 
   useEffect(() => {
     const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
@@ -2133,7 +2283,7 @@ function AppContent({
       const selectionPoint = getCodeSelectionPoint(mousePosition);
       if (selectionPoint) {
         setHoveredAction(null);
-        setCodeSelection({anchor: selectionPoint, focus: selectionPoint, active: true});
+        setCodeSelection({anchor: selectionPoint, focus: selectionPoint, active: true, lines: allDiffLines});
         return;
       }
 
@@ -2183,36 +2333,9 @@ function AppContent({
       const relativeY = mousePosition.y - diffBounds.top;
       const relativeX = mousePosition.x - diffBounds.left;
 
-      if (relativeY === 1) {
-        const activeStatus = activeFile?.status;
-        const status = ansiStatus(activeStatus);
-        const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', Math.max(1, rightWidth - 4))}${ANSI_RESET}`;
-        const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-        const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-        const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), Math.max(1, rightWidth - 4));
-        const actionId = getActionFromRenderedLine(relativeX - 2, fileHeaderLine, FILE_ACTIONS);
-        if (actionId) {
-          void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
-        }
-        return;
-      }
-
-      if (relativeY === 2) {
-        const currentFileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-        const currentFileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
-        const activeStatus = activeFile?.status;
-        const status = ansiStatus(activeStatus);
-        const inner = Math.max(1, rightWidth - 4);
-        const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-        const fileHeaderLine = composeLeftRight(fileLabel, fileActions(currentFileHover, currentFileCopied), inner);
-        const metricsCore = activeSection
-          ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
-          : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-        const actionId = getActionFromRenderedLine(
-          relativeX - 2,
-          addAbsolutePathActionToMetricsRow(metricsCore, fileHeaderLine, currentFileHover, currentFileCopied, inner),
-          currentFileCopied === ABSOLUTE_PATH_ACTION.id ? [] : [ABSOLUTE_PATH_ACTION],
-        );
+      if (relativeY === 1 || relativeY === 2) {
+        const header = diffHeaderRef.current;
+        const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
         if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
         }
@@ -2220,16 +2343,16 @@ function AppContent({
       }
 
       const diffLineIndex = diffOffset + relativeY - 3;
-      const blockLineIndex = findHoveredBlockLineIndex(allDiffLines, diffLineIndex);
-      const line = blockLineIndex === null ? undefined : allDiffLines[blockLineIndex];
-      if (!line || diffLineIndex !== blockLineIndex) return;
+      const row = allDiffRows[diffLineIndex];
+      if (row?.kind !== 'header' || !row.target) return;
 
-      const blockTarget = findBlockTargetFromLine(line, review);
-      const actionId = getActionFromRenderedLine(relativeX - 2, addBlockActionsToLine(line), BLOCK_ACTIONS);
-      if (!blockTarget) return;
-
+      const blockTarget = row.target;
+      // Only the header that currently shows its actions has clickable ones;
+      // anywhere else on a header row toggles the block.
+      const actionsShown = (hoveredBlockLineIndex ?? focusedBlockLineIndex) === diffLineIndex;
+      const actionId = actionsShown ? spanAt(blockHeaderSpans(diffLineIndex), relativeX - 2) : null;
       if (actionId) {
-        void runCopyCommand(actionId, blockTarget.file, blockTarget.block, {kind: 'block', id: actionId, lineIndex: blockLineIndex});
+        void runCopyCommand(actionId, blockTarget.file, blockTarget.block, {kind: 'block', id: actionId, lineIndex: diffLineIndex});
         return;
       }
 
@@ -2240,16 +2363,17 @@ function AppContent({
     return () => mouse.events.off('click', handleClick);
   }, [
     activeFile,
-    activeFilePath,
-    activeSection,
-    activeSectionIndex,
     allDiffLines,
+    allDiffRows,
+    blockHeaderSpans,
     clearTreeTooltip,
     copiedAction,
     diffOffset,
+    focusedBlock,
+    focusedBlockLineIndex,
     getCodeSelectionPoint,
+    hoveredBlockLineIndex,
     getTreeRowHit,
-    hoveredAction,
     leftWidth,
     mouse,
     copyCodeSelection,
@@ -2257,11 +2381,8 @@ function AppContent({
     jumpToFile,
     review,
     resizeTreeToMouse,
-    rightWidth,
     runCopyCommand,
     setCodeSelection,
-    sections.length,
-    showToast,
     toggleBlock,
     toggleTreeDirectory,
     treeCollapsed,
@@ -2314,14 +2435,14 @@ function AppContent({
         <Box>
           <Text color="cyanBright" bold>branch-review</Text>
           <Text color="gray"> </Text>
-          <Text color="white">{branch}</Text>
+          <Text color="white">{displayBranch}</Text>
           <Text color="gray"> against </Text>
-          <Text color="yellow">{base}</Text>
+          <Text color="yellow">{displayBase}</Text>
         </Box>
         {infoTip
           ? (
             <Text color="cyanBright" bold wrap="truncate-end">
-              {truncateStart(infoTip, Math.max(18, columns - visibleWidth('branch-review ') - visibleWidth(branch) - visibleWidth(' against ') - visibleWidth(base) - 8))}
+              {truncateStart(infoTip, Math.max(18, columns - visibleWidth('branch-review ') - visibleWidth(displayBranch) - visibleWidth(' against ') - visibleWidth(displayBase) - 8))}
             </Text>
           )
           : (
@@ -2398,76 +2519,67 @@ function AppContent({
             const borderAnsi = diffHovered ? ANSI_CYAN : ANSI_GRAY;
             const inner = Math.max(1, rightWidth - 4);
             const hasChanges = sections.length > 0;
-
-            const activeStatus = review?.files.find((file) => file.path === activeFilePath)?.status;
-            const status = ansiStatus(activeStatus);
-            const fileLabel = `${status}${status ? ' ' : ''}${ANSI_CYAN_BRIGHT_BOLD}${truncateStart(activeFilePath || ' ', inner)}${ANSI_RESET}`;
-            const fileArrival = arrivalAnimations.files.get(activeFilePath);
-            const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
-            const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
             const fileLabelWithActions = applyArrivalWash(
-              composeLeftRight(fileLabel, review && hasChanges ? fileActions(fileHover, fileCopied) : '', inner),
-              fileArrival,
+              diffHeader.fileRow,
+              arrivalAnimations.files.get(activeFilePath),
               arrivalNow,
-            );
-
-            const metricsCore = activeSection
-              ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
-              : `${ANSI_GRAY}No changes to review${ANSI_RESET}`;
-            const metricsRow = addAbsolutePathActionToMetricsRow(
-              metricsCore,
-              fileLabelWithActions,
-              fileHover,
-              fileCopied,
-              inner,
             );
 
             const rows: string[] = [
               frameTopBorder(rightWidth, borderAnsi),
               frameLine(fileLabelWithActions, inner, borderAnsi),
-              frameLine(metricsRow, inner, borderAnsi),
+              frameLine(diffHeader.metricsRow, inner, borderAnsi),
             ];
             if (!hasChanges) {
               rows.push(frameLine(`${ANSI_CYAN_BRIGHT_BOLD}No changes to review${ANSI_RESET}`, inner, borderAnsi));
-              rows.push(frameLine(`${ANSI_GRAY}${emptyStateHint ?? 'Run again after making changes.'}${ANSI_RESET}`, inner, borderAnsi));
+              rows.push(frameLine(`${ANSI_GRAY}${toDisplayText(emptyStateHint ?? 'Run again after making changes.')}${ANSI_RESET}`, inner, borderAnsi));
             }
 
+            const visibleSelection = codeSelection?.lines === allDiffLines ? codeSelection : null;
+            const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
             for (const [index, line] of visibleDiffLines.entries()) {
               const absoluteLineIndex = diffOffset + index;
-              const currentBlockHeaderLineIndex = findHoveredBlockLineIndex(allDiffLines, absoluteLineIndex);
-              const currentBlockTarget = currentBlockHeaderLineIndex === null
-                ? undefined
-                : findBlockTargetFromLine(allDiffLines[currentBlockHeaderLineIndex] ?? '', review);
-              const blockArrival = currentBlockTarget
-                ? arrivalAnimations.blocks.get(blockAnimationKey(currentBlockTarget.file.path, currentBlockTarget.block))
+              const row = allDiffRows[absoluteLineIndex];
+              const blockTarget = row?.target;
+              const blockArrival = blockTarget
+                ? arrivalAnimations.blocks.get(blockAnimationKey(blockTarget.file.path, blockTarget.block))
                 : undefined;
-              const blockHover = hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex
-                ? hoveredAction.id
-                : undefined;
-              const blockCopied = copiedAction?.kind === 'block' && copiedAction.lineIndex === absoluteLineIndex
-                ? copiedAction.id
-                : undefined;
-              const visibleActionBlockLineIndex = hoveredBlockLineIndex ?? focusedBlockLineIndex;
-              const blockStateLine = decorateBlockHeaderLine(line || ' ', review, collapsedBlockIds);
-              const visibleLine = visibleActionBlockLineIndex === absoluteLineIndex
-                ? addBlockActionsToLine(blockStateLine, blockHover, blockCopied)
-                : blockStateLine;
-              const selectedLine = highlightSelectedCode(visibleLine, absoluteLineIndex, codeSelection);
+              let visibleLine = line || ' ';
+              if (row?.kind === 'header') {
+                const showActions = visibleActionBlockLineIndex === absoluteLineIndex;
+                visibleLine = renderBlockHeaderRow(
+                  row,
+                  Boolean(blockTarget && collapsedBlockIds.has(blockTarget.block.id)),
+                  diffContentWidth,
+                  showActions
+                    ? {
+                      hovered: hoveredAction?.kind === 'block' && hoveredAction.lineIndex === absoluteLineIndex ? hoveredAction.id : undefined,
+                      copied: copiedAction?.kind === 'block' && copiedAction.lineIndex === absoluteLineIndex ? copiedAction.id : undefined,
+                    }
+                    : null,
+                ).line;
+              }
+
+              const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, visibleSelection);
               const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-              rows.push(frameLine(highlightActionLabel(arrivalLine, blockHover), inner, borderAnsi));
+              rows.push(frameLine(arrivalLine, inner, borderAnsi));
             }
             rows.push(frameBottomBorder(rightWidth, borderAnsi));
 
-            return rows.map((row, i) => <Text key={`diff-${i}`}>{row}</Text>);
+            // Every row is padded to the pane width in terminal cells; truncate
+            // so a row can never soft-wrap and push later rows out of the pane.
+            return rows.map((row, i) => <Text key={`diff-${i}`} wrap="truncate">{row}</Text>);
           })()}
         </DiffPane>
       </Box>
 
       <Box borderStyle="round" borderColor="gray" paddingX={1} justifyContent="space-between">
         {toast
-          ? <Text color="cyan">✓ {toast}</Text>
+          ? toast.kind === 'error'
+            ? <Text color="red">✗ {toast.text}</Text>
+            : <Text color="cyan">{toast.kind === 'success' ? '✓ ' : ''}{toast.text}</Text>
           : <Text color="gray">{footerHints}</Text>}
-        <Text color="gray">{base}...{branch}</Text>
+        <Text color="gray">{displayBase}...{displayBranch}</Text>
       </Box>
       {treeTooltip ? <TreeTooltipOverlay tooltip={treeTooltip} /> : null}
     </Box>

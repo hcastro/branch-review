@@ -7,6 +7,7 @@ import {
   getSectionForLine,
   getSectionIndexForLine,
   getContinuationPrefix,
+  padToWidth,
   truncateAnsi,
   visibleWidth,
   wrapAnsi,
@@ -163,7 +164,7 @@ describe('section helpers', () => {
     expect(wrapped[0].endLineExclusive).toBe(wrapped[0].lines.length);
   });
 
-  it('renders block headers with one width-constrained frame', () => {
+  it('renders block headers on one framed row, truncating the path from the start', () => {
     const base = buildDiffSections([
       {
         path: 'notes.md',
@@ -174,18 +175,97 @@ describe('section helpers', () => {
 
     const wrapped = wrapSections(base, 48);
     const frameStart = wrapped[0].lines.findIndex((line) => stripAnsi(line).startsWith('╭'));
-    const plainHeader = wrapped[0].lines.slice(frameStart, frameStart + 4).map(stripAnsi);
+    const plainHeader = wrapped[0].lines.slice(frameStart, frameStart + 3).map(stripAnsi);
 
     expect(stripAnsi(wrapped[0].lines[frameStart - 1])).toBe('');
     expect(plainHeader).toEqual([
       `╭${'─'.repeat(46)}╮`,
-      '│ • very/long/path/to/a/file/that/should/wrap. │',
-      '│   md:12:                                     │',
+      '│ • …ng/path/to/a/file/that/should/wrap.md:12: │',
       `╰${'─'.repeat(46)}╯`,
     ]);
-    expect(stripAnsi(wrapped[0].lines[frameStart + 4])).toBe('');
-    for (const line of wrapped[0].lines.slice(frameStart, frameStart + 4)) {
+    expect(stripAnsi(wrapped[0].lines[frameStart + 3])).toBe('');
+    for (const line of wrapped[0].lines.slice(frameStart, frameStart + 3)) {
       expect(visibleWidth(line)).toBe(48);
+    }
+    expect(wrapped[0].rows?.map((row) => row.kind)).toEqual(['frame', 'frame', 'header', 'frame', 'frame', 'body']);
+    expect(wrapped[0].rows?.[2]).toMatchObject({
+      block: 0,
+      label: '• very/long/path/to/a/file/that/should/wrap.md:12:',
+      lineNumber: 12,
+    });
+  });
+
+  it('records block identity, continuations and the code column for every wrapped row', () => {
+    const base = buildDiffSections([
+      {
+        path: 'src/a.ts',
+        metrics: {path: 'src/a.ts', additions: 2, deletions: 0, changedLines: 2},
+        diff: [
+          '• src/a.ts:3: function a()',
+          '  3 ⋮  3 │const first = 1;',
+          '• src/a.ts:40: function b()',
+          ` 40 ⋮ 40 │${'word '.repeat(12)}`,
+        ].join('\n'),
+      },
+    ]);
+
+    const [section] = wrapSections(base, 30);
+    const rows = section!.rows!;
+    expect(rows).toHaveLength(section!.lines.length);
+    expect(rows.filter((row) => row.kind === 'header').map((row) => [row.block, row.lineNumber])).toEqual([[0, 3], [1, 40]]);
+
+    const firstBody = rows.findIndex((row) => row.kind === 'body');
+    expect(rows[firstBody]).toMatchObject({block: 0, continuation: false, codeColumn: 10});
+
+    const wrappedStart = rows.findIndex((row, index) => row.kind === 'body' && row.block === 1 && index > 0);
+    const wrappedRows = rows.slice(wrappedStart).filter((row) => row.block === 1 && row.kind === 'body');
+    expect(wrappedRows.length).toBeGreaterThan(2);
+    expect(wrappedRows[0]).toMatchObject({continuation: false, codeColumn: 10});
+    expect(wrappedRows[1]).toMatchObject({continuation: true, codeColumn: 10});
+  });
+
+  it('keeps a path containing :<digits>: whole in its block header label', () => {
+    const base = buildDiffSections([
+      {path: 'a:1:b.ts', metrics: {path: 'a:1:b.ts', additions: 1, deletions: 0, changedLines: 1}, diff: '• a:1:b.ts:12: context'},
+    ]);
+
+    const header = wrapSections(base, 80)[0]!.rows!.find((row) => row.kind === 'header');
+    expect(header).toMatchObject({label: '• a:1:b.ts:12:', lineNumber: 12});
+  });
+
+  it('detects a block header whose path holds control characters and shows them as markers', () => {
+    const path = 'src/a\rb\u001B]0;x\u0007.ts';
+    const base = buildDiffSections([
+      {path, metrics: {path, additions: 1, deletions: 0, changedLines: 1}, diff: `• ${path}:7: context`},
+    ]);
+
+    const [section] = wrapSections(base, 80);
+    const header = section!.rows!.find((row) => row.kind === 'header');
+    expect(header).toMatchObject({label: '• src/a^Mb␛]0;x^G.ts:7:', lineNumber: 7});
+    expect(section!.lines.join('')).not.toContain('\r');
+  });
+
+  it('measures, truncates and wraps wide characters in terminal cells', () => {
+    expect(visibleWidth('日本語')).toBe(6);
+    expect(visibleWidth('\u001B[31m日本\u001B[0mab')).toBe(6);
+    expect(stripAnsi(truncateAnsi('日本語テキスト', 5))).toBe('日本');
+    expect(visibleWidth(padToWidth('日本', 6))).toBe(6);
+
+    const wrapped = wrapAnsi('日本語テキストです 日本語テキストです', 12);
+    for (const row of wrapped) {
+      expect(visibleWidth(row)).toBeLessThanOrEqual(12);
+    }
+    expect(wrapped.map(stripAnsi).join('')).toBe('日本語テキストです 日本語テキストです');
+  });
+
+  it('never splits a surrogate pair or grapheme when truncating or wrapping', () => {
+    const emoji = '👍🏽';
+    expect(stripAnsi(truncateAnsi(`ab${emoji}cd`, 3))).toBe('ab');
+    expect(stripAnsi(truncateAnsi(`ab${emoji}cd`, 4))).toBe(`ab${emoji}`);
+    const wrapped = wrapAnsi(`${emoji}${emoji}${emoji}`, 3).map(stripAnsi);
+    expect(wrapped.join('')).toBe(`${emoji}${emoji}${emoji}`);
+    for (const row of wrapped) {
+      expect(row).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
     }
   });
 

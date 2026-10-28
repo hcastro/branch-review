@@ -698,7 +698,7 @@ describe('App', () => {
     await waitForTreeTooltip();
 
     const frame = stripAnsi(instance.lastFrame() ?? '');
-    expect(frame).not.toContain(longName);
+    expect(frame).not.toContain(`│ ${longName} │`);
 
     instance.unmount();
   });
@@ -1471,8 +1471,9 @@ describe('App', () => {
         metrics: {path: 'src/example.ts', additions: 2, deletions: 0, changedLines: 2},
         diff: [
           '• src/example.ts:10: function example()',
-          '  10 ⋮  10 │ const first = 1;',
-          '  11 ⋮  11 │ const secondName = call();',
+          // delta puts code directly after the gutter bar, with no padding space.
+          '  10 ⋮  10 │const first = 1;',
+          '  11 ⋮  11 │const secondName = call();',
         ].join('\n'),
       },
     ]);

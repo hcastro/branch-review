@@ -12,11 +12,32 @@ export type BranchMetrics = {
   changedLines: number;
 };
 
+// Structure of one rendered row, produced when sections are wrapped, so the UI
+// never has to recover block identity or wrap boundaries from display text.
+export type SectionRow = {
+  // Ordinal of the block (hunk) this row belongs to within its file, or -1
+  // for rows before the first block header.
+  block: number;
+  // 'header' is the framed `• path:line:` row, 'frame' the blank and border
+  // rows around it, 'body' everything else.
+  kind: 'header' | 'frame' | 'body';
+  // True when this row continues the previous row's source line after wrapping.
+  continuation: boolean;
+  // Cell column where code starts after delta's line-number gutter, when the
+  // row has one.
+  codeColumn?: number;
+  // Header rows: the full display label (`• path:line:`) and its line number.
+  label?: string;
+  lineNumber?: number;
+};
+
 export type DiffSection = {
   path: string;
   signature?: string;
   metrics: FileMetrics;
   lines: string[];
+  // Parallel to `lines` once the section has been wrapped.
+  rows?: SectionRow[];
   startLine: number;
   endLineExclusive: number;
 };
@@ -26,6 +47,8 @@ export const BLOCK_ACTION_LABELS = {
   diff: 'Copy diff',
   prompt: 'Copy block',
 } as const;
+
+import {cellWidth, graphemes, toDisplayText, truncateStart} from './ui/text.js';
 
 const ANSI_CSI_TOKEN = /(\[[0-9;:]*[A-Za-z])/;
 const RESET = '[0m';
@@ -185,12 +208,12 @@ export function truncateAnsi(line: string, maxWidth: number) {
       continue;
     }
 
-    for (const ch of part) {
-      if (visible >= maxWidth) {
+    for (const grapheme of graphemes(part)) {
+      if (visible + grapheme.width > maxWidth) {
         return output + RESET;
       }
-      output += ch;
-      visible += 1;
+      output += grapheme.text;
+      visible += grapheme.width;
     }
   }
 
@@ -203,7 +226,7 @@ export function getContinuationPrefix(line: string): string {
 
   if (gutterIndex >= 0) {
     const separatorPadding = plain[gutterIndex + 1] === ' ' ? ' ' : '';
-    return `${' '.repeat(gutterIndex)}│${separatorPadding}`;
+    return `${' '.repeat(cellWidth(plain.slice(0, gutterIndex)))}│${separatorPadding}`;
   }
 
   const bulletMatch = plain.match(/^(\s*(?:[+\-•])\s+)/);
@@ -241,13 +264,13 @@ function segmentize(line: string): AnsiSegment[] {
       continue;
     }
 
-    for (const ch of part) {
-      const isWs = /\s/.test(ch);
+    for (const grapheme of graphemes(part)) {
+      const isWs = /^\s+$/.test(grapheme.text);
       if (!isWs && prevWasWhitespace && visible > 0) {
         commit();
       }
-      text += ch;
-      visible += 1;
+      text += grapheme.text;
+      visible += grapheme.width;
       prevWasWhitespace = isWs;
     }
   }
@@ -256,9 +279,13 @@ function segmentize(line: string): AnsiSegment[] {
   return segments;
 }
 
+// Splits off the longest head of `segment` that fits in `amount` cells without
+// splitting a grapheme. With `atLeastOne`, a grapheme wider than `amount` is
+// still taken so wrapping always makes progress on an empty row.
 function takeVisible(
   segment: AnsiSegment,
   amount: number,
+  atLeastOne = false,
 ): {head: AnsiSegment; tail: AnsiSegment} {
   if (amount >= segment.visible) {
     return {head: segment, tail: {text: '', visible: 0}};
@@ -268,6 +295,7 @@ function takeVisible(
   let headText = '';
   let tailText = '';
   let taken = 0;
+  let stopped = false;
 
   for (let i = 0; i < parts.length; i += 1) {
     const part = parts[i];
@@ -275,7 +303,7 @@ function takeVisible(
 
     if (i % 2 === 1) {
       if (!part.endsWith('m')) continue;
-      if (taken < amount) {
+      if (!stopped && taken < amount) {
         headText += part;
       } else {
         tailText += part;
@@ -283,19 +311,25 @@ function takeVisible(
       continue;
     }
 
-    for (const ch of part) {
-      if (taken < amount) {
-        headText += ch;
-        taken += 1;
+    for (const grapheme of graphemes(part)) {
+      const fits = taken + grapheme.width <= amount || (atLeastOne && taken === 0);
+      if (!stopped && fits) {
+        headText += grapheme.text;
+        taken += grapheme.width;
       } else {
-        tailText += ch;
+        stopped = true;
+        tailText += grapheme.text;
       }
     }
   }
 
+  if (taken === 0) {
+    return {head: {text: '', visible: 0}, tail: segment};
+  }
+
   return {
-    head: {text: headText, visible: amount},
-    tail: {text: tailText, visible: segment.visible - amount},
+    head: {text: headText, visible: taken},
+    tail: {text: tailText, visible: segment.visible - taken},
   };
 }
 
@@ -312,17 +346,23 @@ function updateActiveStyle(segmentText: string, activeStyle: string): string {
 }
 
 export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''): string[] {
+  return wrapAnsiRows(line, maxWidth, continuationPrefix).rows;
+}
+
+// Wraps one source line and reports the continuation prefix actually used, so
+// callers can tell where content starts on continuation rows.
+function wrapAnsiRows(line: string, maxWidth: number, continuationPrefix = ''): {rows: string[]; prefix: string} {
   if (maxWidth <= 0) {
-    return [''];
+    return {rows: [''], prefix: ''};
   }
 
   const cleaned = stripNonSgrCsi(line);
   if (visibleWidth(cleaned) <= maxWidth) {
-    return [cleaned];
+    return {rows: [cleaned], prefix: ''};
   }
 
-  const safePrefix = continuationPrefix && continuationPrefix.length < maxWidth ? continuationPrefix : '';
-  const prefixWidth = safePrefix.length;
+  const safePrefix = continuationPrefix && cellWidth(continuationPrefix) < maxWidth ? continuationPrefix : '';
+  const prefixWidth = cellWidth(safePrefix);
   const segments = segmentize(cleaned);
 
   const result: string[] = [];
@@ -362,12 +402,12 @@ export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''
     let remaining = segment;
     while (remaining.visible > 0) {
       const available = maxWidth - lineVisible;
-      if (available <= 0) {
+      const {head, tail} = takeVisible(remaining, Math.max(0, available), lineVisible <= prefixWidth);
+      if (head.visible === 0) {
         flushLine();
         continue;
       }
 
-      const {head, tail} = takeVisible(remaining, available);
       lineText += head.text;
       lineVisible += head.visible;
       activeStyle = updateActiveStyle(head.text, activeStyle);
@@ -384,14 +424,14 @@ export function wrapAnsi(line: string, maxWidth: number, continuationPrefix = ''
   }
 
   if (result.length === 0) {
-    return [''];
+    return {rows: [''], prefix: safePrefix};
   }
 
-  return result;
+  return {rows: result, prefix: safePrefix};
 }
 
 export function visibleWidth(line: string): number {
-  return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').length;
+  return cellWidth(line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, ''));
 }
 
 export function padToWidth(line: string, width: number): string {
@@ -423,60 +463,100 @@ export function frameBottomBorder(paneWidth: number, borderAnsi: string): string
 export function wrapSections(sections: DiffSection[], maxWidth: number): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {
-    const wrappedLines = section.lines.flatMap((line) => wrapSectionLine(line, maxWidth));
+    const lines: string[] = [];
+    const rows: SectionRow[] = [];
+    let block = -1;
+
+    for (const line of section.lines) {
+      const header = parseBlockHeader(line, section.path);
+      if (header) {
+        block += 1;
+        const framed = frameBlockHeader(header.label, maxWidth);
+        lines.push(...framed.lines);
+        rows.push(...framed.kinds.map((kind): SectionRow => kind === 'header'
+          ? {block, kind, continuation: false, label: header.label, lineNumber: header.lineNumber}
+          : {block, kind, continuation: false}));
+        continue;
+      }
+
+      const plain = stripAnsi(line);
+      const gutterIndex = plain.indexOf('│');
+      const wrapped = wrapAnsiRows(line, maxWidth, getContinuationPrefix(line));
+      for (const [index, row] of wrapped.rows.entries()) {
+        lines.push(row);
+        rows.push({
+          block,
+          kind: 'body',
+          continuation: index > 0,
+          ...(index === 0 && gutterIndex > 0
+            ? {codeColumn: cellWidth(plain.slice(0, gutterIndex + 1))}
+            : index > 0 && wrapped.prefix.includes('│')
+              ? {codeColumn: cellWidth(wrapped.prefix)}
+              : {}),
+        });
+      }
+    }
+
     const startLine = cursor;
-    const endLineExclusive = cursor + wrappedLines.length;
+    const endLineExclusive = cursor + lines.length;
     cursor = endLineExclusive;
 
     return {
       path: section.path,
       signature: section.signature,
       metrics: section.metrics,
-      lines: wrappedLines,
+      lines,
+      rows,
       startLine,
       endLineExclusive,
     };
   });
 }
 
-function wrapSectionLine(line: string, maxWidth: number) {
-  if (isBlockHeader(line)) {
-    return frameWrappedLines(
-      wrapAnsi(compactBlockHeader(line), Math.max(maxWidth - 4, 1), getContinuationPrefix(line)),
-      maxWidth,
-    );
+// Delta renders each hunk header as `• <path>:<line>: <context>`. The label
+// keeps `• <path>:<line>:`; when the file's own path prefixes the line it is
+// used verbatim, so a path that itself contains `:<digits>:` stays whole.
+function parseBlockHeader(line: string, path: string): {label: string; lineNumber: number} | null {
+  const plain = stripAnsi(line);
+  if (!/^• .+:\d+:/s.test(plain)) return null;
+
+  const ownPrefix = `• ${path}:`;
+  const ownLine = plain.startsWith(ownPrefix) ? plain.slice(ownPrefix.length).match(/^(\d+):/) : null;
+  const label = ownLine
+    ? `${ownPrefix}${ownLine[1]}:`
+    : plain.replace(/^(•\s+.+?:\d+:).*$/s, '$1');
+  const lineNumber = Number(label.match(/:(\d+):$/)?.[1]);
+  return {label: toDisplayText(label), lineNumber};
+}
+
+// Fits a block header label on one row by dropping the start of the path,
+// the way the file header does, so a header never wraps.
+export function fitBlockHeaderLabel(label: string, maxWidth: number) {
+  if (cellWidth(label) <= maxWidth) return label;
+  const marker = label.slice(0, 2);
+  return `${marker}${truncateStart(label.slice(2), Math.max(0, maxWidth - 2))}`;
+}
+
+function frameBlockHeader(label: string, maxWidth: number): {lines: string[]; kinds: SectionRow['kind'][]} {
+  if (maxWidth < 4) {
+    return {lines: [truncateAnsi(label, Math.max(maxWidth, 0))], kinds: ['header']};
   }
 
-  return wrapAnsi(line, maxWidth, getContinuationPrefix(line));
-}
-
-function isBlockHeader(line: string) {
-  const plain = stripAnsi(line);
-  return /^• .+:\d+:/.test(plain);
-}
-
-function compactBlockHeader(line: string) {
-  return stripAnsi(line).replace(/^(•\s+.+?:\d+:).*$/, '$1');
+  const innerWidth = maxWidth - 4;
+  return {
+    lines: [
+      '',
+      frameTopBorder(maxWidth, SECTION_BORDER),
+      frameLine(fitBlockHeaderLabel(label, innerWidth), innerWidth, SECTION_BORDER),
+      frameBottomBorder(maxWidth, SECTION_BORDER),
+      '',
+    ],
+    kinds: ['frame', 'frame', 'header', 'frame', 'frame'],
+  };
 }
 
 function stripAnsi(line: string) {
   return line.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '');
-}
-
-function frameWrappedLines(lines: string[], maxWidth: number) {
-  if (maxWidth < 4) {
-    return lines;
-  }
-
-  const innerWidth = maxWidth - 4;
-
-  return [
-    '',
-    frameTopBorder(maxWidth, SECTION_BORDER),
-    ...lines.map((line) => frameLine(line, innerWidth, SECTION_BORDER)),
-    frameBottomBorder(maxWidth, SECTION_BORDER),
-    '',
-  ];
 }
 
 function yellow(text: string) {
@@ -525,7 +605,10 @@ export function flattenSectionLines(sections: DiffSection[]) {
   return sections.flatMap((section) => section.lines);
 }
 
-export function getSectionIndexForLine(sections: DiffSection[], lineOffset: number) {
+export function getSectionIndexForLine(
+  sections: ReadonlyArray<Pick<DiffSection, 'startLine' | 'endLineExclusive'>>,
+  lineOffset: number,
+) {
   if (sections.length === 0) {
     return -1;
   }
