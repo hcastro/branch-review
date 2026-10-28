@@ -1,6 +1,8 @@
+import fs from 'node:fs';
 import {Worker} from 'node:worker_threads';
-import {getCurrentBranchName, getReviewFingerprint, resolveRefs} from './git.js';
-import {buildReviewModel} from './review/build.js';
+import {getCurrentBranchName, getReviewFingerprint, resolveRefs, type DiffRange} from './git.js';
+import * as build from './review/build.js';
+import type {ReviewModel} from './review/model.js';
 
 type RefreshRequest = {
   id: number;
@@ -11,9 +13,38 @@ type RefreshRequest = {
   previousFingerprint?: string | null;
 };
 
-// `onFileBuilt` is called once after each file is built; it lets the parent
-// tell a large refresh that keeps moving from a stuck one.
-type BuildOptions = Parameters<typeof buildReviewModel>[0] & {onFileBuilt?: () => void};
+type RefreshOptions = Omit<RefreshRequest, 'id' | 'previousFingerprint'> & {
+  previousFingerprint: string | null;
+  onProgress?: () => void;
+  signal?: AbortSignal;
+};
+
+type RefreshResult = {range: DiffRange; fingerprint: string; branchName: string | null; review?: ReviewModel};
+
+type RefreshReview = (options: RefreshOptions) => Promise<RefreshResult>;
+
+// `onFileBuilt` is called once after each file is built.
+type BuildOptions = Parameters<typeof build.buildReviewModel>[0] & {onFileBuilt?: () => void};
+
+// The synchronous refresh, used only when build.ts has no `refreshReview`.
+// It reports progress between steps and after each built file, so a phase
+// that loops over every file, or one long git or delta run, reports nothing.
+function refreshReviewSync({cwd, requestedBranch, requestedBase, width, previousFingerprint, onProgress}: RefreshOptions) {
+  const range = resolveRefs(cwd, requestedBranch, requestedBase);
+  onProgress?.();
+  const fingerprint = getReviewFingerprint(cwd, range);
+  onProgress?.();
+  const branchName = getCurrentBranchName(cwd);
+  if (fingerprint === previousFingerprint) return Promise.resolve({range, fingerprint, branchName});
+
+  const buildOptions: BuildOptions = {cwd, range, width, onFileBuilt: onProgress};
+  return Promise.resolve({range, fingerprint, branchName, review: build.buildReviewModel(buildOptions)});
+}
+
+// build.ts's asynchronous refresh runs git and delta without blocking this
+// process and reports progress per file and per chunk of tool output.
+const refreshReview: RefreshReview = (build as unknown as {refreshReview?: RefreshReview}).refreshReview
+  ?? refreshReviewSync;
 
 function errorStderr(error: unknown) {
   const stderr = (error as {stderr?: unknown} | null)?.stderr;
@@ -27,14 +58,24 @@ if (!send) {
   throw new Error('refreshWorker must run as a forked child process');
 }
 
-// The refresh is synchronous, so while it waits on git this thread cannot
-// see the IPC channel close. A small thread checks whether the parent is
-// still there and, once it is gone, kills this process's group (this process
-// and the git or delta it is waiting on).
+const groupKill = process.platform !== 'win32';
+// The parent gives each refresh process its own temp dir; the private index
+// copy goes there.
+const tempDir = process.env.BRANCH_REVIEW_TMPDIR;
+
+// While this thread is busy (a synchronous step), it cannot see the IPC
+// channel close. A small thread checks whether the parent is still there
+// and, once it is gone, removes this refresh's temp dir and kills this
+// process's group (this process and the git or delta it is waiting on). A
+// parent killed outright runs no cleanup, so nobody else would remove it.
 const PARENT_CHECK_SOURCE = `
+const fs = require('node:fs');
 const {workerData} = require('node:worker_threads');
 setInterval(() => {
   if (process.ppid === workerData.parentPid) return;
+  if (workerData.tempDir) {
+    try { fs.rmSync(workerData.tempDir, {recursive: true, force: true}); } catch {}
+  }
   try { process.kill(workerData.group ? -workerData.pid : workerData.pid, 'SIGKILL'); } catch {}
 }, workerData.intervalMs);
 `;
@@ -43,43 +84,92 @@ const parentCheck = new Worker(PARENT_CHECK_SOURCE, {
   workerData: {
     parentPid: process.ppid,
     pid: process.pid,
-    group: process.platform !== 'win32',
+    group: groupKill,
+    tempDir,
     intervalMs: 250,
   },
 });
 parentCheck.unref();
 
-// When the event loop is free, a closed channel ends the process at once.
-process.once('disconnect', () => process.exit(0));
+const parentGone = new AbortController();
+let answered = false;
 
-// Sent as a step finishes. The IPC write goes out at once, even while the
-// rest of the refresh keeps this thread busy.
-function reportProgress(id: number) {
+// A closed channel before the answer means the parent is gone: stop the git
+// or delta the refresh started, remove the temp dir and end the group. After
+// the answer it is this process's own disconnect, and it simply exits.
+process.once('disconnect', () => {
+  if (answered) process.exit(0);
+  parentGone.abort();
+  if (tempDir) {
+    try {
+      fs.rmSync(tempDir, {recursive: true, force: true});
+    } catch {
+      // The parent-check thread tries again.
+    }
+  }
+  try {
+    process.kill(groupKill ? -process.pid : process.pid, 'SIGKILL');
+  } catch {
+    process.exit(0);
+  }
+});
+
+// The parent only needs to know the refresh is still moving, so progress
+// goes out at most this often however fast tool output arrives. A report
+// that comes too soon is sent at the end of the interval instead, so the
+// parent never sees a gap longer than the real one.
+const PROGRESS_INTERVAL_MS = 200;
+let lastProgressAt = 0;
+let trailingProgress: NodeJS.Timeout | undefined;
+
+function sendProgress(id: number) {
+  lastProgressAt = Date.now();
+  // The IPC write goes out at once, even while the rest of the refresh keeps
+  // this thread busy.
   send!({id, progress: true});
+}
+
+function reportProgress(id: number) {
+  const wait = lastProgressAt + PROGRESS_INTERVAL_MS - Date.now();
+  // Checked before the pending timer: a synchronous step keeps the timer
+  // from firing, and its later reports must still go out.
+  if (wait <= 0) {
+    clearTimeout(trailingProgress);
+    trailingProgress = undefined;
+    sendProgress(id);
+    return;
+  }
+  if (trailingProgress) return;
+  trailingProgress = setTimeout(() => {
+    trailingProgress = undefined;
+    if (!answered) sendProgress(id);
+  }, wait);
+  trailingProgress.unref();
 }
 
 // One request per process: answer, then drop the IPC channel so the process
 // exits on its own.
-process.once('message', (request: RefreshRequest) => {
+process.once('message', async (request: RefreshRequest) => {
   let message: object;
   try {
     reportProgress(request.id);
-    const range = resolveRefs(request.cwd, request.requestedBranch, request.requestedBase);
-    reportProgress(request.id);
-    const fingerprint = getReviewFingerprint(request.cwd, range);
-    reportProgress(request.id);
-    const branchName = getCurrentBranchName(request.cwd);
-    if (fingerprint === request.previousFingerprint) {
-      message = {id: request.id, ok: true, range, fingerprint, branchName};
-    } else {
-      const buildOptions: BuildOptions = {
-        cwd: request.cwd,
-        range,
-        width: request.width,
-        onFileBuilt: () => reportProgress(request.id),
-      };
-      message = {id: request.id, ok: true, range, fingerprint, branchName, review: buildReviewModel(buildOptions)};
-    }
+    const result = await refreshReview({
+      cwd: request.cwd,
+      requestedBranch: request.requestedBranch,
+      requestedBase: request.requestedBase,
+      width: request.width,
+      previousFingerprint: request.previousFingerprint ?? null,
+      onProgress: () => reportProgress(request.id),
+      signal: parentGone.signal,
+    });
+    message = {
+      id: request.id,
+      ok: true,
+      range: result.range,
+      fingerprint: result.fingerprint,
+      branchName: result.branchName,
+      ...(result.review === undefined ? {} : {review: result.review}),
+    };
   } catch (error) {
     message = {
       id: request.id,
@@ -89,5 +179,6 @@ process.once('message', (request: RefreshRequest) => {
     };
   }
 
+  answered = true;
   send(message, undefined, {}, () => process.disconnect());
 });

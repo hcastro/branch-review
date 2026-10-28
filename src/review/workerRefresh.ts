@@ -78,18 +78,18 @@ function removeTempDir(dir: string) {
 }
 
 // The child runs in its own process group so killing the group also stops
-// the git and delta processes it is blocked on.
+// the git and delta processes it is blocked on. The group is killed even
+// after the child itself has exited: a child that died on its own leaves
+// its git running in that group.
 function killChild(child: ChildProcess) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-
   try {
     if (killsProcessGroup && child.pid) {
       process.kill(-child.pid, 'SIGKILL');
-    } else {
+    } else if (child.exitCode === null && child.signalCode === null) {
       child.kill('SIGKILL');
     }
   } catch {
-    // Already gone.
+    // ESRCH: nothing is left in the group.
   }
 }
 
@@ -163,6 +163,8 @@ export function refreshReviewInWorker({
     installExitHook();
     child.once('exit', () => {
       activeChildren.delete(child);
+      // Whatever the child left running would keep writing to the temp dir.
+      killChild(child);
       removeTempDir(tempDir);
     });
 
@@ -182,24 +184,27 @@ export function refreshReviewInWorker({
       killChild(child);
       settle();
     };
-    const restartIdleTimer = () => {
+    const restartIdleTimer = (limitMs: number) => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         finish(() => reject(refreshError(
-          `refresh timed out: no progress for ${Math.round(timeoutMs / 1000)}s`,
+          `refresh timed out: no progress for ${Math.round(limitMs / 1000)}s`,
         )));
-      }, timeoutMs);
+      }, limitMs);
     };
 
     const handleAbort = () => finish(() => reject(refreshError('refresh aborted')));
-    restartIdleTimer();
+    // Starting node and loading the worker reports nothing, and on a loaded
+    // machine can take longer than a short limit; until the first message the
+    // default limit applies.
+    restartIdleTimer(Math.max(timeoutMs, REFRESH_TIMEOUT_MS));
     signal?.addEventListener('abort', handleAbort, {once: true});
 
     child.on('message', (message: WorkerRefreshMessage) => {
       if (message.id !== id || settled) return;
 
       if ('progress' in message) {
-        restartIdleTimer();
+        restartIdleTimer(timeoutMs);
         return;
       }
 

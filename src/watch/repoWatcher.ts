@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {execFile, execFileSync, spawn} from 'node:child_process';
+import {execFile, execFileSync, spawn, type ChildProcess} from 'node:child_process';
 import {watch as chokidarWatch, type FSWatcher as ChokidarWatcher} from 'chokidar';
 import {debounce} from './debounce.js';
 
@@ -73,7 +73,9 @@ function tryRunGit(repoRoot: string, args: string[]) {
 function gitFailure(action: string, error: unknown) {
   const stderr = (error as {stderr?: unknown}).stderr;
   const text = typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
-  const reason = text.split('\n').map((line) => line.trim()).find(Boolean)
+  const lines = text.split('\n').map((line) => line.trim());
+  const reason = lines.find((line) => /^(fatal|error):/.test(line))
+    ?? lines.find(Boolean)
     ?? (error instanceof Error ? error.message.split('\n')[0] : String(error));
   return new Error(`${action}: ${reason}`);
 }
@@ -99,23 +101,32 @@ export function listIgnoredPaths(repoRoot: string) {
   }));
 }
 
-function listIgnoredPathsAsync(repoRoot: string) {
+// Adds a running git to `children` until it exits, so its owner can kill it.
+function track(child: ChildProcess, children: Set<ChildProcess> | undefined) {
+  if (!children) return;
+  children.add(child);
+  child.once('close', () => children.delete(child));
+}
+
+function listIgnoredPathsAsync(repoRoot: string, children?: Set<ChildProcess>) {
   return new Promise<string[]>((resolve, reject) => {
-    execFile('git', [...GIT_ARGS, ...IGNORED_LIST_ARGS], {
+    const child = execFile('git', [...GIT_ARGS, ...IGNORED_LIST_ARGS], {
       cwd: repoRoot,
       encoding: 'utf8',
       env: gitEnv(),
       maxBuffer: GIT_MAX_BUFFER,
-    }, (error, stdout) => {
-      if (error) reject(error);
+    }, (error, stdout, stderr) => {
+      // execFile's error does not carry stderr, where git's reason is.
+      if (error) reject(Object.assign(error, {stderr}));
       else resolve(parseNulList(stdout));
     });
+    track(child, children);
   });
 }
 
 type CheckIgnoreRun = {code: number | null; records: string[]; stderr: string};
 
-function runCheckIgnore(repoRoot: string, queries: string[]) {
+function runCheckIgnore(repoRoot: string, queries: string[], children?: Set<ChildProcess>) {
   return new Promise<CheckIgnoreRun>((resolve, reject) => {
     // -v -n prints one record per answered path, matched or not, so a run
     // that git stops part way through still says which paths it answered.
@@ -124,6 +135,7 @@ function runCheckIgnore(repoRoot: string, queries: string[]) {
       env: gitEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    track(child, children);
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8');
@@ -146,15 +158,15 @@ function runCheckIgnore(repoRoot: string, queries: string[]) {
  * to git as `./<path>` so a name such as `:!x.ts` is not read as pathspec
  * magic. git refuses some paths outright (inside a submodule, beyond a
  * symlink) and stops there; such a path counts as not ignored and the rest
- * are asked again.
+ * are asked again. Each git it runs is in `children` while it runs.
  */
-export async function checkIgnored(repoRoot: string, relativePaths: string[]) {
+export async function checkIgnored(repoRoot: string, relativePaths: string[], children?: Set<ChildProcess>) {
   const ignored = new Set<string>();
   let remaining = relativePaths;
 
   while (remaining.length > 0) {
     const queries = remaining.map((entry) => `./${entry}`);
-    const {code, records, stderr} = await runCheckIgnore(repoRoot, queries);
+    const {code, records, stderr} = await runCheckIgnore(repoRoot, queries, children);
     // Each answer is <source> NUL <line> NUL <pattern> NUL <path> NUL; an
     // empty source means no pattern matched, and a `!` pattern re-includes.
     const answered = Math.min(Math.floor(records.length / 4), remaining.length);
@@ -235,6 +247,7 @@ function createNestedRepoMatcher(repoRoot: string) {
   };
 
   return {
+    isRepoDir,
     /** True for a nested repo's directory and everything below it. */
     isInside(relative: string) {
       const segments = relative.split('/');
@@ -245,17 +258,62 @@ function createNestedRepoMatcher(repoRoot: string) {
       }
       return false;
     },
+    /** Drops the cached answer for one directory and returns it. */
     forget(relativeDir: string) {
+      const previous = cache.get(relativeDir);
       cache.delete(relativeDir);
+      return previous;
     },
   };
 }
 
+// The Git dir of a checked-out submodule: its `.git` directory, or the one a
+// `.git` file (`gitdir: <path>`) points to.
+function submoduleGitDir(submoduleDir: string) {
+  const dotGit = path.join(submoduleDir, '.git');
+  try {
+    if (fs.lstatSync(dotGit).isDirectory()) return dotGit;
+    const pointer = /^gitdir: (.+)$/m.exec(fs.readFileSync(dotGit, 'utf8'))?.[1]?.trim();
+    return pointer ? path.resolve(submoduleDir, pointer) : null;
+  } catch {
+    return null;
+  }
+}
+
+// HEAD and logs/HEAD of each submodule's own Git dir: a commit or checkout
+// inside a submodule moves the gitlink the review shows without touching
+// anything else the watcher sees.
+function submoduleStatePaths(repoRoot: string) {
+  let staged: string;
+  try {
+    staged = execFileSync('git', [...GIT_ARGS, 'ls-files', '-z', '--stage'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: gitEnv(),
+      maxBuffer: GIT_MAX_BUFFER,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    return [];
+  }
+
+  const paths: string[] = [];
+  for (const record of parseNulList(staged)) {
+    // <mode> SP <object> SP <stage> TAB <path>; 160000 is a gitlink.
+    if (!record.startsWith('160000 ')) continue;
+    const tab = record.indexOf('\t');
+    const gitDir = tab >= 0 ? submoduleGitDir(path.join(repoRoot, record.slice(tab + 1))) : null;
+    if (gitDir) paths.push(path.join(gitDir, 'HEAD'), path.join(gitDir, 'logs', 'HEAD'));
+  }
+  return paths;
+}
+
 /**
  * Files and directories under the Git dir whose changes can move the reviewed
- * range or what git ignores. Directories (`refs`, `logs/refs`, `reftable`)
- * cover everything below them. Paths that do not exist yet are included, so
- * the watcher picks them up when git creates them.
+ * range or what git ignores, plus each submodule's HEAD and logs/HEAD.
+ * Directories (`refs`, `logs/refs`, `reftable`) cover everything below them.
+ * Paths that do not exist yet are included, so the watcher picks them up when
+ * git creates them.
  */
 export function getGitStateWatchPaths(repoRoot: string) {
   const gitDirRaw = tryRunGit(repoRoot, ['rev-parse', '--git-dir']);
@@ -274,6 +332,7 @@ export function getGitStateWatchPaths(repoRoot: string) {
     path.join(commonGitDir, 'logs', 'refs'),
     path.join(commonGitDir, 'reftable'),
     path.join(commonGitDir, 'info', 'exclude'),
+    ...submoduleStatePaths(repoRoot),
   ])].sort();
 }
 
@@ -287,6 +346,11 @@ type TreeWatcher = {
   add: (directories: string[]) => void;
   /** Stops watching these paths and everything below them. */
   remove: (paths: string[]) => void;
+  /**
+   * Decides again how to watch a directory and what is below it, after it
+   * became or stopped being a nested repo. Resolves once that is in place.
+   */
+  rewatch: (directory: string) => Promise<void>;
   close: () => Promise<void>;
 };
 
@@ -294,6 +358,17 @@ type TreeWatcherOptions = {
   root: string;
   /** Whether to watch a directory and walk into it. Never sees symlinks. */
   shouldWatchDir: (directory: string) => boolean;
+  /**
+   * A directory watched for its own entries but never walked into: a nested
+   * repo's directory, so its `.git` coming or going is seen. `fresh` asks
+   * the disk again rather than a cached answer.
+   */
+  isBoundary: (directory: string, fresh?: boolean) => boolean;
+  /**
+   * Of directories that appeared after the watcher started, the ones git does
+   * not ignore. The startup ignore listing knows nothing about them.
+   */
+  visibleNewDirs: (directories: string[]) => Promise<string[]>;
   /** A path that changed; null when the platform did not say which. */
   onEvent: (filePath: string | null) => void;
   onError: (error: Error) => void;
@@ -317,6 +392,7 @@ function watchTreeRecursive({root, onEvent, onError, onReady}: TreeWatcherOption
   return {
     add: () => undefined,
     remove: () => undefined,
+    rewatch: async () => undefined,
     async close() {
       clearTimeout(readyTimer);
       watcher?.close();
@@ -324,7 +400,15 @@ function watchTreeRecursive({root, onEvent, onError, onReady}: TreeWatcherOption
   };
 }
 
-function watchTreeByDirectory({root, shouldWatchDir, onEvent, onError, onReady}: TreeWatcherOptions): TreeWatcher {
+function watchTreeByDirectory({
+  root,
+  shouldWatchDir,
+  isBoundary,
+  visibleNewDirs,
+  onEvent,
+  onError,
+  onReady,
+}: TreeWatcherOptions): TreeWatcher {
   // Directory path -> its watcher and inode, so a directory deleted and made
   // again under the same name is seen as new.
   const watched = new Map<string, {watcher: fs.FSWatcher; ino: number}>();
@@ -337,6 +421,8 @@ function watchTreeByDirectory({root, shouldWatchDir, onEvent, onError, onReady}:
       watched.delete(directory);
     }
   };
+
+  const wanted = (directory: string) => shouldWatchDir(directory) || isBoundary(directory);
 
   const handleEvent = (directory: string, filename: string | Buffer | null) => {
     if (closed) return;
@@ -358,8 +444,8 @@ function watchTreeByDirectory({root, shouldWatchDir, onEvent, onError, onReady}:
       if (existing) unwatchTree(filePath);
     } else if (!existing || existing.ino !== stat.ino) {
       if (existing) unwatchTree(filePath);
-      if (shouldWatchDir(filePath)) {
-        void walk(filePath).then(() => onEvent(filePath));
+      if (wanted(filePath)) {
+        void walk(filePath, true).then(() => onEvent(filePath));
         return;
       }
     }
@@ -384,50 +470,67 @@ function watchTreeByDirectory({root, shouldWatchDir, onEvent, onError, onReady}:
     }
   };
 
-  // The watch on a directory is set before its entries are read, so an entry
-  // created during the walk is either listed or reported by the watch.
-  const walk = async (start: string) => {
-    const pending = [start];
-    while (pending.length > 0 && !closed) {
-      const directory = pending.pop()!;
-      let ino: number;
-      try {
-        const stat = fs.lstatSync(directory);
-        if (!stat.isDirectory()) continue;
-        ino = stat.ino;
-      } catch {
-        continue;
-      }
-      if (!watchDirectory(directory, ino)) continue;
+  // Walks one level at a time. The watch on a directory is set before its
+  // entries are read, so an entry created during the walk is either listed or
+  // reported by the watch. A tree that is new since startup is unknown to the
+  // ignore listing, so each level is shown to git before it is watched: a new
+  // ignored tree (a build output, a dependency install) opens no handles.
+  const walk = async (start: string, isNew: boolean) => {
+    let level = isNew ? await visibleNewDirs([start]) : [start];
+    while (level.length > 0 && !closed) {
+      const next: string[] = [];
+      for (const directory of level) {
+        if (closed) return;
+        // Ignore rules and nested repos may have changed since it was queued.
+        if (!wanted(directory)) continue;
+        let ino: number;
+        try {
+          const stat = fs.lstatSync(directory);
+          if (!stat.isDirectory()) continue;
+          ino = stat.ino;
+        } catch {
+          continue;
+        }
+        if (!watchDirectory(directory, ino)) continue;
+        // Asked again once the watch is set: a `.git` made or removed before
+        // that is reported by no event.
+        if (isBoundary(directory, true)) continue;
 
-      let entries: fs.Dirent[];
-      try {
-        entries = await fs.promises.readdir(directory, {withFileTypes: true});
-      } catch {
-        continue;
+        let entries: fs.Dirent[];
+        try {
+          entries = await fs.promises.readdir(directory, {withFileTypes: true});
+        } catch {
+          continue;
+        }
+        for (const entry of entries) {
+          // Dirent types come from lstat, so a symlink to a directory is never
+          // walked.
+          if (!entry.isDirectory()) continue;
+          const child = path.join(directory, entry.name);
+          if (wanted(child)) next.push(child);
+        }
       }
-      for (const entry of entries) {
-        // Dirent types come from lstat, so a symlink to a directory is never
-        // walked.
-        if (!entry.isDirectory()) continue;
-        const child = path.join(directory, entry.name);
-        if (shouldWatchDir(child)) pending.push(child);
-      }
+      level = isNew && next.length > 0 ? await visibleNewDirs(next) : next;
     }
   };
 
-  void walk(root).then(() => {
+  void walk(root, false).then(() => {
     if (!closed) onReady();
   });
 
   return {
     add(directories) {
       for (const directory of directories) {
-        if (!watched.has(directory) && shouldWatchDir(directory)) void walk(directory);
+        if (!watched.has(directory) && wanted(directory)) void walk(directory, false);
       }
     },
     remove(paths) {
       for (const target of paths) unwatchTree(target);
+    },
+    async rewatch(directory) {
+      unwatchTree(directory);
+      // What was inside a nested repo was never in the ignore listing.
+      await walk(directory, true);
     },
     async close() {
       closed = true;
@@ -469,16 +572,22 @@ function watchTreeByPolling({root, ignored, atomic, onEvent, onError, onReady}: 
   return {
     add: (directories) => void watcher.add(directories),
     remove: (paths) => void watcher.unwatch(paths),
+    async rewatch(directory) {
+      // chokidar decided what to skip below the directory when it first read
+      // it, so drop and re-add it to have it decide again.
+      watcher.unwatch(directory);
+      watcher.add(directory);
+    },
     close: () => watcher.close(),
   };
 }
 
-type PathState = {mtimeMs: number; ctimeMs: number; size: number} | 'missing';
+type PathState = {mtimeMs: number; ctimeMs: number; size: number; ino: number} | 'missing';
 
 function readPathState(filePath: string): PathState {
   try {
     const stat = fs.lstatSync(filePath);
-    return {mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size};
+    return {mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, size: stat.size, ino: stat.ino};
   } catch {
     return 'missing';
   }
@@ -487,25 +596,39 @@ function readPathState(filePath: string): PathState {
 function samePathState(left: PathState | undefined, right: PathState) {
   if (left === undefined) return false;
   if (left === 'missing' || right === 'missing') return left === right;
-  return left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs && left.size === right.size;
+  return left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+    && left.size === right.size
+    && left.ino === right.ino;
+}
+
+// A ctime in whole seconds may come from a file system that stores no finer
+// time (HFS+, ext3, many network mounts). There a second write of the same
+// size in the same second leaves lstat unchanged, so an unchanged state proves
+// nothing until that second is well past.
+function mayHideAWrite(state: Exclude<PathState, 'missing'>, nowMs: number) {
+  return state.ctimeMs % 1000 === 0 && nowMs - state.ctimeMs < TIMESTAMP_SLACK_MS;
 }
 
 /**
- * Drops events for a path whose own mtime, ctime and size (lstat, so a
+ * Drops events for a path whose own mtime, ctime, size and inode (lstat, so a
  * symlink is judged by the link, never its target) have not moved since its
  * last event. Reads, which only touch atime, then never refresh; any write,
- * rename or re-pointed link moves ctime. A path first reported with a ctime
- * from before the watcher started has not changed since: the event came from
- * a read, or from a symlink's target, and only records the baseline.
+ * rename or re-pointed link moves ctime. On a file system with whole-second
+ * times an unchanged state counts as a change while its ctime is recent. A
+ * path first reported with a ctime from before the watcher started has not
+ * changed since: the event came from a read, or from a symlink's target, and
+ * only records the baseline.
  */
-export function createEventDeduper(startedAtMs: number) {
+export function createEventDeduper(startedAtMs: number, now: () => number = Date.now) {
   const states = new Map<string, PathState>();
   return (filePath: string) => {
     const next = readPathState(filePath);
     const previous = states.get(filePath);
     states.set(filePath, next);
     if (previous === undefined) return next === 'missing' || next.ctimeMs >= startedAtMs;
-    return !samePathState(previous, next);
+    if (!samePathState(previous, next)) return true;
+    return next !== 'missing' && mayHideAWrite(next, now());
   };
 }
 
@@ -524,6 +647,8 @@ export function createRepoWatcher({
   const notify = debounce(onChange, debounceMs, {maxWaitMs: MAX_NOTIFY_WAIT_MS});
   const reportError = (error: unknown) => onError?.(error instanceof Error ? error : new Error(String(error)));
   const trees: TreeWatcher[] = [];
+  // The ignore listings and checks running now; close() stops them.
+  const gitChildren = new Set<ChildProcess>();
   let closed = false;
   let pendingReady = 0;
   const handleReady = () => {
@@ -534,10 +659,14 @@ export function createRepoWatcher({
   };
 
   const createTree = (
-    options: Omit<TreeWatcherOptions, 'onReady' | 'onError'> & {ignored: (filePath: string) => boolean; atomic: boolean},
+    options: Omit<TreeWatcherOptions, 'onReady' | 'onError' | 'isBoundary' | 'visibleNewDirs'>
+      & Partial<Pick<TreeWatcherOptions, 'isBoundary' | 'visibleNewDirs'>>
+      & {ignored: (filePath: string) => boolean; atomic: boolean},
   ) => {
     pendingReady += 1;
     const full: PollingOptions = {
+      isBoundary: () => false,
+      visibleNewDirs: async (directories) => directories,
       ...options,
       onEvent: (filePath) => {
         if (!closed) options.onEvent(filePath);
@@ -579,13 +708,40 @@ export function createRepoWatcher({
     return relative !== null && nestedRepos.isInside(relative);
   };
 
+  // Whether a directory itself is in review or is the top of a nested repo
+  // that is: not ignored, and not inside another nested repo.
+  const isReviewedOrNestedTop = (relativeDir: string) => {
+    if (matcher.isIgnored(path.join(repoRoot, relativeDir))) return false;
+    const parent = path.posix.dirname(relativeDir);
+    return parent === '.' || !nestedRepos.isInside(parent);
+  };
+
+  // The top directory of a nested repo, watched only for its `.git` entry.
+  const isNestedRepoTop = (filePath: string, fresh = false) => {
+    const relative = toRelative(repoRoot, filePath);
+    if (relative === null) return false;
+    if (fresh) nestedRepos.forget(relative);
+    return isReviewedOrNestedTop(relative) && nestedRepos.isRepoDir(relative);
+  };
+
+  // The `.git` entry of a directory in review, which makes it a nested repo.
+  const isNestedGitEntry = (filePath: string) => {
+    const relative = toRelative(repoRoot, filePath);
+    if (relative === null || path.posix.basename(relative) !== '.git') return false;
+    const directory = path.posix.dirname(relative);
+    return directory !== '.' && isReviewedOrNestedTop(directory);
+  };
+
   let handleWorktreeEvent: (filePath: string | null) => void = () => undefined;
+  let visibleNewDirs: (directories: string[]) => Promise<string[]> = async (directories) => directories;
   const worktree = createTree({
     root: repoRoot,
-    ignored: isOutsideReview,
+    ignored: (filePath) => isOutsideReview(filePath) && !isNestedRepoTop(filePath) && !isNestedGitEntry(filePath),
     // Editor backup and swap names are left to git's ignore rules.
     atomic: false,
     shouldWatchDir: (directory) => !isOutsideReview(directory),
+    isBoundary: isNestedRepoTop,
+    visibleNewDirs: (directories) => visibleNewDirs(directories),
     onEvent: (filePath) => handleWorktreeEvent(filePath),
   });
 
@@ -602,7 +758,7 @@ export function createRepoWatcher({
 
     rescanRunning = true;
     try {
-      const nextList = await listIgnoredPathsAsync(repoRoot);
+      const nextList = await listIgnoredPathsAsync(repoRoot, gitChildren);
       if (closed) return;
       const next = new Set(nextList.map((entry) => entry.replace(/\/+$/, '')));
       const noLongerIgnored = [...currentIgnored].filter((entry) => !next.has(entry));
@@ -621,7 +777,8 @@ export function createRepoWatcher({
         notify();
       }
     } catch (error) {
-      reportError(gitFailure('could not list ignored files', error));
+      // close() kills a running listing; that is no watcher fault.
+      if (!closed) reportError(gitFailure('could not list ignored files', error));
     } finally {
       rescanRunning = false;
       if (rescanAgain && !closed) {
@@ -631,34 +788,63 @@ export function createRepoWatcher({
     }
   };
 
+  // Asks git which of these new paths it ignores and remembers the answers,
+  // unless the rules were re-listed meanwhile. Without an answer every path
+  // counts as visible, so a real change is never missed.
+  const askGitWhichIgnored = async (relativePaths: string[]) => {
+    const generation = ignoreGeneration;
+    let ignored: Set<string>;
+    try {
+      ignored = await checkIgnored(repoRoot, relativePaths, gitChildren);
+    } catch (error) {
+      if (!closed) reportError(gitFailure('could not check ignored files', error));
+      ignored = new Set();
+    }
+    if (closed || generation !== ignoreGeneration) return ignored;
+
+    if (ignored.size > 0) {
+      matcher.add(ignored);
+      for (const entry of ignored) currentIgnored.add(entry);
+      worktree.remove([...ignored].map((entry) => path.join(repoRoot, entry)));
+    }
+    for (const entry of relativePaths) {
+      if (!ignored.has(entry)) knownVisible.add(entry);
+    }
+    return ignored;
+  };
+
+  visibleNewDirs = async (directories) => {
+    const unknown = directories
+      .map((directory) => toRelative(repoRoot, directory))
+      .filter((relative): relative is string => relative !== null && !knownVisible.has(relative));
+    if (unknown.length === 0 || closed) return directories;
+    const ignored = await askGitWhichIgnored(unknown);
+    return directories.filter((directory) => !ignored.has(toRelative(repoRoot, directory) ?? ''));
+  };
+
   const flushIgnoreChecks = async () => {
     ignoreCheckTimer = null;
     const batch = [...ignoreCheckQueue];
     ignoreCheckQueue = new Set();
     if (batch.length === 0 || closed) return;
 
-    const generation = ignoreGeneration;
-    let ignoredInBatch: Set<string>;
-    try {
-      ignoredInBatch = await checkIgnored(repoRoot, batch);
-    } catch (error) {
-      // Without an answer, refresh rather than risk missing a real change.
-      reportError(gitFailure('could not check ignored files', error));
-      ignoredInBatch = new Set();
-    }
+    const ignoredInBatch = await askGitWhichIgnored(batch);
     if (closed) return;
+    if (batch.some((entry) => !ignoredInBatch.has(entry))) notify();
+  };
 
-    if (generation === ignoreGeneration && ignoredInBatch.size > 0) {
-      matcher.add(ignoredInBatch);
-      for (const entry of ignoredInBatch) currentIgnored.add(entry);
-      worktree.remove([...ignoredInBatch].map((entry) => path.join(repoRoot, entry)));
-    }
-
-    const visible = batch.filter((entry) => !ignoredInBatch.has(entry));
-    if (generation === ignoreGeneration) {
-      for (const entry of visible) knownVisible.add(entry);
-    }
-    if (visible.length > 0) notify();
+  // A `.git` entry appearing or vanishing makes or unmakes a nested repo. Its
+  // files leave or join the review, so refresh, re-list what git ignores
+  // there, and watch the directory the new way.
+  const handleNestedGitChange = (relativeDir: string) => {
+    const before = nestedRepos.forget(relativeDir);
+    if (!isReviewedOrNestedTop(relativeDir)) return;
+    if (nestedRepos.isRepoDir(relativeDir) === before) return;
+    void worktree.rewatch(path.join(repoRoot, relativeDir)).then(() => {
+      if (!closed) notify();
+    });
+    void rescanIgnored();
+    notify();
   };
 
   // Checked after the cheap filters, so busy ignored paths cost no lstat.
@@ -666,10 +852,11 @@ export function createRepoWatcher({
   handleWorktreeEvent = (filePath) => {
     const relative = filePath ? toRelative(repoRoot, filePath) : null;
     if (relative) {
-      // A `.git` entry appearing or vanishing makes or unmakes a nested repo.
+      // Events below a nested `.git` can stand for the entry itself: a stream
+      // may fold a removed directory into events for what was inside it.
       const segments = relative.split('/');
       const gitSegment = segments.indexOf('.git');
-      if (gitSegment > 0) nestedRepos.forget(segments.slice(0, gitSegment).join('/'));
+      if (gitSegment > 0) handleNestedGitChange(segments.slice(0, gitSegment).join('/'));
     }
     if (filePath && (isOutsideReview(filePath) || !worktreeIsNew(filePath))) return;
     if (!relative) {
@@ -723,6 +910,9 @@ export function createRepoWatcher({
       closed = true;
       notify.cancel();
       if (ignoreCheckTimer) clearTimeout(ignoreCheckTimer);
+      // Their answers would be dropped anyway; quitting must not wait for them.
+      for (const child of gitChildren) child.kill('SIGKILL');
+      gitChildren.clear();
       await Promise.all(trees.map((tree) => tree.close()));
     },
   };
