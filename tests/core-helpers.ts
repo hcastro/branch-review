@@ -91,3 +91,46 @@ export function withEnv<T>(overrides: Record<string, string | undefined>, fn: ()
     }
   }
 }
+
+export type GitSpyCall = {optionalLocks: string; terminalPrompt: string; indexFile: string; args: string};
+
+// A PATH directory whose `git` logs the environment each call received, then
+// runs the real git. Prepend it to PATH and read the calls back with `calls()`.
+export function gitSpy() {
+  const dir = makeTempDir('branch-review-gitspy-');
+  const log = path.join(dir, 'calls.log');
+  const realGit = execFileSync('/usr/bin/which', ['git'], {encoding: 'utf8'}).trim();
+  writeExecutable(path.join(dir, 'git'), [
+    '#!/bin/sh',
+    `printf '%s\\t%s\\t%s\\t%s\\n' "\${GIT_OPTIONAL_LOCKS-unset}" "\${GIT_TERMINAL_PROMPT-unset}" "\${GIT_INDEX_FILE-unset}" "$*" >> '${log}'`,
+    `exec '${realGit}' "$@"`,
+    '',
+  ].join('\n'));
+
+  return {
+    pathValue: `${dir}${path.delimiter}${process.env.PATH ?? ''}`,
+    calls(): GitSpyCall[] {
+      if (!fs.existsSync(log)) return [];
+      return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => {
+        const [optionalLocks = '', terminalPrompt = '', indexFile = '', args = ''] = line.split('\t');
+        return {optionalLocks, terminalPrompt, indexFile, args};
+      });
+    },
+  };
+}
+
+// Every file under `dir` with its content hash and mtime, keyed by relative path.
+export function snapshotTree(dir: string) {
+  const files = new Map<string, {hash: string; mtimeMs: number}>();
+  const walk = (current: string) => {
+    for (const entry of fs.readdirSync(current, {withFileTypes: true})) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(absolute);
+      else if (entry.isFile()) {
+        files.set(path.relative(dir, absolute), {hash: hashFile(absolute), mtimeMs: fs.statSync(absolute).mtimeMs});
+      }
+    }
+  };
+  walk(dir);
+  return files;
+}

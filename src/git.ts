@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import {isUtf8} from 'node:buffer';
 import {createHash} from 'node:crypto';
 import {spawnSync} from 'node:child_process';
 import type {BranchMetrics, FileMetrics} from './sections.js';
+import {escapeHiddenCharactersInLines} from './controlChars.js';
 
 const MIB = 1024 * 1024;
 // High enough that real diffs never hit it. Output past the limit is an error,
@@ -13,13 +15,38 @@ const MAX_TOOL_OUTPUT_BYTES = 512 * MIB;
 export const MAX_FILE_CONTENT_BYTES = 16 * MIB;
 
 // Prepended to every git call. core.fsmonitor would run a command named in the
-// repo's config; a split index would make git write a shared index file into
-// .git; --literal-pathspecs keeps names like `app/[id]/page.tsx` from being
-// read as glob patterns.
-const GIT_SAFETY_ARGS = ['-c', 'core.fsmonitor=false', '-c', 'core.splitIndex=false', '--literal-pathspecs'];
+// repo's config. core.splitIndex=false keeps git from splitting the private
+// index copy, which would write a new shared index file into .git.
+// --literal-pathspecs keeps names like `app/[id]/page.tsx` from being read as
+// glob patterns. core.quotePath=false prints non-ASCII names as they are in
+// patch headers (control characters are still quoted), and
+// diff.suppressBlankEmpty=false keeps the space on blank context lines so a
+// copied patch still applies.
+//
+// Two things under .git can still change, both accepted: clean and process
+// filters configured for the repo (git-lfs, for example) run on worktree files
+// exactly as they do for `git status` or `git diff`, and may store objects
+// under .git/lfs; and in a repo that already uses a split index, every read
+// refreshes the shared index file's mtime (its content stays the same).
+// Nothing else under .git is created or rewritten.
+const GIT_SAFETY_ARGS = [
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.splitIndex=false',
+  '-c', 'core.quotePath=false',
+  '-c', 'diff.suppressBlankEmpty=false',
+  '--literal-pathspecs',
+];
+// Set for every git call. Without optional locks, a status check inside a
+// submodule (which git runs with the submodule's own index, not
+// GIT_INDEX_FILE) reads that index without writing a refreshed copy back.
+// With terminal prompts off, a lazy fetch in a partial clone that needs
+// credentials fails at once instead of prompting while the UI owns the
+// terminal.
+export const GIT_ENV = {GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0'} as const;
 // Added to every diff so repo config can't replace the patch text with an
-// external tool's output or a textconv rendering.
-const DIFF_ARGS = ['--no-ext-diff', '--no-textconv', '--no-color'];
+// external tool's output or a textconv rendering, or change the a/ b/ path
+// prefixes (diff.noprefix, diff.mnemonicPrefix) that git apply relies on.
+const DIFF_ARGS = ['--no-ext-diff', '--no-textconv', '--no-color', '--src-prefix=a/', '--dst-prefix=b/'];
 // Rename detection only, even when diff.renames=copies, so the file list,
 // metrics and per-file diffs all pair the same files.
 const RENAME_ARGS = ['-M'];
@@ -27,9 +54,28 @@ const RENAME_ARGS = ['-M'];
 /** A required executable (git or delta) is not on PATH. */
 export class MissingToolError extends Error {}
 
+/**
+ * git or delta was stopped by SIGINT, SIGTERM or SIGHUP: the user pressed
+ * Ctrl-C or closed the terminal, and the signal reached the whole process
+ * group. The build stops instead of moving on to the next file.
+ */
+export class InterruptedError extends Error {
+  constructor(readonly signal: NodeJS.Signals) {
+    super(`interrupted by ${signal}`);
+  }
+}
+
 class OutputTooLargeError extends Error {}
 
-type ToolResult = {stdout: string; stderr: string; status: number | null};
+const INTERRUPT_SIGNALS = new Set<NodeJS.Signals>(['SIGINT', 'SIGTERM', 'SIGHUP']);
+
+type ToolResult = {
+  stdout: string;
+  /** Whether the raw stdout bytes were valid UTF-8 before decoding. */
+  stdoutIsUtf8: boolean;
+  stderr: string;
+  status: number | null;
+};
 
 type RunToolOptions = {
   cwd: string;
@@ -52,7 +98,6 @@ function runTool(command: string, args: string[], options: RunToolOptions): Tool
     cwd: options.cwd,
     env: options.env,
     input: options.input,
-    encoding: 'utf8',
     maxBuffer,
     windowsHide: true,
   });
@@ -68,14 +113,35 @@ function runTool(command: string, args: string[], options: RunToolOptions): Tool
     }
     throw new Error(`${command} failed: ${result.error.message}`);
   }
+  if (result.signal && INTERRUPT_SIGNALS.has(result.signal)) throw new InterruptedError(result.signal);
 
-  return {stdout: result.stdout, stderr: result.stderr, status: result.status};
+  return {
+    stdout: result.stdout.toString('utf8'),
+    stdoutIsUtf8: isUtf8(result.stdout),
+    stderr: result.stderr.toString('utf8'),
+    status: result.status,
+  };
 }
 
 // While a private index is active for a repo, every git call in it reads and
 // refreshes a temp copy of the index, so the repo's own .git/index is never
 // rewritten. The code is synchronous, so one module-level slot is enough.
-let indexSession: {cwd: string; env: NodeJS.ProcessEnv} | null = null;
+let indexSession: {cwd: string; indexFile: string} | null = null;
+
+// Temp dirs holding a private index copy that `finally` has not removed yet.
+const liveIndexDirs = new Set<string>();
+
+/**
+ * Removes every private index copy still on disk. For an exit hook: a
+ * process.exit() or fatal signal ends the process without running the
+ * `finally` that normally removes them.
+ */
+export function removePrivateIndexDirs() {
+  for (const dir of liveIndexDirs) {
+    fs.rmSync(dir, {recursive: true, force: true});
+    liveIndexDirs.delete(dir);
+  }
+}
 
 /**
  * Runs `fn` with every git call in `cwd` pointed at a temp copy of the repo's
@@ -87,7 +153,11 @@ export function withPrivateIndex<T>(cwd: string, fn: () => T): T {
   if (indexSession?.cwd === cwd) return fn();
 
   const indexPath = path.resolve(cwd, runGitLine(cwd, ['rev-parse', '--git-path', 'index']));
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-index-'));
+  // A parent process that may kill this one passes its own temp dir, so it can
+  // remove whatever is left behind.
+  const parent = process.env.BRANCH_REVIEW_TMPDIR || os.tmpdir();
+  const dir = fs.mkdtempSync(path.join(parent, 'branch-review-index-'));
+  liveIndexDirs.add(dir);
   const privateIndex = path.join(dir, 'index');
   try {
     try {
@@ -108,7 +178,7 @@ export function withPrivateIndex<T>(cwd: string, fn: () => T): T {
     }
 
     const previous = indexSession;
-    indexSession = {cwd, env: {...process.env, GIT_INDEX_FILE: privateIndex}};
+    indexSession = {cwd, indexFile: privateIndex};
     try {
       return fn();
     } finally {
@@ -116,7 +186,14 @@ export function withPrivateIndex<T>(cwd: string, fn: () => T): T {
     }
   } finally {
     fs.rmSync(dir, {recursive: true, force: true});
+    liveIndexDirs.delete(dir);
   }
+}
+
+function gitEnv(cwd: string): NodeJS.ProcessEnv {
+  return indexSession?.cwd === cwd
+    ? {...process.env, ...GIT_ENV, GIT_INDEX_FILE: indexSession.indexFile}
+    : {...process.env, ...GIT_ENV};
 }
 
 type RunGitOptions = {
@@ -125,13 +202,13 @@ type RunGitOptions = {
   maxBuffer?: number;
 };
 
-function runGit(cwd: string, args: string[], options: RunGitOptions = {}) {
+function runGitResult(cwd: string, args: string[], options: RunGitOptions = {}): ToolResult {
   const result = runTool('git', [...GIT_SAFETY_ARGS, ...args], {
     cwd,
-    env: indexSession?.cwd === cwd ? indexSession.env : undefined,
+    env: gitEnv(cwd),
     maxBuffer: options.maxBuffer,
   });
-  if (result.status === 0) return result.stdout;
+  if (result.status === 0) return result;
 
   // Exit 1 also covers errors such as an unreadable or vanished file, which
   // print error:/fatal: and no patch.
@@ -141,13 +218,22 @@ function runGit(cwd: string, args: string[], options: RunGitOptions = {}) {
     && result.stdout !== ''
     && !/^(error|fatal):/m.test(result.stderr)
   ) {
-    return result.stdout;
+    return result;
   }
 
   const reason = firstLine(result.stderr) || `exit code ${result.status ?? 'unknown'}`;
   // The full stderr rides along so callers can show git's fatal:/error: line
   // when it is not the first line.
-  throw Object.assign(new Error(`git ${args[0]} failed: ${reason}`), {stderr: result.stderr});
+  throw Object.assign(new Error(`git ${args[0]} failed: ${reason}`), {stderr: result.stderr, status: result.status});
+}
+
+function runGit(cwd: string, args: string[], options: RunGitOptions = {}) {
+  return runGitResult(cwd, args, options).stdout;
+}
+
+// Failures that affect every file, so per-file isolation must not swallow them.
+export function isFatalToolError(error: unknown) {
+  return error instanceof MissingToolError || error instanceof InterruptedError;
 }
 
 /** For commands that print one value: drops only the final newline. */
@@ -159,7 +245,7 @@ function tryRunGit(cwd: string, args: string[]) {
   try {
     return runGitLine(cwd, args);
   } catch (error) {
-    if (error instanceof MissingToolError) throw error;
+    if (isFatalToolError(error)) throw error;
     return null;
   }
 }
@@ -189,7 +275,7 @@ export type ChangedFileEntry = {
 
 /** The work tree root for `cwd`, with a one-line reason when there is none. */
 export function getRepoRoot(cwd: string) {
-  const result = runTool('git', [...GIT_SAFETY_ARGS, 'rev-parse', '--show-toplevel'], {cwd});
+  const result = runTool('git', [...GIT_SAFETY_ARGS, 'rev-parse', '--show-toplevel'], {cwd, env: gitEnv(cwd)});
   const root = result.status === 0 ? result.stdout.replace(/\r?\n$/, '') : '';
   if (root) return root;
 
@@ -234,6 +320,19 @@ export function getCurrentBranchName(cwd: string) {
   return tryRunGit(cwd, ['branch', '--show-current']) || null;
 }
 
+// `git merge-base` exits 1 with no output when the refs have no common
+// ancestor: unrelated branches, or a shallow clone cut above the fork point.
+function mergeBase(cwd: string, base: string, branch: string) {
+  try {
+    return runGitLine(cwd, ['merge-base', base, branch]);
+  } catch (error) {
+    if ((error as {status?: unknown}).status === 1) {
+      throw new Error(`${base} and ${branch} share no history (shallow clone or unrelated branches)`);
+    }
+    throw error;
+  }
+}
+
 export function resolveRefs(cwd: string, requestedBranch: string, requestedBase: string): DiffRange {
   const base = resolveRef(cwd, requestedBase);
   if (!base) {
@@ -241,11 +340,11 @@ export function resolveRefs(cwd: string, requestedBranch: string, requestedBase:
   }
 
   if (requestedBranch === 'HEAD') {
-    const mergeBase = runGitLine(cwd, ['merge-base', base, 'HEAD']);
+    const diffBase = mergeBase(cwd, base, 'HEAD');
     return {
       base,
       branch: 'HEAD',
-      diffArg: mergeBase,
+      diffArg: diffBase,
       includeWorktree: true,
     };
   }
@@ -254,6 +353,9 @@ export function resolveRefs(cwd: string, requestedBranch: string, requestedBase:
   if (!branch) {
     throw new Error(`Branch ref not found: ${requestedBranch}`);
   }
+  // `base...branch` needs a merge base too; without this check git's error
+  // would name neither ref.
+  mergeBase(cwd, base, branch);
 
   return {
     base,
@@ -327,10 +429,94 @@ export function getChangedFileEntries(cwd: string, range: DiffRange): ChangedFil
   });
 }
 
+const C_ESCAPES: Record<string, string> = {
+  '\x07': '\\a', '\b': '\\b', '\t': '\\t', '\n': '\\n', '\v': '\\v', '\f': '\\f', '\r': '\\r', '"': '\\"', '\\': '\\\\',
+};
+
+// A path in a patch header, quoted the way git quotes it with
+// core.quotePath=false: only a name holding a quote, a backslash or a control
+// character is wrapped in quotes and C-escaped.
+function headerPath(prefix: string, filePath: string) {
+  const name = `${prefix}${filePath}`;
+  if (!/["\\\x00-\x1F\x7F]/.test(name)) return name;
+  const escaped = name.replace(/["\\\x00-\x1F\x7F]/g, (char) => (
+    C_ESCAPES[char] ?? `\\${char.charCodeAt(0).toString(8).padStart(3, '0')}`
+  ));
+  return `"${escaped}"`;
+}
+
+// `git diff --no-index` can't diff a symlink to a directory (it diffs the
+// directory instead), so every untracked symlink gets the patch git prints
+// for a link to a file: mode 120000 and the link text as one line.
+function untrackedSymlinkPatch(filePath: string, target: Buffer) {
+  const blob = createHash('sha1')
+    .update(`blob ${target.length}\0`)
+    .update(target)
+    .digest('hex');
+  return [
+    `diff --git ${headerPath('a/', filePath)} ${headerPath('b/', filePath)}`,
+    'new file mode 120000',
+    `index 0000000..${blob.slice(0, 7)}`,
+    '--- /dev/null',
+    // Like git, end a name holding a space with a tab, for patch(1).
+    `+++ ${headerPath('b/', filePath)}${filePath.includes(' ') ? '\t' : ''}`,
+    '@@ -0,0 +1 @@',
+    `+${target.toString('utf8')}`,
+    '\\ No newline at end of file',
+    '',
+  ].join('\n');
+}
+
+function untrackedFileDiff(cwd: string, filePath: string): {text: string; utf8: boolean} {
+  let stat: fs.Stats | null = null;
+  try {
+    stat = fs.lstatSync(path.join(cwd, filePath));
+  } catch {
+    // Gone since it was listed: git reports that as the error below.
+  }
+  if (stat?.isSymbolicLink()) {
+    const target = fs.readlinkSync(path.join(cwd, filePath), {encoding: 'buffer'});
+    return {text: untrackedSymlinkPatch(filePath, target), utf8: isUtf8(target)};
+  }
+
+  // `--no-index` reads a bare `-` from stdin, so that name goes in as `./-`
+  // and the header is put back to the plain name.
+  const arg = filePath === '-' ? './-' : filePath;
+  const result = runGitResult(cwd, ['diff', '--no-index', ...DIFF_ARGS, '--', '/dev/null', arg], {allowDiffExit: true});
+  if (arg === filePath) return {text: result.stdout, utf8: result.stdoutIsUtf8};
+
+  const hunk = result.stdout.search(/^@@ /m);
+  const headerEnd = hunk < 0 ? result.stdout.length : hunk;
+  const header = result.stdout.slice(0, headerEnd)
+    .replace(/^diff --git a\/\.\/- b\/\.\/-$/m, 'diff --git a/- b/-')
+    .replace(/^\+\+\+ b\/\.\/-$/m, '+++ b/-');
+  return {text: header + result.stdout.slice(headerEnd), utf8: result.stdoutIsUtf8};
+}
+
 /**
- * The exact patch text for one file, trailing newline included. A renamed
- * file passes its `oldPath` so git pairs both sides of the rename.
+ * The exact patch text for one file, trailing newline included, and whether
+ * git printed it as valid UTF-8. A renamed file passes its `oldPath` so git
+ * pairs both sides of the rename.
  */
+export function readRawFileDiff(
+  cwd: string,
+  range: DiffRange,
+  filePath: string,
+  untrackedFiles?: ReadonlySet<string>,
+  oldPath?: string,
+): {text: string; utf8: boolean} {
+  const isUntracked = range.includeWorktree && (untrackedFiles?.has(filePath) ?? false);
+
+  return withPrivateIndex(cwd, () => {
+    if (isUntracked) return untrackedFileDiff(cwd, filePath);
+
+    const paths = oldPath && oldPath !== filePath ? [oldPath, filePath] : [filePath];
+    const result = runGitResult(cwd, ['diff', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--', ...paths]);
+    return {text: result.stdout, utf8: result.stdoutIsUtf8};
+  });
+}
+
+/** The exact patch text for one file; see readRawFileDiff. */
 export function getRawFileDiff(
   cwd: string,
   range: DiffRange,
@@ -338,16 +524,7 @@ export function getRawFileDiff(
   untrackedFiles?: ReadonlySet<string>,
   oldPath?: string,
 ) {
-  const isUntracked = range.includeWorktree && (untrackedFiles?.has(filePath) ?? false);
-
-  return withPrivateIndex(cwd, () => {
-    if (isUntracked) {
-      return runGit(cwd, ['diff', '--no-index', ...DIFF_ARGS, '--', '/dev/null', filePath], {allowDiffExit: true});
-    }
-
-    const paths = oldPath && oldPath !== filePath ? [oldPath, filePath] : [filePath];
-    return runGit(cwd, ['diff', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--', ...paths]);
-  });
+  return readRawFileDiff(cwd, range, filePath, untrackedFiles, oldPath).text;
 }
 
 const OPEN_REGULAR_FLAGS = fs.constants.O_RDONLY
@@ -391,10 +568,15 @@ function readRegularFile(absolutePath: string, displayPath: string, limit: numbe
   }
 }
 
+function notUtf8(filePath: string) {
+  return new Error(`${filePath} is not UTF-8 text`);
+}
+
 /**
  * Worktree contents the way git diffs them: a symlink is its link text, and
  * only regular files are read, so a link can't pull in a file from outside the
- * repo and a FIFO or device can't block or stream forever.
+ * repo and a FIFO or device can't block or stream forever. Contents that are
+ * not valid UTF-8 throw rather than come back altered.
  */
 function readWorktreeText(cwd: string, filePath: string) {
   const absolutePath = path.join(cwd, filePath);
@@ -407,14 +589,18 @@ function readWorktreeText(cwd: string, filePath: string) {
     throw error;
   }
 
-  if (stat.isSymbolicLink()) return fs.readlinkSync(absolutePath, 'utf8');
-  if (!stat.isFile()) throw new Error(`${filePath} is not a regular file`);
-  return readRegularFile(absolutePath, filePath, MAX_FILE_CONTENT_BYTES).toString('utf8');
+  const bytes = stat.isSymbolicLink()
+    ? fs.readlinkSync(absolutePath, {encoding: 'buffer'})
+    : stat.isFile() ? readRegularFile(absolutePath, filePath, MAX_FILE_CONTENT_BYTES) : null;
+  if (!bytes) throw new Error(`${filePath} is not a regular file`);
+  if (!isUtf8(bytes)) throw notUtf8(filePath);
+  return bytes.toString('utf8');
 }
 
 /**
  * Full contents of the reviewed version of a file, or null for a deleted
- * file. Throws with a one-line reason when the contents can't be read.
+ * file. Throws with a one-line reason when the contents can't be read or are
+ * not valid UTF-8.
  */
 export function getReviewFileContents(
   cwd: string,
@@ -430,7 +616,9 @@ export function getReviewFileContents(
   }
 
   try {
-    return runGit(cwd, ['show', `${range.branch}:${file.path}`], {maxBuffer: MAX_FILE_CONTENT_BYTES});
+    const result = runGitResult(cwd, ['show', `${range.branch}:${file.path}`], {maxBuffer: MAX_FILE_CONTENT_BYTES});
+    if (!result.stdoutIsUtf8) throw notUtf8(file.path);
+    return result.stdout;
   } catch (error) {
     if (error instanceof OutputTooLargeError) {
       throw new Error(`${file.path} is larger than ${Math.floor(MAX_FILE_CONTENT_BYTES / MIB)} MB`);
@@ -509,11 +697,48 @@ function parseNumstat(output: string) {
   return metrics;
 }
 
-export function getFileMetricsMap(cwd: string, range: DiffRange) {
+function errorLine(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.split('\n')[0] || 'unknown error';
+}
+
+// Whole-range numstat fails outright when git can't hash one worktree file
+// (an unreadable file, a missing blob in a partial clone). Then each changed
+// file is counted on its own, and the ones that fail get an error instead.
+function perFileNumstat(cwd: string, range: DiffRange) {
+  const metrics = new Map<string, FileMetrics>();
+  const errors = new Map<string, string>();
+  for (const entry of getChangedFileEntries(cwd, range)) {
+    if (entry.status === 'untracked') continue;
+    const paths = entry.oldPath && entry.oldPath !== entry.path ? [entry.oldPath, entry.path] : [entry.path];
+    try {
+      const output = runGit(cwd, ['diff', '--numstat', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--', ...paths]);
+      for (const [filePath, metric] of parseNumstat(output)) metrics.set(filePath, metric);
+    } catch (error) {
+      if (isFatalToolError(error)) throw error;
+      errors.set(entry.path, errorLine(error));
+    }
+  }
+  return {metrics, errors};
+}
+
+/**
+ * Line counts for every changed file, plus a one-line reason for each file
+ * git could not count.
+ */
+export function readFileMetrics(cwd: string, range: DiffRange) {
   return withPrivateIndex(cwd, () => {
-    const metrics = parseNumstat(
-      runGit(cwd, ['diff', '--numstat', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg]),
-    );
+    let counted: {metrics: Map<string, FileMetrics>; errors: Map<string, string>};
+    try {
+      counted = {
+        metrics: parseNumstat(runGit(cwd, ['diff', '--numstat', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg])),
+        errors: new Map(),
+      };
+    } catch (error) {
+      if (isFatalToolError(error)) throw error;
+      counted = perFileNumstat(cwd, range);
+    }
+    const {metrics} = counted;
 
     if (range.includeWorktree) {
       for (const filePath of getUntrackedFiles(cwd)) {
@@ -527,8 +752,12 @@ export function getFileMetricsMap(cwd: string, range: DiffRange) {
       }
     }
 
-    return metrics;
+    return counted;
   });
+}
+
+export function getFileMetricsMap(cwd: string, range: DiffRange) {
+  return readFileMetrics(cwd, range).metrics;
 }
 
 export function getBranchMetrics(cwd: string, range: DiffRange): BranchMetrics {
@@ -560,8 +789,13 @@ function worktreeFingerprint(cwd: string, filePath: string) {
     if (stat.isSymbolicLink()) return `link:${fs.readlinkSync(absolutePath, 'utf8')}`;
     if (!stat.isFile()) return `other:${stat.mode}`;
     if (stat.size > MAX_FILE_CONTENT_BYTES) return `large:${stat.size}:${stat.mtimeMs}`;
-    const contents = readRegularFile(absolutePath, filePath, MAX_FILE_CONTENT_BYTES);
-    return `file:${createHash('sha1').update(contents).digest('hex')}`;
+    try {
+      const contents = readRegularFile(absolutePath, filePath, MAX_FILE_CONTENT_BYTES);
+      return `file:${createHash('sha1').update(contents).digest('hex')}`;
+    } catch {
+      // Unreadable (permissions): its stat still changes when it is written.
+      return `unreadable:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    }
   } catch {
     return 'missing';
   }
@@ -570,7 +804,7 @@ function worktreeFingerprint(cwd: string, filePath: string) {
 export function getReviewFingerprint(cwd: string, range: DiffRange) {
   return withPrivateIndex(cwd, () => {
     const entries = getChangedFileEntries(cwd, range);
-    const metrics = getFileMetricsMap(cwd, range);
+    const {metrics, errors} = readFileMetrics(cwd, range);
     const head = tryRunGit(cwd, ['rev-parse', 'HEAD']) ?? '';
     const raw = runGit(cwd, ['diff', '--raw', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg]);
     const hash = createHash('sha1');
@@ -594,6 +828,8 @@ export function getReviewFingerprint(cwd: string, range: DiffRange) {
       hash.update('\0');
       hash.update(metric ? `${metric.additions}:${metric.deletions}:${metric.changedLines}` : '0:0:0');
       hash.update('\0');
+      hash.update(errors.get(entry.path) ?? '');
+      hash.update('\0');
       hash.update(range.includeWorktree ? worktreeFingerprint(cwd, entry.path) : statFingerprint(cwd, entry.path));
     }
 
@@ -601,29 +837,28 @@ export function getReviewFingerprint(cwd: string, range: DiffRange) {
   });
 }
 
-/** NO_COLOR set and non-empty, or FORCE_COLOR=0, turns colour off. */
+/**
+ * The one colour-off rule for delta and the app chrome: NO_COLOR set and
+ * non-empty, FORCE_COLOR of `0` or `false`, or TERM=dumb.
+ */
 export function isColorDisabled(env: NodeJS.ProcessEnv = process.env) {
-  return Boolean(env.NO_COLOR) || env.FORCE_COLOR === '0';
+  return Boolean(env.NO_COLOR) || env.FORCE_COLOR === '0' || env.FORCE_COLOR === 'false' || env.TERM === 'dumb';
 }
 
 /**
- * Replaces control characters that a terminal would act on with visible
- * markers: C0 controls as caret notation (^M, ^H, ^G), ESC as U+241B, DEL as
- * ^?, and C1 controls as <U+009B>. Tab and newline are kept.
+ * Replaces characters a terminal would act on, or that reorder or hide text,
+ * with visible markers (^M, ␛, <U+202E>; see controlChars.ts). Tab and
+ * newline are kept.
  */
 export function makeControlCharsVisible(text: string) {
-  return text.replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/g, (char) => {
-    const code = char.charCodeAt(0);
-    if (code === 0x1b) return '␛';
-    if (code < 0x20) return `^${String.fromCharCode(code + 0x40)}`;
-    if (code === 0x7f) return '^?';
-    return `<U+${code.toString(16).toUpperCase().padStart(4, '0')}>`;
-  });
+  return escapeHiddenCharactersInLines(text);
 }
 
 const DELTA_LAYOUT_ARGS = [
   '--no-gitconfig',
   '--paging=never',
+  // delta cuts lines past 3000 characters by default; the app wraps rows itself.
+  '--max-line-length=0',
   '--line-numbers',
   '--navigate',
   '--line-fill-method=spaces',
@@ -678,9 +913,13 @@ export function renderDiffForDisplay(cwd: string, rawDiff: string, width: number
     `--width=${Math.max(width, 80)}`,
   ];
 
+  // DELTA_FEATURES would switch on side-by-side, hyperlinks and other layouts
+  // the fixed argument list rules out.
+  const {DELTA_FEATURES: _features, ...env} = process.env;
+
   let result: ToolResult;
   try {
-    result = runTool('delta', args, {cwd, input: makeControlCharsVisible(rawDiff)});
+    result = runTool('delta', args, {cwd, env, input: makeControlCharsVisible(rawDiff)});
   } catch (error) {
     if (error instanceof MissingToolError) {
       throw new MissingToolError('delta not found on PATH. Install git-delta: https://dandavison.github.io/delta/installation.html');

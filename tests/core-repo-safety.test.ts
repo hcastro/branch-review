@@ -3,7 +3,7 @@ import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {getChangedFileEntries, getReviewFingerprint, resolveRefs} from '../src/git.js';
 import {buildReviewModel} from '../src/review/build.js';
-import {cleanupTempDirs, commitAll, git, hashFile, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, commitAll, git, gitSpy, hashFile, initRepo, makeTempDir, withEnv, writeExecutable, writeFiles} from './core-helpers.js';
 
 // Each test builds real repos and runs git and delta many times.
 vi.setConfig({testTimeout: 30_000});
@@ -66,10 +66,23 @@ describe('git calls never write the reviewed repo', () => {
     git(cwd, 'commit', '-q', '--allow-empty', '-m', 'empty');
     fs.rmSync(path.join(cwd, '.git', 'index'), {force: true});
     writeFiles(cwd, {'new.txt': 'new\n'});
+    const spy = gitSpy();
 
     const range = resolveRefs(cwd, 'HEAD', 'main');
-    expect(getChangedFileEntries(cwd, range).map((entry) => entry.path)).toEqual(['new.txt']);
+    withEnv({PATH: spy.pathValue, GIT_INDEX_FILE: undefined}, () => {
+      expect(getChangedFileEntries(cwd, range).map((entry) => entry.path)).toEqual(['new.txt']);
+    });
     expect(fs.existsSync(path.join(cwd, '.git', 'index'))).toBe(false);
+
+    // git writes no index for these reads when none exists, so the check above
+    // alone can't tell a private index from none. Every listing call must
+    // still be pointed at a temp index outside the repo.
+    const listing = spy.calls().filter((call) => /^-c .* (diff|ls-files) /.test(call.args));
+    expect(listing.length).toBeGreaterThan(0);
+    for (const call of listing) {
+      expect(call.indexFile).toMatch(/branch-review-index-[^/]+\/index$/);
+      expect(call.indexFile.startsWith(cwd)).toBe(false);
+    }
   });
 });
 

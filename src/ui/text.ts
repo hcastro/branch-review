@@ -1,4 +1,5 @@
 import stringWidth from 'string-width';
+import {escapeHiddenCharacters} from '../controlChars.js';
 
 // Terminal-cell measurement and display escaping shared by the section
 // builder and the Ink UI. Ink measures with string-width, so everything that
@@ -59,22 +60,10 @@ export function truncateEnd(text: string, maxWidth: number): string {
   return `${kept}…`;
 }
 
-const ESCAPE_MARKER = '␛';
-// C0 controls, DEL, C1 controls, and the bidirectional formatting characters
-// that can reorder or hide neighbouring text on screen.
-const HIDDEN_CHARACTERS = /[\u0000-\u001F\u007F-\u009F؜‎‏‪-‮⁦-⁩]/g;
-
-function visibleMarker(char: string) {
-  const code = char.codePointAt(0)!;
-  if (code === 0x1B) return ESCAPE_MARKER;
-  if (code < 0x20) return `^${String.fromCharCode(code + 0x40)}`;
-  if (code === 0x7F) return '^?';
-  return `<U+${code.toString(16).toUpperCase().padStart(4, '0')}>`;
-}
-
 // Makes repo-derived text (paths, ref names, error messages) safe to draw:
-// control and bidi characters become visible markers instead of reaching the
-// terminal. Copy payloads must keep using the original text.
+// control, bidi and invisible format characters become visible markers
+// instead of reaching the terminal. Copy payloads must keep using the
+// original text.
 export function toDisplayText(text: string): string {
-  return text.replace(HIDDEN_CHARACTERS, visibleMarker);
+  return escapeHiddenCharacters(text);
 }
