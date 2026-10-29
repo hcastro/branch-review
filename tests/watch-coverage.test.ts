@@ -626,6 +626,30 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
     await watcher.close();
   });
 
+  it('refreshes for a commit in a gitlink Git dir inside .git that lands before the watcher adds the dir', async () => {
+    const lib = createRepo();
+    // The CLI watches git's toplevel, a real path, as git's own paths are.
+    const cwd = fs.realpathSync(createRepo());
+    // Once armed, the gitlink listing takes long enough for a commit to land
+    // between the index change and the watcher adding the new Git dir.
+    const slowFlag = path.join(makeTempDir('branch-review-slow-flag-'), 'on');
+    installFakeGit(`case "$*" in *"ls-files -z --stage"*) [ -f '${slowFlag}' ] && sleep 2;; esac\nexec "$REAL_GIT" "$@"`);
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    runGit(cwd, 'clone', '-q', '--separate-git-dir', path.join(cwd, '.git', 'vendored-git'), lib, 'vendored');
+    await flush(1000);
+    fs.writeFileSync(slowFlag, '');
+    runGit(cwd, '-c', 'advice.addEmbeddedRepo=false', 'add', 'vendored');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(500);
+
+    runGit(path.join(cwd, 'vendored'), 'commit', '-q', '--allow-empty', '-m', 'inside the clone');
+    expect(runGit(cwd, 'diff', '--name-only')).toBe('vendored');
+    expect(await watcher.waitForChange(8000)).toBe(true);
+
+    await watcher.close();
+  });
+
   // A linked worktree keeps its submodules' Git dirs under its own Git dir
   // (`<common git dir>/worktrees/<name>/modules`), apart from the main
   // checkout's.

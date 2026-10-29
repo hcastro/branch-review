@@ -1059,6 +1059,7 @@ export function createRepoWatcher({
       // A tree decides what to skip when it first sees a directory, so a
       // state dir found after startup inside an existing root is added to
       // that tree, along with the directories on the way to it.
+      let addedNested = false;
       for (const nested of nestedRoots) {
         if (!late || previousNested.has(nested)) continue;
         const [root, tree] = [...stateTrees].find(([candidate]) => isWithin(candidate, nested)) ?? [];
@@ -1068,7 +1069,11 @@ export function createRepoWatcher({
           chain.unshift(directory);
         }
         tree.add(chain);
+        addedNested = true;
       }
+      // The dir was filtered out until now, so a write to it that landed
+      // before the add (a commit while the gitlinks were listed) was dropped.
+      if (addedNested) notify();
     };
 
     let submoduleRescanRunning = false;
