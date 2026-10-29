@@ -469,6 +469,19 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
     await watcher.close();
   });
 
+  it("reports git's fatal line, not a warning printed before it, when the ignore listing fails", async () => {
+    const cwd = createRepo();
+    installFakeGit('case "$*" in *--ignored*) echo "warning: a warning first" >&2; echo "fatal: the real reason" >&2; exit 128;; esac\nexec "$REAL_GIT" "$@"');
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+    process.env.PATH = originalPath;
+
+    expect(watcher.errors.map((error) => error.message)).toEqual([
+      'could not list ignored files: fatal: the real reason',
+    ]);
+
+    await watcher.close();
+  });
+
   it('refreshes when a cloned directory loses its .git, and sees later edits there', async () => {
     const lib = createRepo({'lib/m.ts': 'export const m = 1;\n'});
     const cwd = createRepo();
@@ -531,6 +544,66 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
     await watcher.close();
   });
 
+  it('refreshes when a submodule added after the watcher started commits or checks out another commit', async () => {
+    const subSource = createRepo();
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    runGit(cwd, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(1500);
+
+    runGit(path.join(cwd, 'sub'), 'commit', '-q', '--allow-empty', '-m', 'inside the late submodule');
+    expect(runGit(cwd, 'diff', '--name-only')).toBe('sub');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle();
+
+    runGit(path.join(cwd, 'sub'), 'checkout', '-q', '--detach', 'HEAD~1');
+    expect(runGit(cwd, 'diff', '--name-only')).toBe('');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('does not refresh for a file edit inside a submodule added after the watcher started', async () => {
+    const subSource = createRepo();
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    runGit(cwd, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(1500);
+
+    fs.appendFileSync(path.join(cwd, 'sub', 'src', 'one.ts'), 'export const inside = 1;\n');
+    writeFile(cwd, 'sub/src/new.ts', 'export const added = 1;\n');
+    await flush(1000);
+    expect(watcher.changes).toBe(0);
+
+    fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('refreshes when a clone staged as a gitlink after the watcher started commits', async () => {
+    const lib = createRepo();
+    const cwd = createRepo();
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    // Its Git dir stays inside the worktree, outside .git/modules.
+    runGit(cwd, 'clone', '-q', lib, 'vendored');
+    runGit(cwd, '-c', 'advice.addEmbeddedRepo=false', 'add', 'vendored');
+    expect(runGit(cwd, 'ls-files', '--stage', 'vendored')).toMatch(/^160000 /);
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(1500);
+
+    runGit(path.join(cwd, 'vendored'), 'commit', '-q', '--allow-empty', '-m', 'inside the clone');
+    expect(runGit(cwd, 'diff', '--name-only')).toBe('vendored');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
   it('stops a running ignore re-listing and ignore check when closed', async () => {
     const cwd = createRepo({'.gitignore': '*.log\n'});
     const flagDir = makeTempDir('branch-review-slow-git-');
@@ -579,20 +652,31 @@ describe.each(watchModes.filter((mode) => mode.nativeMode === 'directories'))('r
     const originalWatch = fs.watch;
     let live = 0;
     let peak = 0;
+    // Every path ever watched, and the paths watched now.
+    const everWatched = new Set<string>();
+    const openPaths = new Map<string, number>();
     const spy = base.vi.spyOn(fs, 'watch').mockImplementation(((...args: Parameters<typeof fs.watch>) => {
       const watcher = originalWatch(...args);
+      const watchedPath = String(args[0]);
       live += 1;
       peak = Math.max(peak, live);
+      everWatched.add(watchedPath);
+      openPaths.set(watchedPath, (openPaths.get(watchedPath) ?? 0) + 1);
       const close = watcher.close.bind(watcher);
       let open = true;
       watcher.close = () => {
-        if (open) live -= 1;
+        if (open) {
+          live -= 1;
+          openPaths.set(watchedPath, (openPaths.get(watchedPath) ?? 1) - 1);
+        }
         open = false;
         close();
       };
       return watcher;
     }) as typeof fs.watch);
     return {
+      everWatched,
+      isOpen: (watchedPath: string) => (openPaths.get(watchedPath) ?? 0) > 0,
       get live() {
         return live;
       },
@@ -638,6 +722,147 @@ describe.each(watchModes.filter((mode) => mode.nativeMode === 'directories'))('r
       // The visible part of the new tree is watched.
       fs.writeFileSync(path.join(cwd, 'pkg', 'src', 'a.ts'), 'export const a = 2;\n');
       expect(await watcher.waitForChange()).toBe(true);
+
+      await watcher.close();
+    } finally {
+      handles.restore();
+    }
+  });
+
+  it('opens no handle for a new directory that git ignores', async () => {
+    const cwd = createRepo({'.gitignore': 'build/\n'});
+    const handles = countWatchHandles();
+    try {
+      const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+      const buildDir = path.join(cwd, 'build');
+
+      fs.mkdirSync(buildDir);
+      await flush(800);
+      writeFile(cwd, 'build/out.js', 'output\n');
+      await flush(500);
+
+      expect(handles.everWatched.has(buildDir)).toBe(false);
+      expect(watcher.changes).toBe(0);
+
+      fs.writeFileSync(path.join(cwd, 'src', 'one.ts'), 'export const value = 2;\n');
+      expect(await watcher.waitForChange()).toBe(true);
+
+      await watcher.close();
+    } finally {
+      handles.restore();
+    }
+  });
+
+  it('skips a queued directory that became ignored while git was asked about it', async () => {
+    const cwd = createRepo({'.gitignore': '*.log\n'});
+    const flags = makeTempDir('branch-review-held-check-');
+    const on = path.join(flags, 'on');
+    const held = path.join(flags, 'held');
+    const listed = path.join(flags, 'listed');
+    const release = path.join(flags, 'release');
+    // Once `on` exists, a check-ignore asking about pkg/inner answers at
+    // once but holds its answer until `release` exists, and each ignore
+    // re-listing leaves `listed` behind when it is done.
+    installFakeGit([
+      `if [ -f '${on}' ]; then case "$*" in`,
+      `  *check-ignore*) work=$(mktemp -d '${flags}/run.XXXXXX'); cat > "$work/in"`,
+      `    "$REAL_GIT" "$@" < "$work/in" > "$work/out"; code=$?`,
+      `    if grep -q 'pkg/inner' "$work/in"; then : > '${held}'; while [ ! -f '${release}' ]; do sleep 0.05; done; fi`,
+      `    cat "$work/out"; exit $code;;`,
+      `  *--ignored*) "$REAL_GIT" "$@"; code=$?; : > '${listed}'; exit $code;;`,
+      'esac; fi',
+      'exec "$REAL_GIT" "$@"',
+    ].join('\n'));
+    const handles = countWatchHandles();
+    try {
+      const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+      fs.writeFileSync(on, '');
+
+      // pkg/a.ts keeps pkg itself visible once pkg/inner is ignored.
+      moveTreeIn(cwd, 'pkg', (dir) => {
+        writeFile(dir, 'a.ts', 'export const a = 1;\n');
+        writeFile(dir, 'inner/deep/x.txt', 'x\n');
+      });
+      expect(await waitUntil(() => fs.existsSync(held), 10_000)).toBe(true);
+      // The answer git is holding was computed under the old rules.
+      fs.writeFileSync(path.join(cwd, '.gitignore'), '*.log\npkg/inner/\n');
+      expect(await waitUntil(() => fs.existsSync(listed), 10_000)).toBe(true);
+      await flush(300);
+      fs.writeFileSync(release, '');
+      await flush(800);
+
+      expect(handles.isOpen(path.join(cwd, 'pkg'))).toBe(true);
+      expect(handles.everWatched.has(path.join(cwd, 'pkg', 'inner'))).toBe(false);
+
+      await watcher.close();
+    } finally {
+      fs.writeFileSync(release, '');
+      handles.restore();
+    }
+  });
+
+  it('asks git about the directories a checkout adds in a few runs, and watches them', async () => {
+    const cwd = createRepo({'.gitignore': 'build/\n'});
+    runGit(cwd, 'checkout', '-q', '-b', 'many');
+    for (let index = 0; index < 60; index += 1) writeFile(cwd, `src/d${index}/f.ts`, `export const v = ${index};\n`);
+    runGit(cwd, 'add', '.');
+    runGit(cwd, 'commit', '-q', '-m', 'sixty directories');
+    runGit(cwd, 'checkout', '-q', 'main');
+    const runs = path.join(makeTempDir('branch-review-check-ignore-runs-'), 'runs');
+    installFakeGit(`case "$*" in *check-ignore*) echo run >> '${runs}';; esac\nexec "$REAL_GIT" "$@"`);
+    const countRuns = () => {
+      try {
+        return fs.readFileSync(runs, 'utf8').split('\n').filter(Boolean).length;
+      } catch {
+        return 0;
+      }
+    };
+    const handles = countWatchHandles();
+    try {
+      const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+      const runsBefore = countRuns();
+
+      runGit(cwd, 'checkout', '-q', 'many');
+      expect(await watcher.waitForChange()).toBe(true);
+      await watcher.settle(1500);
+
+      expect(countRuns() - runsBefore).toBeLessThanOrEqual(10);
+      expect(handles.isOpen(path.join(cwd, 'src', 'd59'))).toBe(true);
+
+      fs.writeFileSync(path.join(cwd, 'src', 'd59', 'f.ts'), 'export const v = -1;\n');
+      expect(await watcher.waitForChange()).toBe(true);
+      await watcher.settle();
+
+      // An ignored directory made now is still never watched.
+      fs.mkdirSync(path.join(cwd, 'build'));
+      writeFile(cwd, 'build/nested/out.js', 'output\n');
+      await flush(800);
+      expect(handles.everWatched.has(path.join(cwd, 'build'))).toBe(false);
+      expect(watcher.changes).toBe(0);
+
+      await watcher.close();
+    } finally {
+      handles.restore();
+    }
+  });
+
+  it("watches a submodule's Git dir for HEAD and logs/HEAD without opening its objects or refs", async () => {
+    const subSource = createRepo();
+    const cwd = createRepo();
+    const handles = countWatchHandles();
+    try {
+      const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+      runGit(cwd, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+      expect(await watcher.waitForChange()).toBe(true);
+      await watcher.settle(1500);
+
+      const subGitDir = path.join(cwd, '.git', 'modules', 'sub');
+      expect(handles.isOpen(subGitDir)).toBe(true);
+      expect(handles.isOpen(path.join(subGitDir, 'logs'))).toBe(true);
+      const internals = [...handles.everWatched].filter((watched) => (
+        ['objects', 'refs', 'hooks', 'info'].includes(path.relative(subGitDir, watched).split(path.sep)[0] ?? '')
+      ));
+      expect(internals).toEqual([]);
 
       await watcher.close();
     } finally {

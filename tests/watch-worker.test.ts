@@ -361,33 +361,44 @@ describe('refreshReviewInWorker progress limit', () => {
 
   // A limit well under the time these refreshes take, so only progress from
   // inside the per-file loops and from tool output keeps them alive.
-  it('keeps reporting progress through 300 changed files with one unreadable', async () => {
+  it('keeps reporting progress through every per-file loop of a refresh with one unreadable file', async () => {
     const cwd = createRepo();
+    // The unreadable file makes the whole-range numstat fail, so the refresh
+    // runs numstat once per file and then builds each file: two per-file
+    // loops of git calls. Each per-file call is slowed so either loop alone
+    // runs past the limit whatever the machine's speed, while one call stays
+    // far inside it.
+    const fileCount = 30;
+    const perFileDelaySeconds = 0.25;
     fs.mkdirSync(path.join(cwd, 'f'));
-    for (let index = 0; index < 300; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `a${index}\n`);
+    for (let index = 0; index < fileCount; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `a${index}\n`);
     runGit(cwd, 'add', '.');
     runGit(cwd, 'commit', '-q', '-m', 'many files');
-    for (let index = 0; index < 300; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `b${index}\n`);
+    for (let index = 0; index < fileCount; index += 1) fs.writeFileSync(path.join(cwd, 'f', `${index}.txt`), `b${index}\n`);
     const locked = path.join(cwd, 'f', '0.txt');
     fs.chmodSync(locked, 0o000);
+    expect(fileCount * perFileDelaySeconds * 1000).toBeGreaterThan(PROGRESS_LIMIT_MS);
+    const binDir = fakeGitBinDir(`case "$*" in *" -- "*) sleep ${perFileDelaySeconds};; esac\nexec "$REAL_GIT" "$@"`);
 
     try {
-      const result = await settleWithin(refreshReviewInWorker({
+      const startedAt = Date.now();
+      const result = await settleWithin(withPath(binDir, () => refreshReviewInWorker({
         cwd,
         requestedBranch: 'HEAD',
         requestedBase: 'development',
         width: 100,
         previousFingerprint: null,
         timeoutMs: PROGRESS_LIMIT_MS,
-      }), 240_000);
+      })), 150_000);
 
       expect(result.state === 'rejected' ? result.error.message : result.state).toBe('resolved');
       if (result.state !== 'resolved') return;
-      expect(result.value.review?.files.length).toBe(301);
+      expect(result.value.review?.files.length).toBe(fileCount + 1);
+      expect(Date.now() - startedAt).toBeGreaterThan(2 * PROGRESS_LIMIT_MS);
     } finally {
       fs.chmodSync(locked, 0o644);
     }
-  }, 300_000);
+  }, 180_000);
 
   it('keeps reporting progress through the delta run of one 20 MB added file', async () => {
     const cwd = createRepo();
@@ -678,6 +689,66 @@ describe('refreshReviewInWorker when its parent goes away', () => {
       expect(await waitFor(() => !isAlive(pids.gitPid) && !isAlive(pids.refreshPid), 3000)).toBe(true);
     } finally {
       parent.kill('SIGKILL');
+    }
+  }, 40_000);
+
+  it('removes the refresh temp dir from its parent-check thread while the refresh is stuck in a synchronous step', async () => {
+    const cwd = createRepo();
+    const tmp = makeTempDir('branch-review-parent-tmp-');
+    const pidFile = path.join(makeTempDir('branch-review-pids-'), 'refresh.pid');
+    const {binDir, readPids} = hangingGit();
+    // In the refresh process only (the one with an IPC channel): a while
+    // after the request arrives, with the refresh waiting on the hung git and
+    // its parent-check thread long started, record the pid and block the
+    // main thread, so its disconnect handler cannot run.
+    const preload = path.join(makeTempDir('branch-review-preload-'), 'block.cjs');
+    fs.writeFileSync(preload, [
+      'if (process.send) {',
+      "  process.once('message', () => setTimeout(() => {",
+      "    require('node:fs').writeFileSync(process.env.BLOCK_PID_FILE, String(process.pid));",
+      '    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);',
+      '  }, 1500));',
+      '}',
+      '',
+    ].join('\n'));
+    const probe = writeProbe([
+      `refreshReviewInWorker({cwd: ${JSON.stringify(cwd)}, requestedBranch: 'HEAD', requestedBase: 'development', width: 100}).catch(() => undefined);`,
+      'setInterval(() => undefined, 1000);',
+    ]);
+
+    const parent = spawn(process.execPath, ['--import', 'tsx', probe], {
+      cwd: projectRoot,
+      env: {
+        ...process.env,
+        TMPDIR: tmp,
+        NODE_OPTIONS: `--require ${preload}`,
+        BLOCK_PID_FILE: pidFile,
+        PATH: `${binDir}${path.delimiter}${originalPath ?? ''}`,
+      },
+      stdio: ['ignore', 'ignore', 'inherit'],
+    });
+    const readPid = () => {
+      try {
+        return Number(fs.readFileSync(pidFile, 'utf8').trim()) || null;
+      } catch {
+        return null;
+      }
+    };
+    try {
+      expect(await waitFor(() => readPid() !== null, 20_000)).toBe(true);
+      expect(refreshLeftovers(tmp).length).toBeGreaterThan(0);
+      parent.kill('SIGKILL');
+
+      const refreshPid = readPid()!;
+      expect(await waitFor(() => !isAlive(refreshPid), 3000)).toBe(true);
+      expect(await waitFor(() => refreshLeftovers(tmp).length === 0, 3000)).toBe(true);
+    } finally {
+      parent.kill('SIGKILL');
+      const refreshPid = readPid();
+      const gitPid = readPids()?.gitPid;
+      for (const pid of [refreshPid, gitPid]) {
+        if (pid && isAlive(pid)) process.kill(pid, 'SIGKILL');
+      }
     }
   }, 40_000);
 });

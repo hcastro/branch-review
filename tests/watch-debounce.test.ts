@@ -186,6 +186,15 @@ describe('watch event deduper with whole-second and future timestamps', () => {
     expect(isNew('/repo/future.ts')).toBe(false);
   });
 
+  it('lets a repeated event through at most once for a whole-second ctime in the future', () => {
+    const future = wholeSecond(Date.now()) + 60 * 60 * 1000;
+    fakeLstat({mtimeMs: future, ctimeMs: future, size: 13, ino: 7});
+    const isNew = createEventDeduper(0);
+
+    const passed = Array.from({length: 5}, () => isNew('/repo/clock-skew.ts'));
+    expect(passed.filter(Boolean).length).toBeLessThanOrEqual(1);
+  });
+
   it('passes an event when only the inode changed', () => {
     const state = fakeLstat({mtimeMs: 1_000.5, ctimeMs: 1_000.5, size: 13, ino: 7});
     const isNew = createEventDeduper(0);

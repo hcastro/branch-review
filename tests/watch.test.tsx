@@ -533,6 +533,101 @@ describe('ReviewController watch refresh', {timeout: 20_000}, () => {
     instance.unmount();
   });
 
+  it('rebuilds at the new width through the refresh worker when the terminal resizes, keeping the watcher', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const fingerprint = getReviewFingerprint(cwd, range);
+    const refreshInWorker = vi.fn(async (_options: {width: number; previousFingerprint?: string | null}) => ({
+      range,
+      fingerprint,
+      branchName: 'feature/watch',
+      review: reviewModel([{path: 'src/one.ts', text: 'rebuilt one'}]),
+    }));
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={fingerprint}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+      />,
+    );
+
+    await flush();
+    expect(watchers.createWatcher).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(instance.stdout, 'columns', {value: 200, configurable: true});
+    instance.stdout.emit('resize');
+    const frame = await waitForFrame(instance, (text) => text.includes('rebuilt one'), 5000);
+    // Let any second, unwanted rebuild or watcher recreation show up.
+    await flush(300);
+
+    expect(frame).toContain('rebuilt one');
+    expect(watchers.createWatcher).toHaveBeenCalledTimes(1);
+    expect(watchers.current.close).not.toHaveBeenCalled();
+    expect(refreshInWorker).toHaveBeenCalledTimes(1);
+    // The fingerprint did not move, so only a forced rebuild picks up the width.
+    expect(refreshInWorker.mock.calls[0]?.[0]).toMatchObject({width: getModelWidth(200), previousFingerprint: null});
+
+    instance.unmount();
+  });
+
+  it('keeps the last view when a worker refresh fails and refreshes again on the next change', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const fingerprint = getReviewFingerprint(cwd, range);
+    const calls: Array<string | null | undefined> = [];
+    const refreshInWorker = vi.fn(async (options: {previousFingerprint?: string | null}) => {
+      calls.push(options.previousFingerprint);
+      if (calls.length === 1) {
+        throw Object.assign(new Error('Command failed: git diff'), {stderr: 'fatal: simulated diff failure\n'});
+      }
+      return {
+        range,
+        fingerprint: 'after-error',
+        branchName: 'feature/watch',
+        review: reviewModel([{path: 'src/two.ts', text: 'recovered two'}]),
+      };
+    });
+    const watchers = fakeWatcherFactory();
+
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviewModel([{path: 'src/one.ts', text: 'initial one'}])}
+        initialFingerprint={fingerprint}
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 16}}
+      />,
+    );
+
+    await flush();
+    watchers.current.options.onChange();
+    let frame = await waitForFrame(instance, (text) => text.includes('watch error'), 5000);
+    expect(frame).toContain('watch error: fatal: simulated diff failure');
+    expect(frame).toContain('initial one');
+
+    watchers.current.options.onChange();
+    frame = await waitForFrame(instance, (text) => text.includes('recovered two') && !text.includes('refreshing'), 5000);
+    expect(frame).toContain('recovered two');
+    expect(frame).toContain('updated');
+    expect(frame).not.toContain('watch error');
+    expect(calls).toEqual([fingerprint, fingerprint]);
+
+    instance.unmount();
+  });
+
   it('starts a fresh refresh for a change that arrived while a refresh failed', async () => {
     const cwd = createRepo();
     const range = resolveRefs(cwd, 'HEAD', 'development');

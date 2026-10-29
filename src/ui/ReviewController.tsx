@@ -184,6 +184,10 @@ export function ReviewController({
       const previousFingerprint = forceRebuild ? null : fingerprintRef.current;
 
       try {
+        // The app always passes both refs and never a builder, so it always
+        // refreshes in the worker. The synchronous path below (fingerprint
+        // and build in this process) exists only for tests that inject
+        // `buildReview`.
         const workerRefreshAvailable = latest.requestedBranch
           && latest.requestedBase
           && latest.buildReview === buildReviewModel;

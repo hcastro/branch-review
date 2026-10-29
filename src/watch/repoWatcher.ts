@@ -280,23 +280,10 @@ function submoduleGitDir(submoduleDir: string) {
   }
 }
 
-// HEAD and logs/HEAD of each submodule's own Git dir: a commit or checkout
-// inside a submodule moves the gitlink the review shows without touching
-// anything else the watcher sees.
-function submoduleStatePaths(repoRoot: string) {
-  let staged: string;
-  try {
-    staged = execFileSync('git', [...GIT_ARGS, 'ls-files', '-z', '--stage'], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-      env: gitEnv(),
-      maxBuffer: GIT_MAX_BUFFER,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-  } catch {
-    return [];
-  }
-
+// HEAD and logs/HEAD of each submodule's own Git dir, from `git ls-files
+// -z --stage` output: a commit or checkout inside a submodule moves the
+// gitlink the review shows without touching anything else the watcher sees.
+function gitlinkStatePaths(repoRoot: string, staged: string) {
   const paths: string[] = [];
   for (const record of parseNulList(staged)) {
     // <mode> SP <object> SP <stage> TAB <path>; 160000 is a gitlink.
@@ -308,21 +295,52 @@ function submoduleStatePaths(repoRoot: string) {
   return paths;
 }
 
-/**
- * Files and directories under the Git dir whose changes can move the reviewed
- * range or what git ignores, plus each submodule's HEAD and logs/HEAD.
- * Directories (`refs`, `logs/refs`, `reftable`) cover everything below them.
- * Paths that do not exist yet are included, so the watcher picks them up when
- * git creates them.
- */
-export function getGitStateWatchPaths(repoRoot: string) {
+const STAGED_LIST_ARGS = ['ls-files', '-z', '--stage'];
+
+function submoduleStatePaths(repoRoot: string) {
+  try {
+    return gitlinkStatePaths(repoRoot, execFileSync('git', [...GIT_ARGS, ...STAGED_LIST_ARGS], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: gitEnv(),
+      maxBuffer: GIT_MAX_BUFFER,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function submoduleStatePathsAsync(repoRoot: string, children: Set<ChildProcess>) {
+  return new Promise<string[]>((resolve, reject) => {
+    const child = execFile('git', [...GIT_ARGS, ...STAGED_LIST_ARGS], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: gitEnv(),
+      maxBuffer: GIT_MAX_BUFFER,
+    }, (error, stdout) => {
+      if (error) reject(error);
+      else resolve(gitlinkStatePaths(repoRoot, stdout));
+    });
+    track(child, children);
+  });
+}
+
+type GitDirs = {gitDir: string; commonGitDir: string};
+
+function resolveGitDirs(repoRoot: string): GitDirs | null {
   const gitDirRaw = tryRunGit(repoRoot, ['rev-parse', '--git-dir']);
-  if (!gitDirRaw) return [];
+  if (!gitDirRaw) return null;
+  return {
+    gitDir: path.resolve(repoRoot, gitDirRaw),
+    commonGitDir: path.resolve(repoRoot, tryRunGit(repoRoot, ['rev-parse', '--git-common-dir']) ?? gitDirRaw),
+  };
+}
 
-  const gitDir = path.resolve(repoRoot, gitDirRaw);
-  const commonGitDir = path.resolve(repoRoot, tryRunGit(repoRoot, ['rev-parse', '--git-common-dir']) ?? gitDirRaw);
-
-  return [...new Set([
+// Paths in the repo's own Git dirs whose changes can move the reviewed range
+// or what git ignores.
+function repoStatePaths({gitDir, commonGitDir}: GitDirs) {
+  return [
     path.join(gitDir, 'HEAD'),
     path.join(gitDir, 'FETCH_HEAD'),
     path.join(gitDir, 'index'),
@@ -332,8 +350,58 @@ export function getGitStateWatchPaths(repoRoot: string) {
     path.join(commonGitDir, 'logs', 'refs'),
     path.join(commonGitDir, 'reftable'),
     path.join(commonGitDir, 'info', 'exclude'),
-    ...submoduleStatePaths(repoRoot),
-  ])].sort();
+  ];
+}
+
+/**
+ * Files and directories under the Git dir whose changes can move the reviewed
+ * range or what git ignores, plus each submodule's HEAD and logs/HEAD.
+ * Directories (`refs`, `logs/refs`, `reftable`) cover everything below them.
+ * Paths that do not exist yet are included, so the watcher picks them up when
+ * git creates them.
+ */
+export function getGitStateWatchPaths(repoRoot: string) {
+  const gitDirs = resolveGitDirs(repoRoot);
+  if (!gitDirs) return [];
+  return [...new Set([...repoStatePaths(gitDirs), ...submoduleStatePaths(repoRoot)])].sort();
+}
+
+/**
+ * Decides which paths at or below `<common git dir>/modules` the watcher
+ * covers. Each submodule has its own Git dir there, named after the
+ * submodule (so possibly a few directories deep); a nested submodule's sits
+ * under its parent's own `modules`. Inside a Git dir only HEAD and logs/HEAD
+ * can move a gitlink, so only they, `logs` and `modules` are covered there;
+ * objects, refs and hooks get no handle or poll timer. Everything on the way
+ * to a Git dir is covered.
+ */
+function createModulesMatcher(modulesDir: string) {
+  // A directory holding HEAD is a Git dir. Only yes answers are kept: a
+  // submodule's Git dir is created a moment before its HEAD.
+  const gitDirs = new Set<string>();
+  const isGitDir = (directory: string) => {
+    if (gitDirs.has(directory)) return true;
+    if (!fs.existsSync(path.join(directory, 'HEAD'))) return false;
+    gitDirs.add(directory);
+    return true;
+  };
+
+  return (target: string) => {
+    const segments = path.relative(modulesDir, target).split(path.sep).filter(Boolean);
+    let current = modulesDir;
+    for (let index = 0; index < segments.length; index += 1) {
+      const segment = segments[index]!;
+      const remaining = segments.length - index - 1;
+      // `modules` itself is never a Git dir.
+      if (index > 0 && isGitDir(current)) {
+        if (segment === 'HEAD') return remaining === 0;
+        if (segment === 'logs') return remaining === 0 || (remaining === 1 && segments[index + 1] === 'HEAD');
+        if (segment !== 'modules') return false;
+      }
+      current = path.join(current, segment);
+    }
+    return true;
+  };
 }
 
 function isWithin(parent: string, child: string) {
@@ -445,7 +513,10 @@ function watchTreeByDirectory({
     } else if (!existing || existing.ino !== stat.ino) {
       if (existing) unwatchTree(filePath);
       if (wanted(filePath)) {
-        void walk(filePath, true).then(() => onEvent(filePath));
+        // Adding watches can lose events that arrive meanwhile (seen with
+        // macOS FSEvents), so a walk that added any reports an unnamed change
+        // and the refresh after it reads whatever those events were about.
+        void walk(filePath, true).then((added) => onEvent(added > 0 ? null : filePath));
         return;
       }
     }
@@ -475,12 +546,14 @@ function watchTreeByDirectory({
   // reported by the watch. A tree that is new since startup is unknown to the
   // ignore listing, so each level is shown to git before it is watched: a new
   // ignored tree (a build output, a dependency install) opens no handles.
+  // Resolves to the number of directories it started watching.
   const walk = async (start: string, isNew: boolean) => {
+    let added = 0;
     let level = isNew ? await visibleNewDirs([start]) : [start];
     while (level.length > 0 && !closed) {
       const next: string[] = [];
       for (const directory of level) {
-        if (closed) return;
+        if (closed) return added;
         // Ignore rules and nested repos may have changed since it was queued.
         if (!wanted(directory)) continue;
         let ino: number;
@@ -492,6 +565,7 @@ function watchTreeByDirectory({
           continue;
         }
         if (!watchDirectory(directory, ino)) continue;
+        added += 1;
         // Asked again once the watch is set: a `.git` made or removed before
         // that is reported by no event.
         if (isBoundary(directory, true)) continue;
@@ -512,6 +586,7 @@ function watchTreeByDirectory({
       }
       level = isNew && next.length > 0 ? await visibleNewDirs(next) : next;
     }
+    return added;
   };
 
   void walk(root, false).then(() => {
@@ -605,9 +680,11 @@ function samePathState(left: PathState | undefined, right: PathState) {
 // A ctime in whole seconds may come from a file system that stores no finer
 // time (HFS+, ext3, many network mounts). There a second write of the same
 // size in the same second leaves lstat unchanged, so an unchanged state proves
-// nothing until that second is well past.
+// nothing until that second is well past. A ctime in the future (clock skew,
+// a network mount) never counts, or every repeated event would pass.
 function mayHideAWrite(state: Exclude<PathState, 'missing'>, nowMs: number) {
-  return state.ctimeMs % 1000 === 0 && nowMs - state.ctimeMs < TIMESTAMP_SLACK_MS;
+  const ageMs = nowMs - state.ctimeMs;
+  return state.ctimeMs % 1000 === 0 && ageMs >= 0 && ageMs < TIMESTAMP_SLACK_MS;
 }
 
 /**
@@ -658,12 +735,15 @@ export function createRepoWatcher({
     }
   };
 
+  // A tree created after startup (`late`) does not hold back onReady; once
+  // it is ready it refreshes, for whatever changed before it was listening.
   const createTree = (
     options: Omit<TreeWatcherOptions, 'onReady' | 'onError' | 'isBoundary' | 'visibleNewDirs'>
       & Partial<Pick<TreeWatcherOptions, 'isBoundary' | 'visibleNewDirs'>>
       & {ignored: (filePath: string) => boolean; atomic: boolean},
+    late = false,
   ) => {
-    pendingReady += 1;
+    if (!late) pendingReady += 1;
     const full: PollingOptions = {
       isBoundary: () => false,
       visibleNewDirs: async (directories) => directories,
@@ -672,7 +752,9 @@ export function createRepoWatcher({
         if (!closed) options.onEvent(filePath);
       },
       onError: reportError,
-      onReady: handleReady,
+      onReady: late ? () => {
+        if (!closed) notify();
+      } : handleReady,
     };
     const tree = usePolling
       ? watchTreeByPolling(full)
@@ -698,6 +780,12 @@ export function createRepoWatcher({
   let knownVisible = new Set<string>();
   let ignoreCheckQueue = new Set<string>();
   let ignoreCheckTimer: NodeJS.Timeout | null = null;
+  // New directories waiting to be shown to git, each list with the walk
+  // waiting on it. One check-ignore answers a whole batch and one batch runs
+  // at a time, so a checkout that adds many directories starts few gits.
+  let dirCheckQueue: Array<{directories: string[]; resolve: (visible: string[]) => void}> = [];
+  let dirCheckTimer: NodeJS.Timeout | null = null;
+  let dirCheckRunning = false;
   let ignoreGeneration = 0;
 
   // Skipped entirely: .git, what git ignores, and other repositories nested
@@ -744,6 +832,9 @@ export function createRepoWatcher({
     visibleNewDirs: (directories) => visibleNewDirs(directories),
     onEvent: (filePath) => handleWorktreeEvent(filePath),
   });
+
+  // Re-reads which gitlinks the index holds; set up with the Git state trees.
+  let rescanSubmodules: () => Promise<void> = async () => undefined;
 
   // Ignore rules can change with any .gitignore, info/exclude, or a checkout,
   // so re-list them and start or stop watching whatever moved.
@@ -813,13 +904,36 @@ export function createRepoWatcher({
     return ignored;
   };
 
+  const unknownDirs = (directories: string[]) => directories
+    .map((directory) => toRelative(repoRoot, directory))
+    .filter((relative): relative is string => relative !== null && !knownVisible.has(relative));
+
+  const scheduleDirChecks = () => {
+    if (dirCheckTimer || dirCheckRunning || dirCheckQueue.length === 0 || closed) return;
+    dirCheckTimer = setTimeout(() => void flushDirChecks(), IGNORE_CHECK_DELAY_MS);
+  };
+
+  const flushDirChecks = async () => {
+    dirCheckTimer = null;
+    const batch = dirCheckQueue;
+    dirCheckQueue = [];
+    const unknown = [...new Set(batch.flatMap(({directories}) => unknownDirs(directories)))];
+    dirCheckRunning = true;
+    // askGitWhichIgnored never rejects.
+    const ignored = unknown.length > 0 ? await askGitWhichIgnored(unknown) : new Set<string>();
+    dirCheckRunning = false;
+    for (const {directories, resolve} of batch) {
+      resolve(directories.filter((directory) => !ignored.has(toRelative(repoRoot, directory) ?? '')));
+    }
+    scheduleDirChecks();
+  };
+
   visibleNewDirs = async (directories) => {
-    const unknown = directories
-      .map((directory) => toRelative(repoRoot, directory))
-      .filter((relative): relative is string => relative !== null && !knownVisible.has(relative));
-    if (unknown.length === 0 || closed) return directories;
-    const ignored = await askGitWhichIgnored(unknown);
-    return directories.filter((directory) => !ignored.has(toRelative(repoRoot, directory) ?? ''));
+    if (closed || unknownDirs(directories).length === 0) return directories;
+    return new Promise((resolve) => {
+      dirCheckQueue.push({directories, resolve});
+      scheduleDirChecks();
+    });
   };
 
   const flushIgnoreChecks = async () => {
@@ -861,12 +975,16 @@ export function createRepoWatcher({
     if (filePath && (isOutsideReview(filePath) || !worktreeIsNew(filePath))) return;
     if (!relative) {
       notify();
+      // Whatever changed may have staged a new gitlink (a clone `git add`ed),
+      // and its index event may be one of those lost while watches were added.
+      void rescanSubmodules();
       return;
     }
 
     if (path.posix.basename(relative) === '.gitignore') {
       void rescanIgnored();
     }
+    if (relative === '.gitmodules') void rescanSubmodules();
 
     if (knownVisible.has(relative)) {
       notify();
@@ -879,30 +997,83 @@ export function createRepoWatcher({
     ignoreCheckTimer ??= setTimeout(() => void flushIgnoreChecks(), IGNORE_CHECK_DELAY_MS);
   };
 
-  const gitStatePaths = getGitStateWatchPaths(repoRoot);
-  if (gitStatePaths.length > 0) {
-    // Watch the Git directories themselves, filtered down to the state paths,
-    // so state files and ref directories created later are still seen.
-    const roots = [...new Set(gitStatePaths.map((statePath) => path.dirname(statePath)))]
-      .filter((root, _index, all) => !all.some((other) => other !== root && isWithin(other, root)));
-    const isGitStatePath = (filePath: string) => gitStatePaths.some((statePath) => (
-      isWithin(statePath, filePath) || isWithin(filePath, statePath)
-    ));
+  // Git state lives outside the worktree tree: the repo's own Git dirs, each
+  // submodule's Git dir under `<common git dir>/modules`, and the Git dir of
+  // any other gitlink (a clone staged with `git add`), wherever it is.
+  const gitDirs = resolveGitDirs(repoRoot);
+  if (gitDirs) {
+    const fixedStatePaths = repoStatePaths(gitDirs);
+    const indexPath = path.join(gitDirs.gitDir, 'index');
+    const modulesDir = path.join(gitDirs.commonGitDir, 'modules');
+    const isCoveredInModules = createModulesMatcher(modulesDir);
+    let submodulePaths = submoduleStatePaths(repoRoot);
+    // Any path on the way to a state path, or below one.
+    const isGitStatePath = (filePath: string) => {
+      if (isWithin(modulesDir, filePath)) return isCoveredInModules(filePath);
+      return [...fixedStatePaths, ...submodulePaths].some((statePath) => (
+        isWithin(statePath, filePath) || isWithin(filePath, statePath)
+      ));
+    };
 
     const gitStateIsNew = createEventDeduper(startedAtMs);
-    for (const root of roots) {
-      createTree({
-        root,
-        ignored: (filePath) => !isGitStatePath(filePath),
-        atomic: true,
-        shouldWatchDir: isGitStatePath,
-        onEvent: (filePath) => {
-          if (filePath && (!isGitStatePath(filePath) || !gitStateIsNew(filePath))) return;
-          notify();
-          void rescanIgnored();
-        },
-      });
-    }
+    // Watch the Git directories themselves, filtered down to the state paths,
+    // so state files and ref directories created later are still seen.
+    const stateTrees = new Map<string, TreeWatcher>();
+    const syncStateTrees = (late: boolean) => {
+      const statePaths = [...fixedStatePaths, ...submodulePaths];
+      const roots = [...new Set(statePaths.map((statePath) => path.dirname(statePath)))]
+        .filter((root, _index, all) => !all.some((other) => other !== root && isWithin(other, root)));
+      for (const [root, tree] of stateTrees) {
+        if (roots.includes(root)) continue;
+        stateTrees.delete(root);
+        trees.splice(trees.indexOf(tree), 1);
+        void tree.close();
+      }
+      for (const root of roots) {
+        if (stateTrees.has(root)) continue;
+        stateTrees.set(root, createTree({
+          root,
+          ignored: (filePath) => !isGitStatePath(filePath),
+          atomic: true,
+          shouldWatchDir: isGitStatePath,
+          onEvent: (filePath) => {
+            if (filePath && (!isGitStatePath(filePath) || !gitStateIsNew(filePath))) return;
+            notify();
+            void rescanIgnored();
+            // A gitlink added or removed changes which Git dirs to watch.
+            if (!filePath || filePath === indexPath) void rescanSubmodules();
+          },
+        }, late));
+      }
+    };
+
+    let submoduleRescanRunning = false;
+    let submoduleRescanAgain = false;
+    rescanSubmodules = async () => {
+      if (closed) return;
+      if (submoduleRescanRunning) {
+        submoduleRescanAgain = true;
+        return;
+      }
+      submoduleRescanRunning = true;
+      try {
+        const next = await submoduleStatePathsAsync(repoRoot, gitChildren);
+        if (closed || next.join('\0') === submodulePaths.join('\0')) return;
+        submodulePaths = next;
+        syncStateTrees(true);
+      } catch {
+        // Keep watching the Git dirs found before, as at startup when the
+        // listing fails.
+      } finally {
+        submoduleRescanRunning = false;
+        if (submoduleRescanAgain && !closed) {
+          submoduleRescanAgain = false;
+          void rescanSubmodules();
+        }
+      }
+    };
+
+    syncStateTrees(false);
   }
 
   return {
@@ -910,6 +1081,9 @@ export function createRepoWatcher({
       closed = true;
       notify.cancel();
       if (ignoreCheckTimer) clearTimeout(ignoreCheckTimer);
+      if (dirCheckTimer) clearTimeout(dirCheckTimer);
+      // Walks waiting on a check stop there.
+      for (const {resolve} of dirCheckQueue.splice(0)) resolve([]);
       // Their answers would be dropped anyway; quitting must not wait for them.
       for (const child of gitChildren) child.kill('SIGKILL');
       gitChildren.clear();
