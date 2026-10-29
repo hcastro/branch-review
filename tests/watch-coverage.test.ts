@@ -947,7 +947,9 @@ describe.each(watchModes.filter((mode) => mode.nativeMode === 'directories'))('r
       await watcher.settle(1500);
 
       expect(countRuns() - runsBefore).toBeLessThanOrEqual(10);
-      expect(handles.isOpen(path.join(cwd, 'src', 'd59'))).toBe(true);
+      // New directories are watched once git has checked them for ignore
+      // rules, which can outlast the settle window on a slow machine.
+      expect(await waitUntil(() => handles.isOpen(path.join(cwd, 'src', 'd59')), 10_000)).toBe(true);
 
       fs.writeFileSync(path.join(cwd, 'src', 'd59', 'f.ts'), 'export const v = -1;\n');
       expect(await watcher.waitForChange()).toBe(true);
