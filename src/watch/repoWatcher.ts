@@ -367,10 +367,10 @@ export function getGitStateWatchPaths(repoRoot: string) {
 }
 
 /**
- * Decides which paths at or below `<common git dir>/modules` the watcher
- * covers. Each submodule has its own Git dir there, named after the
- * submodule (so possibly a few directories deep); a nested submodule's sits
- * under its parent's own `modules`. Inside a Git dir only HEAD and logs/HEAD
+ * Decides which paths at or below the reviewed worktree's modules dir
+ * (`<git dir>/modules`) the watcher covers. Each submodule has its own Git
+ * dir there, named after the submodule (so possibly a few directories
+ * deep); a nested submodule's sits under its parent's own `modules`. Inside a Git dir only HEAD and logs/HEAD
  * can move a gitlink, so only they, `logs` and `modules` are covered there;
  * objects, refs and hooks get no handle or poll timer. Everything on the way
  * to a Git dir is covered.
@@ -998,13 +998,18 @@ export function createRepoWatcher({
   };
 
   // Git state lives outside the worktree tree: the repo's own Git dirs, each
-  // submodule's Git dir under `<common git dir>/modules`, and the Git dir of
+  // submodule's Git dir under this worktree's modules dir, and the Git dir of
   // any other gitlink (a clone staged with `git add`), wherever it is.
   const gitDirs = resolveGitDirs(repoRoot);
   if (gitDirs) {
     const fixedStatePaths = repoStatePaths(gitDirs);
     const indexPath = path.join(gitDirs.gitDir, 'index');
-    const modulesDir = path.join(gitDirs.commonGitDir, 'modules');
+    // `<git dir>/modules`: a linked worktree keeps its own submodules there,
+    // apart from the main checkout's under the common Git dir.
+    const modulesDir = path.resolve(
+      repoRoot,
+      tryRunGit(repoRoot, ['rev-parse', '--git-path', 'modules']) ?? path.join(gitDirs.gitDir, 'modules'),
+    );
     const isCoveredInModules = createModulesMatcher(modulesDir);
     let submodulePaths = submoduleStatePaths(repoRoot);
     // Any path on the way to a state path, or below one.
@@ -1019,10 +1024,15 @@ export function createRepoWatcher({
     // Watch the Git directories themselves, filtered down to the state paths,
     // so state files and ref directories created later are still seen.
     const stateTrees = new Map<string, TreeWatcher>();
+    // State dirs covered by another tree's root rather than a tree of their own.
+    let nestedRoots = new Set<string>();
     const syncStateTrees = (late: boolean) => {
       const statePaths = [...fixedStatePaths, ...submodulePaths];
-      const roots = [...new Set(statePaths.map((statePath) => path.dirname(statePath)))]
-        .filter((root, _index, all) => !all.some((other) => other !== root && isWithin(other, root)));
+      const allRoots = [...new Set(statePaths.map((statePath) => path.dirname(statePath)))];
+      const roots = allRoots
+        .filter((root) => !allRoots.some((other) => other !== root && isWithin(other, root)));
+      const previousNested = nestedRoots;
+      nestedRoots = new Set(allRoots.filter((root) => !roots.includes(root)));
       for (const [root, tree] of stateTrees) {
         if (roots.includes(root)) continue;
         stateTrees.delete(root);
@@ -1040,10 +1050,24 @@ export function createRepoWatcher({
             if (filePath && (!isGitStatePath(filePath) || !gitStateIsNew(filePath))) return;
             notify();
             void rescanIgnored();
-            // A gitlink added or removed changes which Git dirs to watch.
-            if (!filePath || filePath === indexPath) void rescanSubmodules();
+            // A gitlink added or removed changes which Git dirs to watch, and
+            // a submodule initialized in place gives a gitlink its Git dir.
+            if (!filePath || filePath === indexPath || isWithin(modulesDir, filePath)) void rescanSubmodules();
           },
         }, late));
+      }
+      // A tree decides what to skip when it first sees a directory, so a
+      // state dir found after startup inside an existing root is added to
+      // that tree, along with the directories on the way to it.
+      for (const nested of nestedRoots) {
+        if (!late || previousNested.has(nested)) continue;
+        const [root, tree] = [...stateTrees].find(([candidate]) => isWithin(candidate, nested)) ?? [];
+        if (!root || !tree) continue;
+        const chain: string[] = [];
+        for (let directory = nested; directory !== root; directory = path.dirname(directory)) {
+          chain.unshift(directory);
+        }
+        tree.add(chain);
       }
     };
 

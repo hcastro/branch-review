@@ -94,7 +94,7 @@ function hangingGit() {
       return null;
     }
   };
-  return {binDir, readPids};
+  return {binDir, pidFile, readPids};
 }
 
 // Routes os.tmpdir() to a fresh directory for the refresh parent.
@@ -696,18 +696,26 @@ describe('refreshReviewInWorker when its parent goes away', () => {
     const cwd = createRepo();
     const tmp = makeTempDir('branch-review-parent-tmp-');
     const pidFile = path.join(makeTempDir('branch-review-pids-'), 'refresh.pid');
-    const {binDir, readPids} = hangingGit();
-    // In the refresh process only (the one with an IPC channel): a while
-    // after the request arrives, with the refresh waiting on the hung git and
-    // its parent-check thread long started, record the pid and block the
-    // main thread, so its disconnect handler cannot run.
+    const {binDir, pidFile: gitPidFile, readPids} = hangingGit();
+    // In the refresh process only (the one with an IPC channel): once the
+    // hung git it started has recorded this process as its parent, so the
+    // refresh is waiting on it and its parent-check thread is running,
+    // record the pid and block the main thread, so its disconnect handler
+    // cannot run. It listens for no message: a listener added this early
+    // would take the request before the refresh's own listener exists.
     const preload = path.join(makeTempDir('branch-review-preload-'), 'block.cjs');
     fs.writeFileSync(preload, [
       'if (process.send) {',
-      "  process.once('message', () => setTimeout(() => {",
-      "    require('node:fs').writeFileSync(process.env.BLOCK_PID_FILE, String(process.pid));",
+      "  const fs = require('node:fs');",
+      '  const poll = setInterval(() => {',
+      '    let parentPid = 0;',
+      "    try { parentPid = Number(fs.readFileSync(process.env.GIT_PID_FILE, 'utf8').trim().split(' ')[1]); } catch {}",
+      '    if (parentPid !== process.pid) return;',
+      '    clearInterval(poll);',
+      '    fs.writeFileSync(process.env.BLOCK_PID_FILE, String(process.pid));',
       '    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000);',
-      '  }, 1500));',
+      '  }, 20);',
+      '  poll.unref();',
       '}',
       '',
     ].join('\n'));
@@ -723,6 +731,7 @@ describe('refreshReviewInWorker when its parent goes away', () => {
         TMPDIR: tmp,
         NODE_OPTIONS: `--require ${preload}`,
         BLOCK_PID_FILE: pidFile,
+        GIT_PID_FILE: gitPidFile,
         PATH: `${binDir}${path.delimiter}${originalPath ?? ''}`,
       },
       stdio: ['ignore', 'ignore', 'inherit'],

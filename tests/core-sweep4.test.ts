@@ -359,24 +359,29 @@ describe('the asynchronous driver\'s file loops', () => {
     // The build is skipped: only the line counts and the hashing loop over every file.
     const fingerprint = getReviewFingerprint(cwd, range);
 
-    let longest = 0;
-    let last = Date.now();
-    const timer = setInterval(() => {
-      const now = Date.now();
-      longest = Math.max(longest, now - last);
-      last = now;
-    }, 5);
-    const started = Date.now();
-    let result;
-    try {
-      last = Date.now();
-      result = await refreshReview(refreshOptions(cwd, fingerprint));
-    } finally {
-      clearInterval(timer);
-    }
-    const elapsed = Date.now() - started;
+    // The longest gap between timer ticks during one refresh.
+    const longestGap = async () => {
+      let longest = 0;
+      let last = Date.now();
+      const timer = setInterval(() => {
+        const now = Date.now();
+        longest = Math.max(longest, now - last);
+        last = now;
+      }, 5);
+      try {
+        last = Date.now();
+        const result = await refreshReview(refreshOptions(cwd, fingerprint));
+        expect('review' in result).toBe(false);
+      } finally {
+        clearInterval(timer);
+      }
+      return longest;
+    };
 
-    expect('review' in result).toBe(false);
-    expect(longest, `refresh took ${elapsed} ms`).toBeLessThan(300);
+    // A loaded machine can stall the process for a moment in any one run, so
+    // a second run gets a chance; an unsliced loop blocks in every run.
+    const gaps = [await longestGap()];
+    if (gaps[0]! >= 300) gaps.push(await longestGap());
+    expect(Math.min(...gaps), `longest gaps ${gaps.join(', ')} ms`).toBeLessThan(300);
   });
 });

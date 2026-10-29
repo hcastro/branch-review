@@ -604,6 +604,102 @@ describe.each(watchModes)('repo watcher coverage ($name)', {timeout: 60_000}, ({
     await watcher.close();
   });
 
+  it('refreshes when a gitlink staged after the watcher started, with its Git dir inside .git, commits', async () => {
+    const lib = createRepo();
+    // The CLI watches git's toplevel, a real path, as git's own paths are.
+    const cwd = fs.realpathSync(createRepo());
+    const watcher = await startWatcher(cwd, {usePolling, nativeMode});
+
+    // The Git dir lands inside the already-watched .git, outside .git/modules,
+    // and exists before anything says it belongs to a gitlink.
+    runGit(cwd, 'clone', '-q', '--separate-git-dir', path.join(cwd, '.git', 'vendored-git'), lib, 'vendored');
+    await flush(1000);
+    runGit(cwd, '-c', 'advice.addEmbeddedRepo=false', 'add', 'vendored');
+    expect(runGit(cwd, 'ls-files', '--stage', 'vendored')).toMatch(/^160000 /);
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(1500);
+
+    runGit(path.join(cwd, 'vendored'), 'commit', '-q', '--allow-empty', '-m', 'inside the clone');
+    expect(runGit(cwd, 'diff', '--name-only')).toBe('vendored');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  // A linked worktree keeps its submodules' Git dirs under its own Git dir
+  // (`<common git dir>/worktrees/<name>/modules`), apart from the main
+  // checkout's.
+  function createLinkedWorktree(main: string) {
+    const linked = path.join(makeTempDir('branch-review-watch-linked-'), 'linked');
+    runGit(main, 'worktree', 'add', '-q', linked, '-b', 'linked-work');
+    // The CLI watches git's toplevel, a real path, as git's own paths are.
+    return fs.realpathSync(linked);
+  }
+
+  it('refreshes when a submodule added in a linked worktree after the watcher started commits or checks out', async () => {
+    const subSource = createRepo();
+    const main = createRepo();
+    const linked = createLinkedWorktree(main);
+    const watcher = await startWatcher(linked, {usePolling, nativeMode});
+
+    runGit(linked, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    expect(runGit(linked, 'rev-parse', '--git-path', 'modules')).toContain(`${path.sep}worktrees${path.sep}`);
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle(1500);
+
+    runGit(path.join(linked, 'sub'), 'commit', '-q', '--allow-empty', '-m', 'inside the late submodule');
+    expect(runGit(linked, 'diff', '--name-only')).toBe('sub');
+    expect(await watcher.waitForChange()).toBe(true);
+    await watcher.settle();
+
+    runGit(path.join(linked, 'sub'), 'checkout', '-q', '--detach', 'HEAD~1');
+    expect(runGit(linked, 'diff', '--name-only')).toBe('');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it('refreshes when a submodule initialized in a linked worktree after the watcher started commits', async () => {
+    const subSource = createRepo();
+    const main = createRepo();
+    runGit(main, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    runGit(main, 'commit', '-q', '-m', 'add submodule');
+    // A new worktree leaves its submodules uninitialized.
+    const linked = createLinkedWorktree(main);
+    expect(fs.existsSync(path.join(linked, 'sub', '.git'))).toBe(false);
+    const watcher = await startWatcher(linked, {usePolling, nativeMode});
+
+    runGit(linked, '-c', 'protocol.file.allow=always', 'submodule', 'update', '-q', '--init');
+    expect(fs.existsSync(path.join(linked, 'sub', '.git'))).toBe(true);
+    await watcher.settle(1500);
+
+    runGit(path.join(linked, 'sub'), 'commit', '-q', '--allow-empty', '-m', 'inside the initialized submodule');
+    expect(runGit(linked, 'diff', '--name-only')).toBe('sub');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
+  it("does not refresh a linked worktree's review when the main checkout's submodule commits", async () => {
+    const subSource = createRepo();
+    const main = createRepo();
+    runGit(main, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', subSource, 'sub');
+    runGit(main, 'commit', '-q', '-m', 'add submodule');
+    const linked = createLinkedWorktree(main);
+    const watcher = await startWatcher(linked, {usePolling, nativeMode});
+    await watcher.settle();
+
+    runGit(path.join(main, 'sub'), 'commit', '-q', '--allow-empty', '-m', 'inside the main checkout submodule');
+    expect(runGit(main, 'diff', '--name-only')).toBe('sub');
+    await flush(1500);
+    expect(watcher.changes).toBe(0);
+
+    fs.writeFileSync(path.join(linked, 'src', 'one.ts'), 'export const value = 2;\n');
+    expect(await watcher.waitForChange()).toBe(true);
+
+    await watcher.close();
+  });
+
   it('stops a running ignore re-listing and ignore check when closed', async () => {
     const cwd = createRepo({'.gitignore': '*.log\n'});
     const flagDir = makeTempDir('branch-review-slow-git-');

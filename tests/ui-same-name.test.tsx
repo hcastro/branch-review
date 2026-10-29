@@ -2,13 +2,25 @@ import path from 'node:path';
 import {execFileSync} from 'node:child_process';
 import React from 'react';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {App} from '../src/ui/App.js';
-import {buildReviewModel, buildReviewSections} from '../src/review/build.js';
-import {NAME_NOT_UTF8, getReviewFileContents, resolveRefs} from '../src/git.js';
-import {cleanupTempDirs, git, initRepo} from './core-helpers.js';
-import {
+
+// Ink colours through chalk, which picks its colour level when first
+// imported; force colour on before any import so the frame carries the bold
+// that marks the selected tree row.
+const previousForceColor = vi.hoisted(() => {
+  const previous = process.env.FORCE_COLOR;
+  process.env.FORCE_COLOR = '1';
+  return previous;
+});
+
+const {App} = await import('../src/ui/App.js');
+const {buildReviewModel, buildReviewSections} = await import('../src/review/build.js');
+const {NAME_NOT_UTF8, getReviewFileContents, resolveRefs} = await import('../src/git.js');
+const {cleanupTempDirs, git, initRepo} = await import('./core-helpers.js');
+const {
+  appElement,
   buildFixture,
   cellPosition,
+  emitMouseDragAt,
   emitMousePressAt,
   flush,
   frameLines,
@@ -16,7 +28,15 @@ import {
   recordingWriter,
   renderFixture,
   renderSized,
-} from './ui-fixtures.js';
+} = await import('./ui-fixtures.js');
+
+if (previousForceColor === undefined) {
+  delete process.env.FORCE_COLOR;
+} else {
+  process.env.FORCE_COLOR = previousForceColor;
+}
+
+const BOLD = /\u001B\[(?:\d+;)*1m/;
 
 // A file whose name is not UTF-8 is shown by an escaped stand-in. A second,
 // real file can have that stand-in as its name. The two must stay two rows,
@@ -231,6 +251,69 @@ describe('a name that is not UTF-8 next to a real file shown with the same text'
       }
     }
     expect(seen.sort()).toEqual(['real', 'undecodable']);
+
+    instance.unmount();
+  });
+
+  // The real file first, as git lists it, so a lookup by path finds it in
+  // place of the undecodable one. Each file has a block.
+  const realFirst = (extra: boolean) => {
+    const built = buildFixture([
+      ...(extra ? [{path: 'a.txt', rawDiff: '@@ -0,0 +1 @@\n+above', rendered: ['• a.txt:1: ', `${gutter(1)}above`]}] : []),
+      {
+        path: literalCafe,
+        rawDiff: '@@ -0,0 +1,3 @@\n+one\n+two\n+three',
+        rendered: [`• ${literalCafe}:1: `, `${gutter(1)}one`, `${gutter(2)}two`, `${gutter(3)}three`],
+      },
+      {path: literalCafe, rawDiff: '@@ -0,0 +1,2 @@\n+latin1\n+latin2', rendered: [`• ${literalCafe}:1: `, `${gutter(1)}latin1`, `${gutter(2)}latin2`]},
+    ]);
+    Object.assign(built.review.files.at(-1)!, {pathError: NAME_NOT_UTF8, rawDiffError: NAME_NOT_UTF8});
+    return built;
+  };
+
+  it('highlights the tree row that was clicked, not the other file with the same text', async () => {
+    const instance = renderFixture(realFirst(false), {columns: 140, rows: 30});
+    await flush(5);
+    const rowsOnScreen = cafeRows(instance);
+    expect(rowsOnScreen).toHaveLength(2);
+
+    // Only the tree part of the row: the diff pane on the same row has its own styles.
+    const treeIsBold = (row: number) => {
+      const line = (instance.lastFrame() ?? '').split('\n')[row] ?? '';
+      return BOLD.test(line.slice(0, line.indexOf(literalCafe) + literalCafe.length));
+    };
+    for (const [index, {row, column}] of rowsOnScreen.entries()) {
+      await emitMousePressAt(column, row);
+      await flush(5);
+      const other = rowsOnScreen[1 - index]!.row;
+      expect([treeIsBold(row), treeIsBold(other)], `click on row ${row}`).toEqual([true, false]);
+    }
+
+    instance.unmount();
+  });
+
+  it('keeps a selection on the undecodable file\'s lines when a refresh moves them', async () => {
+    const writes: string[] = [];
+    const dimensions = {columns: 140, rows: 30};
+    const instance = renderFixture(realFirst(false), dimensions, writes);
+    await flush(5);
+
+    const start = cellPosition(instance.lastFrame(), ['latin1'], 'latin1');
+    const end = cellPosition(instance.lastFrame(), ['latin2'], 'latin2', 'latin2'.length - 1);
+    await emitMousePressAt(start.column, start.row);
+    await emitMouseDragAt(end.column, end.row);
+
+    // A file appears above both, so every line moves down.
+    instance.rerender(appElement(realFirst(true), dimensions, recordingWriter(writes)));
+    await flush(5);
+    expect(frameLines(instance.lastFrame()).join('\n')).not.toContain('Selection cancelled');
+
+    const endAfter = cellPosition(instance.lastFrame(), ['latin2'], 'latin2', 'latin2'.length - 1);
+    await emitMouseDragAt(endAfter.column, endAfter.row, true);
+    await flush(5);
+    // Still the undecodable file's selection, so its copy fails with its reason.
+    expect(writes).toEqual([]);
+    expect(footer(instance.lastFrame())).toContain(`✗ Copy action unavailable. · ${NAME_NOT_UTF8}`);
 
     instance.unmount();
   });
