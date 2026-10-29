@@ -195,8 +195,11 @@ describe('a file named like the range argument', () => {
 
     const range = resolveRefs(cwd, 'feat2', 'main');
     expect(range.diffArg).toBe('main...feat2');
-    const model = buildReviewModel({cwd, range, width: 100});
+    const spy = gitSpy();
+    const model = withEnv({PATH: spy.pathValue}, () => buildReviewModel({cwd, range, width: 100}));
     expect(model.files.map((file) => [file.path, file.error])).toEqual([['a.txt', undefined]]);
+    // The whole-range count succeeds, so the per-file fallback never runs.
+    expect(spy.calls().filter((call) => call.args.includes('--numstat'))).toHaveLength(1);
     expect(() => getReviewFingerprint(cwd, range)).not.toThrow();
   });
 

@@ -48,12 +48,14 @@ describe('startup', () => {
     const root = initRepo({'a.txt': 'one\n'});
     writeFiles(root, {'a.txt': 'one\ntwo\n'});
     // delta runs only during the build, after the fingerprint: this one
-    // writes to the reviewed file, then renders as the real delta.
+    // writes to the reviewed file, then renders as the real delta. The edit
+    // keeps the line counts, so only a fingerprint taken before it differs
+    // from a fresh one.
     const bin = makeTempDir('branch-review-writing-delta-');
     const realDelta = spawnSync('/usr/bin/which', ['delta'], {encoding: 'utf8'}).stdout.trim();
     writeExecutable(path.join(bin, 'delta'), [
       '#!/bin/sh',
-      `printf 'one\\ntwo\\nthree\\n' > '${path.join(root, 'a.txt')}'`,
+      `printf 'one\\nTWO\\n' > '${path.join(root, 'a.txt')}'`,
       `exec '${realDelta}' "$@"`,
       '',
     ].join('\n'));
@@ -64,7 +66,7 @@ describe('startup', () => {
       width: 100,
     }));
 
-    expect(fs.readFileSync(path.join(root, 'a.txt'), 'utf8')).toBe('one\ntwo\nthree\n');
+    expect(fs.readFileSync(path.join(root, 'a.txt'), 'utf8')).toBe('one\nTWO\n');
     expect(startup.initialFingerprint).toBeDefined();
     expect(startup.initialFingerprint).not.toBe(getReviewFingerprint(root, startup.range));
   });

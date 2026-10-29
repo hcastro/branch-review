@@ -369,55 +369,46 @@ describe('files with no text diff', () => {
   });
 });
 
-describe('build progress', () => {
-  it('reports each file once, in order, error rows included', () => {
+describe('building file by file', () => {
+  it('builds each file once, in order, an unreadable one as an error row', () => {
     const cwd = initRepo({'a.txt': 'a\n'});
     writeFiles(cwd, {'a.txt': 'a2\n', 'b.txt': 'b\n', 'locked.txt': 'secret\n', 'z.txt': 'z\n'});
     fs.chmodSync(path.join(cwd, 'locked.txt'), 0o000);
 
     try {
       const range = resolveRefs(cwd, 'HEAD', 'main');
-      let calls = 0;
-      const model = buildReviewModel({cwd, range, width: 100, onFileBuilt: () => {
-        calls += 1;
-      }});
+      const model = buildReviewModel({cwd, range, width: 100});
 
       expect(model.files.map((file) => file.path)).toEqual(['a.txt', 'b.txt', 'locked.txt', 'z.txt']);
-      expect(model.files.find((file) => file.path === 'locked.txt')?.error).toBeTruthy();
-      expect(calls).toBe(4);
+      expect(model.files.filter((file) => file.error !== undefined).map((file) => file.path)).toEqual(['locked.txt']);
     } finally {
       fs.chmodSync(path.join(cwd, 'locked.txt'), 0o644);
     }
   });
 
-  it('calls the callback after each file, before the next one starts', () => {
+  it('reads each file when its turn comes, so one deleted mid-build becomes an error row', () => {
     const cwd = initRepo({'a.txt': 'a\n'});
     writeFiles(cwd, {'a.txt': 'a2\n', 'b.txt': 'b\n', 'c.txt': 'c\n'});
     const range = resolveRefs(cwd, 'HEAD', 'main');
+    // A delta that deletes c.txt while it renders b.txt, then prints the
+    // patch as it came in. c.txt is affected only if it has not been read yet.
+    const bin = makeTempDir('branch-review-deleting-delta-');
+    const delta = path.join(bin, 'delta');
+    fs.writeFileSync(delta, [
+      '#!/bin/sh',
+      'input=$(cat)',
+      `case "$input" in *'+++ b/b.txt'*) rm -f '${path.join(cwd, 'c.txt')}';; esac`,
+      `printf '%s\\n' "$input"`,
+      '',
+    ].join('\n'));
+    fs.chmodSync(delta, 0o755);
 
-    // Deleting c.txt from inside the callback for b.txt only affects c.txt if
-    // c.txt has not been built yet.
-    let calls = 0;
-    const model = buildReviewModel({
-      cwd,
-      range,
-      width: 100,
-      onFileBuilt: () => {
-        calls += 1;
-        if (calls === 2) fs.rmSync(path.join(cwd, 'c.txt'));
-      },
-    });
+    const model = withEnv({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => buildReviewModel({cwd, range, width: 100}));
 
-    expect(calls).toBe(3);
+    expect(model.files.map((file) => file.path)).toEqual(['a.txt', 'b.txt', 'c.txt']);
     expect(model.files.find((file) => file.path === 'b.txt')?.error).toBeUndefined();
+    expect(model.files.find((file) => file.path === 'b.txt')?.renderedLines).toContain('+b');
     expect(model.files.find((file) => file.path === 'c.txt')?.error).toMatch(/c\.txt/);
-  });
-
-  it('builds the same model without the callback', () => {
-    const cwd = initRepo({'a.txt': 'a\n'});
-    writeFiles(cwd, {'a.txt': 'a2\n', 'b.txt': 'b\n'});
-    const range = resolveRefs(cwd, 'HEAD', 'main');
-    expect(buildReviewModel({cwd, range, width: 100, onFileBuilt: () => {}}))
-      .toEqual(buildReviewModel({cwd, range, width: 100}));
+    expect(fs.existsSync(path.join(cwd, 'c.txt'))).toBe(false);
   });
 });

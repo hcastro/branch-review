@@ -1,5 +1,6 @@
 import {
   currentBranchNameOperation,
+  fileKey,
   fileMetricsOperation,
   isFatalToolError,
   progressTick,
@@ -27,10 +28,6 @@ type BuildReviewModelOptions = {
   cwd: string;
   range: DiffRange;
   width: number;
-  /** Called after each file is built, error rows included, before the next starts. */
-  onFileBuilt?: () => void;
-  /** Called once per file in every loop over the changed files. */
-  onProgress?: () => void;
 };
 
 function emptyMetrics(path: string): FileMetrics {
@@ -157,8 +154,11 @@ function* reviewModelOperation(
   {metrics: metricsMap, errors: metricsErrors}: ReviewMetrics,
 ): GitOperation<ReviewModel> {
   const {range} = options;
+  // Paths that are diffed as new files. A name that is not UTF-8 is never
+  // diffed, and its escaped stand-in may be the name of a real tracked file,
+  // so it is left out.
   const untrackedFiles = new Set(
-    entries.filter((entry) => entry.status === 'untracked').map((entry) => entry.path),
+    entries.filter((entry) => entry.status === 'untracked' && entry.nameError === undefined).map((entry) => entry.path),
   );
 
   const files: ReviewFile[] = [];
@@ -166,11 +166,10 @@ function* reviewModelOperation(
     files.push(yield* reviewFileOperation(
       options,
       entry,
-      metricsMap.get(entry.path) ?? emptyMetrics(entry.path),
-      metricsErrors.get(entry.path),
+      metricsMap.get(fileKey(entry)) ?? emptyMetrics(entry.path),
+      metricsErrors.get(fileKey(entry)),
       untrackedFiles,
     ));
-    options.onFileBuilt?.();
     yield* progressTick();
   }
 
@@ -192,7 +191,7 @@ export function buildReviewModel(options: BuildReviewModelOptions): ReviewModel 
     const changes = yield* reviewChangesOperation(cwd, range);
     const metrics = yield* fileMetricsOperation(cwd, range, changes);
     return yield* reviewModelOperation(options, changes, metrics);
-  })(), options.onProgress));
+  })()));
 }
 
 export type RefreshReviewOptions = {

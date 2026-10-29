@@ -39,12 +39,25 @@ function isAlive(pid: number) {
   }
 }
 
-// Every onProgress call's time, and the longest stretch without one.
+// Whether onProgress was called by a file loop's tick: the asynchronous
+// driver calls it straight from runOperationAsync for a tick, and from a pipe
+// event for a chunk a tool printed or read.
+function calledFromLoopTick() {
+  return /\bat (async )?runOperationAsync\b/.test(new Error().stack ?? '');
+}
+
+// Every onProgress call's time, how many came from file loop ticks, and the
+// longest stretch without one.
 function progressLog() {
   const times: number[] = [];
+  let ticks = 0;
   return {
     times,
-    onProgress: () => times.push(Date.now()),
+    ticks: () => ticks,
+    onProgress: () => {
+      times.push(Date.now());
+      if (calledFromLoopTick()) ticks += 1;
+    },
     maxGap(from: number, to: number) {
       const points = [from, ...times.filter((time) => time >= from && time <= to), to];
       let gap = 0;
@@ -56,14 +69,15 @@ function progressLog() {
 
 describe('refreshReview progress', () => {
   it('reports progress through the per-file numstat fallback, the fingerprint and the build, and counts lines once', async () => {
+    const fileCount = 100;
     const files: Record<string, string> = {};
-    for (let index = 0; index < 300; index += 1) files[`src/file-${String(index).padStart(3, '0')}.txt`] = `line ${index}\n`;
+    for (let index = 0; index < fileCount; index += 1) files[`src/file-${String(index).padStart(3, '0')}.txt`] = `line ${index}\n`;
     const cwd = initRepo(files);
     const changed: Record<string, string> = {};
     for (const name of Object.keys(files)) changed[name] = `${files[name]}more\n`;
     writeFiles(cwd, changed);
     // git can't hash it, so whole-range numstat fails and every file is counted on its own.
-    fs.chmodSync(path.join(cwd, 'src/file-150.txt'), 0o000);
+    fs.chmodSync(path.join(cwd, 'src/file-050.txt'), 0o000);
     const spy = gitSpy();
     const progress = progressLog();
 
@@ -77,15 +91,17 @@ describe('refreshReview progress', () => {
       onProgress: progress.onProgress,
     }));
     const finished = Date.now();
-    fs.chmodSync(path.join(cwd, 'src/file-150.txt'), 0o644);
+    fs.chmodSync(path.join(cwd, 'src/file-050.txt'), 0o644);
 
-    expect(result.review?.files).toHaveLength(300);
-    expect(result.review?.files.filter((file) => file.error !== undefined).map((file) => file.path)).toEqual(['src/file-150.txt']);
-    // Per-file numstat, fingerprint hashing and the build each report every file.
-    expect(progress.times.length).toBeGreaterThanOrEqual(900);
-    expect(progress.maxGap(started, finished)).toBeLessThan(5000);
+    expect(result.review?.files).toHaveLength(fileCount);
+    expect(result.review?.files.filter((file) => file.error !== undefined).map((file) => file.path)).toEqual(['src/file-050.txt']);
+    // Per-file numstat, fingerprint hashing and the build each tick once per
+    // file, whatever the tools print.
+    expect(progress.ticks()).toBe(3 * fileCount);
+    // Well inside the refresh child's 30 s limit without progress.
+    expect(progress.maxGap(started, finished)).toBeLessThan(20_000);
     // Line counts are read once and shared: one whole-range numstat, then one per file.
-    expect(spy.calls().filter((call) => call.args.includes('--numstat'))).toHaveLength(301);
+    expect(spy.calls().filter((call) => call.args.includes('--numstat'))).toHaveLength(fileCount + 1);
   });
 
   it('reports each untracked file while counting its lines and hashing it, even when the build is skipped', async () => {
@@ -102,6 +118,47 @@ describe('refreshReview progress', () => {
     expect('review' in unchanged).toBe(false);
     // One tick per file for the line counts and one for the hashing.
     expect(progress.times.length).toBeGreaterThanOrEqual(400);
+  });
+
+  it('reports progress while delta slowly reads a large patch and prints nothing until it has all of it', async () => {
+    const cwd = initRepo({'a.txt': 'a\n'});
+    const line = `${'x'.repeat(79)}\n`;
+    fs.writeFileSync(path.join(cwd, 'big.txt'), line.repeat(Math.ceil((4 * 1024 * 1024) / line.length)));
+    // A delta that pauses after every chunk it reads, logs when it started
+    // and when its input ended, and prints one line after that.
+    const bin = makeTempDir('branch-review-slow-reader-');
+    const log = path.join(bin, 'times.log');
+    writeExecutable(path.join(bin, 'delta'), [
+      `#!${process.execPath}`,
+      `const fs = require('node:fs');`,
+      `fs.appendFileSync(${JSON.stringify(log)}, 'start ' + Date.now() + '\\n');`,
+      `process.stdin.on('data', () => {`,
+      `  process.stdin.pause();`,
+      `  setTimeout(() => process.stdin.resume(), 20);`,
+      `});`,
+      `process.stdin.on('end', () => {`,
+      `  fs.appendFileSync(${JSON.stringify(log)}, 'end ' + Date.now() + '\\n');`,
+      `  process.stdout.write('rendered\\n');`,
+      `});`,
+      '',
+    ].join('\n'));
+    const progress = progressLog();
+
+    const result = await withEnvAsync({PATH: prependPath(bin)}, () => refreshReview({
+      cwd,
+      requestedBranch: 'HEAD',
+      requestedBase: 'main',
+      width: 100,
+      previousFingerprint: null,
+      onProgress: progress.onProgress,
+    }));
+
+    expect(result.review?.files[0]?.renderedLines).toEqual(['rendered']);
+    const [startLine, endLine] = fs.readFileSync(log, 'utf8').trim().split('\n');
+    const readStart = Number(startLine!.split(' ')[1]);
+    const readEnd = Number(endLine!.split(' ')[1]);
+    // delta prints nothing while it reads, so these are the input chunks it took.
+    expect(progress.times.filter((time) => time >= readStart && time <= readEnd).length).toBeGreaterThanOrEqual(10);
   });
 
   it('reports progress while delta renders a 20 MB added file', async () => {

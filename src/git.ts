@@ -146,7 +146,11 @@ function runTool(command: string, args: string[], options: RunToolOptions): Tool
     windowsHide: true,
   });
 
-  if (result.error) {
+  // A tool that exits without reading all of its input makes the write fail
+  // with EPIPE; it still ran and returned a status, and its own reason is in
+  // its stderr.
+  const stoppedReading = errorCode(result.error) === 'EPIPE' && (result.status !== null || result.signal !== null);
+  if (result.error && !stoppedReading) {
     if (errorCode(result.error) === 'ENOBUFS') throw outputTooLarge(command, maxBuffer);
     throw spawnError(command, options.cwd, result.error);
   }
@@ -222,6 +226,11 @@ function runToolAsync(command: string, args: string[], options: RunToolOptions, 
     const stopWith = (error: Error) => {
       if (settled) return;
       child.kill('SIGKILL');
+      // A process the tool started may still hold the pipes open; closing
+      // our ends keeps them from holding this process's event loop.
+      child.stdin?.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
       let reported = false;
       const report = () => {
         if (reported) return;
@@ -585,6 +594,20 @@ export type ChangedFileEntry = {
 
 export const NAME_NOT_UTF8 = 'file name is not UTF-8';
 
+function nameKey(name: string, utf8: boolean) {
+  // No real path holds a NUL byte, so a marked key never equals a path.
+  return utf8 ? name : `${name}\0undecodable`;
+}
+
+/**
+ * Identifies a changed file in the sets and maps built for one review: its
+ * path, marked when the name failed to decode, so an escaped stand-in such
+ * as `caf\351.txt` never merges with a real file whose name is that text.
+ */
+export function fileKey(entry: Pick<ChangedFileEntry, 'path' | 'nameError'>) {
+  return nameKey(entry.path, entry.nameError === undefined);
+}
+
 /** The work tree root for `cwd`, with a one-line reason when there is none. */
 export function getRepoRoot(cwd: string) {
   const result = runTool('git', [...GIT_SAFETY_ARGS, 'rev-parse', '--show-toplevel'], {cwd, env: gitEnv(cwd)});
@@ -707,7 +730,9 @@ function utf8SequenceLength(lead: number) {
 /**
  * A file name from a `-z` listing. A name that is not valid UTF-8 keeps its
  * valid characters and shows each invalid byte as a `\ooo` octal escape, the
- * way git quotes it, so two such names never decode to the same string.
+ * way git quotes it. The result is a stand-in, not a unique name: a real file
+ * may be named with that exact text (a backslash and three digits), so
+ * changed files are told apart by fileKey, never by path alone.
  */
 function decodeName(bytes: Buffer): {name: string; utf8: boolean} {
   if (isUtf8(bytes)) return {name: bytes.toString('utf8'), utf8: true};
@@ -804,11 +829,11 @@ export function* reviewChangesOperation(cwd: string, range: DiffRange): GitOpera
   );
   const untracked = range.includeWorktree ? yield* untrackedFilesOperation(cwd) : [];
 
-  const seen = new Set(entries.map((entry) => entry.path));
+  const seen = new Set(entries.map(fileKey));
   for (const entry of untracked) {
-    if (!seen.has(entry.path)) {
+    if (!seen.has(fileKey(entry))) {
       entries.push(entry);
-      seen.add(entry.path);
+      seen.add(fileKey(entry));
     }
   }
 
@@ -1072,6 +1097,7 @@ function countUntrackedLines(cwd: string, filePath: string) {
   }
 }
 
+// Line counts keyed by fileKey.
 function parseNumstat(output: Buffer) {
   const fields = splitNul(output);
   const metrics = new Map<string, FileMetrics>();
@@ -1087,16 +1113,19 @@ function parseNumstat(output: Buffer) {
 
     const additions = parseNumstatValue(field.toString('latin1', 0, firstTab));
     const deletions = parseNumstatValue(field.toString('latin1', firstTab + 1, secondTab));
-    let filePath = decodeName(field.subarray(secondTab + 1)).name;
+    let {name: filePath, utf8} = decodeName(field.subarray(secondTab + 1));
     // A rename is `adds\tdels\t` followed by the old and new paths as their
-    // own fields; metrics are keyed on the new path.
+    // own fields; metrics are keyed on the new path, marked when either name
+    // failed to decode, as the rename's entry is.
     if (filePath === '') {
-      index += 1;
-      filePath = decodeName(fields[index++] ?? Buffer.alloc(0)).name;
+      const oldName = decodeName(fields[index++] ?? Buffer.alloc(0));
+      const newName = decodeName(fields[index++] ?? Buffer.alloc(0));
+      filePath = newName.name;
+      utf8 = oldName.utf8 && newName.utf8;
     }
     if (!filePath) continue;
 
-    metrics.set(filePath, {
+    metrics.set(nameKey(filePath, utf8), {
       path: filePath,
       additions,
       deletions,
@@ -1128,14 +1157,17 @@ function* perFileNumstatOperation(cwd: string, range: DiffRange, entries: readon
       for (const [filePath, metric] of parseNumstat(output)) metrics.set(filePath, metric);
     } catch (error) {
       if (isFatalToolError(error)) throw error;
-      errors.set(entry.path, errorLine(error));
+      errors.set(fileKey(entry), errorLine(error));
     }
     yield* progressTick();
   }
   return {metrics, errors};
 }
 
-/** Line counts per changed file, and a one-line reason for each file git could not count. */
+/**
+ * Line counts per changed file, and a one-line reason for each file git could
+ * not count, both keyed by fileKey.
+ */
 export type ReviewMetrics = {
   metrics: Map<string, FileMetrics>;
   errors: Map<string, string>;
@@ -1156,7 +1188,7 @@ export function* fileMetricsOperation(cwd: string, range: DiffRange, changes: Re
 
   for (const entry of changes.untracked) {
     const additions = entry.nameError === undefined ? countUntrackedLines(cwd, entry.path) : 0;
-    metrics.set(entry.path, {
+    metrics.set(fileKey(entry), {
       path: entry.path,
       additions,
       deletions: 0,
@@ -1179,6 +1211,7 @@ export function readFileMetrics(cwd: string, range: DiffRange): ReviewMetrics {
   })()));
 }
 
+/** Line counts keyed by fileKey: the path, for every name that is UTF-8. */
 export function getFileMetricsMap(cwd: string, range: DiffRange) {
   return readFileMetrics(cwd, range).metrics;
 }
@@ -1206,13 +1239,14 @@ function statFingerprint(cwd: string, filePath: string) {
 // Size and mtime alone miss a same-size edit inside one mtime tick on coarse
 // filesystems, so worktree files are hashed by content up to the size cap.
 // The executable bit is part of it: a chmod changes the file's diff header.
+// git records only the owner's bit (100755 or 100644), so only that counts.
 function worktreeFingerprint(cwd: string, filePath: string) {
   const absolutePath = path.join(cwd, filePath);
   try {
     const stat = fs.lstatSync(absolutePath);
     if (stat.isSymbolicLink()) return `link:${fs.readlinkSync(absolutePath, 'utf8')}`;
     if (!stat.isFile()) return `other:${stat.mode}`;
-    const kind = stat.mode & 0o111 ? 'exec' : 'file';
+    const kind = stat.mode & 0o100 ? 'exec' : 'file';
     if (stat.size > MAX_FILE_CONTENT_BYTES) return `large-${kind}:${stat.size}:${stat.mtimeMs}`;
     try {
       const contents = readRegularFile(absolutePath, filePath, MAX_FILE_CONTENT_BYTES);
@@ -1224,6 +1258,30 @@ function worktreeFingerprint(cwd: string, filePath: string) {
   } catch {
     return 'missing';
   }
+}
+
+const GITLINK_MODE = '160000';
+
+// The paths of submodule entries (mode 160000 on either side) in a
+// `diff --raw -z` listing. A name that is not UTF-8 can't be passed back to
+// git, so it is left out.
+function gitlinkPaths(raw: Buffer) {
+  const fields = splitNul(raw);
+  const paths: string[] = [];
+  for (let index = 0; index < fields.length;) {
+    const meta = fields[index++]!.toString('latin1');
+    if (!meta.startsWith(':')) continue;
+    // `:oldmode newmode oldsha newsha status`, then one path, or two for a
+    // rename or copy.
+    const [oldMode, newMode, , , status = ''] = meta.slice(1).split(' ');
+    const names = (status.startsWith('R') || status.startsWith('C') ? [index++, index++] : [index++])
+      .map((at) => decodeName(fields[at] ?? Buffer.alloc(0)));
+    if (oldMode !== GITLINK_MODE && newMode !== GITLINK_MODE) continue;
+    for (const {name, utf8} of names) {
+      if (name && utf8 && !paths.includes(name)) paths.push(name);
+    }
+  }
+  return paths;
 }
 
 /**
@@ -1238,7 +1296,7 @@ export function* reviewFingerprintOperation(
   {metrics, errors}: ReviewMetrics,
 ): GitOperation<string> {
   const head = (yield* tryGitOperation(cwd, ['rev-parse', 'HEAD'])) ?? '';
-  const raw = yield* gitOperation(cwd, ['diff', '--raw', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--']);
+  const raw = yield* gitResultOperation(cwd, ['diff', '--raw', '-z', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--']);
   const hash = createHash('sha1');
 
   hash.update(range.base);
@@ -1247,20 +1305,39 @@ export function* reviewFingerprintOperation(
   hash.update('\0');
   hash.update(head);
   hash.update('\0');
-  hash.update(raw);
+  hash.update(raw.stdout);
+
+  // On the worktree side, --raw shows a submodule as a null id however far
+  // its checkout moves or whether it is dirty, and its directory has no
+  // contents to hash. Its diff text holds the `Subproject commit <id>[-dirty]`
+  // line the review shows, so that is hashed instead.
+  const gitlinks = range.includeWorktree ? gitlinkPaths(raw.stdoutBytes) : [];
+  if (gitlinks.length > 0) {
+    let submodules: string;
+    try {
+      submodules = yield* gitOperation(cwd, ['diff', ...DIFF_ARGS, ...RENAME_ARGS, range.diffArg, '--', ...gitlinks]);
+    } catch (error) {
+      if (isFatalToolError(error)) throw error;
+      // The file rows show this failure; it still changes when the cause does.
+      submodules = `error: ${errorLine(error)}`;
+    }
+    hash.update('\0');
+    hash.update(submodules);
+  }
 
   for (const entry of changes.entries) {
-    const metric = metrics.get(entry.path);
+    const key = fileKey(entry);
+    const metric = metrics.get(key);
     hash.update('\0');
     hash.update(entry.status);
     hash.update('\0');
     hash.update(entry.oldPath ?? '');
     hash.update('\0');
-    hash.update(entry.path);
+    hash.update(key);
     hash.update('\0');
     hash.update(metric ? `${metric.additions}:${metric.deletions}:${metric.changedLines}` : '0:0:0');
     hash.update('\0');
-    hash.update(errors.get(entry.path) ?? '');
+    hash.update(errors.get(key) ?? '');
     hash.update('\0');
     hash.update(range.includeWorktree ? worktreeFingerprint(cwd, entry.path) : statFingerprint(cwd, entry.path));
     yield* progressTick();

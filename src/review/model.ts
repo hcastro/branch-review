@@ -36,7 +36,8 @@ export type ReviewFile = {
    * empty), or git printed it as bytes that are not valid UTF-8. Every copy
    * of this file's diff or blocks fails with this reason. Copy file contents
    * is not blocked by it: that reads the file itself and fails only when the
-   * file can't be read or is not UTF-8 text.
+   * file can't be read, is not UTF-8 text, or its name is not UTF-8
+   * (`pathError`).
    */
   rawDiffError?: string;
   /**
