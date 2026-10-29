@@ -143,6 +143,64 @@ describe('block focus while the focused header stays in place', () => {
     instance.unmount();
   });
 
+  // The same three one-line blocks, by tag, so a refresh can change one.
+  const taggedFile = (hunks: Array<{start: number; size: number; tag: string}>) => buildFixture([file('src/one.ts', hunks)]);
+
+  async function focusLastTagged(writes: string[]) {
+    const instance = renderFixture(
+      taggedFile([{start: 10, size: 1, tag: 'P'}, {start: 20, size: 1, tag: 'Q'}, {start: 30, size: 1, tag: 'R'}]),
+      DIMENSIONS,
+      writes,
+    );
+    await flush();
+    await press(instance, ']');
+    await press(instance, ']');
+    expect(markedRows(instance.lastFrame())).toHaveLength(1);
+    expect(markedRows(instance.lastFrame())[0]).toContain('src/one.ts:30:');
+    return instance;
+  }
+
+  it('drops the focus when a refresh puts another block\'s header on the focused row', async () => {
+    const writes: string[] = [];
+    const instance = await focusLastTagged(writes);
+
+    // Row 4 is still a header, but of a block with other content.
+    const next = taggedFile([{start: 10, size: 1, tag: 'P'}, {start: 20, size: 1, tag: 'Q'}, {start: 30, size: 1, tag: 'S'}]);
+    instance.rerender(appElement(next, DIMENSIONS, recordingWriter(writes)));
+    await flush(3);
+    expect(markedRows(instance.lastFrame())).toHaveLength(1);
+    expect(markedRows(instance.lastFrame())[0]).toContain('src/one.ts:10:');
+
+    await press(instance, 'c');
+    await flush(2);
+    expect(writes).toEqual(['P-0']);
+
+    instance.unmount();
+  });
+
+  it('drops the focus when a refresh puts a body row of the focused block on the focused row', async () => {
+    const writes: string[] = [];
+    const instance = await focusLastTagged(writes);
+    const headerRow = frameLines(instance.lastFrame()).findIndex((line) => line.includes('src/one.ts:30:'));
+
+    // The focused block keeps its content, so its key, but its header moves
+    // up and its body row lands on the row the header held. A block draws
+    // its header three rows above its first body row, so four lines in P
+    // and Q gone put R's body row exactly there.
+    const next = taggedFile([{start: 10, size: 4, tag: 'P'}, {start: 30, size: 1, tag: 'R'}]);
+    instance.rerender(appElement(next, DIMENSIONS, recordingWriter(writes)));
+    await flush(3);
+    expect(frameLines(instance.lastFrame())[headerRow]).toContain('R-0');
+    expect(markedRows(instance.lastFrame())).toHaveLength(1);
+    expect(markedRows(instance.lastFrame())[0]).toContain('src/one.ts:10:');
+
+    await press(instance, 'c');
+    await flush(2);
+    expect(writes).toEqual(['P-0\nP-1\nP-2\nP-3']);
+
+    instance.unmount();
+  });
+
   it('collapses and expands the same block on Enter twice', async () => {
     const instance = await focusLastBlock([]);
 

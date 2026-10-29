@@ -441,6 +441,36 @@ describe.each(scriptShells)('review-command.sh under %s', (shell) => {
       expect(report(run.stderr, 'uncommitted')).toBe('2 entries');
     });
 
+    it('ignores stat-only changes when the repo sets diff.autoRefreshIndex=false', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      git(sandbox, repo, 'config', 'diff.autoRefreshIndex', 'false');
+      const future = new Date(Date.now() + 3_600_000);
+      fs.utimesSync(path.join(repo, 'b.txt'), future, future);
+      expect(git(sandbox, repo, 'diff-files', '--name-only')).toBe('b.txt');
+
+      const run = runScript(sandbox, shell, [repo]);
+      expect(run.status, run.stderr).toBe(0);
+      expect(report(run.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+    });
+
+    it('reads the range as revisions when a file in the worktree has the same name', () => {
+      const sandbox = createSandbox();
+      const repo = createRepo(sandbox);
+      fs.writeFileSync(path.join(repo, 'main...feat'), '');
+      fs.writeFileSync(path.join(repo, git(sandbox, repo, 'merge-base', 'main', 'HEAD')), '');
+
+      const branch = runScript(sandbox, shell, [repo, 'feat', 'main']);
+      expect(branch.status, branch.stderr).toBe(0);
+      expect(branch.stderr).not.toContain('git diff failed');
+      expect(report(branch.stderr, 'in review')).toBe('1 files (1 tracked, 0 untracked)');
+
+      const head = runScript(sandbox, shell, [repo]);
+      expect(head.status, head.stderr).toBe(0);
+      expect(head.stderr).not.toContain('git diff failed');
+      expect(report(head.stderr, 'in review')).toBe('3 files (1 tracked, 2 untracked)');
+    });
+
     it('leaves a submodule index alone when a file inside the submodule is stat-dirty', {timeout: 30_000}, () => {
       const sandbox = createSandbox();
       const repo = createRepo(sandbox);

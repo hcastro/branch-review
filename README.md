@@ -173,6 +173,7 @@ Some copies fail on purpose, and the toast names the reason:
 - Copying contents (`Copy file` or `f`) fails for a file over 16 MB.
 - When a file's diff failed to load, its diff and block copies report that failure as the reason. `Copy file` and `f` still work, since they read the file itself.
 - A file whose name isn't valid UTF-8 can't be copied at all, its path included. Every copy of it reports "file name is not UTF-8".
+- `Copy tree` and `T` copy nothing when any one file name in the review isn't valid UTF-8. The tree is refused whole, and the toast names that file.
 
 ### Small terminals
 

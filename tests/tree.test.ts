@@ -175,4 +175,13 @@ describe('buildTreeRows', () => {
       '````',
     ].join('\n'));
   });
+
+  it('escapes CR and LF in the root path of a tree with files', () => {
+    expect(formatTreePayload(buildTreeRows(['a.ts']), '/repo\r\n├── forged.ts')).toBe([
+      '```',
+      '/repo\\r\\n├── forged.ts',
+      '└── a.ts',
+      '```',
+    ].join('\n'));
+  });
 });

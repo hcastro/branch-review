@@ -96,7 +96,11 @@ refuse_hidden "repo path" "$root"
 
 # Read-only access to the repo. fsmonitor is off so no hook or daemon runs,
 # and a split index stays off so git never writes a shared index into .git.
-git_root() { git -C "$root" -c core.fsmonitor=false -c core.splitIndex=false "$@"; }
+# autoRefreshIndex on makes a worktree diff re-check a file whose stat info
+# changed but whose content did not, so it isn't counted, as in the CLI.
+git_root() {
+  git -C "$root" -c core.fsmonitor=false -c core.splitIndex=false -c diff.autoRefreshIndex=true "$@"
+}
 
 # Resolve a ref the way the CLI does: local ref first, then origin/<ref>.
 resolve_ref() {
@@ -221,9 +225,10 @@ untracked=0
 # status of the git call feeding it.
 tracked_error=
 # -M counts a rename as one file, as the CLI lists it, whatever diff.renames says.
+# The -- keeps a file named like the range from making git read it as a path.
 if [[ $includes_worktree == yes ]]; then
   if make_private_index; then
-    tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths) \
+    tracked=$(GIT_INDEX_FILE=$tmp_index git_root diff --no-ext-diff -M --name-only -z "$diff_arg" -- | count_paths) \
       || tracked_error="git diff failed"
   else
     tracked_error=$index_error
@@ -236,7 +241,7 @@ if [[ $includes_worktree == yes ]]; then
   fi
   reviewed_tip=HEAD
 else
-  tracked=$(git_root diff --no-ext-diff -M --name-only -z "$diff_arg" | count_paths) \
+  tracked=$(git_root diff --no-ext-diff -M --name-only -z "$diff_arg" -- | count_paths) \
     || tracked_error="git diff failed"
   uncommitted="not in this review (reviewing $branch, not the worktree)"
   reviewed_tip=$resolved_branch

@@ -69,6 +69,30 @@ describe('drag-select over a file that is not UTF-8', () => {
     instance.unmount();
   });
 
+  it('copies nothing from a drag that starts in a UTF-8 file and ends in one that is not', async () => {
+    const cwd = initRepo({'a.txt': 'one\n', 'b.txt': 'two\n'});
+    fs.writeFileSync(path.join(cwd, 'a.txt'), 'one\nplain utf8 line\n');
+    fs.writeFileSync(path.join(cwd, 'b.txt'), Buffer.from('two\ncaf\xe9 latin1\n', 'latin1'));
+    const writes: string[] = [];
+    const {instance, review} = await renderRepo(cwd, writes);
+    expect(review.files.map((file) => file.rawDiffError)).toEqual([undefined, 'not UTF-8 text']);
+
+    const frame = instance.lastFrame();
+    const from = cellPosition(frame, ['plain utf8 line'], 'plain utf8 line');
+    const to = cellPosition(frame, ['latin1'], 'latin1', 'latin1'.length - 1);
+    expect(to.row).toBeGreaterThan(from.row);
+    await emitMousePressAt(from.column, from.row);
+    await emitMouseDragAt(to.column, to.row);
+    await emitMouseDragAt(to.column, to.row, true);
+    await flush(5);
+
+    expect(footer(instance.lastFrame())).toContain('✗ Copy action unavailable. · not UTF-8 text');
+    expect(footer(instance.lastFrame())).not.toContain('Copied selection');
+    expect(writes).toEqual([]);
+
+    instance.unmount();
+  });
+
   it('still copies a selection inside a UTF-8 file of the same review', async () => {
     const cwd = initRepo({'a.txt': 'one\n', 'b.txt': 'two\n'});
     fs.writeFileSync(path.join(cwd, 'a.txt'), Buffer.from('one\ncaf\xe9 latin1\n', 'latin1'));
