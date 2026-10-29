@@ -2449,7 +2449,7 @@ function AppContent({
 
   const copyFileTree = useCallback(async () => {
     // A name that is not UTF-8 is shown as an escaped stand-in that names no
-    // real file; refuse the whole tree, as Copy all changed paths does.
+    // real file, so the whole tree is refused with that file's reason.
     const unnamed = review?.files.find((file) => file.pathError !== undefined);
     if (unnamed) {
       showToast('Copy action unavailable.', `${unnamed.pathError}: ${unnamed.path}`, 'error');

@@ -1,6 +1,5 @@
 import {
   buildAbsolutePathPayload,
-  buildAllChangedPathsPayload,
   buildBranchPromptPayload,
   buildCodePayload,
   buildFileContentsPayload,
@@ -194,22 +193,6 @@ export const copyCommands: CommandDefinition[] = [
         text: buildPathLinePayload(target.file, target.block),
         toast: 'Copied path:line',
         hint: `${target.file.path}:${target.block.lineStart}`,
-      };
-    },
-  },
-  {
-    id: 'copy.allPaths',
-    group: 'Copy paths',
-    title: 'Copy all changed paths',
-    shortcuts: ['y A'],
-    isEnabled: (context) => context.model.files.length > 0,
-    buildPayload: (context) => {
-      const unnamed = context.model.files.find((file) => file.pathError !== undefined);
-      if (unnamed) throw new Error(`${unnamed.pathError}: ${unnamed.path}`);
-      return {
-        text: buildAllChangedPathsPayload(context.model),
-        toast: 'Copied all changed paths',
-        hint: `${context.model.files.length} files`,
       };
     },
   },

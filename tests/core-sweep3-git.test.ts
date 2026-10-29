@@ -87,8 +87,6 @@ describe('file names that are not UTF-8', () => {
       const result = await executeCopyCommand(id, context, {write: writer.write});
       expect(result, id).toMatchObject({ok: false, hint: 'file name is not UTF-8'});
     }
-    const allPaths = await executeCopyCommand('copy.allPaths', context, {write: writer.write});
-    expect(allPaths).toMatchObject({ok: false, hint: 'file name is not UTF-8: caf\\350.txt'});
     expect(writer.writes).toEqual([]);
 
     // The UTF-8 file next to them still copies.

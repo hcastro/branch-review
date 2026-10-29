@@ -1,7 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import {
   buildAbsolutePathPayload,
-  buildAllChangedPathsPayload,
   buildBranchPromptPayload,
   buildCodePayload,
   buildFileContentsPayload,
@@ -63,7 +62,6 @@ describe('copy payload builders', () => {
     expect(buildPathPayload(file)).toBe('src/example.ts');
     expect(buildAbsolutePathPayload('/repo/src/example.ts')).toBe('/repo/src/example.ts');
     expect(buildPathLinePayload(file, block)).toBe('src/example.ts:1');
-    expect(buildAllChangedPathsPayload(model)).toBe('src/example.ts');
     expect(buildCodePayload(block)).toMatchInlineSnapshot(`
       "const value = 2;
       const next = 3;"

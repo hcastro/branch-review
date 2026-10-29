@@ -51,7 +51,6 @@ describe('copy command registry', () => {
       'copy.path',
       'copy.absolutePath',
       'copy.pathLine',
-      'copy.allPaths',
       'copy.blockCode',
       'copy.blockDiff',
       'copy.fileDiff',
@@ -99,7 +98,6 @@ describe('copy command registry', () => {
     expect(getCopyCommand('copy.path')?.buildPayload(context)?.text).toBe('src/example.ts');
     expect(getCopyCommand('copy.absolutePath')?.buildPayload(context)?.text).toBe('/repo/src/example.ts');
     expect(getCopyCommand('copy.pathLine')?.buildPayload(context)?.text).toBe('src/example.ts:10');
-    expect(getCopyCommand('copy.allPaths')?.buildPayload(context)?.text).toBe('src/example.ts');
     expect(getCopyCommand('copy.blockCode')?.buildPayload(context)?.text).toBe('new');
     expect(getCopyCommand('copy.blockDiff')?.buildPayload(context)?.text).toBe(block.rawDiff);
     expect(getCopyCommand('copy.fileDiff')?.buildPayload(context)?.text).toBe(file.rawDiff);

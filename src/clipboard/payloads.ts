@@ -36,10 +36,6 @@ export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, block: Pick
   return `${file.path}:${block.lineStart}`;
 }
 
-export function buildAllChangedPathsPayload(model: Pick<ReviewModel, 'files'>) {
-  return model.files.map((file) => linePath(file.path)).join('\n');
-}
-
 export function buildCodePayload(block: Pick<ReviewBlock, 'addedCode'>) {
   return block.addedCode;
 }

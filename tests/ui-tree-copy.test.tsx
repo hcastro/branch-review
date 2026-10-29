@@ -3,7 +3,7 @@ import {buildFixture, cellPosition, emitMousePressAt, flush, frameLines, gutter,
 
 // Copy tree lists every file by name. A file whose name is not valid UTF-8
 // has only an escaped stand-in for a name, so Copy tree refuses the whole
-// tree with that file's reason, the way Copy all changed paths does.
+// tree with that file's reason.
 
 const NAME_ERROR = 'file name is not UTF-8';
 // git's quoted form of the Latin-1 name `caf\xe9.txt`.
