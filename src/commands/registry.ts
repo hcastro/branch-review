@@ -19,6 +19,10 @@ export type CommandContext = {
   model: ReviewModel;
   activeFile?: ReviewFile;
   focusedBlock?: ReviewBlock;
+  // The file `focusedBlock` belongs to, or the file a block copy acts on when
+  // no block is focused. Two files can show the same path text, so a block's
+  // path alone can name the wrong one.
+  focusedBlockFile?: ReviewFile;
   readFileContent?: (file: ReviewFile) => string | null;
   resolveAbsolutePath?: (file: ReviewFile) => string | null;
 };
@@ -66,8 +70,18 @@ function assertPathCopyable(file: Pick<ReviewFile, 'pathError'> | undefined) {
   if (file?.pathError !== undefined) throw new Error(file.pathError);
 }
 
-function blockFile(context: CommandContext, block: ReviewBlock) {
-  return context.model.files.find((file) => file.path === block.filePath) ?? context.activeFile;
+// The file a block copy acts on: the one passed with the block; without it,
+// the file with the block's path, else the active file.
+function blockFile(context: CommandContext, block: ReviewBlock | null) {
+  return context.focusedBlockFile
+    ?? (block ? context.model.files.find((file) => file.path === block.filePath) : undefined)
+    ?? context.activeFile;
+}
+
+// A block copy on a file whose name is not UTF-8 fails with that reason, as
+// its file copies do, even when the file shows no block to focus.
+function blockCopyRefused(context: CommandContext) {
+  return blockFile(context, focusedBlock(context))?.pathError !== undefined;
 }
 
 export const copyCommands: CommandDefinition[] = [
@@ -116,8 +130,9 @@ export const copyCommands: CommandDefinition[] = [
     group: 'Copy for agent',
     title: 'Copy focused block',
     shortcuts: [],
-    isEnabled: (context) => Boolean(fileAndBlock(context)),
+    isEnabled: (context) => Boolean(fileAndBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
+      assertPathCopyable(blockFile(context, focusedBlock(context)));
       const target = fileAndBlock(context);
       if (!target) return null;
       assertPathCopyable(target.file);
@@ -203,9 +218,10 @@ export const copyCommands: CommandDefinition[] = [
     group: 'Copy content',
     title: 'Copy focused block code',
     shortcuts: ['y c'],
-    isEnabled: (context) => Boolean(focusedBlock(context)),
+    isEnabled: (context) => Boolean(focusedBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
       const block = focusedBlock(context);
+      assertPathCopyable(blockFile(context, block));
       if (!block) return null;
       assertDiffCopyable(blockFile(context, block));
       return {
@@ -220,9 +236,10 @@ export const copyCommands: CommandDefinition[] = [
     group: 'Copy content',
     title: 'Copy focused block diff',
     shortcuts: ['y h'],
-    isEnabled: (context) => Boolean(focusedBlock(context)),
+    isEnabled: (context) => Boolean(focusedBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
       const block = focusedBlock(context);
+      assertPathCopyable(blockFile(context, block));
       if (!block) return null;
       assertDiffCopyable(blockFile(context, block));
       return {

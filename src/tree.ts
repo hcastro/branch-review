@@ -8,13 +8,22 @@ export type TreeRow = {
   label: string;
   depth: number;
   path: string;
+  // What identifies the row's file: its path, unless two files show the same
+  // path text (a name that failed to decode next to a real file named like
+  // its escaped stand-in). A directory's key is its path.
+  key: string;
   status?: FileStatus;
   expanded?: boolean;
 };
 
+// A changed file for the tree: its path alone, or its path and the key that
+// tells it apart from another file with the same path text.
+export type TreeFile = string | {path: string; key: string};
+
 type TreeNode = {
   name: string;
   path: string;
+  key: string;
   kind: 'dir' | 'file';
   status?: FileStatus;
   children?: Map<string, TreeNode>;
@@ -26,7 +35,7 @@ function compareNames(a: string, b: string) {
 
 function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
   if (node.kind === 'dir') {
-    rows.push({id: rowId('dir', node.path), kind: 'dir', label: node.name, depth, path: node.path});
+    rows.push({id: rowId('dir', node.path), kind: 'dir', label: node.name, depth, path: node.path, key: node.key});
 
     const children = [...(node.children?.values() ?? [])].sort((left, right) => {
       if (left.kind !== right.kind) {
@@ -43,7 +52,7 @@ function walk(node: TreeNode, depth: number, rows: TreeRow[]) {
     return;
   }
 
-  rows.push({id: rowId('file', node.path), kind: 'file', label: node.name, depth, path: node.path, status: node.status});
+  rows.push({id: rowId('file', node.key), kind: 'file', label: node.name, depth, path: node.path, key: node.key, status: node.status});
 }
 
 function rowId(kind: TreeRow['kind'], path: string) {
@@ -52,16 +61,19 @@ function rowId(kind: TreeRow['kind'], path: string) {
 
 // Children are keyed by kind and name, so a path that is a file on one side
 // of the diff and a directory on the other (`docs` and `docs/README.md`)
-// keeps both nodes.
+// keeps both nodes. A file node goes under its file key, so two files with
+// the same path text keep both nodes too.
 function childKey(kind: TreeNode['kind'], name: string) {
   return `${kind}:${name}`;
 }
 
-export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string, FileStatus>): TreeRow[] {
+// `statusByKey` is keyed like the files: by key where one is given, else by path.
+export function buildTreeRows(files: TreeFile[], statusByKey?: ReadonlyMap<string, FileStatus>): TreeRow[] {
   const roots = new Map<string, TreeNode>();
+  const entries = files.map((file) => (typeof file === 'string' ? {path: file, key: file} : file));
 
-  for (const filePath of [...files].sort(compareNames)) {
-    const status = statusByPath?.get(filePath);
+  for (const {path: filePath, key: fileKey} of entries.sort((left, right) => compareNames(left.path, right.path))) {
+    const status = statusByKey?.get(fileKey);
     const parts = filePath.split('/');
 
     let currentMap = roots;
@@ -71,14 +83,14 @@ export function buildTreeRows(files: string[], statusByPath?: ReadonlyMap<string
       currentPath = currentPath ? `${currentPath}/${part}` : part;
 
       if (index === parts.length - 1) {
-        currentMap.set(childKey('file', part), {name: part, path: currentPath, kind: 'file', status});
+        currentMap.set(childKey('file', fileKey), {name: part, path: currentPath, key: fileKey, kind: 'file', status});
         break;
       }
 
       const key = childKey('dir', part);
       let directory = currentMap.get(key);
       if (!directory) {
-        directory = {name: part, path: currentPath, kind: 'dir', children: new Map()};
+        directory = {name: part, path: currentPath, key: currentPath, kind: 'dir', children: new Map()};
         currentMap.set(key, directory);
       }
       currentMap = directory.children!;
@@ -134,11 +146,12 @@ export function applyTreeCollapse(rows: TreeRow[], collapsedPaths: ReadonlySet<s
   return visibleRows;
 }
 
-// The id of the row that shows the active file: its own row, or the deepest
-// collapsed directory that hides it.
-export function findTreeSelectionId(rows: TreeRow[], activeFilePath: string) {
-  if (!activeFilePath) return '';
-  const fileId = rowId('file', activeFilePath);
+// The id of the row that shows the active file, named by its key: its own
+// row, or the deepest collapsed directory that hides it. A key starts with
+// the file's path, so the directory check works on it as on a path.
+export function findTreeSelectionId(rows: TreeRow[], activeFileKey: string) {
+  if (!activeFileKey) return '';
+  const fileId = rowId('file', activeFileKey);
   if (rows.some((row) => row.id === fileId)) {
     return fileId;
   }
@@ -148,7 +161,7 @@ export function findTreeSelectionId(rows: TreeRow[], activeFilePath: string) {
     if (
       row.kind === 'dir'
       && row.expanded === false
-      && isDescendantOf(activeFilePath, row.path)
+      && isDescendantOf(activeFileKey, row.path)
       && (!collapsedParent || row.path.length > collapsedParent.path.length)
     ) {
       collapsedParent = row;

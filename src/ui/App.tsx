@@ -29,7 +29,7 @@ import {palette, plainDiffMode} from './palette.js';
 import {DiffErrorBoundary, renderFailureText} from './DiffErrorBoundary.js';
 import {blockSourceLines, mapDrawnToRaw} from './rawText.js';
 import {useSettledValue} from './useSettledValue.js';
-import type {FileStatus} from '../git.js';
+import {fileKey, type FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
@@ -249,10 +249,10 @@ function hashText(text: string) {
   return (hash >>> 0).toString(36);
 }
 
-function sectionWrapCacheKey(section: DiffSection, maxWidth: number) {
+function sectionWrapCacheKey(section: KeyedSection, maxWidth: number) {
   const signature = section.signature
     ?? hashText(`${section.metrics.additions}:${section.metrics.deletions}:${section.metrics.changedLines}:${section.lines.join('\n')}`);
-  return `${maxWidth}\0${section.path}\0${signature}`;
+  return `${maxWidth}\0${section.key}\0${signature}`;
 }
 
 function errorText(error: unknown) {
@@ -279,8 +279,8 @@ function wrapSectionSafely(section: DiffSection, maxWidth: number): WrappedSecti
   }
 }
 
-function wrapSectionsWithCache(
-  sections: DiffSection[],
+function wrapSectionsWithCache<S extends KeyedSection>(
+  sections: S[],
   maxWidth: number,
   cache: Map<string, WrappedSectionCacheEntry>,
 ) {
@@ -324,16 +324,16 @@ function fileArrivalKind(file: Pick<ReviewFile, 'status'> | undefined): ArrivalK
   return file?.status === 'added' || file?.status === 'untracked' ? 'new' : 'changed';
 }
 
-function buildArrivalSnapshot(review: ReviewModel | undefined, sections: DiffSection[]): ArrivalSnapshot {
+function buildArrivalSnapshot(review: ReviewModel | undefined, sections: KeyedSection[]): ArrivalSnapshot {
   if (review) {
     return {
       files: new Map(review.files.map((file) => {
         const blocks = new Map(file.blocks.map((block) => [
-          blockAnimationKey(file.path, block),
+          blockAnimationKey(reviewFileKey(file), block),
           block.signature ?? hashText(`${block.lineStart}:${block.lineEnd}:${block.rawDiff}:${block.addedCode}`),
         ]));
         return [
-          file.path,
+          reviewFileKey(file),
           {
             signature: file.signature ?? hashText(`${file.status}:${file.rawDiff}:${file.metrics.additions}:${file.metrics.deletions}`),
             kind: fileArrivalKind(file),
@@ -346,7 +346,7 @@ function buildArrivalSnapshot(review: ReviewModel | undefined, sections: DiffSec
 
   return {
     files: new Map(sections.map((section) => [
-      section.path,
+      section.key,
       {
         signature: hashText(`${section.metrics.additions}:${section.metrics.deletions}:${section.lines.join('\n')}`),
         kind: 'changed' as const,
@@ -1033,19 +1033,16 @@ export function getSelectedCodeText(
 // whose diff text failed to load or is not valid UTF-8.
 function selectionCopyError(
   rows: ReadonlyArray<DiffRow | undefined>,
-  sections: ReadonlyArray<Pick<DiffSection, 'path'>>,
-  review: ReviewModel | undefined,
+  sections: ReadonlyArray<Pick<KeyedSection, 'file'>>,
   selection: Pick<CodeSelection, 'anchor' | 'focus'>,
 ) {
   const {start, end} = normalizeCodeSelection(selection);
-  const fileByPath = new Map(review?.files.map((file) => [file.path, file]) ?? []);
   let previousSection = -1;
   for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
     const sectionIndex = rows[lineIndex]?.sectionIndex;
     if (sectionIndex === undefined || sectionIndex === previousSection) continue;
     previousSection = sectionIndex;
-    const path = sections[sectionIndex]?.path;
-    const reason = path === undefined ? undefined : fileByPath.get(path)?.rawDiffError;
+    const reason = sections[sectionIndex]?.file?.rawDiffError;
     if (reason !== undefined) return reason;
   }
 
@@ -1441,14 +1438,14 @@ function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number
 
 type SelectionSource = {
   lines: string[];
-  sections: ReadonlyArray<Pick<DiffSection, 'path' | 'startLine' | 'endLineExclusive'>>;
+  sections: ReadonlyArray<Pick<KeyedSection, 'key' | 'startLine' | 'endLineExclusive'>>;
 };
 
 function remapLineIndex(lineIndex: number, previous: SelectionSource, next: SelectionSource) {
   const section = previous.sections[getSectionIndexForLine(previous.sections, lineIndex)];
   if (!section || lineIndex < section.startLine || lineIndex >= section.endLineExclusive) return null;
 
-  const target = next.sections.find((entry) => entry.path === section.path);
+  const target = next.sections.find((entry) => entry.key === section.key);
   if (!target) return null;
 
   const mapped = target.startLine + lineIndex - section.startLine;
@@ -1487,7 +1484,7 @@ function blockCollapseKeys(file: ReviewFile) {
     const content = hashText(`${header.replace(/^@@ [^@]* @@/, '')}\n${body.join('\n')}`);
     const occurrence = seen.get(content) ?? 0;
     seen.set(content, occurrence + 1);
-    return `${file.path}\0${content}\0${occurrence}`;
+    return `${reviewFileKey(file)}\0${content}\0${occurrence}`;
   });
 }
 
@@ -1507,7 +1504,38 @@ function resolveBlockTargets(rows: ReadonlyArray<SectionRow>, file: ReviewFile |
   return targets;
 }
 
-type ViewSection = DiffSection & {
+// Names a review file in every set and map the view keeps. It equals the
+// path except for a name that failed to decode, so that file and a real file
+// whose name is its escaped stand-in stay two files.
+function reviewFileKey(file: Pick<ReviewFile, 'path' | 'pathError'>) {
+  return fileKey({path: file.path, nameError: file.pathError});
+}
+
+// A section with the review file it shows and that file's key; a section
+// with no file in the review is keyed by its path.
+type KeyedSection = DiffSection & {key: string; file?: ReviewFile};
+
+// Sections are built from the review's files in order, so the n-th section
+// with a path shows the n-th file with that path. Two files share a path
+// only when one name failed to decode.
+function keySections(sections: DiffSection[], review: ReviewModel | undefined): KeyedSection[] {
+  const filesByPath = new Map<string, ReviewFile[]>();
+  for (const file of review?.files ?? []) {
+    const files = filesByPath.get(file.path);
+    if (files) files.push(file);
+    else filesByPath.set(file.path, [file]);
+  }
+
+  const seen = new Map<string, number>();
+  return sections.map((section) => {
+    const occurrence = seen.get(section.path) ?? 0;
+    seen.set(section.path, occurrence + 1);
+    const file = filesByPath.get(section.path)?.[occurrence];
+    return file ? {...section, key: reviewFileKey(file), file} : {...section, key: section.path};
+  });
+}
+
+type ViewSection = KeyedSection & {
   rows: SectionRow[];
   blockTargets: Array<BlockTarget | undefined>;
   // Parallel to `rows`: the raw text of the code line a row starts.
@@ -1541,16 +1569,14 @@ function resolveRowSources(rows: ReadonlyArray<SectionRow>, blockTargets: Readon
 }
 
 function applyCollapsedBlocks(
-  sections: DiffSection[],
-  review: ReviewModel | undefined,
+  sections: KeyedSection[],
   collapsedBlockIds: ReadonlySet<string>,
 ): ViewSection[] {
-  const fileByPath = new Map(review?.files.map((file) => [file.path, file]) ?? []);
   let cursor = 0;
 
   return sections.map((section) => {
     const allRows = section.rows ?? section.lines.map((): SectionRow => ({block: -1, kind: 'body', continuation: false}));
-    const blockTargets = resolveBlockTargets(allRows, fileByPath.get(section.path));
+    const blockTargets = resolveBlockTargets(allRows, section.file);
     const allSources = resolveRowSources(allRows, blockTargets);
     const isHidden = (row: SectionRow) => row.kind === 'body'
       && row.block >= 0
@@ -1633,16 +1659,11 @@ function fileError(file: ReviewFile) {
 
 // Puts an error row at the top of each section whose file failed to build,
 // directly under the file header when the file is in view.
-function addFileErrorRows(sections: DiffSection[], review: ReviewModel | undefined) {
-  const errors = new Map<string, string>();
-  for (const file of review?.files ?? []) {
-    const error = fileError(file);
-    if (error) errors.set(file.path, error);
-  }
-  if (errors.size === 0) return sections;
+function addFileErrorRows(sections: KeyedSection[]) {
+  if (!sections.some((section) => section.file && fileError(section.file))) return sections;
 
   return sections.map((section) => {
-    const error = errors.get(section.path);
+    const error = section.file && fileError(section.file);
     if (!error) return section;
     return {
       ...section,
@@ -1782,7 +1803,7 @@ function DiffPaneBody({
     const row = allDiffRows[absoluteLineIndex];
     const blockTarget = row?.target;
     const blockArrival = blockTarget
-      ? arrivalAnimations.blocks.get(blockAnimationKey(blockTarget.file.path, blockTarget.block))
+      ? arrivalAnimations.blocks.get(blockAnimationKey(reviewFileKey(blockTarget.file), blockTarget.block))
       : undefined;
     let visibleLine = line || ' ';
     if (row?.kind === 'header') {
@@ -1865,21 +1886,22 @@ function AppContent({
 
   const [collapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
   const wrappedSectionCacheRef = useRef<Map<string, WrappedSectionCacheEntry>>(new Map());
-  const displaySections = useMemo(() => addFileErrorRows(rawSections, review), [rawSections, review]);
+  const keyedSections = useMemo(() => keySections(rawSections, review), [rawSections, review]);
+  const displaySections = useMemo(() => addFileErrorRows(keyedSections), [keyedSections]);
   const wrapWidth = useSettledValue(diffContentWidth, WRAP_SETTLE_MS);
   const wrappedSections = useMemo(
     () => wrapSectionsWithCache(displaySections, wrapWidth, wrappedSectionCacheRef.current),
     [displaySections, wrapWidth],
   );
   const sections = useMemo(
-    () => applyCollapsedBlocks(wrappedSections, review, collapsedBlockIds),
-    [collapsedBlockIds, review, wrappedSections],
+    () => applyCollapsedBlocks(wrappedSections, collapsedBlockIds),
+    [collapsedBlockIds, wrappedSections],
   );
 
-  const files = useMemo(() => sections.map((section) => section.path), [sections]);
-  const statusByPath = useMemo(() => new Map(review?.files.map((file) => [file.path, file.status]) ?? []), [review]);
+  const files = useMemo(() => sections.map((section) => ({path: section.path, key: section.key})), [sections]);
+  const statusByKey = useMemo(() => new Map(review?.files.map((file) => [reviewFileKey(file), file.status]) ?? []), [review]);
   const [collapsedTreePaths, setCollapsedTreePaths] = useState<Set<string>>(() => new Set());
-  const allTreeRows = useMemo(() => buildTreeRows(files, statusByPath), [files, statusByPath]);
+  const allTreeRows = useMemo(() => buildTreeRows(files, statusByKey), [files, statusByKey]);
   const rows = useMemo(() => applyTreeCollapse(allTreeRows, collapsedTreePaths), [allTreeRows, collapsedTreePaths]);
   const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
   const allDiffRows = useMemo(() => buildDiffRows(sections), [sections]);
@@ -1932,7 +1954,7 @@ function AppContent({
   const lastCodeSelectionRenderAtRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
   const viewSnapshotRef = useRef({
-    path: '',
+    key: '',
     sectionIndex: 0,
     relativeOffset: 0,
   });
@@ -1953,12 +1975,10 @@ function AppContent({
   const activeSectionIndex = topSectionIndex;
   const activeSection = activeSectionIndex >= 0 ? sections[activeSectionIndex] : null;
   const activeFilePath = activeSection?.path ?? '';
-  const activeTreeId = useMemo(() => findTreeSelectionId(rows, activeFilePath), [activeFilePath, rows]);
+  const activeFileKey = activeSection?.key ?? '';
+  const activeTreeId = useMemo(() => findTreeSelectionId(rows, activeFileKey), [activeFileKey, rows]);
   const activeRowIndex = rows.findIndex((row) => row.id === activeTreeId);
-  const activeFile = useMemo(
-    () => review?.files.find((file) => file.path === activeFilePath),
-    [activeFilePath, review],
-  );
+  const activeFile = activeSection?.file;
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
     [allDiffRows],
@@ -2018,7 +2038,7 @@ function AppContent({
       return;
     }
 
-    const nextSnapshot = buildArrivalSnapshot(review, rawSections);
+    const nextSnapshot = buildArrivalSnapshot(review, keyedSections);
     const previousSnapshot = arrivalSnapshotRef.current;
     arrivalSnapshotRef.current = nextSnapshot;
 
@@ -2096,12 +2116,12 @@ function AppContent({
 
   useEffect(() => {
     const snapshot = viewSnapshotRef.current;
-    if (!snapshot.path || sections.length === 0) {
+    if (!snapshot.key || sections.length === 0) {
       setDiffOffset((current) => clamp(current, 0, scrollCeiling));
       return;
     }
 
-    const preservedSection = sections.find((section) => section.path === snapshot.path);
+    const preservedSection = sections.find((section) => section.key === snapshot.key);
     const fallbackSection = sections[clamp(snapshot.sectionIndex, 0, sections.length - 1)];
     const nextSection = preservedSection ?? fallbackSection;
     if (!nextSection) {
@@ -2125,11 +2145,11 @@ function AppContent({
 
   useEffect(() => {
     viewSnapshotRef.current = {
-      path: activeFilePath,
+      key: activeFileKey,
       sectionIndex: activeSectionIndex,
       relativeOffset: activeSection ? Math.max(0, diffOffset - activeSection.startLine) : 0,
     };
-  }, [activeFilePath, activeSection, activeSectionIndex, diffOffset]);
+  }, [activeFileKey, activeSection, activeSectionIndex, diffOffset]);
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, scrollCeiling));
@@ -2148,8 +2168,9 @@ function AppContent({
     setDiffOffset(offset);
   }, []);
 
-  const jumpToFile = useCallback((filePath: string) => {
-    const section = sections.find((entry) => entry.path === filePath);
+  // `key` names the file as its tree row does.
+  const jumpToFile = useCallback((key: string) => {
+    const section = sections.find((entry) => entry.key === key);
     if (section) {
       scrollDiffTo(section.startLine);
     }
@@ -2223,7 +2244,7 @@ function AppContent({
 
     // The rebuilt sections restore the view from this snapshot.
     viewSnapshotRef.current = {
-      path: section.path,
+      key: section.key,
       sectionIndex: header.sectionIndex,
       relativeOffset: Math.max(0, offset - section.startLine),
     };
@@ -2407,10 +2428,14 @@ function AppContent({
       return;
     }
 
+    // Every block copy passes the block's own file as `commandFile`; a file
+    // copy may pass a focused block from another file, which then gets none.
+    const blockOwner = !commandBlock || commandFile.blocks.includes(commandBlock) ? commandFile : undefined;
     const result = await executeCopyCommand(commandId, {
       model: review,
       activeFile: commandFile,
       focusedBlock: commandBlock,
+      ...(blockOwner ? {focusedBlockFile: blockOwner} : {}),
       readFileContent,
       resolveAbsolutePath,
     }, copyWriter ? {write: copyWriter} : {});
@@ -2510,7 +2535,7 @@ function AppContent({
       return;
     }
 
-    const {lines, rows, sections: viewSections, review: viewReview} = selectionViewRef.current;
+    const {lines, rows, sections: viewSections} = selectionViewRef.current;
     const text = getSelectedCodeText(lines, rows, selection);
     if (!text) {
       setCodeSelection(null);
@@ -2519,7 +2544,7 @@ function AppContent({
 
     // The drawn text of a file whose diff is not exact (not UTF-8, or failed
     // to load) is not its bytes; copy nothing, as the keyboard copies do.
-    const reason = selectionCopyError(rows, viewSections, viewReview, selection);
+    const reason = selectionCopyError(rows, viewSections, selection);
     if (reason !== undefined) {
       showToast('Copy action unavailable.', reason, 'error');
       return;
@@ -2868,13 +2893,13 @@ function AppContent({
         }
 
         if (row && row.kind === 'file') {
-          const rowFile = review?.files.find((file) => file.path === row.path);
+          const rowFile = sections.find((section) => section.key === row.key)?.file;
           if (isTreeCopyTarget(relativeX, bounds.width) && rowFile) {
             void runCopyCommand('copy.path', rowFile, rowFile.blocks[0], {kind: 'tree-copy', rowIndex});
             return;
           }
 
-          jumpToFile(row.path);
+          jumpToFile(row.key);
         }
         return;
       }
@@ -2933,6 +2958,7 @@ function AppContent({
     review,
     resizeTreeToMouse,
     runCopyCommand,
+    sections,
     setCodeSelection,
     toggleBlock,
     toggleTree,
@@ -3118,7 +3144,7 @@ function AppContent({
                   copiedAction?.kind === 'tree-copy'
                   && copiedAction.rowIndex === treeOffset + index
                 }
-                arrivalEntry={row.kind === 'file' ? arrivalAnimations.files.get(row.path) : undefined}
+                arrivalEntry={row.kind === 'file' ? arrivalAnimations.files.get(row.key) : undefined}
                 arrivalNow={arrivalNow}
                 width={treeContentWidth}
               />
@@ -3134,7 +3160,7 @@ function AppContent({
         >
           <DiffErrorBoundary
             filePath={activeFilePath}
-            resetKey={`${sectionsRevision}\0${activeFilePath}\0${diffOffset}\0${rightWidth}`}
+            resetKey={`${sectionsRevision}\0${activeFileKey}\0${diffOffset}\0${rightWidth}`}
             width={rightWidth}
           >
             <DiffPaneBody
@@ -3152,7 +3178,7 @@ function AppContent({
               collapsedBlockIds={collapsedBlockIds}
               arrivalAnimations={arrivalAnimations}
               arrivalNow={arrivalNow}
-              fileArrival={arrivalAnimations.files.get(activeFilePath)}
+              fileArrival={arrivalAnimations.files.get(activeFileKey)}
               actionBlockLineIndex={hoveredBlockLineIndex ?? focusedBlockLineIndex}
               focusedBlockLineIndex={focusedBlockLineIndex}
               hoveredAction={hoveredAction}

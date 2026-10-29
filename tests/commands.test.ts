@@ -249,3 +249,62 @@ describe('copy command registry', () => {
     expect(writes).toEqual([]);
   });
 });
+
+describe('block copies on two files that show the same path', () => {
+  // A name that failed to decode is shown by an escaped stand-in; a real file
+  // can be named like it. The undecodable one is listed first here.
+  const undecodable: ReviewFile = {
+    ...file,
+    blocks: [{...block, id: 'u', rawDiff: '@@ -9 +10 @@\n-old\n+latin', addedCode: 'latin'}],
+    pathError: 'file name is not UTF-8',
+    rawDiffError: 'file name is not UTF-8',
+  };
+  const real: ReviewFile = {...file, blocks: [{...block, id: 'r'}]};
+  const twoFiles: ReviewModel = {...model, files: [undecodable, real]};
+  const blockCopies = ['copy.blockCode', 'copy.blockDiff', 'copy.blockPrompt'];
+
+  function recorder() {
+    const writes: string[] = [];
+    return {writes, write: async (text: string) => {
+      writes.push(text);
+      return {ok: true as const, command: {command: 'pbcopy', args: [], displayName: 'pbcopy'}};
+    }};
+  }
+
+  it('checks the file passed with the block, not the first file with its path', async () => {
+    const writer = recorder();
+    const context: CommandContext = {model: twoFiles, activeFile: real, focusedBlock: real.blocks[0], focusedBlockFile: real};
+    for (const id of blockCopies) {
+      expect(await executeCopyCommand(id, context, writer), id).toMatchObject({ok: true});
+    }
+    expect(writer.writes[0]).toBe('new');
+    expect(writer.writes).toHaveLength(3);
+  });
+
+  it('fails every block copy on the undecodable file with its reason, with or without a block', async () => {
+    const writer = recorder();
+    const contexts: CommandContext[] = [
+      {model: twoFiles, activeFile: undecodable, focusedBlock: undecodable.blocks[0], focusedBlockFile: undecodable},
+      {model: twoFiles, activeFile: {...undecodable, blocks: []}, focusedBlockFile: {...undecodable, blocks: []}},
+    ];
+    for (const context of contexts) {
+      for (const id of blockCopies) {
+        expect(await executeCopyCommand(id, context, writer), id)
+          .toMatchObject({ok: false, hint: 'file name is not UTF-8', reason: 'disabled'});
+      }
+    }
+    expect(writer.writes).toEqual([]);
+  });
+
+  it('keeps block copies disabled, with no reason, on a valid file that shows no block', async () => {
+    const empty: ReviewFile = {...file, blocks: []};
+    for (const id of blockCopies) {
+      expect(await executeCopyCommand(id, {model, activeFile: empty, focusedBlockFile: empty}), id).toEqual({
+        ok: false,
+        commandId: id,
+        toast: 'Copy action unavailable.',
+        reason: 'disabled',
+      });
+    }
+  });
+});
