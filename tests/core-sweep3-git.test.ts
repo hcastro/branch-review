@@ -83,7 +83,7 @@ describe('file names that are not UTF-8', () => {
       readFileContent: (target) => getReviewFileContents(cwd, range, target),
       resolveAbsolutePath: (target) => path.join(cwd, target.path),
     };
-    for (const id of ['copy.path', 'copy.absolutePath', 'copy.fileContents', 'copy.fileDiff', 'copy.filePrompt']) {
+    for (const id of ['copy.path', 'copy.absolutePath', 'copy.fileContents', 'copy.fileDiff']) {
       const result = await executeCopyCommand(id, context, {write: writer.write});
       expect(result, id).toMatchObject({ok: false, hint: 'file name is not UTF-8'});
     }

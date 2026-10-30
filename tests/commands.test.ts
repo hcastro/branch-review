@@ -45,21 +45,17 @@ describe('copy command registry', () => {
     };
 
     expect(copyCommands.map((command) => command.id)).toEqual([
-      'copy.filePrompt',
       'copy.fileContents',
       'copy.blockPrompt',
       'copy.path',
       'copy.absolutePath',
-      'copy.pathLine',
       'copy.blockCode',
       'copy.blockDiff',
       'copy.fileDiff',
-      'copy.branchPrompt',
     ]);
     expect(copyCommands.some((command) => command.id.toLowerCase().includes('github'))).toBe(false);
 
     const pathCommand = getCopyCommand('copy.path');
-    expect(pathCommand?.shortcuts).toEqual(['y p', 'y P']);
     expect(pathCommand?.buildPayload(context)).toEqual({
       text: 'src/example.ts',
       toast: 'Copied path',
@@ -67,7 +63,6 @@ describe('copy command registry', () => {
     });
 
     const blockDiffCommand = getCopyCommand('copy.blockDiff');
-    expect(blockDiffCommand?.shortcuts).toEqual(['y h']);
     expect(blockDiffCommand?.buildPayload(context)?.text).toBe(block.rawDiff);
 
     expect(getCopyCommand('copy.fileContents')?.buildPayload(context)).toEqual({
@@ -81,7 +76,6 @@ describe('copy command registry', () => {
       hint: 'src/example.ts',
     });
     expect(getCopyCommand('copy.fileDiff')?.buildPayload(context)?.text).toBe(file.rawDiff);
-    expect(getCopyCommand('copy.filePrompt')?.buildPayload(context)?.text).toContain('```diff');
     expect(getCopyCommand('copy.blockCode')?.buildPayload(context)?.text).toBe('new');
     expect(getCopyCommand('copy.blockPrompt')?.buildPayload(context)?.text).toContain('Lines: 10-10');
   });
@@ -97,39 +91,15 @@ describe('copy command registry', () => {
 
     expect(getCopyCommand('copy.path')?.buildPayload(context)?.text).toBe('src/example.ts');
     expect(getCopyCommand('copy.absolutePath')?.buildPayload(context)?.text).toBe('/repo/src/example.ts');
-    expect(getCopyCommand('copy.pathLine')?.buildPayload(context)?.text).toBe('src/example.ts:10');
     expect(getCopyCommand('copy.blockCode')?.buildPayload(context)?.text).toBe('new');
     expect(getCopyCommand('copy.blockDiff')?.buildPayload(context)?.text).toBe(block.rawDiff);
     expect(getCopyCommand('copy.fileDiff')?.buildPayload(context)?.text).toBe(file.rawDiff);
     expect(getCopyCommand('copy.fileContents')?.buildPayload(context)?.text).toBe('export const value = 2;\n');
-    expect(getCopyCommand('copy.filePrompt')?.buildPayload(context)?.text).toMatchInlineSnapshot(`
-      "File: src/example.ts
-
-      \`\`\`diff
-      diff --git a/src/example.ts b/src/example.ts
-      @@ -9 +10 @@
-      -old
-      +new
-      \`\`\`"
-    `);
     expect(getCopyCommand('copy.blockPrompt')?.buildPayload(context)?.text).toMatchInlineSnapshot(`
       "File: src/example.ts
       Lines: 10-10
 
       \`\`\`diff
-      @@ -9 +10 @@
-      -old
-      +new
-      \`\`\`"
-    `);
-    expect(getCopyCommand('copy.branchPrompt')?.buildPayload(context)?.text).toMatchInlineSnapshot(`
-      "# Branch review · development...HEAD + worktree
-      1 files · +1 -1
-
-      ## src/example.ts
-
-      \`\`\`diff
-      diff --git a/src/example.ts b/src/example.ts
       @@ -9 +10 @@
       -old
       +new

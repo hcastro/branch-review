@@ -1,12 +1,4 @@
-import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
-
-function formatNumber(value: number) {
-  return value.toLocaleString('en-US');
-}
-
-function formatMetrics(model: ReviewModel) {
-  return `${model.metrics.filesChanged} files · +${formatNumber(model.metrics.additions)} -${formatNumber(model.metrics.deletions)}`;
-}
+import type {ReviewFile, ReviewBlock} from '../review/model.js';
 
 // The patch goes inside the fence untrimmed, so a trailing blank context line
 // survives and the fenced text still applies. The fence is longer than any
@@ -30,10 +22,6 @@ export function buildPathPayload(file: Pick<ReviewFile, 'path'>) {
 
 export function buildAbsolutePathPayload(absolutePath: string) {
   return absolutePath;
-}
-
-export function buildPathLinePayload(file: Pick<ReviewFile, 'path'>, block: Pick<ReviewBlock, 'lineStart'>) {
-  return `${file.path}:${block.lineStart}`;
 }
 
 export function buildCodePayload(block: Pick<ReviewBlock, 'addedCode'>) {
@@ -64,23 +52,4 @@ export function buildBlockPromptPayload(file: Pick<ReviewFile, 'path'>, block: R
 
   lines.push('', fencedDiff(block.rawDiff));
   return lines.join('\n');
-}
-
-export function buildFilePromptPayload(file: Pick<ReviewFile, 'path' | 'rawDiff'>) {
-  return [`File: ${linePath(file.path)}`, '', fencedDiff(file.rawDiff)].join('\n');
-}
-
-export function buildBranchPromptPayload(model: ReviewModel) {
-  const lines = [
-    `# Branch review · ${model.label}`,
-    formatMetrics(model),
-    '',
-  ];
-
-  for (const file of model.files) {
-    const body = file.rawDiffError === undefined ? fencedDiff(file.rawDiff) : `Diff unavailable: ${file.rawDiffError}`;
-    lines.push(`## ${linePath(file.path)}`, '', body, '');
-  }
-
-  return lines.join('\n').trimEnd();
 }

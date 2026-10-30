@@ -8,7 +8,6 @@ import {
   buildBlockDiffPayload,
   buildBlockPromptPayload,
   buildFileDiffPayload,
-  buildFilePromptPayload,
 } from '../src/clipboard/payloads.js';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, writeFiles} from './core-helpers.js';
 
@@ -71,7 +70,6 @@ describe('copied diffs apply with git apply', () => {
     }
 
     expect(first!.rawDiff.endsWith('\n \n')).toBe(true);
-    expect(fencedBody(buildFilePromptPayload(file))).toBe(file.rawDiff);
     expect(fencedBody(buildBlockPromptPayload(file, first!))).toBe(first!.rawDiff);
   });
 
@@ -86,7 +84,9 @@ describe('copied diffs apply with git apply', () => {
     const file = buildReviewModel({cwd, range, width: 100}).files[0]!;
 
     git(cwd, 'checkout', '-q', 'main');
-    for (const patch of [buildFileDiffPayload(file), fencedBody(buildFilePromptPayload(file))]) {
+    expect(file.blocks).toHaveLength(1);
+    const header = file.rawDiff.slice(0, file.rawDiff.indexOf('@@'));
+    for (const patch of [buildFileDiffPayload(file), header + fencedBody(buildBlockPromptPayload(file, file.blocks[0]!))]) {
       expect(() => applyCheck(cwd, patch)).not.toThrow();
     }
     expect(file.rawDiff.endsWith(' c\n \n')).toBe(true);
@@ -100,7 +100,9 @@ describe('copied diffs apply with git apply', () => {
     const range = resolveRefs(cwd, 'HEAD', 'main');
     const file = buildReviewModel({cwd, range, width: 100}).files.find((entry) => entry.path === 'new.txt')!;
 
-    for (const patch of [buildFileDiffPayload(file), fencedBody(buildFilePromptPayload(file))]) {
+    expect(file.blocks).toHaveLength(1);
+    const header = file.rawDiff.slice(0, file.rawDiff.indexOf('@@'));
+    for (const patch of [buildFileDiffPayload(file), header + fencedBody(buildBlockPromptPayload(file, file.blocks[0]!))]) {
       const scratch = makeTempDir('branch-review-apply-');
       git(scratch, 'init', '-q');
       expect(() => applyCheck(scratch, patch)).not.toThrow();

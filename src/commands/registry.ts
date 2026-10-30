@@ -1,13 +1,10 @@
 import {
   buildAbsolutePathPayload,
-  buildBranchPromptPayload,
   buildCodePayload,
   buildFileContentsPayload,
   buildFileDiffPayload,
-  buildFilePromptPayload,
   buildBlockDiffPayload,
   buildBlockPromptPayload,
-  buildPathLinePayload,
   buildPathPayload,
 } from '../clipboard/payloads.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
@@ -36,7 +33,6 @@ export type CommandDefinition = {
   id: string;
   group: CommandGroup;
   title: string;
-  shortcuts: string[];
   isEnabled: (context: CommandContext) => boolean;
   buildPayload: (context: CommandContext) => CommandPayload | null;
 };
@@ -85,28 +81,9 @@ function blockCopyRefused(context: CommandContext) {
 
 export const copyCommands: CommandDefinition[] = [
   {
-    id: 'copy.filePrompt',
-    group: 'Copy for agent',
-    title: 'Copy active file context',
-    shortcuts: [],
-    isEnabled: (context) => Boolean(activeFile(context)),
-    buildPayload: (context) => {
-      const file = activeFile(context);
-      if (!file) return null;
-      assertPathCopyable(file);
-      assertDiffCopyable(file);
-      return {
-        text: buildFilePromptPayload(file),
-        toast: 'Copied file context',
-        hint: file.path,
-      };
-    },
-  },
-  {
     id: 'copy.fileContents',
     group: 'Copy content',
     title: 'Copy active file contents',
-    shortcuts: [],
     isEnabled: (context) => {
       const file = activeFile(context);
       return Boolean(file && file.status !== 'deleted');
@@ -128,7 +105,6 @@ export const copyCommands: CommandDefinition[] = [
     id: 'copy.blockPrompt',
     group: 'Copy for agent',
     title: 'Copy focused block',
-    shortcuts: [],
     isEnabled: (context) => Boolean(fileAndBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
       assertPathCopyable(blockFile(context, focusedBlock(context)));
@@ -147,7 +123,6 @@ export const copyCommands: CommandDefinition[] = [
     id: 'copy.path',
     group: 'Copy paths',
     title: 'Copy active file path',
-    shortcuts: ['y p', 'y P'],
     isEnabled: (context) => Boolean(activeFile(context)),
     buildPayload: (context) => {
       const file = activeFile(context);
@@ -164,7 +139,6 @@ export const copyCommands: CommandDefinition[] = [
     id: 'copy.absolutePath',
     group: 'Copy paths',
     title: 'Copy active file absolute path',
-    shortcuts: [],
     isEnabled: (context) => Boolean(activeFile(context)),
     buildPayload: (context) => {
       const file = activeFile(context);
@@ -180,27 +154,9 @@ export const copyCommands: CommandDefinition[] = [
     },
   },
   {
-    id: 'copy.pathLine',
-    group: 'Copy paths',
-    title: 'Copy focused block path:line',
-    shortcuts: ['y l'],
-    isEnabled: (context) => Boolean(fileAndBlock(context)),
-    buildPayload: (context) => {
-      const target = fileAndBlock(context);
-      if (!target) return null;
-      assertPathCopyable(target.file);
-      return {
-        text: buildPathLinePayload(target.file, target.block),
-        toast: 'Copied path:line',
-        hint: `${target.file.path}:${target.block.lineStart}`,
-      };
-    },
-  },
-  {
     id: 'copy.blockCode',
     group: 'Copy content',
     title: 'Copy focused block code',
-    shortcuts: ['y c'],
     isEnabled: (context) => Boolean(focusedBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
       const block = focusedBlock(context);
@@ -218,7 +174,6 @@ export const copyCommands: CommandDefinition[] = [
     id: 'copy.blockDiff',
     group: 'Copy content',
     title: 'Copy focused block diff',
-    shortcuts: ['y h'],
     isEnabled: (context) => Boolean(focusedBlock(context)) || blockCopyRefused(context),
     buildPayload: (context) => {
       const block = focusedBlock(context);
@@ -236,7 +191,6 @@ export const copyCommands: CommandDefinition[] = [
     id: 'copy.fileDiff',
     group: 'Copy content',
     title: 'Copy active file diff',
-    shortcuts: ['y f'],
     isEnabled: (context) => Boolean(activeFile(context)),
     buildPayload: (context) => {
       const file = activeFile(context);
@@ -248,18 +202,6 @@ export const copyCommands: CommandDefinition[] = [
         hint: file.path,
       };
     },
-  },
-  {
-    id: 'copy.branchPrompt',
-    group: 'Export',
-    title: 'Copy branch review',
-    shortcuts: ['y a'],
-    isEnabled: (context) => context.model.files.length > 0,
-    buildPayload: (context) => ({
-      text: buildBranchPromptPayload(context.model),
-      toast: 'Copied branch review',
-      hint: `${context.model.files.length} files`,
-    }),
   },
 ];
 
