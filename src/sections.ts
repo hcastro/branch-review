@@ -19,8 +19,10 @@ export type SectionRow = {
   // for rows before the first block header.
   block: number;
   // 'header' is the framed `• path:line:` row, 'frame' the blank and border
-  // rows around it, 'body' everything else.
-  kind: 'header' | 'frame' | 'body';
+  // rows around it, 'media' a row of a media preview (a picture's label or
+  // one row of its box), 'body' everything else. Media rows belong to no
+  // block and hold no code, so focus, folding, selection and copy pass them by.
+  kind: 'header' | 'frame' | 'body' | 'media';
   // True when this row continues the previous row's source line after wrapping.
   continuation: boolean;
   // Cell column where code starts after delta's line-number gutter, when the
@@ -32,6 +34,20 @@ export type SectionRow = {
   // Header rows: the full display label (`• path:line:`) and its line number.
   label?: string;
   lineNumber?: number;
+  media?: MediaRowInfo;
+};
+
+// What a media row shows. A box row names the boxes it crosses (two in a side
+// by side view) and which of their rows it is; the pixels are looked up when
+// the row is drawn, so a picture arriving never rebuilds the sections.
+export type MediaRowInfo = {
+  fileKey: string;
+  boxes?: readonly BoxSpec[];
+  boxRow?: number;
+  // Click targets on a text row, such as the compare tabs.
+  spans?: readonly MediaSpan[];
+  // A click anywhere on the row swaps the side flip mode shows.
+  swap?: boolean;
 };
 
 export type DiffSection = {
@@ -45,6 +61,9 @@ export type DiffSection = {
   endLineExclusive: number;
 };
 
+// A section after wrapping, with one row of structure per line.
+export type WrappedSection = DiffSection & {rows: SectionRow[]};
+
 export const BLOCK_ACTION_LABELS = {
   code: 'Copy code',
   diff: 'Copy diff',
@@ -52,6 +71,8 @@ export const BLOCK_ACTION_LABELS = {
 } as const;
 
 import {cellWidth, graphemes, toDisplayText, truncateStart} from './ui/text.js';
+import type {BoxSpec} from './media/layout.js';
+import type {MediaSpan} from './media/types.js';
 import {palette} from './ui/palette.js';
 
 const ANSI_CSI_TOKEN = /(\[[0-9;:]*[A-Za-z])/;

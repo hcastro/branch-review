@@ -43,4 +43,15 @@ describe('parseCliArgs', () => {
       animations: true,
     });
   });
+
+  it('turns image previews off with --no-images and back on with --images, the last one winning', () => {
+    expect(parseCliArgs([], {interactive: true}).images).toBeUndefined();
+    expect(parseCliArgs(['--no-images'], {interactive: true}).images).toBe('off');
+    expect(parseCliArgs(['--no-images', '--images'], {interactive: true}).images).toBe('auto');
+    expect(parseCliArgs(['--images', '--no-images', 'feature', 'main'], {interactive: false})).toMatchObject({
+      images: 'off',
+      requestedBranch: 'feature',
+      requestedBase: 'main',
+    });
+  });
 });

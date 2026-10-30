@@ -6,9 +6,12 @@ import {render as inkRender} from 'ink';
 import {expect} from 'vitest';
 import {App} from '../src/ui/App.js';
 import {buildDiffSections, type DiffSection} from '../src/sections.js';
+import type {GraphicsCaps} from '../src/media/types.js';
+import type {MediaRowsHook} from '../src/ui/App.js';
 import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
 import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
+import type {FileStatus} from '../src/git.js';
 
 // Shared fixtures for the ui-* test files: a review model built from raw
 // unified diffs plus delta-shaped rendered lines, and SGR mouse input.
@@ -59,7 +62,7 @@ export function recordingWriter(writes: string[]): ClipboardWriter {
   };
 }
 
-export type FixtureFile = {path: string; rawDiff: string; rendered: string[]; error?: string};
+export type FixtureFile = {path: string; rawDiff: string; rendered: string[]; error?: string; status?: FileStatus};
 
 export function buildFixture(files: FixtureFile[]): {sections: DiffSection[]; review: ReviewModel} {
   const reviewFiles = files.map((file): ReviewFile & {error?: string} => {
@@ -68,7 +71,7 @@ export function buildFixture(files: FixtureFile[]): {sections: DiffSection[]; re
     const metrics = {path: file.path, additions, deletions, changedLines: additions + deletions};
     return {
       path: file.path,
-      status: 'modified' as const,
+      status: file.status ?? 'modified',
       metrics,
       rawDiff: file.rawDiff,
       renderedLines: file.rendered,
@@ -99,6 +102,8 @@ export type AppFixtureProps = {
   watchStatus?: string;
   readFileContent?: (file: ReviewFile) => string | null;
   resolveAbsolutePath?: (file: ReviewFile) => string | null;
+  graphics?: GraphicsCaps;
+  addMediaRows?: MediaRowsHook;
 };
 
 export function appElement(
@@ -118,6 +123,8 @@ export function appElement(
       resolveAbsolutePath={fixture.resolveAbsolutePath}
       watchStatus={fixture.watchStatus}
       dimensions={dimensions}
+      {...(fixture.graphics ? {graphics: fixture.graphics} : {})}
+      {...(fixture.addMediaRows ? {addMediaRows: fixture.addMediaRows} : {})}
     />
   );
 }
@@ -316,5 +323,26 @@ export function frameFits(frame: string, columns: number, rows: number) {
     height: lines.length,
     maxWidth: Math.max(...lines.map((line) => stringWidth(line))),
     fits: lines.length <= rows - 1 && lines.every((line) => stringWidth(line) <= columns),
+  };
+}
+
+// Media files the way git and the build print them: a binary patch with an
+// `index` line, drawn as today's one placeholder line.
+export function binaryMediaFile(path: string, status: FileStatus = 'modified', ids = ['029ace0', '97fa3ee']): FixtureFile {
+  const [before, after] = status === 'added' || status === 'untracked' ? ['0000000', ids[1]!] : status === 'deleted' ? [ids[0]!, '0000000'] : ids;
+  const header = status === 'added' || status === 'untracked' ? ['new file mode 100644'] : status === 'deleted' ? ['deleted file mode 100644'] : [];
+  return {
+    path,
+    status,
+    rawDiff: [`diff --git a/${path} b/${path}`, ...header, `index ${before}..${after}${header.length ? '' : ' 100644'}`, `Binary files a/${path} and b/${path} differ`, ''].join('\n'),
+    rendered: ['binary file changed'],
+  };
+}
+
+export function svgSourceFile(path: string): FixtureFile {
+  return {
+    path,
+    rawDiff: [`diff --git a/${path} b/${path}`, 'index b284849..35ecfd6 100644', `--- a/${path}`, `+++ b/${path}`, '@@ -1 +1,2 @@', '-<svg/>', '+<svg>', '+</svg>', ''].join('\n'),
+    rendered: [`• ${path}:1: `, `   1 ⋮     │<svg/>`, `${gutter(1)}<svg>`, `${gutter(2)}</svg>`],
   };
 }

@@ -75,6 +75,7 @@ export function createTerminalSession({stdout, stderr, proc = process, console: 
   let captured: Array<{args: unknown[]}> = [];
   let dropped = 0;
   let originals: Partial<ConsoleLike> | null = null;
+  let restorePrefix: (() => string) | null = null;
 
   const captureConsole = () => {
     if (originals) return;
@@ -117,7 +118,17 @@ export function createTerminalSession({stdout, stderr, proc = process, console: 
 
     if (active) {
       active = false;
-      stdout.write(TERMINAL_RESTORE_SEQUENCE);
+      // The prefix deletes the images sent to the terminal. It rides in the
+      // same write, before the alt screen is left, so no image can outlive
+      // the session on the main screen; a failing prefix never stops the
+      // restore.
+      let prefix = '';
+      try {
+        prefix = restorePrefix?.() ?? '';
+      } catch {
+        prefix = '';
+      }
+      stdout.write(prefix + TERMINAL_RESTORE_SEQUENCE);
     }
     releaseConsole(reported);
   };
@@ -139,6 +150,18 @@ export function createTerminalSession({stdout, stderr, proc = process, console: 
     },
     setUnmount(next: () => void) {
       unmount = next;
+    },
+    /** Sets what restore writes just before the restore sequence, in the same write. */
+    setRestorePrefix(next: () => string) {
+      restorePrefix = next;
+    },
+    /**
+     * Writes a graphics sequence straight to the terminal, between Ink's
+     * frames. Only while the alt screen is active, so nothing graphical ever
+     * reaches the user's main screen.
+     */
+    writeGraphics(sequence: string) {
+      if (active) stdout.write(sequence);
     },
     restore,
     /** Restores the terminal, prints one line, and sets exit code 1. */

@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {getColoredFileDiff, getReviewFileContents, resolveRefs} from '../src/git.js';
-import {buildReviewModel} from '../src/review/build.js';
+import {buildReviewModel, buildReviewSections} from '../src/review/build.js';
 import {buildCodePayload, buildFileDiffPayload} from '../src/clipboard/payloads.js';
 import {cleanupTempDirs, initRepo, makeTempDir, pathWithOnly, withEnv, writeExecutable, writeFiles} from './core-helpers.js';
+import {cellPosition, emitMouseDragAt, emitMousePressAt, flush, renderFixture} from './ui-fixtures.js';
 
 // Each test builds real repos and runs git and delta many times.
 vi.setConfig({testTimeout: 30_000});
@@ -113,5 +114,36 @@ describe('NO_COLOR', () => {
     withEnv({NO_COLOR: '', FORCE_COLOR: undefined, TERM: 'xterm-256color'}, () => {
       expect(getColoredFileDiff(cwd, range, 'a.txt', 100)).toMatch(SGR);
     });
+  });
+});
+
+describe('the Kitty image placeholder character in file contents', () => {
+  // A terminal with Kitty graphics draws a transmitted image wherever
+  // U+10EEEE appears under a 256-colour foreground, which delta's syntax
+  // colours supply. Repo text must never produce such a cell.
+  it('is drawn as a marker and copied by drag-select as the raw character', async () => {
+    const cwd = initRepo({'icons.txt': 'start\n'});
+    writeFiles(cwd, {'icons.txt': 'start\nimg \u{10EEEE}̅̅ end\n'});
+    const range = resolveRefs(cwd, 'HEAD', 'main');
+
+    const model = withEnv(COLOR_ENV, () => buildReviewModel({cwd, range, width: 100}));
+    const rendered = model.files[0]!.renderedLines.join('\n');
+    expect(rendered).toContain('img <U+10EEEE>');
+    expect(rendered).not.toContain('\u{10EEEE}');
+
+    const writes: string[] = [];
+    const instance = renderFixture({sections: buildReviewSections(model), review: model}, {columns: 150, rows: 30}, writes);
+    await flush();
+    const frame = instance.lastFrame();
+    expect(frame).not.toContain('\u{10EEEE}');
+    const from = cellPosition(frame, ['img <U+10EEEE>'], 'img');
+    const to = cellPosition(frame, ['img <U+10EEEE>'], 'end', 'end'.length - 1);
+    await emitMousePressAt(from.column, from.row);
+    await emitMouseDragAt(to.column, to.row);
+    await emitMouseDragAt(to.column, to.row, true);
+    await flush(2);
+
+    expect(writes).toEqual(['img \u{10EEEE}̅̅ end']);
+    instance.unmount();
   });
 });

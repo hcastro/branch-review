@@ -9,6 +9,7 @@ import {createRepoWatcher, type CreateRepoWatcherOptions, type RepoWatcher} from
 import {refreshReviewInWorker} from '../review/workerRefresh.js';
 import {debounce} from '../watch/debounce.js';
 import {App} from './App.js';
+import type {GraphicsCaps} from '../media/types.js';
 
 type WatchState =
   | {state: 'off'}
@@ -32,6 +33,8 @@ export type ReviewControllerProps = {
   watch: boolean;
   watchPoll?: boolean;
   animations?: boolean;
+  // What startup detection found the terminal can draw.
+  graphics?: GraphicsCaps;
   copyWriter?: ClipboardWriter;
   dimensions?: {columns: number; rows: number};
   initialFingerprint?: string;
@@ -109,6 +112,7 @@ export function ReviewController({
   watch,
   watchPoll = false,
   animations = true,
+  graphics,
   copyWriter,
   dimensions,
   initialFingerprint,
@@ -311,6 +315,7 @@ export function ReviewController({
       watchStatus={footerStatus}
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}
       animations={animations}
+      graphics={graphics}
     />
   );
 }

@@ -2,7 +2,8 @@
 // shared by diff content and on-screen repo strings (paths, refs, messages).
 // A terminal acts on C0, DEL and C1 controls; bidi controls reorder the text
 // around them; invisible format characters make two different names look the
-// same (`a.ts` and `a\u200B.ts`).
+// same (`a.ts` and `a\u200B.ts`); and one private-use character the terminal
+// gives a meaning of its own.
 const HIDDEN_RANGES = [
   '\\u0000-\\u001F', // C0 controls
   '\\u007F-\\u009F', // DEL and C1 controls
@@ -15,6 +16,10 @@ const HIDDEN_RANGES = [
   '\\u2066-\\u2069', // bidi isolates
   '\\uFEFF', // zero-width no-break space (BOM)
   '\\u{E0000}-\\u{E007F}', // tag characters
+  // Kitty image placeholder: under a foreground colour, a terminal with
+  // Kitty graphics draws a transmitted image in this cell, so only the
+  // media layer may produce it.
+  '\\u{10EEEE}',
 ].join('');
 
 const HIDDEN_CHARACTERS = new RegExp(`[${HIDDEN_RANGES}]`, 'gu');

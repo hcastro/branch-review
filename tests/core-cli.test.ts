@@ -260,3 +260,92 @@ describe('runInkApp', () => {
     expect(proc.exitCode).toBeUndefined();
   });
 });
+
+describe('graphics writes and the restore prefix', () => {
+  const DELETES = '\x1B_Ga=d,d=I,i=7,q=2\x1B\\\x1B_Ga=d,d=I,i=9,q=2\x1B\\';
+
+  it('writes the prefix and the restore sequence as one write ending in ?1049l', () => {
+    const {writes, proc, session} = fakeTerminal();
+    session.install();
+    session.enter();
+    session.setRestorePrefix(() => DELETES);
+    session.setUnmount(() => writes.push('FINAL-FRAME'));
+
+    proc.emit('SIGTERM');
+
+    expect(writes).toEqual([ENTER, 'FINAL-FRAME', DELETES + TERMINAL_RESTORE_SEQUENCE]);
+    expect(writes.at(-1)!.endsWith('\x1B[?1049l')).toBe(true);
+    expect(proc.exits).toEqual([143]);
+  });
+
+  it('asks for the prefix only once, on the first restore', () => {
+    const {writes, proc, session} = fakeTerminal();
+    let calls = 0;
+    session.install();
+    session.enter();
+    session.setRestorePrefix(() => {
+      calls += 1;
+      return DELETES;
+    });
+
+    proc.emit('exit', 0);
+    proc.emit('exit', 0);
+
+    expect(writes).toEqual([ENTER, DELETES + TERMINAL_RESTORE_SEQUENCE]);
+    expect(calls).toBe(1);
+  });
+
+  it('keeps every write unchanged with an empty prefix', () => {
+    const {writes, proc, session} = fakeTerminal();
+    session.install();
+    session.enter();
+    session.setRestorePrefix(() => '');
+
+    proc.emit('SIGINT');
+
+    expect(writes).toEqual([ENTER, TERMINAL_RESTORE_SEQUENCE]);
+  });
+
+  it('still restores the terminal when the prefix throws', () => {
+    const {writes, proc, session} = fakeTerminal();
+    session.install();
+    session.enter();
+    session.setRestorePrefix(() => {
+      throw new Error('registry broke');
+    });
+
+    proc.emit('SIGHUP');
+
+    expect(writes).toEqual([ENTER, TERMINAL_RESTORE_SEQUENCE]);
+    expect(proc.exits).toEqual([129]);
+  });
+
+  it('writes graphics only while the alt screen is active', () => {
+    const {writes, proc, session} = fakeTerminal();
+    session.install();
+    session.writeGraphics('BEFORE-ENTER');
+    session.enter();
+    session.writeGraphics('IN-ALT-SCREEN');
+    proc.emit('exit', 0);
+    session.writeGraphics('AFTER-RESTORE');
+
+    expect(writes).toEqual([ENTER, 'IN-ALT-SCREEN', TERMINAL_RESTORE_SEQUENCE]);
+  });
+
+  it('writes no graphics and no prefix when stdout is not a terminal', () => {
+    const writes: string[] = [];
+    const proc = new FakeProcess();
+    const session = createTerminalSession({
+      stdout: {isTTY: false, write: (text: string) => writes.push(text)},
+      stderr: {write: () => true},
+      proc,
+    });
+    session.install();
+    session.setRestorePrefix(() => DELETES);
+    session.enter();
+    session.writeGraphics('PIXELS');
+    proc.emit('SIGTERM');
+
+    expect(writes).toEqual([]);
+  });
+});

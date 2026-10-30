@@ -8,6 +8,7 @@ void runCli({
   argv: process.argv.slice(2),
   cwd: process.cwd(),
   proc: process,
+  stdin: process.stdin,
   stdout: process.stdout,
   stderr: process.stderr,
   render: (tree, options) => render(tree, options),

@@ -23,6 +23,7 @@ import {
   type BranchMetrics,
   type DiffSection,
   type SectionRow,
+  type WrappedSection,
 } from '../sections.js';
 import {graphemes, toDisplayText, truncateEnd, truncateStart, type Grapheme} from './text.js';
 import {palette, plainDiffMode} from './palette.js';
@@ -33,6 +34,16 @@ import {fileKey, type FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
+import type {GraphicsCaps} from '../media/types.js';
+import {createLoneEscapeGuard} from '../media/replyGuard.js';
+
+/**
+ * Adds media rows to the wrapped sections, before blocks are folded, and may
+ * put them in place of a media file's placeholder line. Rows it adds have
+ * kind 'media'; every other row and line keeps its content and order. It
+ * returns the same array when it adds nothing.
+ */
+export type MediaRowsHook = <S extends WrappedSection>(sections: S[], layout: {innerWidth: number; viewportRows: number}) => S[];
 
 type AppProps = {
   base: string;
@@ -49,6 +60,9 @@ type AppProps = {
   watchStatus?: string;
   emptyStateHint?: string;
   animations?: boolean;
+  // What startup detection found the terminal can draw.
+  graphics?: GraphicsCaps;
+  addMediaRows?: MediaRowsHook;
 };
 
 const SCROLL_STEP = 3;
@@ -80,6 +94,9 @@ const ARRIVAL_ANIMATION_DURATION_MS = 2600;
 const ARRIVAL_ANIMATION_TICK_MS = 130;
 const MAX_ANIMATED_ENTRIES = 120;
 const COPY_SUCCESS_LABEL = '✓ Copied';
+// After a detection that timed out, how long a lone Esc or the input after a
+// cut-off reply may still be part of a late terminal reply.
+const LATE_REPLY_WINDOW_MS = 1500;
 // Footer key hints in the order they are kept when the row is short.
 const KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'j/k scroll', '[/] block', '⏎ fold', 'y d f c p b copy', 't tree'];
 const KEY_HINT_SEPARATOR = ' • ';
@@ -178,6 +195,7 @@ function ensureVisible(index: number, currentOffset: number, viewportSize: numbe
 function getPrimaryVisibleSectionIndex(
   sections: DiffSection[],
   lines: string[],
+  rows: ReadonlyArray<Pick<SectionRow, 'kind'> | undefined>,
   startLine: number,
   endLineExclusive: number,
 ) {
@@ -189,11 +207,13 @@ function getPrimaryVisibleSectionIndex(
   const end = clamp(endLineExclusive, start + 1, lines.length);
   // The first line from the top that has text or starts a file names the
   // active file: the blank line that ends a file hands over to the next one,
-  // and a file whose only line is blank can still be the active one.
+  // and a file whose only line is blank can still be the active one. A media
+  // row counts as text, so a picture box still blank while it loads names
+  // its own file.
   let sectionIndex = getSectionIndexForLine(sections, start);
   for (let lineIndex = start; lineIndex < end; lineIndex += 1) {
     while (sectionIndex < sections.length - 1 && lineIndex >= sections[sectionIndex]!.endLineExclusive) sectionIndex += 1;
-    if (lineIndex === sections[sectionIndex]!.startLine || stripAnsi(lines[lineIndex] ?? '').trim()) {
+    if (lineIndex === sections[sectionIndex]!.startLine || rows[lineIndex]?.kind === 'media' || stripAnsi(lines[lineIndex] ?? '').trim()) {
       return sectionIndex;
     }
   }
@@ -1438,8 +1458,71 @@ function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number
 
 type SelectionSource = {
   lines: string[];
+  rows: ReadonlyArray<Pick<SectionRow, 'kind'>>;
   sections: ReadonlyArray<Pick<KeyedSection, 'key' | 'startLine' | 'endLineExclusive'>>;
 };
+
+// A place in a section that media rows appearing, growing or going away do
+// not move: `text` counts the section's non-media rows before it, and
+// `mediaInto`, set only when the place is on a media row, is how far into
+// that run of media rows it is. `atTop` marks the section's first row, which
+// stays the first row whatever appears there. Without media rows, `text` is
+// the offset into the section.
+type TextAnchor = {text: number; mediaInto?: number; atTop?: true};
+
+function textAnchor(
+  rows: ReadonlyArray<Pick<SectionRow, 'kind'> | undefined>,
+  section: Pick<DiffSection, 'startLine' | 'endLineExclusive'>,
+  line: number,
+): TextAnchor {
+  let text = 0;
+  let runStart = -1;
+  const end = Math.min(line, section.endLineExclusive);
+  for (let index = section.startLine; index < end; index += 1) {
+    if (rows[index]?.kind === 'media') {
+      if (runStart < 0) runStart = index;
+    } else {
+      text += 1;
+      runStart = -1;
+    }
+  }
+
+  // A line above the section, such as the previous file's trailing blank
+  // row, is its top as well.
+  const atTop = line <= section.startLine ? {atTop: true as const} : {};
+  if (line < section.endLineExclusive && rows[line]?.kind === 'media') {
+    return {text, mediaInto: line - (runStart < 0 ? line : runStart), ...atTop};
+  }
+  return {text, ...atTop};
+}
+
+// The line an anchor names in a section, or the section's last line when the
+// section got shorter. A place inside a run of media rows that shrank lands
+// on the run's last row; one whose run went away lands on the text after it.
+// The top of a file stays the top of the file, so a file jumped to shows its
+// picture when one appears there. Any other place follows its text, so the
+// first text row under a picture stays put when the picture grows.
+function lineForAnchor(
+  rows: ReadonlyArray<Pick<SectionRow, 'kind'> | undefined>,
+  section: Pick<DiffSection, 'startLine' | 'endLineExclusive'>,
+  anchor: TextAnchor,
+) {
+  if (anchor.atTop) return section.startLine;
+  const last = Math.max(section.startLine, section.endLineExclusive - 1);
+  let text = 0;
+  let index = section.startLine;
+  // Past `anchor.text` text rows, to the first row after them.
+  while (index < section.endLineExclusive && text < anchor.text) {
+    if (rows[index]?.kind !== 'media') text += 1;
+    index += 1;
+  }
+  if (text < anchor.text) return last;
+
+  let runEnd = index;
+  while (runEnd < section.endLineExclusive && rows[runEnd]?.kind === 'media') runEnd += 1;
+  if (anchor.mediaInto === undefined || runEnd === index) return Math.min(runEnd, last);
+  return Math.min(index + anchor.mediaInto, runEnd - 1);
+}
 
 function remapLineIndex(lineIndex: number, previous: SelectionSource, next: SelectionSource) {
   const section = previous.sections[getSectionIndexForLine(previous.sections, lineIndex)];
@@ -1448,8 +1531,15 @@ function remapLineIndex(lineIndex: number, previous: SelectionSource, next: Sele
   const target = next.sections.find((entry) => entry.key === section.key);
   if (!target) return null;
 
-  const mapped = target.startLine + lineIndex - section.startLine;
-  return mapped < target.endLineExclusive ? mapped : null;
+  const anchor = textAnchor(previous.rows, section, lineIndex);
+  const mapped = lineForAnchor(next.rows, target, anchor);
+  return mapped >= target.startLine && mapped < target.endLineExclusive && textAnchorsEqual(textAnchor(next.rows, target, mapped), anchor)
+    ? mapped
+    : null;
+}
+
+function textAnchorsEqual(left: TextAnchor, right: TextAnchor) {
+  return left.text === right.text && left.mediaInto === right.mediaInto;
 }
 
 // Moves a selection to where its lines went after the rendered lines were
@@ -1676,14 +1766,14 @@ function addFileErrorRows(sections: KeyedSection[]) {
 // The footer's left text for a row of `width` cells: the status, then as many
 // whole key hints as fit, always starting with `q quit`. A status too long to
 // leave room for `q quit` is cut to fit before it.
-function footerHintText(status: string | undefined, width: number) {
+export function footerHintText(status: string | undefined, width: number, items: ReadonlyArray<string> = KEY_HINT_ITEMS) {
   const prefix = status ? `${status}${KEY_HINT_SEPARATOR}` : '';
-  for (let count = KEY_HINT_ITEMS.length; count > 0; count -= 1) {
-    const text = `${prefix}${KEY_HINT_ITEMS.slice(0, count).join(KEY_HINT_SEPARATOR)}`;
+  for (let count = items.length; count > 0; count -= 1) {
+    const text = `${prefix}${items.slice(0, count).join(KEY_HINT_SEPARATOR)}`;
     if (visibleWidth(text) <= width) return text;
   }
 
-  const quit = `${status ? KEY_HINT_SEPARATOR : ''}${KEY_HINT_ITEMS[0]!}`;
+  const quit = `${status ? KEY_HINT_SEPARATOR : ''}${items[0] ?? KEY_HINT_ITEMS[0]!}`;
   return `${truncateEnd(status ?? '', Math.max(0, width - visibleWidth(quit)))}${quit}`;
 }
 
@@ -1857,6 +1947,8 @@ function AppContent({
   watchStatus,
   emptyStateHint,
   animations = false,
+  graphics,
+  addMediaRows,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -1893,9 +1985,13 @@ function AppContent({
     () => wrapSectionsWithCache(displaySections, wrapWidth, wrappedSectionCacheRef.current),
     [displaySections, wrapWidth],
   );
+  const mediaSections = useMemo(
+    () => addMediaRows ? addMediaRows(wrappedSections, {innerWidth: wrapWidth, viewportRows: visibleDiffRows}) : wrappedSections,
+    [addMediaRows, visibleDiffRows, wrapWidth, wrappedSections],
+  );
   const sections = useMemo(
-    () => applyCollapsedBlocks(wrappedSections, collapsedBlockIds),
-    [collapsedBlockIds, wrappedSections],
+    () => applyCollapsedBlocks(mediaSections, collapsedBlockIds),
+    [collapsedBlockIds, mediaSections],
   );
 
   const files = useMemo(() => sections.map((section) => ({path: section.path, key: section.key})), [sections]);
@@ -1953,10 +2049,23 @@ function AppContent({
   const codeSelectionRenderTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastCodeSelectionRenderAtRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
-  const viewSnapshotRef = useRef({
+  // Armed from mount: replies the detection gave up on wait in stdin until
+  // Ink first reads it.
+  const [escapeGuard] = useState(() => createLoneEscapeGuard({
+    armedUntil: graphics?.detectionTimedOut ? Date.now() + LATE_REPLY_WINDOW_MS : 0,
+    now: Date.now,
+    setTimer: setTimeout,
+    clearTimer: clearTimeout,
+    replyHead: graphics?.replyHead,
+    keysBeforeReply: graphics?.keysBeforeReply,
+  }));
+  useEffect(() => () => escapeGuard.dispose(), [escapeGuard]);
+  // Where the view was, as a file and a place in it that media rows do not
+  // move, so rebuilt sections can put the same text back at the top.
+  const viewSnapshotRef = useRef<{key: string; sectionIndex: number; anchor: TextAnchor}>({
     key: '',
     sectionIndex: 0,
-    relativeOffset: 0,
+    anchor: {text: 0, atTop: true},
   });
   const arrivalSnapshotRef = useRef<ArrivalSnapshot | null>(null);
   const [arrivalAnimations, setArrivalAnimations] = useState<ArrivalAnimations>(() => ({
@@ -1969,6 +2078,7 @@ function AppContent({
   const topSectionIndex = getPrimaryVisibleSectionIndex(
     sections,
     allDiffLines,
+    allDiffRows,
     diffOffset,
     diffOffset + visibleDiffRows,
   );
@@ -2129,27 +2239,25 @@ function AppContent({
       return;
     }
 
-    // The offset into the old file means nothing in another file, so a file
-    // that replaces a removed one opens at its top.
-    const relativeOffset = preservedSection ? snapshot.relativeOffset : 0;
-    // Within the file, and never past the ceiling every scroll uses: lines
-    // that moved into an earlier file can leave the old spot past it.
-    const nextOffset = Math.min(clamp(
-      nextSection.startLine + relativeOffset,
-      nextSection.startLine,
-      Math.max(nextSection.startLine, nextSection.endLineExclusive - 1),
-    ), scrollCeiling);
+    // The place in the old file means nothing in another file, so a file
+    // that replaces a removed one opens at its top. Never past the ceiling
+    // every scroll uses: lines that moved into an earlier file can leave the
+    // old spot past it.
+    const nextOffset = Math.min(
+      preservedSection ? lineForAnchor(allDiffRows, nextSection, snapshot.anchor) : nextSection.startLine,
+      scrollCeiling,
+    );
 
     setDiffOffset((current) => current === nextOffset ? current : nextOffset);
-  }, [sections, scrollCeiling]);
+  }, [allDiffRows, sections, scrollCeiling]);
 
   useEffect(() => {
     viewSnapshotRef.current = {
       key: activeFileKey,
       sectionIndex: activeSectionIndex,
-      relativeOffset: activeSection ? Math.max(0, diffOffset - activeSection.startLine) : 0,
+      anchor: activeSection ? textAnchor(allDiffRows, activeSection, diffOffset) : {text: 0, atTop: true},
     };
-  }, [activeFileKey, activeSection, activeSectionIndex, diffOffset]);
+  }, [activeFileKey, activeSection, activeSectionIndex, allDiffRows, diffOffset]);
 
   useEffect(() => {
     setDiffOffset((current) => clamp(current, 0, scrollCeiling));
@@ -2246,7 +2354,7 @@ function AppContent({
     viewSnapshotRef.current = {
       key: section.key,
       sectionIndex: header.sectionIndex,
-      relativeOffset: Math.max(0, offset - section.startLine),
+      anchor: textAnchor(allDiffRows, section, offset),
     };
     setDiffOffset(offset);
     setBlockFocus({key: blockFocusKey(allDiffRows, focusedBlockLineIndex), offset, line: focusedBlockLineIndex});
@@ -2512,10 +2620,10 @@ function AppContent({
   // A refresh, collapse or resize rebuilds the rendered lines. Keep the
   // selection on the same lines when they moved unchanged, otherwise drop it,
   // so a highlight or copy never lands on lines that were not selected.
-  const selectionSourceRef = useRef({lines: allDiffLines, sections});
+  const selectionSourceRef = useRef<SelectionSource>({lines: allDiffLines, rows: allDiffRows, sections});
   useLayoutEffect(() => {
     const previous = selectionSourceRef.current;
-    const next = {lines: allDiffLines, sections};
+    const next = {lines: allDiffLines, rows: allDiffRows, sections};
     selectionSourceRef.current = next;
 
     const selection = codeSelectionRef.current;
@@ -2527,7 +2635,7 @@ function AppContent({
     } else {
       cancelCodeSelection(selection.active);
     }
-  }, [allDiffLines, cancelCodeSelection, sections, setCodeSelection]);
+  }, [allDiffLines, allDiffRows, cancelCodeSelection, sections, setCodeSelection]);
 
   const copyCodeSelection = useCallback(async (selection: CodeSelection) => {
     if (compareSelectionPoints(selection.anchor, selection.focus) === 0) {
@@ -2967,6 +3075,9 @@ function AppContent({
   ]);
 
   useInput((input, key) => {
+    // A late reply to the startup queries, whole or in parts, does nothing.
+    if (escapeGuard.onInput(input, key, exit) === 'handled') return;
+
     // Ink reports Esc with `meta` set, so quitting is checked before the
     // modifier guard below. Alt-q and Ctrl-q are not quit keys.
     if (key.escape || (input === 'q' && !key.ctrl && !key.meta)) {

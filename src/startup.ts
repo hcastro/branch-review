@@ -5,6 +5,7 @@ import {refreshReview} from './review/build.js';
 import {escapeHiddenCharacters} from './controlChars.js';
 import {ReviewController, getModelWidth} from './ui/ReviewController.js';
 import {INK_RENDER_OPTIONS, createTerminalSession, runInkApp} from './terminalSession.js';
+import {startGraphicsDetection, type TtyInput} from './media/detect.js';
 
 type PrepareStartupOptions = {
   /** Where the CLI was started; any directory inside the work tree. */
@@ -67,9 +68,13 @@ export type CliIo = {
   /** Where the CLI was started. */
   cwd: string;
   proc: CliProcess;
-  stdout: {isTTY?: boolean; columns?: number; write(text: string): unknown};
+  // The terminal's input, read once before the UI mounts to ask what it can
+  // draw. Without it the app draws no media.
+  stdin?: TtyInput;
+  stdout: {isTTY?: boolean; columns?: number; rows?: number; write(text: string): unknown};
   stderr: {write(text: string): unknown};
   render: (tree: React.ReactElement, options: typeof INK_RENDER_OPTIONS) => InkInstance;
+  env?: NodeJS.ProcessEnv;
 };
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIGTERM: 143};
@@ -81,7 +86,7 @@ const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIG
  * exit hooks kill the git or delta the build is running, remove the private
  * index copy, and the UI is never mounted.
  */
-export async function runCli({argv, cwd: startDir, proc, stdout, stderr, render}: CliIo) {
+export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env}: CliIo) {
   const options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
   const terminalWidth = stdout.columns ?? 160;
 
@@ -120,6 +125,32 @@ export async function runCli({argv, cwd: startDir, proc, stdout, stderr, render}
     return;
   }
 
+  // Asks the terminal what it can draw once the UI is sure to mount. Raw
+  // mode moves keys typed ahead out of the terminal into this process, so
+  // asking during the build would swallow them on the exits above, which
+  // leave them to the shell. Raw mode also turns Ctrl-C into a byte, so the
+  // window handles it the way SIGINT would.
+  const detection = startGraphicsDetection({
+    stdin,
+    stdout,
+    env,
+    options: {images: options.images ?? 'auto'},
+    onInterrupt: () => {
+      session.restore();
+      proc.exit(130);
+    },
+  });
+  proc.on('exit', detection.cancel);
+
+  // Settles at the terminal's last reply, usually within milliseconds, or a
+  // short timeout. Nothing draws media yet: the answer only lets the UI tell
+  // late replies from keys.
+  const caps = await detection.result;
+  // Ctrl-C during the window, or a signal, has already exited.
+  if (startupBuild.signal.aborted) return;
+  const {keys, replyHead} = detection.handOff();
+  const graphics = replyHead ? {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : caps;
+
   await runInkApp(session, (guard) => render(guard(
     React.createElement(ReviewController, {
       cwd,
@@ -130,6 +161,7 @@ export async function runCli({argv, cwd: startDir, proc, stdout, stderr, render}
       watch: options.watch,
       watchPoll: options.watchPoll,
       animations: options.animations,
+      graphics,
       requestedBranch,
       requestedBase,
     }),

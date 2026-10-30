@@ -367,6 +367,320 @@ describe('runCli', () => {
   });
 });
 
+// A terminal stdin for runCli's graphics detection. It answers the query
+// the way `reply` says once the query is written, and records raw mode and
+// every `data` listener added, the only way this process could take keys.
+function detectingTerminal(reply: (stdin: EventEmitter) => void, onQuery: (stdin: EventEmitter) => void = () => {}) {
+  const writes: string[] = [];
+  const raw: boolean[] = [];
+  const unshifted: string[] = [];
+  const readers: string[] = [];
+  let markQueried!: () => void;
+  const queried = new Promise<void>((resolve) => {
+    markQueried = resolve;
+  });
+  const stdin = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    setRawMode: (mode: boolean) => {
+      raw.push(mode);
+      writes.push(`RAW:${mode}`);
+    },
+    resume: () => {},
+    pause: () => {},
+    unshift: (chunk: Buffer) => {
+      unshifted.push(chunk.toString('latin1'));
+    },
+  });
+  const stdout = {
+    isTTY: true,
+    columns: 120,
+    rows: 40,
+    write: (text: string) => {
+      writes.push(text);
+      if (text.includes('\x1B[c')) {
+        onQuery(stdin);
+        setImmediate(() => reply(stdin));
+        markQueried();
+      }
+      return true;
+    },
+  };
+  stdin.on('newListener', (event: string) => {
+    if (event === 'data') readers.push(event);
+  });
+  return {writes, raw, unshifted, readers, queried, stdin, stdout, stderr: {write: (text: string) => writes.push(text)}};
+}
+
+// Answers `ms` after the query, the way a terminal over SSH does, and logs
+// whether detection was still listening when the answer came. The answer's
+// clock starts at the query write, as a real terminal's does, so a loop
+// held up after the write still finds the answer due before the timeout.
+function lateTerminal(ms: number) {
+  const terminal = detectingTerminal(() => {}, (stdin) => {
+    setTimeout(() => {
+      terminal.writes.push(stdin.listenerCount('data') > 0 ? 'REPLY:read' : 'REPLY:LEFT-FOR-SHELL');
+      stdin.emit('data', Buffer.from('\x1B_Gi=31;OK\x1B\\\x1B[?62;22c', 'latin1'));
+    }, ms);
+  });
+  return terminal;
+}
+
+const SSH_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: '10.0.0.1 22 10.0.0.2 50000', BRANCH_REVIEW_IMAGES: undefined};
+
+const GRAPHICS_QUERY = '\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\\x1B[>0q\x1B[16t\x1B[14t\x1B[c';
+const GHOSTTY_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: undefined, BRANCH_REVIEW_IMAGES: undefined};
+
+describe('runCli graphics detection', () => {
+  it('asks the terminal before the UI mounts, with raw mode off again, and hands the answer down', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from('\x1B_Gi=31;OK\x1B\\\x1B[6;18;9t\x1B[?62c', 'latin1')));
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: (next) => {
+        tree = next;
+        terminal.writes.push('RENDER');
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    expect(terminal.writes).toEqual([`RAW:true`, GRAPHICS_QUERY, 'RAW:false', ENTER, 'RENDER']);
+    const controller = (tree!.props as {children: React.ReactElement<{graphics?: {protocol: string; cellPx: unknown}}>}).children;
+    expect(controller.props.graphics).toMatchObject({protocol: 'kitty', cellPx: {w: 9, h: 18}});
+    proc.emit('exit', 0);
+  });
+
+  it('exits 130 on Ctrl-C during detection without mounting the UI', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from('\x03', 'latin1')));
+    const proc = new FakeProcess();
+    let rendered = false;
+
+    const done = runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: () => {
+        rendered = true;
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(done, 20_000);
+
+    expect(proc.exits[0]).toBe(130);
+    expect(rendered).toBe(false);
+    expect(terminal.raw).toEqual([true, false]);
+    expect(terminal.writes).toEqual(['RAW:true', GRAPHICS_QUERY, 'RAW:false']);
+  });
+
+  it('lets a slow terminal finish answering before the UI mounts', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    // Well before the 1 s SSH timeout.
+    const terminal = lateTerminal(250);
+    const proc = new FakeProcess();
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: SSH_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: terminal.stderr,
+      render: () => {
+        terminal.writes.push('RENDER');
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    expect(terminal.writes).toEqual(['RAW:true', GRAPHICS_QUERY, 'REPLY:read', 'RAW:false', ENTER, 'RENDER']);
+    proc.emit('exit', 0);
+  });
+
+  // Raw mode would move keys typed ahead out of the terminal into this
+  // process, which exits without reading them.
+  it('asks nothing before a startup error, so keys typed ahead stay with the shell', async () => {
+    const cwd = makeTempDir('branch-review-not-a-repo-');
+    const terminal = lateTerminal(50);
+    const proc = new FakeProcess();
+
+    const done = runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: SSH_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: terminal.stderr,
+      render: () => {
+        throw new Error('must not render');
+      },
+    });
+    terminal.stdin.emit('data', Buffer.from('echo hi', 'latin1'));
+    await withTimeout(done, 20_000);
+
+    expect(proc.exits).toEqual([1]);
+    expect(terminal.writes).toHaveLength(1);
+    expect(terminal.writes[0]).toMatch(/^branch-review: not a git repository/);
+    expect(terminal.raw).toEqual([]);
+    expect(terminal.readers).toEqual([]);
+  });
+
+  it('asks nothing before "No file changes", so keys typed ahead stay with the shell', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    const terminal = lateTerminal(50);
+    const proc = new FakeProcess();
+
+    const done = runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: terminal.stderr,
+      render: () => {
+        throw new Error('must not render');
+      },
+    });
+    terminal.stdin.emit('data', Buffer.from('echo hi', 'latin1'));
+    await withTimeout(done, 20_000);
+
+    expect(proc.exits).toEqual([0]);
+    expect(terminal.writes).toEqual(['No file changes between main and HEAD.\n']);
+    expect(terminal.raw).toEqual([]);
+    expect(terminal.readers).toEqual([]);
+  });
+
+  it('turns raw mode off when the process exits mid-detection', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    const terminal = detectingTerminal(() => {});
+    const proc = new FakeProcess();
+
+    const done = runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: terminal.stderr,
+      render: () => ({waitUntilExit: () => Promise.resolve(), unmount: () => {}}),
+    });
+    await withTimeout(terminal.queried, 20_000);
+    expect(terminal.raw).toEqual([true]);
+    proc.emit('exit', 143);
+
+    expect(terminal.raw).toEqual([true, false]);
+    expect(terminal.stdin.listenerCount('data')).toBe(0);
+    await withTimeout(done, 20_000);
+  });
+
+  it('after a timeout, keeps raw mode on into the UI and hands down a reply cut off mid-way', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    // Starts DA1's reply and never finishes it.
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from('j\x1B[?62;22', 'latin1')));
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let listening = -1;
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: terminal.stderr,
+      render: (next) => {
+        tree = next;
+        listening = terminal.stdin.listenerCount('data');
+        terminal.writes.push('RENDER');
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    // No RAW:false before the UI: a reply arriving now must not be echoed.
+    expect(terminal.writes).toEqual(['RAW:true', GRAPHICS_QUERY, ENTER, 'RENDER']);
+    expect(listening).toBe(0);
+    expect(terminal.unshifted).toEqual(['j']);
+    const controller = (tree!.props as {children: React.ReactElement<{graphics?: {protocol: string; detectionTimedOut: boolean; replyHead?: string; keysBeforeReply?: string}}>}).children;
+    expect(controller.props.graphics).toMatchObject({protocol: 'none', detectionTimedOut: true, replyHead: '\x1B[?62;22', keysBeforeReply: 'j'});
+
+    proc.emit('exit', 0);
+    expect(terminal.raw).toEqual([true, false]);
+  });
+
+  it('asks nothing with --no-images, and the UI gets no graphics', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    const terminal = detectingTerminal(() => {});
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch', '--no-images'],
+      cwd,
+      proc,
+      env: GHOSTTY_ENV,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: (next) => {
+        tree = next;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    expect(terminal.writes).toEqual([ENTER]);
+    expect(terminal.raw).toEqual([]);
+    const controller = (tree!.props as {children: React.ReactElement<{graphics?: {protocol: string}}>}).children;
+    expect(controller.props.graphics?.protocol).toBe('none');
+    proc.emit('exit', 0);
+  });
+});
+
 // A git that stalls on the numstat call inside the startup build, after the
 // private index copy exists, and leaves a marker so the test knows when.
 function slowGitRepo() {

@@ -4,6 +4,9 @@ export type CliOptions = {
   watch: boolean;
   watchPoll: boolean;
   animations: boolean;
+  // Image previews: 'off' from --no-images, 'auto' from --images; unset
+  // means auto. Set only when a flag was given.
+  images?: 'auto' | 'off';
 };
 
 export function parseCliArgs(argv: string[], {interactive}: {interactive: boolean}): CliOptions {
@@ -12,6 +15,7 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
   let noWatch = false;
   let watchPoll = false;
   let animations = true;
+  let images: CliOptions['images'];
 
   for (const arg of argv) {
     if (arg === '--watch') {
@@ -40,6 +44,16 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
       continue;
     }
 
+    if (arg === '--images') {
+      images = 'auto';
+      continue;
+    }
+
+    if (arg === '--no-images') {
+      images = 'off';
+      continue;
+    }
+
     positional.push(arg);
   }
 
@@ -49,5 +63,6 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
     watch: noWatch ? false : watchFlag || interactive,
     watchPoll,
     animations,
+    ...(images ? {images} : {}),
   };
 }
