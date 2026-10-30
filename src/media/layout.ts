@@ -233,8 +233,11 @@ function shownNote(box: Box, caps: GraphicsCaps) {
   return `${box.drawPx.w} × ${box.drawPx.h} px shown`;
 }
 
+// An added or deleted SVG has one picture; a modified one names its sides,
+// as an image does.
 function sideLabel(ref: MediaRef, side: SideName) {
-  return part(ref.kind === 'svg' ? 'picture' : side, ref.kind === 'svg' ? 'plain' : side);
+  const picture = ref.kind === 'svg' && !(ref.before && ref.after);
+  return part(picture ? 'picture' : side, picture ? 'plain' : side);
 }
 
 function tabRow(view: MediaViewState): PlanTextRow {

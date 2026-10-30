@@ -7,9 +7,10 @@ import {palette} from './palette.js';
 import {toDisplayText} from './text.js';
 
 // Splices media rows into wrapped sections: a picture's label and box rows in
-// place of the `binary file changed` line. Rows are built at the pane's inner
-// width, already cut to fit, so neither frameLine nor Ink ever has to cut
-// one. Box rows carry only geometry; the pane fills them in when it draws.
+// place of the `binary file changed` line, or above an SVG's source hunks.
+// Rows are built at the pane's inner width, already cut to fit, so neither
+// frameLine nor Ink ever has to cut one. Box rows carry only geometry; the
+// pane fills them in when it draws.
 
 export type MediaRowsLayout = {innerWidth: number; viewportRows: number};
 
@@ -96,9 +97,13 @@ export function addMediaRows<S extends WrappedSection & {file?: ReviewFile}>(sec
     if (ref) {
       const added = planLines(ref, media, layout);
       if (added.lines.length > 0) {
-        const replace = !added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
-        // The text view keeps the placeholder line and lists details under it.
-        const at = added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
+        // The text view keeps the placeholder line and lists details under
+        // it. An SVG's picture goes before its first source block, whose
+        // frame opens with a blank row under the picture; any line delta
+        // prints above that block is source text and stays.
+        const firstBlock = ref.hasSourceBlocks ? section.rows.findIndex((row) => row.block >= 0) : -1;
+        const replace = firstBlock < 0 && !added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
+        const at = firstBlock >= 0 ? firstBlock : added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
         const lines = [...section.lines];
         const rows = [...section.rows];
         lines.splice(at, replace, ...added.lines);

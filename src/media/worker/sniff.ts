@@ -1,9 +1,10 @@
 import {formatLabel} from '../layout.js';
 import type {MediaFormat} from '../types.js';
 
-// What an image is, from its header bytes alone: format by magic, pixel size,
-// frame count and whether it can be transparent. Nothing is decoded, so a
-// hostile header is refused before any decoder sees it. Pure.
+// What an image is, from its header bytes alone: format by magic (for an SVG,
+// its root element), pixel size, frame count and whether it can be
+// transparent. Nothing is decoded, so a hostile header is refused before any
+// decoder sees it. Pure.
 
 export type Sniffed = {ok: true; format: MediaFormat; width: number; height: number; frames: number; hasAlpha: boolean};
 export type SniffResult = Sniffed | {ok: false; reason: string};
@@ -191,7 +192,160 @@ function avif(bytes: Uint8Array): Header {
   return {width, height, frames: 1, hasAlpha};
 }
 
-const READERS: Partial<Record<MediaFormat, (bytes: Uint8Array) => Header>> = {png, gif, jpeg, webp, avif};
+// The size a browser gives an SVG that states none.
+const SVG_DEFAULT = {width: 300, height: 150};
+// The root element must start this close to the beginning of the file.
+const SVG_ROOT_WITHIN = 4096;
+
+// Skips what may come before an SVG's root element: a byte order mark,
+// white space, an XML declaration or other processing instruction, comments
+// and a doctype (with its internal subset). The offset of the root's `<`, or
+// -1 when something else comes first.
+function svgRootAt(text: string) {
+  let at = text.startsWith('\u00ef\u00bb\u00bf') ? 3 : 0;
+  for (;;) {
+    while (at < text.length && /\s/.test(text[at]!)) at += 1;
+    if (text.startsWith('<?', at)) {
+      const end = text.indexOf('?>', at + 2);
+      if (end < 0) return -1;
+      at = end + 2;
+    } else if (text.startsWith('<!--', at)) {
+      const end = text.indexOf('-->', at + 4);
+      if (end < 0) return -1;
+      at = end + 3;
+    } else if (text.startsWith('<!DOCTYPE', at)) {
+      const subset = text.indexOf('[', at);
+      const close = text.indexOf('>', at);
+      const subsetEnd = subset >= 0 && subset < close ? text.indexOf(']', subset) : -1;
+      if (subset >= 0 && subset < close && subsetEnd < 0) return -1;
+      const end = subsetEnd >= 0 ? text.indexOf('>', subsetEnd) : close;
+      if (end < 0) return -1;
+      at = end + 1;
+    } else {
+      return at;
+    }
+  }
+}
+
+// The root tag's attributes, up to its closing `>` (quotes respected). One
+// pass over the tag, so a long hostile one costs no more than its length.
+function svgRootAttributes(text: string, from: number) {
+  const attributes = new Map<string, string>();
+  let at = from;
+  while (at < text.length) {
+    const char = text[at]!;
+    if (char === '>') return attributes;
+    if (char === '"' || char === "'") {
+      // A quoted value with no name before it: skipped whole, so a `>` in
+      // it never ends the tag.
+      const close = text.indexOf(char, at + 1);
+      if (close < 0) return null;
+      at = close + 1;
+      continue;
+    }
+    const nameStart = at;
+    while (at < text.length && /[\w:.-]/.test(text[at]!)) at += 1;
+    if (at === nameStart) {
+      at += 1;
+      continue;
+    }
+    const name = text.slice(nameStart, at);
+    let next = at;
+    while (next < text.length && /\s/.test(text[next]!)) next += 1;
+    if (text[next] !== '=') continue;
+    next += 1;
+    while (next < text.length && /\s/.test(text[next]!)) next += 1;
+    const quote = text[next];
+    // An unquoted value is not XML; what follows is read as more names.
+    if (quote !== '"' && quote !== "'") {
+      at = next;
+      continue;
+    }
+    const close = text.indexOf(quote, next + 1);
+    if (close < 0) return null;
+    attributes.set(name, text.slice(next + 1, close));
+    at = close + 1;
+  }
+  return null;
+}
+
+// librsvg's pixels per unit at its own density (72 dots to the inch).
+const SVG_UNITS: Record<string, number> = {'': 1, px: 1, in: 72, cm: 72 / 2.54, mm: 72 / 25.4, pt: 1, pc: 12};
+
+// A length in librsvg's pixels: a plain number, px, or a physical unit, and
+// whether it was physical. Relative units say nothing about pixels, so they
+// count as unset. A value can be as long as the header scan, so it is trimmed
+// and capped first, and the pattern has one way to match any string: a
+// pattern with two, such as `\d*\.?\d+`, backtracks quadratically on a long
+// run of digits.
+const MAX_SVG_LENGTH_CHARS = 64;
+function svgLength(value: string | undefined) {
+  const trimmed = value?.trim();
+  const match = trimmed === undefined || trimmed.length > MAX_SVG_LENGTH_CHARS
+    ? null
+    : /^\+?(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)\s*(px|in|cm|mm|pt|pc)?$/.exec(trimmed);
+  const unit = match?.[2] ?? '';
+  const number = match ? Number(match[1]) * SVG_UNITS[unit]! : NaN;
+  return Number.isFinite(number) && number > 0 ? {px: number, physical: unit !== '' && unit !== 'px'} : undefined;
+}
+
+function svgViewBox(value: string | undefined) {
+  const parts = value?.trim().split(/[\s,]+/).map(Number) ?? [];
+  if (parts.length !== 4 || !parts.every(Number.isFinite) || parts[2]! <= 0 || parts[3]! <= 0) return undefined;
+  return {width: parts[2]!, height: parts[3]!};
+}
+
+/**
+ * The pixel size an SVG states on its root element, from width and height,
+ * else the viewBox, else the browser default; never by parsing the document,
+ * so nothing in it (entities, links) is read here. `physical` says the width
+ * comes from a physical unit, which librsvg scales differently. Null when the
+ * bytes are not an SVG.
+ */
+export function svgSize(bytes: Uint8Array) {
+  const text = Buffer.from(bytes.buffer, bytes.byteOffset, Math.min(bytes.byteLength, HEADER_SCAN_BYTES)).toString('latin1');
+  const root = svgRootAt(text.slice(0, SVG_ROOT_WITHIN));
+  if (root < 0 || !/^<svg[\s/>]/.test(text.slice(root, root + 5))) return null;
+  const attributes = svgRootAttributes(text, root + 4);
+  if (!attributes) return null;
+
+  const statedWidth = svgLength(attributes.get('width'));
+  const statedHeight = svgLength(attributes.get('height'));
+  let width = statedWidth?.px;
+  let height = statedHeight?.px;
+  const viewBox = svgViewBox(attributes.get('viewBox'));
+  if (viewBox && width === undefined && height === undefined) {
+    ({width, height} = viewBox);
+  } else if (viewBox && height === undefined) {
+    height = (width! * viewBox.height) / viewBox.width;
+  } else if (viewBox && width === undefined) {
+    width = (height! * viewBox.width) / viewBox.height;
+  }
+  return {
+    width: Math.max(1, Math.round(width ?? SVG_DEFAULT.width)),
+    height: Math.max(1, Math.round(height ?? SVG_DEFAULT.height)),
+    physical: Boolean(statedWidth ? statedWidth.physical : width !== undefined && statedHeight?.physical),
+  };
+}
+
+function svg(bytes: Uint8Array): Header {
+  const size = svgSize(bytes);
+  if (!size) return null;
+  // Whatever the document does not paint is transparent.
+  return {width: size.width, height: size.height, frames: 1, hasAlpha: true};
+}
+
+const READERS: Partial<Record<MediaFormat, (bytes: Uint8Array) => Header>> = {png, gif, jpeg, webp, avif, svg};
+
+/** What a file whose bytes are not the format its name says reads. */
+export function notFormatReason(format: MediaFormat) {
+  return `not ${format === 'svg' ? 'an' : 'a'} ${formatLabel(format)} image`;
+}
+
+/** Whether the bytes are the format the name says: magic bytes, or an SVG root near the start. */
+export function isFormat(bytes: Uint8Array, format: MediaFormat) {
+  return format === 'svg' ? svg(bytes) !== null : magicFormat(bytes) === format;
+}
 
 /**
  * The header facts of a raster the extension says is `expected`. Bytes of
@@ -200,8 +354,10 @@ const READERS: Partial<Record<MediaFormat, (bytes: Uint8Array) => Header>> = {pn
  */
 export function sniffImage(bytes: Uint8Array, expected: MediaFormat): SniffResult {
   const read = READERS[expected];
-  if (!read || magicFormat(bytes) !== expected) return {ok: false, reason: `not a ${formatLabel(expected)} image`};
+  if (!read || (expected !== 'svg' && magicFormat(bytes) !== expected)) return {ok: false, reason: notFormatReason(expected)};
   const header = read(bytes);
+  // An SVG has no magic bytes: its root element is the proof.
+  if (!header && expected === 'svg') return {ok: false, reason: notFormatReason(expected)};
   if (!header || header.width < 1 || header.height < 1) return {ok: false, reason: 'could not read the image size'};
   if (header.width > MAX_SIDE_PX || header.height > MAX_SIDE_PX || header.width * header.height > MAX_PIXELS) {
     return {ok: false, reason: `image too large to preview (${header.width} × ${header.height})`};

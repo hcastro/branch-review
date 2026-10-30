@@ -124,6 +124,8 @@ const RASTER_FILE_ACTIONS: readonly FileAction[] = [
 const RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'o open', 'v text', 'j/k scroll', 'y d copy', 't tree'];
 const MODIFIED_RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', 'o open', 'v text', 'j/k scroll', 't tree'];
 const FLIP_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', '2 swap', 'o open', 'v text', 'j/k scroll', 't tree'];
+// An SVG's source folds under its picture.
+const SVG_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '⏎ unfold source', 'v source only', '[/] block', 'o open', 'y d f c p b copy', 't tree'];
 // The compare view each digit picks, and each tab on the tab row.
 const COMPARE_KEYS: Record<string, CompareMode | undefined> = {1: 'sideBySide', 2: 'flip', 3: 'difference'};
 const COMPARE_SPANS: Record<string, CompareMode | undefined> = {
@@ -1354,6 +1356,9 @@ function renderBlockHeaderRow(
   width: number,
   actions: {hovered?: string; copied?: string} | null,
   focused = false,
+  // Lines a folded SVG source block holds, said after its label while the
+  // picture shows above it.
+  foldedLines?: number,
 ): {line: string; spans: ActionSpan[]} {
   const baseLabel = row.label ?? '•';
   const label = row.target ? `${collapsed ? '▸' : '▾'}${baseLabel.slice(1)}` : baseLabel;
@@ -1370,7 +1375,14 @@ function renderBlockHeaderRow(
   );
   const right = blockActionsLine(drawnActions, actions?.hovered, actions?.copied);
   const rightWidth = visibleWidth(right);
-  const fittedLabel = fitBlockHeaderLabel(label, drawnActions.length > 0 ? inner - rightWidth - 1 : inner);
+  const labelRoom = drawnActions.length > 0 ? inner - rightWidth - 1 : inner;
+  let fittedLabel = fitBlockHeaderLabel(label, labelRoom);
+  if (collapsed && foldedLines !== undefined) {
+    // Only where it fits whole, and never in the room the actions keep.
+    const note = ` · ${foldedLines} ${foldedLines === 1 ? 'line' : 'lines'} folded`;
+    const noted = `${fittedLabel.replace(/:$/, '')}${note}`;
+    if (visibleWidth(noted) <= labelRoom) fittedLabel = noted;
+  }
   if (!actions || drawnActions.length === 0) {
     return {line: markFocusedHeader(frameLine(fittedLabel, inner, ANSI_CYAN), focused), spans: []};
   }
@@ -1639,6 +1651,33 @@ function blockCollapseKeys(file: ReviewFile) {
   });
 }
 
+// The diff lines a block holds, its header and git's `\ No newline` notes
+// left out.
+function blockLineCount(block: ReviewBlock) {
+  return block.rawDiff.split('\n').slice(1).filter((line) => line !== '' && !line.startsWith('\\')).length;
+}
+
+// The SVG source blocks folded by default under their picture. `seen` holds
+// every key ever folded that way, so a key is folded by default once only:
+// the reader's unfold survives refreshes, and a changed SVG, whose blocks
+// have new keys, folds again. `untouched` holds those the reader has not
+// toggled since; they are folded while their picture shows.
+type SvgFolds = {seen: ReadonlySet<string>; untouched: ReadonlySet<string>};
+const NO_SVG_FOLDS: SvgFolds = {seen: new Set(), untouched: new Set()};
+
+function addSvgFolds(current: SvgFolds, keys: readonly string[]): SvgFolds {
+  const fresh = keys.filter((key) => !current.seen.has(key));
+  if (fresh.length === 0) return current;
+  return {seen: new Set([...current.seen, ...fresh]), untouched: new Set([...current.untouched, ...fresh])};
+}
+
+function touchSvgFold(current: SvgFolds, key: string): SvgFolds {
+  if (!current.untouched.has(key)) return current;
+  const untouched = new Set(current.untouched);
+  untouched.delete(key);
+  return {seen: current.seen, untouched};
+}
+
 function resolveBlockTargets(rows: ReadonlyArray<SectionRow>, file: ReviewFile | undefined) {
   const targets: Array<BlockTarget | undefined> = [];
   const keys = file ? blockCollapseKeys(file) : [];
@@ -1904,6 +1943,8 @@ type DiffPaneBodyProps = {
   diffOffset: number;
   allDiffRows: DiffRow[];
   collapsedBlockIds: ReadonlySet<string>;
+  // Line counts of the SVG source blocks folded under a picture on screen.
+  foldedLineCounts?: ReadonlyMap<string, number>;
   arrivalAnimations: ArrivalAnimations;
   arrivalNow: number;
   fileArrival?: ArrivalEntry;
@@ -1923,9 +1964,13 @@ const noMediaVersion = () => 0;
 // The metrics row for a media file once its shown side is inspected: format,
 // pixel size and bytes in place of line counts. A modified file with both
 // sides inspected reads before → after, the byte change yellow when the file
-// grew and green when it shrank.
-function mediaMetricsText(media: MediaService, ref: MediaRef) {
+// grew and green when it shrank. An SVG is text too: its line counts stay
+// first, and its size is in its own units rather than pixels.
+function mediaMetricsText(media: MediaService, ref: MediaRef, lineMetrics: string) {
+  const svg = ref.kind === 'svg';
   const format = formatLabel(ref.format);
+  const unit = svg ? '' : ' px';
+  const lead = svg ? `${lineMetrics} · ` : '';
   const before = ref.before ? media.sideState(ref, 'before') : null;
   const after = ref.after ? media.sideState(ref, 'after') : null;
   if (before?.status === 'ready' && after?.status === 'ready') {
@@ -1937,16 +1982,17 @@ function mediaMetricsText(media: MediaService, ref: MediaRef) {
     const change = delta === 0
       ? ''
       : ` ${delta > 0 ? ANSI_YELLOW : ANSI_GREEN}${delta > 0 ? '+' : '−'}${formatBytes(Math.abs(delta))}${ANSI_RESET}`;
-    return `${format} · ${size} px · ${formatBytes(old.bytes)} → ${formatBytes(next.bytes)}${change}`;
+    return `${lead}${format} · ${size}${unit} · ${formatBytes(old.bytes)} → ${formatBytes(next.bytes)}${change}`;
   }
   const state = after ?? before;
   if (state?.status !== 'ready') return null;
-  return `${format} · ${state.info.width} × ${state.info.height} px · ${formatBytes(state.info.bytes)}`;
+  return `${lead}${format} · ${state.info.width} × ${state.info.height}${unit} · ${formatBytes(state.info.bytes)}`;
 }
 
 // The footer's key hints for the active file.
 function mediaHintItems(media: MediaService | undefined, ref: MediaRef | null): ReadonlyArray<string> {
   if (!media || !ref) return KEY_HINT_ITEMS;
+  if (ref.hasSourceBlocks) return SVG_KEY_HINT_ITEMS;
   if (!ref.before || !ref.after) return RASTER_KEY_HINT_ITEMS;
   return media.canSwap(ref) ? FLIP_KEY_HINT_ITEMS : MODIFIED_RASTER_KEY_HINT_ITEMS;
 }
@@ -1955,7 +2001,8 @@ function mediaHintItems(media: MediaService | undefined, ref: MediaRef | null): 
 // media row.
 function mediaHoverHint(ref: MediaRef, row: SectionRow) {
   if (row.media?.swap) return 'click to swap · o open';
-  return ref.before && ref.after ? 'o open · v text · 1/2/3 compare' : 'o open · v text';
+  const text = ref.hasSourceBlocks ? 'v source only' : 'v text';
+  return ref.before && ref.after ? `o open · ${text} · 1/2/3 compare` : `o open · ${text}`;
 }
 
 /**
@@ -2028,6 +2075,7 @@ function DiffPaneBody({
   diffOffset,
   allDiffRows,
   collapsedBlockIds,
+  foldedLineCounts,
   arrivalAnimations,
   arrivalNow,
   fileArrival,
@@ -2080,6 +2128,7 @@ function DiffPaneBody({
           }
           : null,
         focusedBlockLineIndex === absoluteLineIndex,
+        blockTarget ? foldedLineCounts?.get(blockTarget.key) : undefined,
       ).line;
     }
 
@@ -2145,7 +2194,9 @@ function AppContent({
   const visibleTreeRows = contentHeight - 3;
   const visibleDiffRows = contentHeight - DIFF_PANE_OVERHEAD;
 
-  const [collapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
+  // The blocks the reader folded; SVG source blocks folded by default are
+  // added to these below.
+  const [userCollapsedBlockIds, setCollapsedBlockIds] = useState<Set<string>>(() => new Set());
   const wrappedSectionCacheRef = useRef<Map<string, WrappedSectionCacheEntry>>(new Map());
   const keyedSections = useMemo(() => keySections(rawSections, review), [rawSections, review]);
   const displaySections = useMemo(() => addFileErrorRows(keyedSections), [keyedSections]);
@@ -2170,6 +2221,46 @@ function AppContent({
     // The plan version stands for the media state the rows are built from.
     [addMediaRows, media, mediaOn, mediaPlanVersion, mediaViewportRows, visibleDiffRows, wrapWidth, wrappedSections],
   );
+  // Each SVG with source hunks: its block keys and line counts, and whether
+  // its picture shows (the source is all there is otherwise), judged by the
+  // boxes its rows show now. The plan version stands for the text views and
+  // failures behind `shown`.
+  const svgSources = useMemo(() => {
+    if (!mediaOn || !review) return [];
+    const boxKeys = new Map<string, string[]>();
+    for (const section of mediaSections) {
+      for (const row of section.rows) {
+        if (!row.media?.boxes || row.media.boxRow !== 0) continue;
+        const keys = boxKeys.get(row.media.fileKey) ?? [];
+        keys.push(...row.media.boxes.map((box) => box.imageKey));
+        boxKeys.set(row.media.fileKey, keys);
+      }
+    }
+    return review.files.flatMap((file) => {
+      const ref = media!.refFor(file);
+      return ref?.hasSourceBlocks ? [{keys: blockCollapseKeys(file), lines: file.blocks.map(blockLineCount), shown: media!.pictureShown(ref, boxKeys.get(ref.fileKey) ?? [])}] : [];
+    });
+  }, [media, mediaOn, mediaPlanVersion, mediaSections, review]);
+  const [svgFolds, setSvgFolds] = useState<SvgFolds>(NO_SVG_FOLDS);
+  const unseenSvgKeys = svgSources.flatMap((source) => source.keys.filter((key) => !svgFolds.seen.has(key)));
+  if (unseenSvgKeys.length > 0) {
+    // Set while rendering: React renders again before committing, so no
+    // frame ever shows a new SVG's source open under its picture.
+    setSvgFolds((current) => addSvgFolds(current, unseenSvgKeys));
+  }
+  const {collapsedBlockIds, foldedLineCounts} = useMemo(() => {
+    const counts = new Map<string, number>();
+    const folded: string[] = [];
+    for (const source of svgSources) {
+      if (!source.shown) continue;
+      for (const [index, key] of source.keys.entries()) {
+        counts.set(key, source.lines[index]!);
+        if (svgFolds.untouched.has(key) && !userCollapsedBlockIds.has(key)) folded.push(key);
+      }
+    }
+    const ids: ReadonlySet<string> = folded.length > 0 ? new Set([...userCollapsedBlockIds, ...folded]) : userCollapsedBlockIds;
+    return {collapsedBlockIds: ids, foldedLineCounts: counts.size > 0 ? counts : undefined};
+  }, [svgFolds, svgSources, userCollapsedBlockIds]);
   const sections = useMemo(
     () => applyCollapsedBlocks(mediaSections, collapsedBlockIds),
     [collapsedBlockIds, mediaSections],
@@ -2300,7 +2391,7 @@ function AppContent({
   const displayBase = toDisplayText(base);
 
   const activeMediaRef = mediaOn && activeFile ? media!.refFor(activeFile) : null;
-  const activeMediaMetrics = activeMediaRef ? mediaMetricsText(media!, activeMediaRef) : null;
+  const activeMediaMetrics = activeMediaRef && activeSection ? mediaMetricsText(media!, activeMediaRef, formatMetrics(activeSection.metrics)) : null;
   const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
   const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
   const diffHeader = buildDiffHeader({
@@ -2511,6 +2602,19 @@ function AppContent({
   }, []);
 
   const toggleBlock = useCallback((blockId: string) => {
+    if (svgFolds.untouched.has(blockId)) {
+      // The reader's first toggle of a block folded by default: from here on
+      // it keeps the state they chose, picture or not.
+      const folded = collapsedBlockIds.has(blockId);
+      setSvgFolds((current) => touchSvgFold(current, blockId));
+      setCollapsedBlockIds((current) => {
+        const next = new Set(current);
+        if (folded) next.delete(blockId);
+        else next.add(blockId);
+        return next;
+      });
+      return;
+    }
     setCollapsedBlockIds((current) => {
       const next = new Set(current);
       if (next.has(blockId)) {
@@ -2521,11 +2625,13 @@ function AppContent({
 
       return next;
     });
-  }, []);
+  }, [collapsedBlockIds, svgFolds]);
 
   // Enter and Space: collapses or expands the focused block. A header that has
-  // scrolled off the top is brought back first, and the block stays focused
-  // where the view lands, so the next Enter acts on the same block.
+  // scrolled off the top is brought back first, and one below the viewport
+  // (an SVG's source under its picture) is brought to the top, so the block
+  // never changes out of sight. The block stays focused where the view
+  // lands, so the next Enter acts on the same block.
   const toggleFocusedBlock = useCallback(() => {
     if (focusedBlockLineIndex === null) return;
     const header = allDiffRows[focusedBlockLineIndex];
@@ -2533,7 +2639,8 @@ function AppContent({
     const section = header ? sections[header.sectionIndex] : undefined;
     if (!header || !target || !section) return;
 
-    let offset = focusedBlockLineIndex < diffOffset ? blockFrameStart(allDiffRows, focusedBlockLineIndex) : diffOffset;
+    const outOfView = focusedBlockLineIndex < diffOffset || focusedBlockLineIndex >= diffOffset + visibleDiffRows;
+    let offset = outOfView ? blockFrameStart(allDiffRows, focusedBlockLineIndex) : diffOffset;
     if (!collapsedBlockIds.has(target.key)) {
       // Collapsing removes the block's body rows, which can lower the scroll
       // ceiling; land where the ceiling will hold the view.
@@ -3596,6 +3703,7 @@ function AppContent({
               diffOffset={diffOffset}
               allDiffRows={allDiffRows}
               collapsedBlockIds={collapsedBlockIds}
+              foldedLineCounts={foldedLineCounts}
               arrivalAnimations={arrivalAnimations}
               arrivalNow={arrivalNow}
               fileArrival={arrivalAnimations.files.get(activeFileKey)}

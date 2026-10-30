@@ -10,6 +10,7 @@ import {createWorkerBackend} from '../src/media/workerClient.js';
 import {createWorkerHandler} from '../src/media/worker/handler.js';
 import {createSideReader} from '../src/media/worker/read.js';
 import {sniffImage} from '../src/media/worker/sniff.js';
+import {createRenderer, svgDensity} from '../src/media/worker/render.js';
 import {fitBox, planMedia} from '../src/media/layout.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import {createMediaService} from '../src/media/service.js';
@@ -751,5 +752,265 @@ describe('the difference view in the real media worker', {timeout: 60_000}, () =
       target: {cols: 1, rows: 1, cellPx: CELL, drawPx: {w: 8, h: 8}, nearest: false},
     });
     expect(result).toMatchObject({ok: false, state: 'error'});
+  });
+});
+
+// SVG: the size comes from the root element's attributes, read without
+// parsing the document; librsvg draws it from a buffer at the density the
+// box needs, and never fetches anything the document points at.
+describe('SVG pictures in the media worker', {timeout: 60_000}, () => {
+  const svg = (text: string) => Buffer.from(text);
+  const NS = 'xmlns="http://www.w3.org/2000/svg"';
+
+  it('reads the size from width and height, or the viewBox, or the default', () => {
+    expect(sniffImage(svg(`<svg ${NS} width="120" height="60"/>`), 'svg')).toEqual({ok: true, format: 'svg', width: 120, height: 60, frames: 1, hasAlpha: true});
+    expect(sniffImage(svg(`<svg ${NS} width='120px' height='60.4px'></svg>`), 'svg')).toMatchObject({ok: true, width: 120, height: 60});
+    expect(sniffImage(svg(`<svg ${NS} viewBox="0 0 48 24"></svg>`), 'svg')).toMatchObject({ok: true, width: 48, height: 24});
+    expect(sniffImage(svg(`<svg ${NS} viewBox="-5,-5,96.5,32"></svg>`), 'svg')).toMatchObject({ok: true, width: 97, height: 32});
+    // A relative size says nothing about pixels: the viewBox decides.
+    expect(sniffImage(svg(`<svg ${NS} width="100%" height="100%" viewBox="0 0 64 32"></svg>`), 'svg')).toMatchObject({ok: true, width: 64, height: 32});
+    // One side given: the other follows the viewBox's aspect.
+    expect(sniffImage(svg(`<svg ${NS} width="50" viewBox="0 0 200 100"></svg>`), 'svg')).toMatchObject({ok: true, width: 50, height: 25});
+    expect(sniffImage(svg(`<svg ${NS} height="40" viewBox="0 0 200 100"></svg>`), 'svg')).toMatchObject({ok: true, width: 80, height: 40});
+    expect(sniffImage(svg(`<svg ${NS}><rect width="10" height="10"/></svg>`), 'svg')).toMatchObject({ok: true, width: 300, height: 150});
+    // A size in em says nothing about pixels either: the browser default.
+    expect(sniffImage(svg(`<svg ${NS} width="10em" height="2em"></svg>`), 'svg')).toMatchObject({ok: true, width: 300, height: 150});
+  });
+
+  it('reads physical units as librsvg draws them at its own density, 72 to the inch', () => {
+    expect(sniffImage(svg(`<svg ${NS} width="1in" height="4in"></svg>`), 'svg')).toMatchObject({ok: true, width: 72, height: 288});
+    expect(sniffImage(svg(`<svg ${NS} width="3cm" height="2cm"></svg>`), 'svg')).toMatchObject({ok: true, width: 85, height: 57});
+    expect(sniffImage(svg(`<svg ${NS} width="10cm" height="2cm"></svg>`), 'svg')).toMatchObject({ok: true, width: 283, height: 57});
+    expect(sniffImage(svg(`<svg ${NS} width="210mm" height="297mm"></svg>`), 'svg')).toMatchObject({ok: true, width: 595, height: 842});
+    expect(sniffImage(svg(`<svg ${NS} width="72pt" height="6pc"></svg>`), 'svg')).toMatchObject({ok: true, width: 72, height: 72});
+    // With a viewBox too, the stated size wins and the viewBox only maps the
+    // drawing into it.
+    expect(sniffImage(svg(`<svg ${NS} width="21cm" height="29.7cm" viewBox="0 0 21 29.7"></svg>`), 'svg')).toMatchObject({ok: true, width: 595, height: 842});
+    expect(sniffImage(svg(`<svg ${NS} width="210mm" height="297mm" viewBox="0 0 210 297"></svg>`), 'svg')).toMatchObject({ok: true, width: 595, height: 842});
+    expect(sniffImage(svg(`<svg ${NS} width="460.8pt" height="345.6pt" viewBox="0 0 460.8 345.6"></svg>`), 'svg')).toMatchObject({ok: true, width: 461, height: 346});
+    expect(sniffImage(svg(`<svg ${NS} width="2in" viewBox="0 0 200 100"></svg>`), 'svg')).toMatchObject({ok: true, width: 144, height: 72});
+    expect(sniffImage(svg(`<svg ${NS} width="1000in" height="1in"></svg>`), 'svg')).toEqual({ok: false, reason: 'image too large to preview (72000 × 72)'});
+  });
+
+  it('reads the root tag in one pass, however long a hostile one is', () => {
+    const bytes = svg(`<svg ${'a'.repeat(60 * 1024)} width="10" height="20">`);
+    sniffImage(svg(`<svg ${NS} width="1" height="1"/>`), 'svg');
+    const started = performance.now();
+    expect(sniffImage(bytes, 'svg')).toMatchObject({ok: true, width: 10, height: 20});
+    expect(performance.now() - started).toBeLessThan(50);
+  });
+
+  it('reads a long hostile width, height or viewBox in time linear in its length', () => {
+    const digits = '9'.repeat(60 * 1024);
+    const spaces = ' '.repeat(60 * 1024);
+    // Each value alone nearly fills the header scan, and none is a length,
+    // so the browser default stands for that side.
+    const hostile = [
+      `width="${digits}x" height="20"`,
+      `width="10" height="1${spaces}x"`,
+      `width="${digits.slice(0, 30 * 1024)}.${digits.slice(0, 30 * 1024)}x" height="20"`,
+      `width="10" height="1e${digits}x"`,
+      `width="10" height="20" viewBox="0 0 ${digits}x 1"`,
+    ];
+    sniffImage(svg(`<svg ${NS} width="1" height="1"/>`), 'svg');
+    const sizes = [];
+    for (const attributes of hostile) {
+      const started = performance.now();
+      sizes.push(sniffImage(svg(`<svg ${NS} ${attributes}>`), 'svg'));
+      expect(performance.now() - started).toBeLessThan(50);
+    }
+    expect(sizes).toMatchObject([
+      {ok: true, width: 300, height: 20},
+      {ok: true, width: 10, height: 150},
+      {ok: true, width: 300, height: 20},
+      {ok: true, width: 10, height: 150},
+      {ok: true, width: 10, height: 20},
+    ]);
+    // Ordinary values, padded or spaced before the unit, still read.
+    expect(sniffImage(svg(`<svg ${NS} width=" 10 px " height="+2.5e1">`), 'svg')).toMatchObject({ok: true, width: 10, height: 25});
+    expect(sniffImage(svg(`<svg ${NS} width="${' '.repeat(100)}1in" height=".5in">`), 'svg')).toMatchObject({ok: true, width: 72, height: 36});
+  });
+
+  it('finds the root after a byte order mark, an XML declaration, comments and a doctype', () => {
+    const head = '﻿<?xml version="1.0" encoding="UTF-8"?>\n<!-- made by hand -->\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n';
+    expect(sniffImage(svg(`${head}<svg\n  ${NS}\n  width="10" height="20">`), 'svg')).toMatchObject({ok: true, width: 10, height: 20});
+  });
+
+  it('refuses bytes that are not an SVG, or whose root is not near the start', async () => {
+    const notSvg = {ok: false, reason: 'not an SVG image'};
+    expect(sniffImage(svg('<html><svg width="10" height="10"/></html>'), 'svg')).toEqual(notSvg);
+    expect(sniffImage(svg(`<svgx ${NS} width="10" height="10"/>`), 'svg')).toEqual(notSvg);
+    expect(sniffImage(pngFixture(4, 4), 'svg')).toEqual(notSvg);
+    expect(sniffImage(svg('version https://git-lfs.github.com/spec/v1\n'), 'svg')).toEqual(notSvg);
+    expect(sniffImage(svg(`<!--${'x'.repeat(5000)}--><svg ${NS} width="10" height="10"/>`), 'svg')).toEqual(notSvg);
+    // An SVG is never taken for a raster, nor a raster for an SVG.
+    expect(sniffImage(svg(`<svg ${NS} width="10" height="10"/>`), 'png')).toEqual({ok: false, reason: 'not a PNG image'});
+  });
+
+  it('refuses a giant declared size before drawing anything', () => {
+    expect(sniffImage(svg(`<svg ${NS} width="100000" height="10"/>`), 'svg')).toEqual({ok: false, reason: 'image too large to preview (100000 × 10)'});
+    expect(sniffImage(svg(`<svg ${NS} viewBox="0 0 10000 10000"/>`), 'svg')).toEqual({ok: false, reason: 'image too large to preview (10000 × 10000)'});
+  });
+
+  it('draws an SVG at the density its box needs, within librsvg\'s range', () => {
+    expect(svgDensity({format: 'svg', width: 20}, 200)).toEqual({density: 720});
+    expect(svgDensity({format: 'svg', width: 300}, 150)).toEqual({density: 36});
+    expect(svgDensity({format: 'svg', width: 1}, 5000)).toEqual({density: 2400});
+    expect(svgDensity({format: 'svg', width: 16_000}, 10)).toEqual({density: 1});
+    // Rasters have no density to set.
+    expect(svgDensity({format: 'png', width: 20}, 200)).toEqual({});
+    // librsvg scales a physical size by the density twice (as dots per inch
+    // and as a zoom), so it grows with the density's square.
+    expect(svgDensity({format: 'svg', width: 72, physical: true}, 288)).toEqual({density: 144});
+  });
+
+  it('hands sharp that density for an SVG, and none for a raster', async () => {
+    const inputs: unknown[] = [];
+    const recording = Object.assign((input: Buffer, options?: object) => {
+      inputs.push(options);
+      return sharp(input, options);
+    }, {cache: (options: false) => sharp.cache(options), concurrency: (threads: number) => sharp.concurrency(threads)}) as unknown as typeof sharp;
+    const renderer = createRenderer({loadSharp: async () => recording});
+    const fitFirst = async (bytes: Buffer, format: MediaFormat, drawPx: {w: number; h: number}) => {
+      const info = sniffImage(bytes, format);
+      if (!info.ok) throw new Error(info.reason);
+      inputs.length = 0;
+      const target = {cols: Math.ceil(drawPx.w / CELL.w), rows: Math.ceil(drawPx.h / CELL.h), cellPx: CELL, drawPx, nearest: false};
+      expect(await renderer.fit(bytes, info, target, false)).toMatchObject({ok: true});
+      return inputs[0];
+    };
+
+    expect(await fitFirst(svg(`<svg ${NS} width="20" height="20"/>`), 'svg', {w: 200, h: 200})).toMatchObject({density: 720});
+    expect(await fitFirst(svg(`<svg ${NS} width="1in" height="1in"/>`), 'svg', {w: 288, h: 288})).toMatchObject({density: 144});
+    expect(await fitFirst(pngFixture(20, 20), 'png', {w: 200, h: 200})).not.toHaveProperty('density');
+  });
+
+  it('draws an SVG sized in physical units at its own aspect, within the pixel cap', async () => {
+    const renderer = createRenderer();
+    const painted = async (text: string, drawPx: {w: number; h: number}) => {
+      const bytes = svg(text);
+      const info = sniffImage(bytes, 'svg');
+      if (!info.ok) throw new Error(info.reason);
+      const target = {cols: Math.ceil(drawPx.w / CELL.w), rows: Math.ceil(drawPx.h / CELL.h), cellPx: CELL, drawPx, nearest: false};
+      const result = await renderer.fit(bytes, info, target, false);
+      if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+      const {data, info: out} = await sharp(result.png).raw().toBuffer({resolveWithObject: true});
+      let [left, right, top, bottom] = [out.width, -1, out.height, -1];
+      for (let y = 0; y < out.height; y += 1) {
+        for (let x = 0; x < out.width; x += 1) {
+          if (data[(y * out.width + x) * 4 + 3]! === 0) continue;
+          [left, right, top, bottom] = [Math.min(left, x), Math.max(right, x), Math.min(top, y), Math.max(bottom, y)];
+        }
+      }
+      return {w: right - left + 1, h: bottom - top + 1};
+    };
+    const fill = '<rect width="100%" height="100%" fill="#ff0000"/>';
+    // An inch by four inches, mapped from a 20 × 80 viewBox: drawn tall
+    // into the box its sniffed size gives.
+    expect(await painted(`<svg ${NS} width="1in" height="4in" viewBox="0 0 20 80">${fill}</svg>`, {w: 200, h: 800})).toEqual({w: 200, h: 800});
+    // A size the sniff cannot read (em) lands in the default 300 × 150 box,
+    // but keeps the 5:1 shape librsvg draws.
+    expect(await painted(`<svg ${NS} width="10em" height="2em">${fill}</svg>`, {w: 300, h: 150})).toEqual({w: 300, h: 60});
+  });
+
+  it('inspects an SVG blob and renders it crisp at the box size, from the source rather than an upscaled raster', async () => {
+    const cwd = initRepo();
+    // Stripes half a unit wide in a 20 × 20 SVG, drawn into a 200 × 200 box.
+    // Drawn at ten times the density, each stripe is five solid pixels with
+    // five clear ones between. Drawn at its own size and scaled up, every
+    // pixel would be half covered, a flat half-transparent wash.
+    const stripes = Array.from({length: 20}, (_, x) => `<rect x="${x}" width="0.5" height="20" fill="#ff0000"/>`).join('');
+    fs.writeFileSync(path.join(cwd, 'dot.svg'), `<svg ${NS} width="20" height="20">${stripes}</svg>`);
+    commitAll(cwd, 'add dot');
+    const {backend} = backendFor();
+    const side = blobSide(cwd, 'dot.svg');
+
+    expect(await backend.inspect({cwd, side, kind: 'svg', format: 'svg'}, never)).toMatchObject({ok: true, info: {format: 'svg', width: 20, height: 20, hasAlpha: true}});
+    const target = {cols: 20, rows: 10, cellPx: CELL, drawPx: {w: 200, h: 200}, nearest: false};
+    const result = await backend.render({cwd, op: 'fit', sides: [side], kind: 'svg', format: 'svg', checker: false, target}, never);
+    if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+    const {data, info} = await sharp(result.png).raw().toBuffer({resolveWithObject: true});
+    expect([info.width, info.height]).toEqual([200, 200]);
+    const row = Array.from({length: info.width}, (_, x) => data[(100 * info.width + x) * 4 + 3]!);
+    expect(row.filter((alpha) => alpha === 255).length).toBeGreaterThanOrEqual(80);
+    expect(row.filter((alpha) => alpha === 0).length).toBeGreaterThanOrEqual(80);
+  });
+
+  it('draws nothing an SVG points at outside itself, and refuses an external entity', async () => {
+    const cwd = initRepo();
+    const outside = makeTempDir('branch-review-media-outside-');
+    const red = pngFixture(20, 20, [255, 0, 0, 255]);
+    fs.writeFileSync(path.join(outside, 'red.png'), red);
+    fs.writeFileSync(path.join(outside, 'rect.xml'), '<rect width="100" height="100" fill="#ff0000"/>');
+    fs.writeFileSync(path.join(cwd, 'red.png'), red);
+    const hrefs = [
+      `file://${path.join(outside, 'red.png')}`,
+      path.join(outside, 'red.png'),
+      'red.png',
+      'http://127.0.0.1:9/red.png',
+    ];
+    const images = hrefs.map((href, index) => `<image href="${href}" xlink:href="${href}" x="${index * 25}" width="25" height="25"/>`).join('');
+    fs.writeFileSync(path.join(cwd, 'refs.svg'), `<svg ${NS} xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="50"><rect y="40" width="10" height="10" fill="#0000ff"/>${images}<use href="file://${path.join(outside, 'rect.xml')}#r"/></svg>`);
+    fs.writeFileSync(path.join(cwd, 'xxe.svg'), `<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY x SYSTEM "file://${path.join(outside, 'rect.xml')}">]><svg ${NS} width="100" height="100">&x;</svg>`);
+    commitAll(cwd, 'add hostile svgs');
+    const {backend} = backendFor();
+    const target = {cols: 10, rows: 3, cellPx: CELL, drawPx: {w: 100, h: 50}, nearest: false};
+
+    const result = await backend.render({cwd, op: 'fit', sides: [blobSide(cwd, 'refs.svg')], kind: 'svg', format: 'svg', checker: false, target}, never);
+    if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+    const {data} = await sharp(result.png).raw().toBuffer({resolveWithObject: true});
+    let redPixels = 0;
+    let bluePixels = 0;
+    for (let at = 0; at < data.length; at += 4) {
+      if (data[at + 3]! > 0 && data[at]! > 128 && data[at + 2]! < 128) redPixels += 1;
+      if (data[at + 3]! > 0 && data[at + 2]! > 128 && data[at]! < 128) bluePixels += 1;
+    }
+    // The document's own rectangle draws; nothing it points at does.
+    expect(bluePixels).toBeGreaterThan(50);
+    expect(redPixels).toBe(0);
+
+    const xxe = await backend.render({cwd, op: 'fit', sides: [blobSide(cwd, 'xxe.svg')], kind: 'svg', format: 'svg', checker: false, target: {...target, rows: 5, drawPx: {w: 100, h: 100}}}, never);
+    expect(xxe).toEqual({ok: false, state: 'error', reason: 'could not decode image'});
+  });
+
+  it('compares two SVGs as pictures in the difference view', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'before.svg'), `<svg ${NS} width="10" height="10"><rect width="10" height="10" fill="#0000ff"/></svg>`);
+    fs.writeFileSync(path.join(cwd, 'after.svg'), `<svg ${NS} width="10" height="10"><rect width="10" height="10" fill="#0000ff"/><rect width="5" height="10" fill="#ff0000"/></svg>`);
+    commitAll(cwd, 'add both sides');
+    const {backend} = backendFor();
+    const result = await backend.render({
+      cwd, op: 'difference', sides: [{...blobSide(cwd, 'before.svg'), side: 'before'}, blobSide(cwd, 'after.svg')], kind: 'svg', format: 'svg', checker: false,
+      target: {cols: 1, rows: 1, cellPx: CELL, drawPx: {w: 10, h: 10}, nearest: false},
+    }, never);
+    expect(result).toMatchObject({ok: true, changedRatio: 0.5});
+  });
+
+  it('exports a copy of a verified SVG for a viewer, and nothing for bytes that are not one', async () => {
+    const cwd = initRepo();
+    const source = `<svg ${NS} width="4" height="4"/>`;
+    fs.writeFileSync(path.join(cwd, 'icon.svg'), source);
+    fs.writeFileSync(path.join(cwd, 'fake.svg'), pngFixture(2, 2));
+    commitAll(cwd, 'add svgs');
+    const dir = makeTempDir('branch-review-media-export-');
+    const handler = createWorkerHandler();
+
+    const result = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'icon.svg'), format: 'svg', dir});
+    expect(result).toMatchObject({ok: true});
+    if (!result.ok || !('path' in result)) return;
+    expect(path.basename(result.path)).toBe('after.svg');
+    expect(fs.readFileSync(result.path, 'utf8')).toBe(source);
+
+    const fake = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'fake.svg'), format: 'svg', dir: makeTempDir('branch-review-media-export-')});
+    expect(fake).toEqual({ok: false, state: 'error', reason: 'not an SVG image'});
+  });
+
+  it('refuses an SVG over 4 MB without drawing it', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'big.svg'), `<svg ${NS} width="10" height="10"><!--${'x'.repeat(4 * 1024 * 1024)}--></svg>`);
+    commitAll(cwd, 'add big');
+    const handler = createWorkerHandler();
+    const result = await handler.handle({type: 'inspect', cwd, side: blobSide(cwd, 'big.svg'), kind: 'svg', format: 'svg'});
+    expect(result).toMatchObject({ok: false, state: 'error', reason: expect.stringMatching(/larger than 4 MB/)});
   });
 });

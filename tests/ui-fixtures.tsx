@@ -355,6 +355,39 @@ export function svgSourceFile(path: string): FixtureFile {
   };
 }
 
+// An SVG the way git and delta print it: an `index` line and text hunks,
+// one per entry of `hunks` (its new start line), each adding `size` lines
+// named by hunk ordinal and `tag`, so a new tag is new content. With
+// `binary`, the `*.svg binary` attribute case: a binary patch and no hunks.
+export function svgMediaFile(path: string, {status = 'added', ids = ['0000000', '35ecfd6'], hunks = [1], size = 6, tag = '', binary = false}: {
+  status?: FileStatus;
+  ids?: [string, string] | string[];
+  hunks?: number[];
+  size?: number;
+  tag?: string;
+  binary?: boolean;
+} = {}): FixtureFile {
+  const added = status === 'added' || status === 'untracked';
+  const raw = [`diff --git a/${path} b/${path}`, ...(added ? ['new file mode 100644'] : []), `index ${ids[0]}..${ids[1]}${added ? '' : ' 100644'}`];
+  if (binary) {
+    raw.push(`Binary files ${added ? '/dev/null' : `a/${path}`} and b/${path} differ`, '');
+    return {path, status, rawDiff: raw.join('\n'), rendered: ['binary file changed']};
+  }
+  raw.push(`--- ${added ? '/dev/null' : `a/${path}`}`, `+++ b/${path}`);
+  const rendered: string[] = [];
+  for (const [ordinal, start] of hunks.entries()) {
+    raw.push(`@@ -${added ? '0,0' : `${start},0`} +${start},${size} @@`);
+    rendered.push(`• ${path}:${start}: `);
+    for (let index = 0; index < size; index += 1) {
+      const line = `<g id="${tag}h${ordinal}-${index}"/>`;
+      raw.push(`+${line}`);
+      rendered.push(`${gutter(start + index)}${line}`);
+    }
+  }
+  raw.push('');
+  return {path, status, rawDiff: raw.join('\n'), rendered};
+}
+
 export type FakeBackendCall =
   | {type: 'inspect'; request: InspectRequest}
   | {type: 'render'; request: RenderRequest}

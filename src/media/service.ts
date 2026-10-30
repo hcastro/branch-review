@@ -130,8 +130,8 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   const refFor = (file: ReviewFile): MediaRef | null => {
     if (!context || caps.protocol !== 'kitty') return null;
     const ref = classifyMedia(file, context.range);
-    // Still images only; SVG and video keep today's view.
-    return ref?.kind === 'raster' ? ref : null;
+    // Still images and SVG; video keeps today's view.
+    return ref?.kind === 'raster' || ref?.kind === 'svg' ? ref : null;
   };
 
   const inspect = (ref: MediaRef, side: SideName, priority: number) => {
@@ -272,6 +272,8 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       }
       const reason = result.ok ? 'preview unavailable' : result.state === 'stale' ? staleReason(watching) : result.reason;
       boxErrors.set(box.imageKey, reason);
+      // An SVG whose picture failed shows its source instead: its rows change.
+      if (ref.kind === 'svg') planVersion += 1;
       if (disk) diskBoxes.add(box.imageKey);
       if (!result.ok) noteFailure(result.reason);
       notify();
@@ -386,6 +388,24 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     canSwap(ref: MediaRef): boolean {
       return compare === 'flip' && Boolean(ref.before && ref.after)
         && sideState(ref, 'before').status === 'ready' && sideState(ref, 'after').status === 'ready';
+    },
+    /**
+     * Whether the file's picture is on screen in place of its source: not in
+     * the text view, and nothing it draws from failed. `boxKeys` are the
+     * boxes its rows show now; a failure in another compare mode or at an
+     * old size does not count. An SVG's source blocks fold under its picture
+     * only while this holds, so a picture that cannot draw never hides the
+     * source.
+     */
+    pictureShown(ref: MediaRef, boxKeys: Iterable<string>): boolean {
+      if (textViews.has(ref.fileKey)) return false;
+      for (const side of ['before', 'after'] as const) {
+        if (!ref[side]) continue;
+        const status = sideState(ref, side).status;
+        if (status === 'error' || status === 'stale') return false;
+      }
+      for (const key of boxKeys) if (boxErrors.has(key)) return false;
+      return true;
     },
     setCompare(mode: CompareMode) {
       if (mode === compare) return;

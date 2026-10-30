@@ -15,7 +15,7 @@ import {
   type CreateRepoWatcherOptions,
 } from '../src/watch/repoWatcher.js';
 import {formatWatchFooterStatus, getModelWidth, ReviewController} from '../src/ui/ReviewController.js';
-import {decodePlaceholders, fakeMediaService, KITTY_CAPS, parseApc, pngFixture, sideInfo} from './ui-fixtures.js';
+import {buildFixture, decodePlaceholders, fakeMediaService, KITTY_CAPS, parseApc, pngFixture, sideInfo, svgMediaFile} from './ui-fixtures.js';
 import type {MediaBackend} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
 
@@ -1275,6 +1275,50 @@ describe('ReviewController with media previews', {timeout: 20_000}, () => {
     expect(frame).not.toContain('watch error');
     expect(idsIn(instance.lastFrame())).toEqual([]);
 
+    instance.unmount();
+  });
+
+  // A review with an added SVG with one source hunk of three lines, then a
+  // text file whose one line names the version.
+  function svgReview(version: string, svgId: string, tag = '') {
+    return buildFixture([
+      svgMediaFile('docs/flow.svg', {ids: ['0000000', svgId], tag, size: 3}),
+      {path: 'src/one.ts', rawDiff: '', rendered: [`review ${version}`]},
+    ]).review;
+  }
+  const svgSides = {aaaa111: sideInfo({format: 'svg', width: 200, height: 100, hasAlpha: true}), bbbb222: sideInfo({format: 'svg', width: 200, height: 100, hasAlpha: true})};
+
+  it('keeps an SVG source block the reader unfolded open through three refreshes of other files', async () => {
+    const reviews = ['v1', 'v2', 'v3', 'v4'].map((version) => svgReview(version, 'aaaa111'));
+    const {instance, watchers} = await mediaController(reviews, svgSides);
+    await waitForFrame(instance, (text) => text.includes('▸ docs/flow.svg:1 · 3 lines folded') && decodePlaceholders(instance.lastFrame()).length > 0);
+    instance.stdin.write('\r');
+    await waitForFrame(instance, (text) => text.includes('▾ docs/flow.svg:1:'));
+
+    for (const version of ['v2', 'v3', 'v4']) {
+      watchers.current.options.onChange();
+      await waitForFrame(instance, (text) => text.includes(`review ${version}`) && !text.includes('refreshing'));
+      await flush(10);
+      const text = stripAnsi(instance.lastFrame() ?? '');
+      expect(text, version).toContain(`review ${version}`);
+      expect(text, version).toContain('▾ docs/flow.svg:1:');
+      expect(text, version).toContain('h0-2');
+      expect(text, version).not.toContain('lines folded');
+    }
+    instance.unmount();
+  });
+
+  it('folds an SVG source block again when the SVG changes', async () => {
+    const {instance, watchers} = await mediaController([svgReview('v1', 'aaaa111'), svgReview('v2', 'bbbb222', 'b')], svgSides);
+    await waitForFrame(instance, (text) => text.includes('▸ docs/flow.svg:1 · 3 lines folded'));
+    await flush(5);
+    instance.stdin.write('\r');
+    await waitForFrame(instance, (text) => text.includes('h0-2'));
+
+    watchers.current.options.onChange();
+    const text = await waitForFrame(instance, (frame) => frame.includes('review v2') && !frame.includes('refreshing'));
+    expect(text).toContain('▸ docs/flow.svg:1 · 3 lines folded');
+    expect(text).not.toContain('h0-2');
     instance.unmount();
   });
 });

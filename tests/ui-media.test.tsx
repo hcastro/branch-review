@@ -21,6 +21,7 @@ import {
   renderFixture,
   sgrCodeNames,
   sideInfo,
+  svgMediaFile,
   type FixtureFile,
 } from './ui-fixtures.js';
 import {tooltipCoversKittyRows} from '../src/ui/App.js';
@@ -1147,3 +1148,278 @@ describe('compare modes', () => {
 });
 
 type RenderRequestLike = {sides: Array<{abbrevId: string}>};
+
+// An SVG opens on its rendered picture; its source hunks follow as ordinary
+// blocks, folded until the reader asks for them.
+describe('SVG picture first', () => {
+  const SVG_ID = '35ecfd6';
+  const OLD_ID = 'b284849';
+  const SVG_SIDES = {
+    [SVG_ID]: sideInfo({format: 'svg', width: 200, height: 100, bytes: 1_200, hasAlpha: true}),
+    [OLD_ID]: sideInfo({format: 'svg', width: 200, height: 100, bytes: 1_000, hasAlpha: true}),
+  };
+  const FLOW = svgMediaFile('docs/flow.svg');
+  const text = (frame: string | undefined) => frameLines(frame).join('\n');
+  // The rows inside the diff pane, without its borders.
+  const paneLines = (frame: string | undefined) => frameLines(frame)
+    .filter((line) => line.includes('│'))
+    .map((line) => {
+      const start = line.lastIndexOf('│', line.lastIndexOf('│') - 1);
+      return line.slice(start + 1, line.lastIndexOf('│')).trim();
+    });
+
+  it('opens an added SVG on its picture, with its source folded under it from the first frame', async () => {
+    const {instance} = mediaApp([FLOW, textFile('src/b.ts', 3)], {sides: SVG_SIDES});
+    await settle();
+    const frame = instance.lastFrame();
+    const lines = frameLines(frame);
+    const label = lines.findIndex((line) => line.includes('picture · rendered from the SVG source'));
+    const header = lines.findIndex((line) => line.includes('▸ docs/flow.svg:1 · 6 lines folded'));
+    expect(label).toBeGreaterThan(0);
+    expect(header).toBeGreaterThan(label);
+    const cells = decodePlaceholders(frame);
+    expect(cells).toHaveLength(20 * 5);
+    // The picture sits above the source block, the frame's blank row between.
+    expect(Math.max(...cells.map((cell) => cell.line))).toBeLessThan(header - 2);
+    for (const each of instance.frames) expect(stripAnsi(each)).not.toContain('h0-0');
+    expect(text(frame)).not.toContain('binary file changed');
+
+    expect(lines.at(-2)).toContain('q quit • ↑/↓ jump file • ⏎ unfold source • v source only • [/] block • o open');
+    const fileHeader = lines.find((line) => line.includes('docs/flow.svg') && line.includes('Copy path'))!;
+    expect(fileHeader).toMatch(/Copy path.*Copy diff.*Copy file/);
+    expect(text(frame)).toMatch(/\+\d+ -\d+ \d+ changed · SVG · 200 × 100 · 1\.2 KB  file 1\/2/);
+    instance.unmount();
+  });
+
+  it('puts the picture after any line before the first hunk, directly above block 0', async () => {
+    const withNote = {...FLOW, rendered: ['note before the first hunk', ...FLOW.rendered]};
+    const {instance} = mediaApp([withNote], {sides: SVG_SIDES});
+    await settle();
+    const frame = instance.lastFrame();
+    const lines = frameLines(frame);
+    const note = lines.findIndex((line) => line.includes('note before the first hunk'));
+    const label = lines.findIndex((line) => line.includes('picture · rendered from the SVG source'));
+    const header = lines.findIndex((line) => line.includes('▸ docs/flow.svg:1 · 6 lines folded'));
+    expect(note).toBeGreaterThan(0);
+    expect(label).toBeGreaterThan(note);
+    const boxLines = decodePlaceholders(frame).map((cell) => cell.line);
+    expect(Math.min(...boxLines)).toBeGreaterThan(label);
+    // Under the last box row: the frame's blank row, its top border, then
+    // the folded header.
+    expect(Math.max(...boxLines)).toBe(header - 3);
+    expect(lines[header - 1]).toMatch(/╭─+╮/);
+    instance.unmount();
+  });
+
+  it('folds the source again once the picture draws, after a failure in another compare mode', async () => {
+    const modified = svgMediaFile('docs/flow.svg', {status: 'modified', ids: [OLD_ID, SVG_ID], size: 3});
+    const {instance} = mediaApp([modified], {
+      sides: SVG_SIDES,
+      render: (request) => request.op === 'difference'
+        ? {ok: false, state: 'error', reason: 'could not decode image'}
+        : {ok: true, png: pngFixture(request.target.cols * request.target.cellPx.w, request.target.rows * request.target.cellPx.h, [30, 120, 200, 255])},
+    }, {columns: 120, rows: 40});
+    await settle();
+    expect(text(instance.lastFrame())).toContain('▸ docs/flow.svg:1 · 3 lines folded');
+
+    // The difference cannot draw: the source opens so nothing is hidden.
+    instance.stdin.write('3');
+    await settle();
+    let frame = text(instance.lastFrame());
+    expect(frame).toContain('could not decode image');
+    expect(frame).toContain('▾ docs/flow.svg:1:');
+    expect(frame).toContain('h0-2');
+
+    // Side by side draws both pictures again, so the untouched source folds
+    // back under them.
+    instance.stdin.write('1');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    expect(frame).toContain('▸ docs/flow.svg:1 · 3 lines folded');
+    expect(frame).not.toContain('h0-2');
+    instance.unmount();
+  });
+
+  it('copies the full hunk with c, p and b while it is folded, exactly as with previews off', async () => {
+    const run = async (withMedia: boolean) => {
+      const fixture = buildFixture([FLOW]);
+      const fake = fakeMediaService({sides: SVG_SIDES, review: fixture.review});
+      const writes: string[] = [];
+      const instance = renderFixture({...fixture, ...(withMedia ? {media: fake.service} : {})}, SIZE, writes);
+      await settle();
+      for (const key of ['c', 'p', 'b', 'y', 'd']) {
+        instance.stdin.write(key);
+        await settle(3);
+      }
+      const folded = text(instance.lastFrame()).includes('6 lines folded');
+      instance.unmount();
+      return {writes, folded};
+    };
+    const on = await run(true);
+    const off = await run(false);
+    expect(on.folded).toBe(true);
+    expect(off.folded).toBe(false);
+    expect(on.writes).toHaveLength(5);
+    expect(on.writes).toEqual(off.writes);
+    expect(on.writes[1]).toContain('+<g id="h0-5"/>');
+    expect(on.writes[0]).toContain('<g id="h0-5"/>');
+  });
+
+  it('unfolds with Enter and brings a header below the picture to the top', async () => {
+    const tall = svgMediaFile('docs/tall.svg', {ids: ['0000000', 'ab12cd3']});
+    const {instance} = mediaApp([tall, textFile('src/z.ts', 30)], {sides: {ab12cd3: sideInfo({format: 'svg', width: 1000, height: 2000, hasAlpha: true})}});
+    await settle();
+    // The picture fills the pane; the folded header is below it.
+    expect(text(instance.lastFrame())).not.toContain('docs/tall.svg:1');
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+
+    instance.stdin.write('\r');
+    await settle();
+    let pane = paneLines(instance.lastFrame());
+    // Under the top bar, the file header and the metrics row: the block's
+    // frame from its blank row, its header focused, then its source.
+    expect(pane[2]).toContain('file 1/2');
+    expect(pane.slice(3, 7)).toEqual(['', expect.stringMatching(/^╭─+╮$/), expect.stringMatching(/^┃ ▾ docs\/tall\.svg:1:/), expect.stringMatching(/^╰─+╯$/)]);
+    expect(text(instance.lastFrame())).toContain('h0-0');
+    expect(text(instance.lastFrame())).toContain('h0-5');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+
+    // Enter again folds it where it is.
+    instance.stdin.write('\r');
+    await settle();
+    pane = paneLines(instance.lastFrame());
+    expect(pane.find((line) => line.includes('docs/tall.svg:1'))).toMatch(/▸ docs\/tall\.svg:1 · 6 lines folded/);
+    expect(text(instance.lastFrame())).not.toContain('h0-0');
+    instance.unmount();
+  });
+
+  it('shows the source when the picture fails to draw, so nothing is hidden', async () => {
+    const failedRender = mediaApp([FLOW], {sides: SVG_SIDES, render: () => ({ok: false, state: 'error', reason: 'could not decode image'})});
+    await settle();
+    let frame = text(failedRender.instance.lastFrame());
+    expect(frame).toContain('preview unavailable: could not decode image');
+    expect(frame).toContain('▾ docs/flow.svg:1:');
+    expect(frame).toContain('h0-5');
+    expect(frame).not.toContain('lines folded');
+    failedRender.instance.unmount();
+
+    const failedInspect = mediaApp([FLOW], {sides: {[SVG_ID]: {error: 'not an SVG image'}}});
+    await settle();
+    frame = text(failedInspect.instance.lastFrame());
+    expect(frame).toContain('not an SVG image');
+    expect(frame).toContain('▾ docs/flow.svg:1:');
+    expect(frame).toContain('h0-5');
+    failedInspect.instance.unmount();
+  });
+
+  it('shows the source alone with v, and v again folds back only the blocks the reader never touched', async () => {
+    const twoHunks = svgMediaFile('docs/flow.svg', {status: 'modified', ids: [OLD_ID, SVG_ID], hunks: [1, 40], size: 3});
+    const {instance} = mediaApp([twoHunks], {sides: SVG_SIDES}, {columns: 120, rows: 40});
+    await settle();
+    let frame = text(instance.lastFrame());
+    expect(frame).toContain('[1 Side by side]');
+    expect(frame).toMatch(/before 200 × 100 · 1\.0 KB\s+after 200 × 100 · 1\.2 KB/);
+    expect(frame).toContain('▸ docs/flow.svg:1 · 3 lines folded');
+    expect(frame).toContain('▸ docs/flow.svg:40 · 3 lines folded');
+
+    // The reader unfolds the first block.
+    instance.stdin.write('\r');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(frame).toContain('h0-2');
+    expect(frame).not.toContain('h1-2');
+
+    instance.stdin.write('v');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    expect(frame).not.toContain('Side by side');
+    expect(frame).toContain('h0-2');
+    expect(frame).toContain('h1-2');
+    expect(frame).not.toContain('lines folded');
+
+    // Folded by the reader in the source view: no folded-lines note there.
+    instance.stdin.write('g');
+    await settle(3);
+    instance.stdin.write('\r');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(frame).toMatch(/▸ docs\/flow\.svg:1:/);
+    expect(frame).not.toContain('lines folded');
+    instance.stdin.write('\r');
+    await settle();
+
+    instance.stdin.write('v');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    // The block the reader unfolded stays open; the other folds again.
+    expect(frame).toContain('h0-2');
+    expect(frame).toContain('▾ docs/flow.svg:1:');
+    expect(frame).toContain('▸ docs/flow.svg:40 · 3 lines folded');
+    instance.unmount();
+  });
+
+  it('draws an SVG marked binary in place of its placeholder line, and v shows the line again', async () => {
+    const binary = svgMediaFile('docs/flow.svg', {binary: true});
+    const {instance} = mediaApp([binary], {sides: SVG_SIDES});
+    await settle();
+    let frame = text(instance.lastFrame());
+    expect(frame).toContain('picture · rendered from the SVG source');
+    expect(frame).not.toContain('binary file changed');
+    expect(decodePlaceholders(instance.lastFrame())).toHaveLength(100);
+    instance.stdin.write('v');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(frame).toContain('binary file changed');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    instance.unmount();
+  });
+
+  it('names v as the source view when hovering an SVG picture', async () => {
+    const {instance} = mediaApp([FLOW], {sides: SVG_SIDES});
+    await settle();
+    const cell = decodePlaceholders(instance.lastFrame())[0]!;
+    await emitMouseMoveAt(cell.column, cell.line);
+    await settle();
+    expect(frameLines(instance.lastFrame())[1]).toContain('o open · v source only');
+    instance.unmount();
+  });
+
+  it('opens a temp copy of the SVG with o', async () => {
+    const {instance, opened, calls} = mediaApp([FLOW], {sides: SVG_SIDES});
+    await settle();
+    instance.stdin.write('o');
+    await settle();
+    const exported = calls.filter((call) => call.type === 'exportCopy');
+    expect(exported).toHaveLength(1);
+    expect(exported[0]!.request).toMatchObject({format: 'svg', side: {abbrevId: SVG_ID}});
+    expect(opened).toHaveLength(1);
+    expect(opened[0]!.command).toBe('/usr/bin/open');
+    expect(opened[0]!.args[0]!.startsWith('/')).toBe(true);
+    expect(text(instance.lastFrame())).toContain('opened flow.svg (after)');
+    instance.unmount();
+  });
+
+  it('folds nothing and draws nothing when the protocol is none', async () => {
+    const files = [FLOW, textFile('src/b.ts', 3)];
+    const plain = renderFixture(buildFixture(files), SIZE);
+    await settle();
+    const fixture = buildFixture(files);
+    const fake = fakeMediaService({caps: {...KITTY_CAPS, protocol: 'none'}, sides: SVG_SIDES, review: fixture.review});
+    const none = renderFixture({...fixture, media: fake.service}, SIZE);
+    await settle();
+    expect(text(none.lastFrame())).toContain('h0-0');
+    for (const key of ['\r', 'v', '\r', 'o', ']', '1', '2', '\u001B[B']) {
+      plain.stdin.write(key);
+      none.stdin.write(key);
+      await settle(3);
+    }
+    expect(none.frames).toEqual(plain.frames);
+    expect(fake.graphicsWrites).toEqual([]);
+    expect(fake.calls).toEqual([]);
+    plain.unmount();
+    none.unmount();
+  });
+});

@@ -280,6 +280,19 @@ describe('planMedia', () => {
     expect(planRowText(plan.rows[0]!, 100)).toMatch(/^picture · rendered from the SVG source/);
   });
 
+  it('names a modified SVG\'s sides before and after in every compare mode', () => {
+    const r = ref('svg', {before: true, after: true});
+    const sides = {before: ready(300, 150, {format: 'svg'}), after: ready(300, 150, {format: 'svg'})};
+    const label = (compare: MediaViewState['compare'], flipSide: MediaViewState['flipSide'] = 'after') => planRowText(planMedia(r, sides, {...VIEW, compare, flipSide}, layout(100, 30)).rows[1]!, 100);
+    expect(label('sideBySide')).toMatch(/^before 300 × 150 · 232 KB\s+after 300 × 150 · 232 KB$/);
+    expect(label('flip')).toMatch(/^after · 2 or click swaps/);
+    expect(label('flip', 'before')).toMatch(/^before · 2 or click swaps/);
+    expect(label('difference')).toMatch(/^difference/);
+    // A side alone keeps the picture label.
+    const failed = planMedia(r, {before: {status: 'error', reason: 'could not decode image'}, after: sides.after}, VIEW, layout(100, 30));
+    expect(planRowText(failed.rows[1]!, 100)).toMatch(/^after · rendered from the SVG source · before: could not decode image/);
+  });
+
   it('shows a details table and no picture in the text view', () => {
     const raster = planMedia(ref('raster', {before: true, after: true}), {before: ready(1280, 400), after: ready(1280, 480, {bytes: 102_000})}, {...VIEW, textView: true}, layout(100, 30));
     expect(boxRows(raster)).toEqual([]);

@@ -1,6 +1,6 @@
 import type {RenderResult, RenderTarget} from '../backend.js';
 import type {Sniffed} from './sniff.js';
-import {MAX_PIXELS} from './sniff.js';
+import {MAX_PIXELS, svgSize} from './sniff.js';
 
 // Decodes and scales an image into the PNG the terminal is sent. The PNG is
 // exactly cols × cell width by rows × cell height, the picture centred on
@@ -26,6 +26,19 @@ const CHANGE_THRESHOLD = 8;
 const DIFF_KEEP = 0.45;
 const DIFF_TINT = [0xd2, 0xa8, 0xff] as const;
 const DIFF_TINT_WEIGHT = 0.6;
+const MAX_SVG_DENSITY = 2400;
+
+// An SVG is drawn at a density (dots per inch, where 72 is its own size) that
+// makes it `drawW` pixels wide, so it is never drawn small and scaled up;
+// within librsvg's range. libvips applies the density to a physical size
+// twice, as librsvg's dots per inch and again as a zoom, so that size grows
+// with the density's square: a linear density would overshoot the box many
+// times over and can pass the pixel cap.
+export function svgDensity(info: Partial<Pick<Sniffed, 'format' | 'width'>> & {physical?: boolean}, drawW: number): {density?: number} {
+  if (info.format !== 'svg' || !info.width) return {};
+  const ratio = drawW / info.width;
+  return {density: Math.min(MAX_SVG_DENSITY, Math.max(1, 72 * (info.physical ? Math.sqrt(ratio) : ratio)))};
+}
 
 // Imported on first use, in the worker only: the library is large, slow to
 // load, and native.
@@ -113,21 +126,27 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
   // The source is encoded bytes, or a raw RGBA image made here (the
   // difference view).
   type Source = {bytes: Buffer} | {raw: RawImage};
+  type SourceInfo = Pick<Sniffed, 'hasAlpha'> & Partial<Pick<Sniffed, 'format' | 'width'>> & {physical?: boolean};
 
-  async function fitOnce(sharp: SharpFactory, source: Source, info: Pick<Sniffed, 'hasAlpha'>, target: RenderTarget, checker: boolean, scale: number) {
+  async function fitOnce(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget, checker: boolean, scale: number) {
     const canvasW = Math.max(1, Math.round(target.cols * target.cellPx.w * scale));
     const canvasH = Math.max(1, Math.round(target.rows * target.cellPx.h * scale));
     const drawW = Math.min(canvasW, Math.max(1, Math.round(target.drawPx.w * scale)));
     const drawH = Math.min(canvasH, Math.max(1, Math.round(target.drawPx.h * scale)));
 
     // The input is always a buffer, never a path; one page, so an animation
-    // shows its first frame.
+    // shows its first frame. An SVG is drawn at the size the box needs, so
+    // its edges stay sharp.
     const input = 'bytes' in source
-      ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
+      ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1, ...svgDensity(info, drawW)})
       : sharp(source.raw.data, {limitInputPixels: MAX_PIXELS, raw: {width: source.raw.width, height: source.raw.height, channels: 4}});
+    // An SVG whose stated size the sniff could not read (em, say) draws at
+    // another shape than its box: it keeps its own, letterboxed on clear
+    // pixels, rather than being stretched.
+    const fit = info.format === 'svg' ? {fit: 'contain' as const, background: {r: 0, g: 0, b: 0, alpha: 0}} : {fit: 'fill' as const};
     const resized = await input
       .timeout({seconds: DECODE_TIMEOUT_S})
-      .resize(drawW, drawH, {fit: 'fill', kernel: target.nearest ? 'nearest' : 'lanczos3'})
+      .resize(drawW, drawH, {...fit, kernel: target.nearest ? 'nearest' : 'lanczos3'})
       .ensureAlpha()
       .raw()
       .toBuffer();
@@ -149,7 +168,7 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
       .toBuffer();
   }
 
-  async function fitSource(sharp: SharpFactory, source: Source, info: Pick<Sniffed, 'hasAlpha'>, target: RenderTarget, checker: boolean) {
+  async function fitSource(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget, checker: boolean) {
     let scale = 1;
     let png = await fitOnce(sharp, source, info, target, checker, scale);
     for (let shrink = 0; shrink < MAX_SHRINKS && png.byteLength > MAX_PNG_BYTES; shrink += 1) {
@@ -165,7 +184,8 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
 
     try {
-      return {ok: true, png: await fitSource(loaded.sharp, {bytes}, info, target, checker)};
+      const physical = info.format === 'svg' && Boolean(svgSize(bytes)?.physical);
+      return {ok: true, png: await fitSource(loaded.sharp, {bytes}, {...info, physical}, target, checker)};
     } catch {
       // A corrupt file, or one caught half-written: tried again only when its
       // content id changes.

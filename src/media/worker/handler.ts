@@ -1,11 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type {ExportResult, InspectResult, RenderResult, WorkerRequest} from '../backend.js';
-import {formatLabel} from '../layout.js';
 import type {MediaFormat, SideRef} from '../types.js';
 import {createSideReader, type SideReader} from './read.js';
 import {createRenderer, type SharpLoader} from './render.js';
-import {magicFormat, sniffImage} from './sniff.js';
+import {isFormat, magicFormat, notFormatReason, sniffImage} from './sniff.js';
 
 // The media worker's jobs, without the process around them, so tests can run
 // them in process.
@@ -15,7 +14,7 @@ import {magicFormat, sniffImage} from './sniff.js';
 const MAX_PASSTHROUGH_BYTES = 4 * 1024 * 1024;
 
 // Copies for a viewer are named from this list only, never from the repo.
-const EXTENSIONS: Partial<Record<MediaFormat, string>> = {png: 'png', jpeg: 'jpg', gif: 'gif', webp: 'webp', avif: 'avif'};
+const EXTENSIONS: Partial<Record<MediaFormat, string>> = {png: 'png', jpeg: 'jpg', gif: 'gif', webp: 'webp', avif: 'avif', svg: 'svg'};
 
 type HandlerOptions = {
   loadSharp?: SharpLoader;
@@ -29,7 +28,7 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
   let exports = 0;
 
   async function inspect(request: Extract<WorkerRequest, {type: 'inspect'}>): Promise<InspectResult> {
-    if (request.kind !== 'raster') return {ok: false, state: 'error', reason: `${request.kind} previews are not supported`};
+    if (request.kind === 'video') return {ok: false, state: 'error', reason: `${request.kind} previews are not supported`};
     const read = await reader.read(request.cwd, request.side, request.kind);
     if (!read.ok) return read;
     const sniffed = sniffImage(read.bytes, request.format);
@@ -51,7 +50,7 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
 
   async function render(request: Extract<WorkerRequest, {type: 'render'}>): Promise<RenderResult> {
     const sides = request.op === 'difference' ? 2 : 1;
-    if ((request.op !== 'fit' && request.op !== 'difference') || request.kind !== 'raster' || request.sides.length !== sides) {
+    if ((request.op !== 'fit' && request.op !== 'difference') || request.kind === 'video' || request.sides.length !== sides) {
       return {ok: false, state: 'error', reason: `${request.op} view is not supported for ${request.kind} files`};
     }
 
@@ -77,11 +76,13 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
   async function exportCopy(request: Extract<WorkerRequest, {type: 'exportCopy'}>): Promise<ExportResult> {
     const extension = EXTENSIONS[request.format];
     if (!extension || !path.isAbsolute(request.dir)) return {ok: false, state: 'error', reason: 'cannot open this file type'};
-    const read = await reader.read(request.cwd, request.side, 'raster');
+    const read = await reader.read(request.cwd, request.side, request.format === 'svg' ? 'svg' : 'raster');
     if (!read.ok) return read;
-    // Only an allow-listed format confirmed by its magic bytes is handed to
-    // a viewer, so opening it can never launch a script or an app.
-    if (magicFormat(read.bytes) !== request.format) return {ok: false, state: 'error', reason: `not a ${formatLabel(request.format)} image`};
+    // Only an allow-listed format confirmed by its magic bytes (an SVG: its
+    // root element) is handed to a viewer, so opening it never launches an
+    // app or a shell script. An SVG is a document, though: the default
+    // viewer may be a browser, which runs any script inside it.
+    if (!isFormat(read.bytes, request.format)) return {ok: false, state: 'error', reason: notFormatReason(request.format)};
 
     try {
       let dir: string;
