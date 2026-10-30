@@ -153,3 +153,62 @@ export function snapshotTree(dir: string) {
   walk(dir);
   return files;
 }
+
+export type FakeToolCall = {tool: string; argv: string[]; pid: number; inputExists?: boolean; fd3Bytes: number | null};
+
+/**
+ * Node-shebang `ffprobe` and `ffmpeg` shims in `dir`. Each logs its argv as a
+ * JSON line, with whether its input (`file:<path>`) existed and the size of
+ * the regular file on fd 3 (null when fd 3 is no regular file), then ffprobe prints `probeJson` and ffmpeg writes `framePng` to
+ * stdout. `hangMs` makes a call whose argv contains `hangWhen` (any call
+ * without it) sleep that long first. `rewrite` makes a call whose argv
+ * contains `rewrite.when` write `rewrite.bytes` to `rewrite.file` after it
+ * logs, as an editor saving the file while ffmpeg reads it would. Read the
+ * calls back with `calls()`.
+ */
+export function fakeMediaTools(dir: string, {probeJson = {}, framePng, exitCode = 0, hangMs = 0, hangWhen = '', rewrite}: {
+  probeJson?: unknown;
+  framePng?: Buffer;
+  exitCode?: number;
+  hangMs?: number;
+  hangWhen?: string;
+  rewrite?: {when: string; file: string; bytes: Buffer};
+} = {}) {
+  fs.mkdirSync(dir, {recursive: true});
+  const log = path.join(dir, 'calls.jsonl');
+  const pngPath = path.join(dir, 'frame.png');
+  if (framePng) fs.writeFileSync(pngPath, framePng);
+  const script = (tool: string) => [
+    `#!${process.execPath}`,
+    `const fs = require('node:fs');`,
+    `const argv = process.argv.slice(2);`,
+    `const input = argv[argv.indexOf('-i') + 1] ?? '';`,
+    // Node opens descriptors of its own, so only a regular file on fd 3 is
+    // one the caller passed.
+    `let fd3Bytes = null;`,
+    `try { const stat = fs.fstatSync(3); if (stat.isFile()) fd3Bytes = stat.size; } catch {}`,
+    `const inputExists = input.startsWith('file:') && !input.startsWith('file:/dev/fd/') ? fs.existsSync(input.slice(5)) : undefined;`,
+    `fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({tool: ${JSON.stringify(tool)}, argv, pid: process.pid, inputExists, fd3Bytes}) + '\\n');`,
+    rewrite
+      ? `if (argv.join(' ').includes(${JSON.stringify(rewrite.when)})) fs.writeFileSync(${JSON.stringify(rewrite.file)}, Buffer.from(${JSON.stringify(rewrite.bytes.toString('base64'))}, 'base64'));`
+      : '',
+    `const finish = () => {`,
+    tool === 'ffprobe'
+      ? `  process.stdout.write(${JSON.stringify(JSON.stringify(probeJson))});`
+      : `  if (fs.existsSync(${JSON.stringify(pngPath)})) process.stdout.write(fs.readFileSync(${JSON.stringify(pngPath)}));`,
+    `  process.exitCode = ${exitCode};`,
+    `};`,
+    `const hang = ${hangMs} > 0 && argv.join(' ').includes(${JSON.stringify(hangWhen)});`,
+    `if (hang) setTimeout(finish, ${hangMs}); else finish();`,
+    '',
+  ].join('\n');
+  writeExecutable(path.join(dir, 'ffprobe'), script('ffprobe'));
+  writeExecutable(path.join(dir, 'ffmpeg'), script('ffmpeg'));
+  return {
+    dir,
+    calls(): FakeToolCall[] {
+      if (!fs.existsSync(log)) return [];
+      return fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as FakeToolCall);
+    },
+  };
+}

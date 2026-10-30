@@ -1,15 +1,18 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {escapeHiddenCharacters} from '../controlChars.js';
+import {findTool} from './worker/tools.js';
 import type {MediaBackend} from './backend.js';
 import type {MediaRef, SideName} from './types.js';
 
-// Opening a media file in the system viewer. The viewer gets a temp copy of
-// the verified bytes, never the repo path, so it shows exactly what the pane
-// shows and its autosave can never touch the repo. The command is a fixed
+// Opening a media file in the system viewer or player. A viewer gets a temp
+// copy of the verified bytes, never the repo path, so it shows exactly what
+// the pane shows and its autosave can never touch the repo. A video in the
+// work tree is the one exception: players never write to it, and copying
+// gigabytes would be slow, so the player gets the file itself after the
+// worker's regular-file and container checks. The command is a fixed
 // absolute program with an argument array: no shell, and the only argument
-// is an absolute path under our temp dir.
+// is an absolute path.
 
 /** Starts a program and forgets it. Injected, so tests never open a real viewer. */
 export type Opener = (command: string, args: string[]) => void;
@@ -21,38 +24,6 @@ export const defaultOpener: Opener = (command, args) => {
 };
 
 export type OpenOutcome = {message: string; kind: 'info' | 'error'};
-
-/**
- * The first regular executable named `name` on PATH, skipping relative
- * entries and any inside the repo, so a repo can never plant the program we
- * run. Never asks a shell.
- */
-export function findOnPath(name: string, env: NodeJS.ProcessEnv, repoRoot: string) {
-  let root: string;
-  try {
-    root = fs.realpathSync(repoRoot);
-  } catch {
-    root = path.resolve(repoRoot);
-  }
-  for (const entry of (env.PATH ?? '').split(path.delimiter)) {
-    if (!entry || !path.isAbsolute(entry)) continue;
-    let dir: string;
-    try {
-      dir = fs.realpathSync(entry);
-    } catch {
-      continue;
-    }
-    if (dir === root || dir.startsWith(`${root}${path.sep}`)) continue;
-    const candidate = path.join(dir, name);
-    try {
-      fs.accessSync(candidate, fs.constants.X_OK);
-      if (fs.statSync(candidate).isFile()) return candidate;
-    } catch {
-      // Not here.
-    }
-  }
-  return null;
-}
 
 type OpenDeps = {
   backend: MediaBackend;
@@ -67,7 +38,7 @@ function viewerCommand(how: 'open' | 'quickLook', file: string, deps: OpenDeps):
   const platform = deps.platform ?? process.platform;
   if (platform === 'darwin') return how === 'quickLook' ? ['/usr/bin/qlmanage', ['-p', file]] : ['/usr/bin/open', [file]];
   if (platform === 'linux' || platform === 'freebsd' || platform === 'openbsd') {
-    const xdgOpen = findOnPath('xdg-open', deps.env, deps.cwd);
+    const xdgOpen = findTool('xdg-open', deps.env, deps.cwd);
     return xdgOpen ? [xdgOpen, [file]] : null;
   }
   return null;

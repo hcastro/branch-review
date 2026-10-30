@@ -182,7 +182,7 @@ Some copies fail on purpose, and the toast names the reason:
 
 ### Images
 
-In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. An animated GIF or WebP shows its first frame.
+In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. In Kitty and in Ghostty 1.4 or later, an animated GIF or WebP plays in a loop, run by the terminal itself. Everywhere else, and with `--no-animations`, it shows its first frame and says how many it has.
 
 A modified image opens with its old and new versions side by side. `2` (or the tab row above the picture) switches to flip mode, which shows one version at a time: press `2` again or click the picture to swap. `3` shows the difference, with changed pixels marked over a darkened copy of the new version and the share of the image that changed. The mode you pick stays for the rest of the session. The metrics row shows both versions' sizes and the change in bytes.
 
@@ -190,10 +190,24 @@ A modified image opens with its old and new versions side by side. `2` (or the t
 | --- | --- |
 | Ghostty, cmux, Kitty | Drawn as pictures |
 | Apple Terminal, Alacritty, iTerm2, WezTerm, VS Code, Warp, Konsole, and any other terminal with 256 colours or more | A block preview |
-| Inside tmux | A block preview |
+| Inside tmux | Drawn as pictures when tmux passes graphics through to Ghostty or Kitty (`set -g allow-passthrough all`), a block preview otherwise |
 | Terminals with fewer than 256 colours, or that don't answer the startup query | The usual `binary file changed` line |
 
 A block preview draws the picture in coloured half-block characters, two pixels to a cell and at most 60 × 20 cells. That's enough to tell which image you're looking at and roughly what changed, in every compare mode. `o` opens the real image, and the footer says `no image support detected` while one is on screen.
+
+Inside tmux, every graphics command goes out wrapped for tmux's passthrough, the startup query and the deletes at exit included. Pictures are used only when the wrapped query gets an answer back, so a tmux that blocks passthrough gets the block preview and never shows stray text.
+
+Use `allow-passthrough all`, not `on`. With `on`, tmux drops graphics sent while the pane is hidden behind another window, so a picture redrawn by a refresh then comes back as empty cells, and a quit from a hidden pane leaves its images in the terminal. With passthrough off, startup waits up to a second for an answer that never comes.
+
+tmux answers the question of which terminal it runs in by itself, so inside tmux branch-review knows the outer terminal only from the variables the tmux server started with. A server started from Ghostty and later attached from WezTerm still looks like Ghostty, and the pictures there can show as empty cells. In that case set `BRANCH_REVIEW_IMAGES=blocks`, or start a new tmux server from the terminal you're using.
+
+#### Video
+
+An added, deleted or changed MP4, MOV or WebM shows a table of its length, size, resolution, codec and frame rate. For a changed video, the new version's row marks what changed: shorter or smaller in green, longer or larger in red. Under the table, each version gets a strip of four frames taken evenly through it, with their times underneath. `2` shows one version's strip at a time, larger, and `2` again swaps it. `1` shows both again.
+
+The metadata and frames come from `ffprobe` and `ffmpeg` on your `PATH` (`brew install ffmpeg`). They're optional: without them a video shows its size, and the strip says what to install. Only a program outside the repo is ever run. It reads the video through a checked file descriptor, or a checked temp copy for a committed version, with the container forced and every input but plain files refused.
+
+`o` plays the video in the default player. On macOS the header has `Play` and `Quick Look` buttons, and `O` opens Quick Look. A video in the work tree opens as the file itself, since players don't write to it. A committed version opens from a temp copy.
 
 The file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
 

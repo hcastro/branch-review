@@ -13,8 +13,8 @@ import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
-import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
-import type {SideInfo} from '../src/media/types.js';
+import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult, VideoRequest, VideoResult} from '../src/media/backend.js';
+import type {SideInfo, VideoMeta} from '../src/media/types.js';
 import {KITTY_CAPS, pngFixture} from './media-helpers.js';
 
 export {BLOCKS_CAPS, decodePlaceholders, KITTY_CAPS, parseApc, pngFixture, sgrCodeNames, sideInfo} from './media-helpers.js';
@@ -391,6 +391,7 @@ export function svgMediaFile(path: string, {status = 'added', ids = ['0000000', 
 export type FakeBackendCall =
   | {type: 'inspect'; request: InspectRequest}
   | {type: 'render'; request: RenderRequest}
+  | {type: 'video'; request: VideoRequest}
   | {type: 'exportCopy'; request: ExportRequest};
 
 type FakeSide = SideInfo | {error: string; state?: 'stale' | 'error'};
@@ -399,12 +400,16 @@ type FakeSide = SideInfo | {error: string; state?: 'stale' | 'error'};
  * An in-process media backend: canned side facts by object id, and a PNG of
  * the box's canvas size for every render. Every call is recorded. `exportCopy`
  * answers the export job instead of the canned path (the worker's own job, say).
+ * A video job answers with `videoMeta` for the side's id (no metadata when it
+ * has none) and a strip PNG of the strip's size, or `video` answers it.
  */
-export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy}: {
+export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, video, videoMeta = {}}: {
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
   exportDir?: string;
   exportCopy?: (request: ExportRequest) => Promise<ExportResult>;
+  video?: (request: VideoRequest) => VideoResult | Promise<VideoResult>;
+  videoMeta?: Record<string, VideoMeta>;
 } = {}) {
   const calls: FakeBackendCall[] = [];
   let disposed = 0;
@@ -428,6 +433,19 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy}: {
       }
       return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h, [30, 120, 200, 255])};
     },
+    async video(request) {
+      calls.push({type: 'video', request});
+      if (video) return video(request);
+      const {stripCols, stripRows, stripCellPx, frameCount} = request;
+      const meta = videoMeta[request.side.abbrevId] ?? null;
+      const times = meta ? Array.from({length: frameCount}, (_, index) => Math.round(meta.durationMs * (index + 0.5) / frameCount)) : [];
+      if (request.blocks) {
+        const cells = new Uint32Array(stripCols * stripRows * 2);
+        for (let at = 0; at < cells.length; at += 2) cells.set([0x1e78c8, 0xc82828], at);
+        return {ok: true, meta, strip: null, cells, times};
+      }
+      return {ok: true, meta, strip: pngFixture(stripCols * stripCellPx.w, stripRows * stripCellPx.h, [30, 120, 200, 255]), times};
+    },
     async exportCopy(request) {
       calls.push({type: 'exportCopy', request});
       if (exportCopy) return exportCopy(request);
@@ -445,19 +463,23 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy}: {
  * (kept apart from the frames, so a frame is never an escape) and a
  * recording opener.
  */
-export function fakeMediaService({caps = KITTY_CAPS, sides, render, exportCopy, tempDir = '/tmp/branch-review-media-test', env = {}, review, includeWorktree = false, watching, registry}: {
+export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, videoMeta, exportCopy, tempDir = '/tmp/branch-review-media-test', env = {}, platform = 'darwin', review, includeWorktree = false, watching, animations, registry}: {
   caps?: GraphicsCaps;
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
+  video?: (request: VideoRequest) => VideoResult | Promise<VideoResult>;
+  videoMeta?: Record<string, VideoMeta>;
+  platform?: NodeJS.Platform;
   exportCopy?: (request: ExportRequest) => Promise<ExportResult>;
   tempDir?: string;
   env?: NodeJS.ProcessEnv;
   review?: ReviewModel;
   includeWorktree?: boolean;
   watching?: boolean;
+  animations?: boolean;
   registry?: Parameters<typeof createMediaService>[0]['registry'];
 } = {}) {
-  const fake = fakeMediaBackend({sides, render, ...(exportCopy ? {exportCopy} : {})});
+  const fake = fakeMediaBackend({sides, render, ...(video ? {video} : {}), ...(videoMeta ? {videoMeta} : {}), ...(exportCopy ? {exportCopy} : {})});
   const graphicsWrites: string[] = [];
   const opened: Array<{command: string; args: string[]}> = [];
   const service = createMediaService({
@@ -467,8 +489,9 @@ export function fakeMediaService({caps = KITTY_CAPS, sides, render, exportCopy, 
     tempDir: () => tempDir,
     opener: (command, args) => opened.push({command, args}),
     env,
-    platform: 'darwin',
+    platform,
     ...(watching === undefined ? {} : {watching}),
+    ...(animations === undefined ? {} : {animations}),
     ...(registry ? {registry} : {}),
   });
   if (review) service.setReview(review, {cwd: '/repo', range: {includeWorktree}});

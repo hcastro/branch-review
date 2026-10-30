@@ -7,7 +7,7 @@ import {ReviewController, getModelWidth} from './ui/ReviewController.js';
 import {INK_RENDER_OPTIONS, createTerminalSession, runInkApp} from './terminalSession.js';
 import {startGraphicsDetection, type TtyInput} from './media/detect.js';
 import type {GraphicsCaps} from './media/types.js';
-import {tmuxWrap} from './media/kitty.js';
+import {tmuxPassthrough} from './media/kitty.js';
 import {createMediaService, type MediaService} from './media/service.js';
 import {createWorkerBackend} from './media/workerClient.js';
 import {createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
@@ -94,20 +94,24 @@ type SessionLike = ReturnType<typeof createTerminalSession>;
  * hooks kill the media worker and remove the session's temp dir. Nothing is
  * sent before the UI enters the alt screen.
  */
-function startMedia({caps, cwd, env, proc, session, watching}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean}): MediaService {
+function startMedia({caps, cwd, env, proc, session, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean; animations: boolean}): MediaService {
   sweepStaleMediaDirs({env});
   const tempDir = createMediaTempDir({env});
   const backend = createWorkerBackend({tempDir: tempDir.get, env, cwd});
+  // Inside tmux every graphics command, the exit deletes too, goes through
+  // passthrough to the outer terminal.
+  const forTerminal = (sequence: string) => (caps.tmux ? tmuxPassthrough(sequence) : sequence);
   const media = createMediaService({
     caps,
     backend,
-    sink: {write: (sequence) => session.writeGraphics(caps.tmux ? tmuxWrap(sequence) : sequence)},
+    sink: {write: (sequence) => session.writeGraphics(forTerminal(sequence))},
     tempDir: tempDir.get,
     opener: defaultOpener,
     env,
     watching,
+    animations,
   });
-  session.setRestorePrefix(() => media.restoreSequence());
+  session.setRestorePrefix(() => forTerminal(media.restoreSequence()));
   proc.on('exit', () => media.dispose());
   proc.on('exit', tempDir.remove);
   return media;
@@ -185,7 +189,7 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
   const graphics = replyHead ? {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : caps;
   // Kitty terminals draw pictures and other colour terminals block previews;
   // with no graphics the app is exactly as it is without media.
-  const media = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch}) : undefined;
+  const media = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch, animations: options.animations}) : undefined;
 
   await runInkApp(session, (guard) => render(guard(
     React.createElement(ReviewController, {

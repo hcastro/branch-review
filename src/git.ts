@@ -4,6 +4,8 @@ import path from 'node:path';
 import {isUtf8} from 'node:buffer';
 import {createHash} from 'node:crypto';
 import {spawn, spawnSync, type ChildProcess} from 'node:child_process';
+import {Transform, Writable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
 import type {BranchMetrics, FileMetrics} from './sections.js';
 import {escapeHiddenCharactersInLines} from './controlChars.js';
 
@@ -1109,12 +1111,12 @@ export function* catFileBlobOperation(cwd: string, abbrevId: string, limit: numb
 export class FileTooLargeError extends Error {}
 
 /**
- * A work tree file's bytes, at most `limit`, read the way nothing outside
- * the repo can be pulled in: a symlink is refused, the parent directory must
- * resolve inside the repo, and the open itself refuses a symlink swapped in
- * after the check and a FIFO or device. The bytes are not checked for UTF-8.
+ * A work tree file opened the way nothing outside the repo can be pulled in:
+ * a symlink is refused, the parent directory must resolve inside the repo,
+ * and the open itself refuses a symlink swapped in after the check and a
+ * FIFO or device. The caller closes the handle.
  */
-export async function readWorktreeBytes(cwd: string, filePath: string, limit: number): Promise<Buffer> {
+export async function openWorktreeFile(cwd: string, filePath: string): Promise<{handle: fs.promises.FileHandle; stat: fs.Stats; absolutePath: string}> {
   const absolutePath = path.join(cwd, filePath);
   let stat: fs.Stats;
   try {
@@ -1133,7 +1135,6 @@ export async function readWorktreeBytes(cwd: string, filePath: string, limit: nu
   ]);
   if (parent !== root && !parent.startsWith(`${root}${path.sep}`)) throw new Error(`${filePath} is outside the repository`);
 
-  const tooLarge = () => new FileTooLargeError(`${filePath} is larger than ${Math.floor(limit / MIB)} MB`);
   let handle: fs.promises.FileHandle;
   try {
     handle = await fs.promises.open(absolutePath, OPEN_REGULAR_FLAGS);
@@ -1146,7 +1147,22 @@ export async function readWorktreeBytes(cwd: string, filePath: string, limit: nu
   try {
     const opened = await handle.stat();
     if (!opened.isFile()) throw new Error(`${filePath} is not a regular file`);
-    if (opened.size > limit) throw tooLarge();
+    return {handle, stat: opened, absolutePath};
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+/**
+ * A work tree file's bytes, at most `limit`, opened by openWorktreeFile. The
+ * bytes are not checked for UTF-8.
+ */
+export async function readWorktreeBytes(cwd: string, filePath: string, limit: number): Promise<Buffer> {
+  const tooLarge = () => new FileTooLargeError(`${filePath} is larger than ${Math.floor(limit / MIB)} MB`);
+  const {handle, stat} = await openWorktreeFile(cwd, filePath);
+  try {
+    if (stat.size > limit) throw tooLarge();
 
     const chunks: Buffer[] = [];
     let total = 0;
@@ -1161,6 +1177,148 @@ export async function readWorktreeBytes(cwd: string, filePath: string, limit: nu
     return Buffer.concat(chunks, total);
   } finally {
     await handle.close();
+  }
+}
+
+// The first bytes of a video, enough for its container header.
+const VIDEO_HEAD_BYTES = 64 * 1024;
+// Largest work tree video hashed and handed to ffmpeg by descriptor.
+export const MAX_WORKTREE_VIDEO_BYTES = 1024 * MIB;
+// Largest committed video copied out of git for ffmpeg.
+export const MAX_BLOB_VIDEO_BYTES = 512 * MIB;
+
+/**
+ * A work tree file's blob id and first bytes, opened by openWorktreeFile and
+ * streamed through the hash with reads at explicit offsets. `stat` names the
+ * file that was hashed, for openVerifiedVideoFd. At most `limit` bytes.
+ */
+export async function hashWorktreeFile(cwd: string, filePath: string, format: ObjectFormat, limit = MAX_WORKTREE_VIDEO_BYTES) {
+  const {handle, stat} = await openWorktreeFile(cwd, filePath);
+  try {
+    if (stat.size > limit) throw new FileTooLargeError(`${filePath} is larger than ${Math.floor(limit / MIB)} MB`);
+    const hash = createHash(format).update(`blob ${stat.size}\0`);
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    let head = Buffer.alloc(0);
+    let position = 0;
+    while (position < stat.size) {
+      const {bytesRead} = await handle.read(chunk, 0, Math.min(chunk.length, stat.size - position), position);
+      if (bytesRead === 0) break;
+      hash.update(chunk.subarray(0, bytesRead));
+      if (head.length < VIDEO_HEAD_BYTES) head = Buffer.concat([head, chunk.subarray(0, Math.min(bytesRead, VIDEO_HEAD_BYTES - head.length))]);
+      position += bytesRead;
+    }
+    // Shorter than its size said: written while being read.
+    if (position !== stat.size) throw new Error(`${filePath} changed while it was read`);
+    return {oid: hash.digest('hex'), head, stat};
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Whether two stats name the same file with the same size and modification time. */
+export function sameFileState(left: fs.Stats, right: fs.Stats) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+/**
+ * The work tree file hashWorktreeFile verified, opened again for a program
+ * to read as a descriptor. Each program gets its own open, starting at
+ * offset 0. A file that is no longer the one hashed (another inode, size or
+ * modification time) is refused.
+ */
+export async function openVerifiedVideoFd(cwd: string, filePath: string, verified: fs.Stats) {
+  const opened = await openWorktreeFile(cwd, filePath);
+  if (!sameFileState(opened.stat, verified)) {
+    await opened.handle.close();
+    throw new Error(`${filePath} changed on disk`);
+  }
+  return opened.handle;
+}
+
+/** A blob's full id and size, by its (abbreviated) id. */
+export function* blobFactsOperation(cwd: string, abbrevId: string): GitOperation<{oid: string; size: number}> {
+  if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
+  const oid = yield* gitLineOperation(cwd, ['-c', 'core.disambiguate=blob', 'rev-parse', '--verify', `${abbrevId}^{blob}`]);
+  const size = Number(yield* gitLineOperation(cwd, ['cat-file', '-s', oid]));
+  if (!/^[0-9a-f]{40,64}$/.test(oid) || !Number.isSafeInteger(size) || size < 0) throw new Error(`not a blob: ${abbrevId}`);
+  return {oid, size};
+}
+
+/** `git cat-file blob <oid>` as a running process, for a caller that streams its output. */
+function spawnCatFileBlob(cwd: string, oid: string) {
+  return spawn('git', [...GIT_SAFETY_ARGS, 'cat-file', 'blob', oid], {cwd, env: gitEnv(cwd), stdio: ['ignore', 'pipe', 'ignore']});
+}
+
+/** The first `bytes` of a blob, without reading the rest. */
+export async function readBlobHead(cwd: string, oid: string, bytes = VIDEO_HEAD_BYTES): Promise<Buffer> {
+  const child = spawnCatFileBlob(cwd, oid);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  return new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.stdout!.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+      total += chunk.length;
+      if (total >= bytes) child.kill('SIGKILL');
+    });
+    child.on('close', (code, signal) => {
+      if (code !== 0 && total < bytes && signal === null) reject(new Error(`git cat-file failed: exit code ${code}`));
+      else resolve(Buffer.concat(chunks, total).subarray(0, bytes));
+    });
+  });
+}
+
+/**
+ * A blob streamed into a new file at `dest` (created, never replaced; 0600)
+ * and hashed on the way. The copy is removed again unless it holds exactly
+ * the blob `facts` names, so a caller only ever reads verified bytes.
+ */
+export async function writeBlobToFile(cwd: string, facts: {oid: string; size: number}, dest: string, format: ObjectFormat): Promise<void> {
+  const mismatch = () => new Error('object bytes do not match their id');
+  const handle = await fs.promises.open(dest, 'wx', 0o600);
+  const child = spawnCatFileBlob(cwd, facts.oid);
+  const hash = createHash(format).update(`blob ${facts.size}\0`);
+  let total = 0;
+  // Handled from the start: a pipeline that fails first must not leave
+  // git's exit to reject with nobody listening.
+  const exited = new Promise<void>((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`git cat-file failed: exit code ${code}`));
+    });
+  });
+  exited.catch(() => undefined);
+  try {
+    // A stream pipeline, so a failed write (a full disk) ends the copy with
+    // its own error, and git is read no faster than the file is written.
+    await pipeline(
+      child.stdout!,
+      new Transform({
+        transform(chunk: Buffer, _encoding, done) {
+          total += chunk.length;
+          if (total > facts.size) {
+            done(mismatch());
+            return;
+          }
+          hash.update(chunk);
+          done(null, chunk);
+        },
+      }),
+      new Writable({
+        write(chunk: Buffer, _encoding, done) {
+          handle.write(chunk).then(() => done(), done);
+        },
+      }),
+    );
+    await exited;
+    if (total !== facts.size || hash.digest('hex') !== facts.oid) throw mismatch();
+    await handle.close();
+  } catch (error) {
+    child.kill('SIGKILL');
+    await handle.close().catch(() => undefined);
+    await fs.promises.rm(dest, {force: true});
+    throw error;
   }
 }
 

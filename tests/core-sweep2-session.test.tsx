@@ -10,6 +10,7 @@ import {runCli} from '../src/startup.js';
 import {INK_RENDER_OPTIONS, TERMINAL_RESTORE_SEQUENCE, createTerminalSession, runInkApp} from '../src/terminalSession.js';
 import {cleanupTempDirs, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
+import {tmuxWrap} from '../src/media/kitty.js';
 
 // Each test builds real repos or spawns the CLI.
 vi.setConfig({testTimeout: 30_000});
@@ -1081,6 +1082,63 @@ describe('runCli media previews', () => {
       expect(terminal.writes.at(-1)).toBe(TERMINAL_RESTORE_SEQUENCE);
       expect(drawn.status).toBe('blocks');
       expect(fs.readdirSync(tmpParent)).toEqual([]);
+    }
+  }, 60_000);
+
+  it('under tmux, asks and draws through passthrough, and wraps the exit deletes the same way', async () => {
+    const {planMedia} = await import('../src/media/layout.js');
+    const tmpParent = makeTempDir('branch-review-media-parent-');
+    const tmuxEnv = {...GHOSTTY_ENV, TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', BRANCH_REVIEW_TMPDIR: tmpParent};
+    // tmux answers DA1 itself before the outer terminal's OK and DA1 come
+    // back through it.
+    const {props, proc, terminal, cwd} = await startedSession(['HEAD', '--no-watch'], `\x1B[?1;2c${KITTY_REPLY}`, tmuxEnv, {'logo.png': pngFixture(4, 2)});
+    const media = props.media!;
+    expect(media.caps).toMatchObject({protocol: 'kitty', tmux: true, detectionTimedOut: false});
+    // The query went out wrapped with a DA1 for the outer terminal, every
+    // ESC inside it doubled.
+    const query = terminal.writes.find((write) => write.includes('\x1B[c'))!;
+    expect(query.startsWith(tmuxWrap('\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\\x1B[c'))).toBe(true);
+
+    media.setReview(props.initialReview, {cwd, range: props.range});
+    const ref = media.refFor(props.initialReview.files.find((entry) => entry.path === 'logo.png')!)!;
+    await waitFor(() => media.sideState(ref, 'after').status !== 'pending', 20_000);
+    const plan = planMedia(ref, {after: media.sideState(ref, 'after')}, media.viewState(ref.fileKey), {innerWidth: 80, viewportRows: 30, caps: media.caps});
+    const box = plan.rows.flatMap((row) => row.type === 'box' ? row.boxes : [])[0]!;
+    const keys = new Set([box.imageKey]);
+    media.want([{fileKey: ref.fileKey, box}], keys);
+    media.sweep(keys, keys);
+    await waitFor(() => media.boxState(box).status !== 'loading', 20_000);
+    const state = media.boxState(box);
+    expect(state.status).toBe('kitty');
+    const id = (state as {id: number}).id;
+
+    // Every graphics command the app sent rides in a passthrough of its own:
+    // no bare APC reaches tmux.
+    const graphics = terminal.writes.filter((write) => write.includes('_G'));
+    expect(graphics.length).toBeGreaterThan(1);
+    for (const write of graphics) {
+      expect(write.replace(/\x1BPtmux;(?:[^\x1B]|\x1B\x1B)*\x1B\\/g, '').includes('_G'), JSON.stringify(write.slice(0, 80))).toBe(false);
+    }
+    expect(graphics.some((write) => write.includes(`\x1B\x1B_Ga=t,f=100,t=d,i=${id},`))).toBe(true);
+
+    proc.emit('exit', 0);
+    expect(terminal.writes.at(-1)).toBe(`${tmuxWrap(`\x1B_Ga=d,d=I,i=${id},q=2\x1B\\`)}${TERMINAL_RESTORE_SEQUENCE}`);
+    expect(fs.readdirSync(tmpParent)).toEqual([]);
+  }, 40_000);
+
+  it('runs animations in a terminal that animates, unless --no-animations turns them off', async () => {
+    // Ghostty from 1.4.0 runs Kitty animations.
+    const animating = {...GHOSTTY_ENV, TERM_PROGRAM_VERSION: '1.4.0'};
+    for (const [argv, animates] of [
+      [['HEAD', '--no-watch'], true],
+      [['HEAD', '--no-watch', '--no-animations'], false],
+    ] as const) {
+      const tmpParent = makeTempDir('branch-review-media-parent-');
+      const {props, proc} = await startedSession(argv, KITTY_REPLY, {...animating, BRANCH_REVIEW_TMPDIR: tmpParent});
+      const media = props.media!;
+      expect(media.caps).toMatchObject({protocol: 'kitty', animation: true});
+      expect(media.animates, argv.join(' ')).toBe(animates);
+      proc.emit('exit', 0);
     }
   }, 60_000);
 

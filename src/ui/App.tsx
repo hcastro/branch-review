@@ -121,9 +121,22 @@ const RASTER_FILE_ACTIONS: readonly FileAction[] = [
   {id: 'media.open', label: 'Open'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
 ];
+// A video plays in the system player; on macOS Quick Look shows it too.
+const VIDEO_FILE_ACTIONS: readonly FileAction[] = [
+  {id: 'copy.path', label: 'Copy path'},
+  {id: 'media.play', label: 'Play'},
+  {id: 'media.quickLook', label: 'Quick Look'},
+];
+const VIDEO_FILE_ACTIONS_ELSEWHERE: readonly FileAction[] = [
+  {id: 'copy.path', label: 'Copy path'},
+  {id: 'media.play', label: 'Open'},
+];
 const RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'o open', 'v text', 'j/k scroll', 'y d copy', 't tree'];
 const MODIFIED_RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', 'o open', 'v text', 'j/k scroll', 't tree'];
 const FLIP_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', '2 swap', 'o open', 'v text', 'j/k scroll', 't tree'];
+// The digits pick both strips or one; an added or deleted video has one.
+const VIDEO_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'o play', 'O Quick Look', '1/2 frames', 'j/k scroll', 't tree'];
+const VIDEO_KEY_HINT_ITEMS_ELSEWHERE = ['q quit', '↑/↓ jump file', 'o open', '1/2 frames', 'j/k scroll', 't tree'];
 // An SVG's source folds under its picture.
 const SVG_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '⏎ unfold source', 'v source only', '[/] block', 'o open', 'y d f c p b copy', 't tree'];
 // The compare view each digit picks, and each tab on the tab row.
@@ -608,6 +621,8 @@ function copyActionHint(actionId: string) {
   if (actionId === 'copy.blockPrompt') return 'copies block with file and line context';
   if (actionId === 'copy.tree') return 'copies changed-file tree';
   if (actionId === 'media.open') return 'opens the image in the default viewer';
+  if (actionId === 'media.play') return 'plays the video in the default player';
+  if (actionId === 'media.quickLook') return 'shows the video in Quick Look';
   return null;
 }
 
@@ -1967,6 +1982,7 @@ const noMediaVersion = () => 0;
 // grew and green when it shrank. An SVG is text too: its line counts stay
 // first, and its size is in its own units rather than pixels.
 function mediaMetricsText(media: MediaService, ref: MediaRef, lineMetrics: string) {
+  if (ref.kind === 'video') return videoMetricsText(media, ref);
   const svg = ref.kind === 'svg';
   const format = formatLabel(ref.format);
   const unit = svg ? '' : ' px';
@@ -1989,9 +2005,35 @@ function mediaMetricsText(media: MediaService, ref: MediaRef, lineMetrics: strin
   return `${lead}${format} · ${state.info.width} × ${state.info.height}${unit} · ${formatBytes(state.info.bytes)}`;
 }
 
+// A video's metrics row: its codec and length once ffprobe answered, its
+// size until then, before → after for a changed one.
+function videoMetricsText(media: MediaService, ref: MediaRef) {
+  const sides = (['before', 'after'] as const).filter((side) => ref[side]).map((side) => media.sideState(ref, side));
+  if (sides.some((state) => state.status !== 'ready')) return null;
+  const infos = sides.map((state) => (state as Extract<typeof state, {status: 'ready'}>).info);
+  const format = formatLabel(ref.format);
+  const metas = infos.map((info) => info.video);
+  if (metas.every(Boolean)) {
+    const codec = metas.at(-1)!.codec;
+    return `${format} · ${CODEC_NAMES[codec.toLowerCase()] ?? codec} · ${metas.map((meta) => clockTime(meta!.durationMs)).join(' → ')}`;
+  }
+  return `${format} · ${infos.map((info) => formatBytes(info.bytes)).join(' → ')}`;
+}
+
+const CODEC_NAMES: Record<string, string> = {h264: 'H.264', hevc: 'HEVC', h265: 'HEVC', vp8: 'VP8', vp9: 'VP9', av1: 'AV1', prores: 'ProRes', mpeg4: 'MPEG-4'};
+
+function clockTime(ms: number) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
 // The footer's key hints for the active file.
 function mediaHintItems(media: MediaService | undefined, ref: MediaRef | null): ReadonlyArray<string> {
   if (!media || !ref) return KEY_HINT_ITEMS;
+  if (ref.kind === 'video') {
+    const items = media.platform === 'darwin' ? VIDEO_KEY_HINT_ITEMS : VIDEO_KEY_HINT_ITEMS_ELSEWHERE;
+    return ref.before && ref.after ? items : items.filter((item) => item !== '1/2 frames');
+  }
   if (ref.hasSourceBlocks) return SVG_KEY_HINT_ITEMS;
   if (!ref.before || !ref.after) return RASTER_KEY_HINT_ITEMS;
   return media.canSwap(ref) ? FLIP_KEY_HINT_ITEMS : MODIFIED_RASTER_KEY_HINT_ITEMS;
@@ -2000,6 +2042,7 @@ function mediaHintItems(media: MediaService | undefined, ref: MediaRef | null): 
 // What the media keys do, for the top bar while the pointer is over a
 // media row.
 function mediaHoverHint(ref: MediaRef, row: SectionRow) {
+  if (ref.kind === 'video') return ref.before && ref.after ? 'o play · v text · 1/2 frames' : 'o play · v text';
   if (row.media?.swap) return 'click to swap · o open';
   const text = ref.hasSourceBlocks ? 'v source only' : 'v text';
   return ref.before && ref.after ? `o open · ${text} · 1/2/3 compare` : `o open · ${text}`;
@@ -2058,6 +2101,12 @@ function renderBoxRow(info: NonNullable<SectionRow['media']>, media: MediaServic
     } else if (state?.status === 'loading' && boxRow === Math.floor((box.rows - 1) / 2) && width >= LOADING_LABEL.length) {
       const before = Math.floor((width - LOADING_LABEL.length) / 2);
       out += `${' '.repeat(before)}${ANSI_GRAY}${LOADING_LABEL}${ANSI_RESET}${' '.repeat(width - before - LOADING_LABEL.length)}`;
+      used += width;
+    } else if (state?.status === 'note' && boxRow === Math.floor((box.rows - 1) / 2)) {
+      // Centered on the box's middle row, dim: nothing failed.
+      const shown = truncateEnd(toDisplayText(state.text), width);
+      const before = Math.floor((width - visibleWidth(shown)) / 2);
+      out += `${' '.repeat(before)}${ANSI_GRAY}${shown}${ANSI_RESET}${' '.repeat(width - before - visibleWidth(shown))}`;
       used += width;
     } else {
       out += ' '.repeat(width);
@@ -2405,7 +2454,11 @@ function AppContent({
     path: activeFilePath,
     status: activeFile?.status,
     showActions: Boolean(review) && sections.length > 0,
-    actions: activeMediaRef?.kind === 'raster' ? RASTER_FILE_ACTIONS : FILE_ACTIONS,
+    actions: activeMediaRef?.kind === 'raster'
+      ? RASTER_FILE_ACTIONS
+      : activeMediaRef?.kind === 'video'
+        ? media!.platform === 'darwin' ? VIDEO_FILE_ACTIONS : VIDEO_FILE_ACTIONS_ELSEWHERE
+        : FILE_ACTIONS,
     hoveredAction: fileHover,
     copiedAction: fileCopied,
     metricsCore: activeSection
@@ -3396,8 +3449,8 @@ function AppContent({
       if (relativeY === 1 || relativeY === 2) {
         const header = diffHeaderRef.current;
         const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
-        if (actionId === 'media.open') {
-          if (activeMediaRef) void openMediaFile(activeMediaRef, 'open');
+        if (actionId === 'media.open' || actionId === 'media.play' || actionId === 'media.quickLook') {
+          if (activeMediaRef) void openMediaFile(activeMediaRef, actionId === 'media.quickLook' ? 'quickLook' : 'open');
         } else if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
         }
@@ -3529,6 +3582,12 @@ function AppContent({
     const compareMode = COMPARE_KEYS[input];
     if (mediaOn && compareMode) {
       if (!activeMediaRef?.before || !activeMediaRef.after) return;
+      // A video's digits pick both strips (1) or one (2); there is no
+      // difference of two videos.
+      if (activeMediaRef.kind === 'video' && compareMode === 'difference') {
+        showToast('difference works on images', undefined, 'info');
+        return;
+      }
       // With one side failed, flip shows the other alone and 2 again has
       // nothing to swap.
       if (compareMode === 'flip' && media!.viewState(activeMediaRef.fileKey).compare === 'flip') {

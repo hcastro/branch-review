@@ -78,6 +78,14 @@ export function transmitFrame(id: number, png: Uint8Array, delayMs: number) {
   return chunked(`a=f,i=${id},f=100,z=${delay}`, png);
 }
 
+/** How long frame `frame` (1 is the first, the one `transmitPng` sent) shows before the next. */
+export function frameGap(id: number, frame: number, delayMs: number) {
+  checkId(id);
+  checkInteger('frame', frame, 1, Number.MAX_SAFE_INTEGER);
+  const delay = Math.max(MIN_FRAME_DELAY_MS, Math.round(Number.isFinite(delayMs) ? delayMs : 0));
+  return apc(`a=a,i=${id},r=${frame},z=${delay},q=2`);
+}
+
 /** Runs the image's frames in a loop, driven by the terminal. */
 export function startLoop(id: number) {
   checkId(id);
@@ -105,4 +113,15 @@ export function placeholderRun(id: number, row: number, col0: number, cols: numb
 /** tmux passthrough: a DCS that tmux forwards to the outer terminal, with every ESC doubled. */
 export function tmuxWrap(sequence: string) {
   return `${ESC}Ptmux;${sequence.replaceAll(ESC, `${ESC}${ESC}`)}${ST}`;
+}
+
+const APC = /\x1B_G[^\x1B]*\x1B\\/g;
+
+/**
+ * Every graphics command in `sequence` wrapped for tmux on its own. tmux
+ * caps the length of one passthrough, so a transmit of many chunks is sent
+ * as many passthroughs, each one chunk long.
+ */
+export function tmuxPassthrough(sequence: string) {
+  return sequence.replace(APC, (command) => tmuxWrap(command));
 }

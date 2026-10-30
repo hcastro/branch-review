@@ -1,4 +1,5 @@
-import {deleteImage, placeVirtual, transmitPng} from './kitty.js';
+import type {Animation} from './backend.js';
+import {deleteImage, frameGap, placeVirtual, startLoop, transmitFrame, transmitPng} from './kitty.js';
 
 // Which terminal image id names which image, and when ids are sent and
 // deleted. An image key names one content at one geometry for one cell size,
@@ -15,15 +16,18 @@ const DEFAULT_QUARANTINE_MS = 2_000;
 type Entry = {id: number; base64Bytes: number};
 
 const base64Size = (png: Uint8Array) => Math.ceil(png.byteLength / 3) * 4;
+// What an image costs the terminal: its first frame and every other one.
+const imageSize = (png: Uint8Array, animation?: Animation) => base64Size(png) + (animation?.frames ?? []).reduce((sum, frame) => sum + base64Size(frame.png), 0);
 
 export type ImageRegistry = {
   /**
    * The key's id, sending the image first when it is new: transmit and
    * placement go out in one write before this returns, so no row can name
    * the id before the terminal has it. Null when every id is live or in
-   * quarantine.
+   * quarantine. An animation's frames and loop go out in the same write,
+   * and the terminal runs it from there.
    */
-  acquire(imageKey: string, png: Uint8Array, cols: number, rows: number): number | null;
+  acquire(imageKey: string, png: Uint8Array, cols: number, rows: number, animation?: Animation): number | null;
   idFor(imageKey: string): number | undefined;
   /** Marks a key drawn this render, for least-recently-used eviction. */
   touch(imageKey: string): void;
@@ -38,10 +42,11 @@ export type ImageRegistry = {
   restoreSequence(): string;
   liveCount(): number;
   /**
-   * Whether one more image of this PNG's size stays within both budgets, the
-   * image count and the bytes sent, so a sweep would not evict it again.
+   * Whether one more image of this PNG's size (and its animation's frames)
+   * stays within both budgets, the image count and the bytes sent, so a
+   * sweep would not evict it again.
    */
-  fits(png: Uint8Array): boolean;
+  fits(png: Uint8Array, animation?: Animation): boolean;
   /**
    * After `acquire` found no free id: how long until the first id leaves
    * quarantine. With every id live, none is due yet, so the full quarantine,
@@ -111,7 +116,7 @@ export function createImageRegistry({
   };
 
   return {
-    acquire(imageKey, png, cols, rows) {
+    acquire(imageKey, png, cols, rows, animation) {
       const existing = entries.get(imageKey);
       if (existing) {
         touch(imageKey);
@@ -119,9 +124,14 @@ export function createImageRegistry({
       }
       const id = freeId();
       if (id === null) return null;
-      write(transmitPng(id, png) + placeVirtual(id, cols, rows));
+      let frames = '';
+      if (animation && animation.frames.length > 0) {
+        for (const frame of animation.frames) frames += transmitFrame(id, frame.png, frame.delayMs);
+        frames += frameGap(id, 1, animation.firstDelayMs) + startLoop(id);
+      }
+      write(transmitPng(id, png) + placeVirtual(id, cols, rows) + frames);
       releasedAt.delete(id);
-      const base64Bytes = base64Size(png);
+      const base64Bytes = imageSize(png, animation);
       entries.set(imageKey, {id, base64Bytes});
       liveIds.add(id);
       liveBytes += base64Bytes;
@@ -148,7 +158,7 @@ export function createImageRegistry({
       return sequence;
     },
     liveCount: () => entries.size,
-    fits: (png) => entries.size < maxLive && liveBytes + base64Size(png) <= maxBytes,
+    fits: (png, animation) => entries.size < maxLive && liveBytes + imageSize(png, animation) <= maxBytes,
     nextFreeIn() {
       const at = now();
       let soonest = quarantineMs;

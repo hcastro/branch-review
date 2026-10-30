@@ -1769,3 +1769,191 @@ describe('block preview', () => {
     expect(on.toasts).toEqual(off.toasts);
   });
 });
+
+describe('video', () => {
+  // A changed MP4: 42 s at 30 fps before, 38 s at 60 fps after.
+  const CLIP = binaryMediaFile('media/demo.mp4', 'modified', ['1a2b3c4', '5d6e7f8']);
+  const VIDEO_SIDES = {
+    '1a2b3c4': sideInfo({oid: '1a2b3c4'.padEnd(40, '0'), format: 'mp4', width: 0, height: 0, bytes: 4_100_000}),
+    '5d6e7f8': sideInfo({oid: '5d6e7f8'.padEnd(40, '0'), format: 'mp4', width: 0, height: 0, bytes: 3_600_000}),
+  };
+  const VIDEO_META = {
+    '1a2b3c4': {durationMs: 42_000, width: 1920, height: 1080, codec: 'h264', fps: 30},
+    '5d6e7f8': {durationMs: 38_000, width: 1920, height: 1080, codec: 'h264', fps: 60},
+  };
+  const TALL = {columns: 120, rows: 50};
+
+  function videoApp(options: Parameters<typeof fakeMediaService>[0] = {}, files: FixtureFile[] = [CLIP]) {
+    return mediaApp(files, {sides: VIDEO_SIDES, videoMeta: VIDEO_META, ...options}, TALL);
+  }
+
+  const videoCalls = (calls: ReturnType<typeof videoApp>['calls']) => calls.flatMap((call) => call.type === 'video' ? [call.request] : []);
+
+  it('shows the table with the after side\'s changes, and a strip of four frames for each side', async () => {
+    const {instance, calls} = videoApp();
+    await settle(10);
+    const lines = frameLines(instance.lastFrame());
+    const text = lines.join('\n');
+    expect(text).toMatch(/length\s+size\s+resolution\s+codec\s+frame rate/);
+    expect(text).toMatch(/before\s+0:42\s+4\.1 MB\s+1920 × 1080\s+H\.264\s+30 fps/);
+    expect(text).toMatch(/after\s+0:38 −4 s\s+3\.6 MB −0\.5 MB\s+1920 × 1080\s+H\.264\s+60 fps changed/);
+    expect(text).toContain('before · 4 frames, evenly spaced');
+    expect(text).toContain('after · 4 frames, evenly spaced');
+    expect(text).not.toContain('binary file changed');
+
+    const requests = videoCalls(calls);
+    expect(requests.map((request) => request.side.side).sort()).toEqual(['after', 'before']);
+    for (const request of requests) {
+      expect(request).toMatchObject({format: 'mp4', frameCount: 4, stripCellPx: {w: 10, h: 20}, gapCols: 1});
+      expect(request.stripCols).toBe(request.frameCount * Math.floor((request.stripCols - 3) / 4) + 3);
+    }
+    // Two strips, each its own image.
+    const cells = decodePlaceholders(instance.lastFrame());
+    expect(new Set(cells.map((cell) => cell.id)).size).toBe(2);
+    // The timestamps under the before strip: a quarter of 42 s apart.
+    expect(text).toMatch(/0:05\s+0:16\s+0:26\s+0:37/);
+    instance.unmount();
+  });
+
+  it('shows one strip with 2, swaps it with 2 again, shows both with 1, and says 3 is for images', async () => {
+    const {instance, graphicsWrites} = videoApp();
+    await settle(10);
+    instance.stdin.write('2');
+    await settle(10);
+    // One strip at a time, of two frames twice as tall.
+    let text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toContain('after · 2 frames, evenly spaced');
+    expect(text).not.toContain('before ·');
+    expect(new Set(decodePlaceholders(instance.lastFrame()).map((cell) => cell.id)).size).toBe(1);
+    const sent = parseApc(graphicsWrites).filter((command) => command.a === 't').length;
+
+    instance.stdin.write('2');
+    await settle(10);
+    text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toContain('before · 2 frames, evenly spaced');
+    expect(text).not.toContain('after ·');
+    // The other strip was sent ahead: the swap sends nothing.
+    expect(parseApc(graphicsWrites).filter((command) => command.a === 't').length).toBe(sent);
+
+    instance.stdin.write('3');
+    await settle();
+    text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toContain('difference works on images');
+    expect(text).toContain('before · 2 frames, evenly spaced');
+
+    instance.stdin.write('1');
+    await settle(10);
+    text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toContain('before · 4 frames, evenly spaced');
+    expect(text).toContain('after · 4 frames, evenly spaced');
+    instance.unmount();
+  });
+
+  it('keeps the same rows without ffmpeg, with the hint where the frames would be', async () => {
+    const withFrames = videoApp();
+    await settle(10);
+    const framed = frameLines(withFrames.instance.lastFrame());
+    withFrames.instance.unmount();
+
+    const hint = 'frames need ffmpeg · brew install ffmpeg · o plays the file';
+    const without = videoApp({video: () => ({ok: true, meta: null, strip: null, times: [], note: hint})});
+    await settle(10);
+    const bare = frameLines(without.instance.lastFrame());
+    expect(bare.filter((line) => line.includes(hint))).toHaveLength(2);
+    expect(decodePlaceholders(without.instance.lastFrame())).toEqual([]);
+    // Same rows: the strips' labels sit on the same screen lines either way.
+    const labelRows = (lines: string[]) => lines.flatMap((line, index) => (/(before|after) · 4 frames/.test(line) ? [index] : []));
+    expect(labelRows(bare)).toEqual(labelRows(framed));
+    expect(bare.join('\n')).toMatch(/before\s+–\s+4\.1 MB\s+–/);
+    expect(without.graphicsWrites).toEqual([]);
+    without.instance.unmount();
+  });
+
+  it('plays with o and Quick Looks with O, from the side on screen, with Play and Quick Look buttons', async () => {
+    const {instance, opened, calls} = videoApp();
+    await settle(10);
+    let lines = frameLines(instance.lastFrame());
+    const header = lines.find((line) => line.includes('media/demo.mp4'))!;
+    expect(header).toMatch(/Copy path.*Play.*Quick Look/);
+    expect(header).not.toContain('Copy file');
+    expect(lines.at(-2)).toContain('q quit • ↑/↓ jump file • o play • O Quick Look • 1/2 frames • j/k scroll • t tree');
+    expect(lines.join('\n')).toContain('MP4 · H.264 · 0:42 → 0:38  file 1/1');
+
+    instance.stdin.write('o');
+    await settle();
+    instance.stdin.write('O');
+    await settle();
+    expect(opened).toEqual([
+      {command: '/usr/bin/open', args: ['/tmp/branch-review-media-test/open-1/after.png']},
+      {command: '/usr/bin/qlmanage', args: ['-p', '/tmp/branch-review-media-test/open-1/after.png']},
+    ]);
+    expect(calls.filter((call) => call.type === 'exportCopy').map((call) => call.request)).toMatchObject([
+      {format: 'mp4', side: {side: 'after', abbrevId: '5d6e7f8'}},
+      {format: 'mp4', side: {side: 'after', abbrevId: '5d6e7f8'}},
+    ]);
+    lines = frameLines(instance.lastFrame());
+
+    const play = cellPosition(instance.lastFrame(), ['Copy path', 'Play'], 'Play', 1);
+    await emitMouseMoveAt(play.column, play.row);
+    expect(frameLines(instance.lastFrame())[1]).toContain('plays the video in the default player');
+    await emitMousePressAt(play.column, play.row);
+    await settle();
+    const quickLook = cellPosition(instance.lastFrame(), ['Copy path', 'Quick Look'], 'Quick Look', 1);
+    await emitMousePressAt(quickLook.column, quickLook.row);
+    await settle();
+    expect(opened.slice(2).map((entry) => entry.command)).toEqual(['/usr/bin/open', '/usr/bin/qlmanage']);
+    instance.unmount();
+  });
+
+  it('gives a video Copy path and Open off macOS', async () => {
+    const {instance} = videoApp({platform: 'linux'});
+    await settle(10);
+    const lines = frameLines(instance.lastFrame());
+    const header = lines.find((line) => line.includes('media/demo.mp4'))!;
+    expect(header).toMatch(/Copy path.*Open/);
+    expect(header).not.toContain('Quick Look');
+    expect(lines.at(-2)).toContain('q quit • ↑/↓ jump file • o open • 1/2 frames • j/k scroll • t tree');
+    instance.unmount();
+  });
+
+  it('shows the size alone in the metrics row until the metadata arrives', async () => {
+    let answer!: () => void;
+    const held = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    const {instance} = videoApp({video: async (request) => {
+      await held;
+      return {ok: true, meta: VIDEO_META[request.side.abbrevId as keyof typeof VIDEO_META], strip: null, times: [], note: 'x'};
+    }});
+    await settle(10);
+    expect(frameLines(instance.lastFrame()).join('\n')).toContain('MP4 · 4.1 MB → 3.6 MB  file 1/1');
+    answer();
+    await settle(10);
+    expect(frameLines(instance.lastFrame()).join('\n')).toContain('MP4 · H.264 · 0:42 → 0:38  file 1/1');
+    instance.unmount();
+  });
+
+  it('draws the strips as half blocks in a block preview, sending nothing to the terminal', async () => {
+    const {instance, calls, graphicsWrites} = videoApp({caps: BLOCKS_CAPS});
+    await settle(10);
+    const requests = videoCalls(calls);
+    expect(requests).toHaveLength(2);
+    for (const request of requests) expect(request).toMatchObject({blocks: true, stripCellPx: {w: 1, h: 2}, framePx: {h: request.stripRows * 2}});
+    const blockRows = frameLines(instance.lastFrame()).filter((line) => line.includes('▀'.repeat(20)));
+    expect(blockRows.length).toBeGreaterThan(0);
+    expect(graphicsWrites).toEqual([]);
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    instance.unmount();
+  });
+
+  it('shows the strip\'s failure on the box and keeps the table', async () => {
+    const {instance} = videoApp({video: () => ({ok: false, state: 'error', reason: 'not an MP4 video'})});
+    await settle(10);
+    const text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toContain('preview unavailable: not an MP4 video');
+    // Settled: the cells say there is nothing to show, not that it is loading.
+    expect(text).toMatch(/before\s+–\s+4\.1 MB/);
+    expect(text).not.toContain('…');
+    instance.unmount();
+  });
+});

@@ -1,5 +1,5 @@
 import {describe, expect, it} from 'vitest';
-import {fitBox, planMedia, planRowText, type Layout, type MediaPlan, type PlanRow} from '../src/media/layout.js';
+import {fitBox, formatBytes, planMedia, planRowText, type Layout, type MediaPlan, type PlanRow} from '../src/media/layout.js';
 import {NO_GRAPHICS, type GraphicsCaps, type MediaRef, type MediaViewState, type SideInfo, type SideState} from '../src/media/types.js';
 
 // Box sizes come from the image's pixel size and the pane; row plans come
@@ -358,6 +358,60 @@ describe('planMedia', () => {
     });
     expect(counts[1]).toEqual(counts[0]);
     expect(counts[2]).toEqual(counts[0]);
+  });
+
+  it('shows the after side\'s changes in the video table: shorter, smaller, and a changed frame rate', () => {
+    const r = ref('video', {before: true, after: true});
+    const before = ready(0, 0, {format: 'mp4', bytes: 4_100_000, video: {durationMs: 42_000, width: 1920, height: 1080, codec: 'h264', fps: 30}});
+    const after = ready(0, 0, {format: 'mp4', bytes: 3_600_000, video: {durationMs: 38_000, width: 1920, height: 1080, codec: 'h264', fps: 60}});
+    const plan = planMedia(r, {before, after}, VIEW, layout(100, 40));
+    const lines = texts(plan, 100);
+    expect(lines[0]).toBe('         length      size           resolution    codec   frame rate');
+    expect(lines[1]).toBe('before   0:42        4.1 MB         1920 × 1080   H.264   30 fps');
+    expect(lines[2]).toBe('after    0:38 −4 s   3.6 MB −0.5 MB 1920 × 1080   H.264   60 fps changed');
+    const deltas = (plan.rows[2] as Extract<PlanRow, {type: 'text'}>).pieces.flatMap((piece) => piece.parts).filter((entry) => entry.tone !== 'plain' && entry.tone !== 'after');
+    expect(deltas.map((entry) => [entry.text.trim(), entry.tone])).toEqual([['−4 s', 'smaller'], ['−0.5 MB', 'smaller'], ['changed', 'changed']]);
+  });
+
+  it('shows a small size change in its own unit, never as 0.0 MB', () => {
+    const r = ref('video', {before: true, after: true});
+    const meta = {durationMs: 42_000, width: 1920, height: 1080, codec: 'h264', fps: 30};
+    const before = ready(0, 0, {format: 'mp4', bytes: 4_100_000, video: meta});
+    const after = ready(0, 0, {format: 'mp4', bytes: 4_070_000, video: meta});
+    const lines = texts(planMedia(r, {before, after}, VIEW, layout(100, 40)), 100);
+    expect(lines[2]).toBe('after    0:42        4.1 MB −30 KB  1920 × 1080   H.264   30 fps');
+    expect(formatBytes(1, 4_100_000)).toBe('1 B');
+    expect(formatBytes(30_000, 4_100_000)).toBe('30 KB');
+    // A change that reads in the shared unit keeps it.
+    expect(formatBytes(500_000, 4_100_000)).toBe('0.5 MB');
+    expect(formatBytes(60_000, 4_100_000)).toBe('0.1 MB');
+  });
+
+  it('places each strip timestamp under its frame when the strip is capped at 297 cells', () => {
+    const r = ref('video', {before: true, after: true});
+    const meta = {durationMs: 40_000, width: 1920, height: 1080, codec: 'h264', fps: 30};
+    for (const width of [200, 296, 320, 600]) {
+      const plan = planMedia(r, {before: ready(1920, 1080, {video: meta}), after: ready(1920, 1080, {video: meta})}, VIEW, layout(width, 40));
+      const strip = boxRows(plan)[0]!.boxes[0]!;
+      expect(strip.cols).toBeLessThanOrEqual(297);
+      // The worker draws frames of this width, one gap column apart, from
+      // the box alone.
+      const frameCols = Math.floor((strip.cols - 3) / 4);
+      expect(strip.cols, String(width)).toBe(4 * frameCols + 3);
+      const times = plan.rows.find((row): row is Extract<PlanRow, {type: 'text'}> => row.type === 'text' && row.role === 'timestamps')!;
+      expect(times.pieces.map((piece) => piece.at), String(width)).toEqual([0, 1, 2, 3].map((index) => index * (frameCols + 1)));
+    }
+  });
+
+  it('lists a video\'s length and resolution in its text view, from the metadata once it arrives', () => {
+    const r = ref('video', {after: true});
+    const meta = {durationMs: 42_000, width: 1920, height: 1080, codec: 'h264', fps: 30};
+    const lines = texts(planMedia(r, {after: ready(0, 0, {format: 'mp4', video: meta})}, {...VIEW, textView: true}, layout(100, 30)), 100);
+    expect(lines.some((line) => /^length\s+0:42$/.test(line))).toBe(true);
+    expect(lines.some((line) => /^pixels\s+1920 × 1080$/.test(line))).toBe(true);
+    expect(lines.some((line) => /^frames/.test(line))).toBe(false);
+    const waiting = texts(planMedia(r, {after: ready(0, 0, {format: 'mp4'})}, {...VIEW, textView: true}, layout(100, 30)), 100);
+    expect(waiting.some((line) => /^length\s+…$/.test(line))).toBe(true);
   });
 
   it('keeps the same rows for an image however its render goes, since the plan never sees it', () => {

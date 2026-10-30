@@ -4,9 +4,11 @@ import {
   PLACEHOLDER,
   apc,
   deleteImage,
+  frameGap,
   placeVirtual,
   placeholderRun,
   startLoop,
+  tmuxPassthrough,
   tmuxWrap,
   transmitFrame,
   transmitPng,
@@ -178,5 +180,36 @@ describe('tmux passthrough', () => {
     expect(wrapped).toBe(`${ESC}Ptmux;${inner.replaceAll(ESC, `${ESC}${ESC}`)}${ST}`);
     const body = wrapped.slice(`${ESC}Ptmux;`.length, -ST.length);
     expect(body.replaceAll(`${ESC}${ESC}`, '')).not.toContain(ESC);
+  });
+});
+
+describe('tmux passthrough for every graphics command', () => {
+  it('wraps each APC in a sequence on its own, so no passthrough is longer than one chunk', () => {
+    const sequence = transmitPng(7, bytes(10_000)) + placeVirtual(7, 4, 2);
+    const wrapped = tmuxPassthrough(sequence);
+    const dcs = [...wrapped.matchAll(/\x1BPtmux;((?:[^\x1B]|\x1B\x1B)*)\x1B\\/g)];
+    // Nothing outside the passthroughs.
+    expect(dcs.map((match) => match[0]).join('')).toBe(wrapped);
+    const inner = dcs.map((match) => match[1]!.replaceAll(`${ESC}${ESC}`, ESC));
+    expect(inner.join('')).toBe(sequence);
+    // One passthrough per command.
+    expect(inner).toEqual([...sequence.matchAll(/\x1B_G[^\x1B]*\x1B\\/g)].map((match) => match[0]));
+    expect(inner.length).toBe(commands(sequence).length);
+    for (const body of dcs.map((match) => match[1]!)) {
+      expect(body.replaceAll(`${ESC}${ESC}`, '')).not.toContain(ESC);
+      expect(body.length).toBeLessThan(4096 + 64);
+    }
+  });
+
+  it('leaves an empty sequence empty', () => {
+    expect(tmuxPassthrough('')).toBe('');
+  });
+});
+
+describe('animation frame gaps', () => {
+  it('sets a frame\'s gap with an exact sequence, at least 20 ms', () => {
+    expect(frameGap(42, 1, 120)).toBe(`${ESC}_Ga=a,i=42,r=1,z=120,q=2${ST}`);
+    expect(frameGap(42, 1, 3)).toBe(`${ESC}_Ga=a,i=42,r=1,z=20,q=2${ST}`);
+    expect(() => frameGap(42, 0, 100)).toThrow(RangeError);
   });
 });

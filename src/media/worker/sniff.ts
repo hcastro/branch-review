@@ -6,7 +6,7 @@ import type {MediaFormat} from '../types.js';
 // transparent. Nothing is decoded, so a hostile header is refused before any
 // decoder sees it. Pure.
 
-export type Sniffed = {ok: true; format: MediaFormat; width: number; height: number; frames: number; hasAlpha: boolean};
+export type Sniffed = {ok: true; format: MediaFormat; width: number; height: number; frames: number; hasAlpha: boolean; durationMs?: number};
 export type SniffResult = Sniffed | {ok: false; reason: string};
 
 // Larger sides or pixel counts are refused before decoding.
@@ -26,7 +26,16 @@ const ascii = (bytes: Uint8Array, at: number, length: number) => String.fromChar
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
-type Header = {width: number; height: number; frames: number; hasAlpha: boolean} | null;
+type Header = {width: number; height: number; frames: number; hasAlpha: boolean; durationMs?: number} | null;
+
+// Browsers show a GIF frame of 10 ms or less for 100 ms, and so do we.
+const MIN_GIF_DELAY_MS = 20;
+const SHORT_GIF_DELAY_MS = 100;
+
+// An animation's total duration, from per-frame delays; none for a still.
+function withDuration(header: NonNullable<Header>, delays: number[]): NonNullable<Header> {
+  return header.frames > 1 ? {...header, durationMs: delays.reduce((sum, delay) => sum + delay, 0)} : header;
+}
 
 function startsWith(bytes: Uint8Array, prefix: readonly number[]) {
   return bytes.length >= prefix.length && prefix.every((byte, index) => bytes[index] === byte);
@@ -85,15 +94,24 @@ function gif(bytes: Uint8Array): Header {
   let at = 13 + (flags & 0x80 ? 3 * (1 << ((flags & 7) + 1)) : 0);
   let frames = 0;
   let hasAlpha = false;
+  // The delay the last graphic control extension set, for the next frame.
+  let delay = 0;
+  const delays: number[] = [];
   while (at >= 0 && at < bytes.length && frames < MAX_FRAMES) {
     const introducer = bytes[at]!;
     if (introducer === 0x3b) break;
     if (introducer === 0x21) {
-      // Graphic control extension: its transparency flag.
-      if (bytes[at + 1] === 0xf9 && (bytes[at + 3]! & 1)) hasAlpha = true;
+      // Graphic control extension: its transparency flag and frame delay,
+      // in hundredths of a second.
+      if (bytes[at + 1] === 0xf9) {
+        if (bytes[at + 3]! & 1) hasAlpha = true;
+        if (at + 5 < bytes.length) delay = u16le(bytes, at + 4) * 10;
+      }
       at = skipSubBlocks(bytes, at + 2);
     } else if (introducer === 0x2c) {
       frames += 1;
+      delays.push(delay < MIN_GIF_DELAY_MS ? SHORT_GIF_DELAY_MS : delay);
+      delay = 0;
       const local = bytes[at + 9] ?? 0;
       at += 10 + (local & 0x80 ? 3 * (1 << ((local & 7) + 1)) : 0) + 1;
       at = skipSubBlocks(bytes, at);
@@ -101,7 +119,7 @@ function gif(bytes: Uint8Array): Header {
       break;
     }
   }
-  return {width: u16le(bytes, 6), height: u16le(bytes, 8), frames: Math.max(1, frames), hasAlpha};
+  return withDuration({width: u16le(bytes, 6), height: u16le(bytes, 8), frames: Math.max(1, frames), hasAlpha}, delays);
 }
 
 const SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
@@ -146,17 +164,22 @@ function webp(bytes: Uint8Array): Header {
   if (chunk === 'VP8X') {
     const flags = bytes[20]!;
     let frames = 1;
+    const delays: number[] = [];
     if (flags & 0x02) {
       frames = 0;
       let at = 12;
       while (at + 8 <= bytes.length && frames < MAX_FRAMES) {
         const size = u32le(bytes, at + 4);
-        if (ascii(bytes, at, 4) === 'ANMF') frames += 1;
+        if (ascii(bytes, at, 4) === 'ANMF') {
+          frames += 1;
+          // The frame's duration in ms follows its offset and size.
+          if (at + 23 <= bytes.length) delays.push(u24le(bytes, at + 20));
+        }
         at += 8 + size + (size & 1);
       }
       frames = Math.max(1, frames);
     }
-    return {width: u24le(bytes, 24) + 1, height: u24le(bytes, 27) + 1, frames, hasAlpha: Boolean(flags & 0x10)};
+    return withDuration({width: u24le(bytes, 24) + 1, height: u24le(bytes, 27) + 1, frames, hasAlpha: Boolean(flags & 0x10)}, delays);
   }
   return null;
 }

@@ -5,7 +5,7 @@ import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {decideCaps, parseReplies, startGraphicsDetection} from '../src/media/detect.js';
-import {KITTY_QUERY} from '../src/media/kitty.js';
+import {KITTY_QUERY, tmuxWrap} from '../src/media/kitty.js';
 import {NO_GRAPHICS} from '../src/media/types.js';
 
 // Detection asks the terminal what it can draw before Ink takes stdin: the
@@ -62,6 +62,11 @@ function setup(env: NodeJS.ProcessEnv, options: {images: 'auto' | 'off'} = {imag
 
 const GHOSTTY = {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2-HEAD-+cb1ef70'};
 const TMUX_ENV = {TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', TERM_PROGRAM: 'tmux'};
+// Under tmux the graphics query and a DA1 of its own go out in one
+// passthrough, so the outer terminal answers both; tmux answers the rest.
+const TMUX_QUERY = `${tmuxWrap(`${KITTY_QUERY}${ESC}[c`)}${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`;
+// What tmux 3.4 itself says to DA1.
+const TMUX_DA1 = `${ESC}[?1;2c`;
 
 // The timeout settles one setImmediate after its timer, so a check that it
 // has not fired yet needs a real macrotask to pass first.
@@ -381,18 +386,78 @@ describe('startGraphicsDetection', () => {
     expect(stdin.raw).toEqual([true, false]);
   });
 
-  it('chooses blocks under tmux, and leaves the graphics query out', async () => {
+  it('asks through tmux passthrough, and chooses blocks when no OK comes back', async () => {
     const {stdin, writes, detection} = setup(TMUX_ENV);
-    expect(writes).toEqual([`${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`]);
+    expect(writes).toEqual([TMUX_QUERY]);
     stdin.reply(`${xtversion('tmux 3.4')}${DA1}`);
     expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
   });
 
   it('chooses blocks under tmux with TERM=screen, which tmux sets by default', async () => {
     const {stdin, writes, detection} = setup({TERM: 'screen', TMUX: '/tmp/tmux-501/default,1,0'});
-    expect(writes).toEqual([`${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`]);
+    expect(writes).toEqual([TMUX_QUERY]);
     stdin.reply(DA1);
     expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+  });
+
+  it('chooses Kitty under tmux when the wrapped query gets an OK from Ghostty', async () => {
+    // tmux sets TERM_PROGRAM to itself; the outer terminal is named by the
+    // variables its shell passed down.
+    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'});
+    expect(writes[0]!.startsWith(`${ESC}Ptmux;${ESC}${ESC}_Gi=31,`)).toBe(true);
+    stdin.reply(`${OK}${xtversion('tmux 3.4')}${CELL}${DA1}`);
+    expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true, cellPx: {w: 10, h: 20}});
+  });
+
+  it('chooses Kitty under tmux when the OK comes after tmux\'s own DA1, keeping stdin raw until the outer DA1', async () => {
+    // tmux answers XTVERSION and DA1 as it reads the query; the outer
+    // terminal's OK and DA1 come back through tmux later.
+    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'});
+    expect(writes).toEqual([TMUX_QUERY]);
+    let settled = false;
+    void detection.result.then(() => {
+      settled = true;
+    });
+    stdin.reply(`${xtversion('tmux 3.4')}${CELL}${TMUX_DA1}`);
+    await turn();
+    expect(settled).toBe(false);
+    expect(stdin.raw).toEqual([true]);
+    expect(stdin.listenerCount('data')).toBe(1);
+
+    stdin.reply(`${OK}${DA1}`);
+    expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true, cellPx: {w: 10, h: 20}, detectionTimedOut: false});
+    expect(stdin.raw).toEqual([true, false]);
+    expect(stdin.unshifted).toEqual([]);
+    expect(stdin.listenerCount('data')).toBe(0);
+  });
+
+  it('chooses blocks under tmux for a terminal it can name when no OK comes back', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    // Passthrough off: tmux drops the wrapped query, so only tmux answers.
+    const {stdin, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'});
+    stdin.reply(`${xtversion('tmux 3.4')}${TMUX_DA1}`);
+    vi.advanceTimersByTime(1000);
+    await turn();
+    expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+    // The window ended at the timeout, so stdin stays raw for a late reply.
+    expect(stdin.raw).toEqual([true]);
+    detection.cancel();
+  });
+
+  it('tells tmux users the passthrough setting that also reaches a hidden pane', () => {
+    // With `on`, tmux drops graphics sent while the pane is not visible, so
+    // a redrawn picture or an exit delete written then never arrives.
+    const readme = fs.readFileSync(path.resolve(__dirname, '../README.md'), 'utf8');
+    expect(readme).toContain('`set -g allow-passthrough all`');
+    expect(readme).not.toMatch(/set -g allow-passthrough on\b/);
+  });
+
+  it('keeps blocks under tmux for an OK from a terminal on the deny list or with no name', async () => {
+    for (const env of [{...TMUX_ENV, WEZTERM_EXECUTABLE: '/usr/local/bin/wezterm-gui', GHOSTTY_RESOURCES_DIR: '/x'}, TMUX_ENV]) {
+      const {stdin, detection} = setup(env);
+      stdin.reply(`${OK}${xtversion('tmux 3.4')}${DA1}`);
+      expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+    }
   });
 
   it('honours BRANCH_REVIEW_IMAGES=kitty and =blocks, still reading the cell size', async () => {
@@ -405,10 +470,10 @@ describe('startGraphicsDetection', () => {
     expect((await forcedBlocks.detection.result).protocol).toBe('blocks');
   });
 
-  it('gives blocks for BRANCH_REVIEW_IMAGES=kitty under tmux, whose APCs are not wrapped yet', async () => {
+  it('honors BRANCH_REVIEW_IMAGES=kitty under tmux, wrapping every command for passthrough', async () => {
     const {stdin, detection} = setup({TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', TERM_PROGRAM: 'tmux', BRANCH_REVIEW_IMAGES: 'kitty'});
     stdin.reply(DA1);
-    expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+    expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true});
   });
 
   const silentCases: Array<[string, Parameters<typeof setup>]> = [
@@ -517,11 +582,13 @@ describe('decideCaps', () => {
     expect(decideCaps(answered(`${OK}${xtversion('XTerm(388)')}`), {TERM: 'xterm-256color'}, {}).protocol).toBe('blocks');
   });
 
-  it('gives blocks whenever TMUX is set, until APCs are wrapped for passthrough', () => {
+  it('gives blocks under tmux unless the wrapped query got an OK from an allowed terminal', () => {
     const tmux = '/tmp/tmux-501/default,1,0';
     expect(decideCaps(answered(), {TERM: 'screen', TMUX: tmux}, {})).toMatchObject({protocol: 'blocks', tmux: true});
     expect(decideCaps(parseReplies(''), {TERM: 'tmux-256color', TMUX: tmux}, {})).toMatchObject({protocol: 'blocks', tmux: true, detectionTimedOut: true});
-    expect(decideCaps(answered(OK), {...GHOSTTY, TMUX: tmux}, {}).protocol).toBe('blocks');
+    expect(decideCaps(answered(OK), {...GHOSTTY, TMUX: tmux}, {})).toMatchObject({protocol: 'kitty', tmux: true});
+    expect(decideCaps(answered(OK), {TERM: 'tmux-256color', TMUX: tmux, TERM_PROGRAM: 'tmux'}, {}).protocol).toBe('blocks');
+    expect(decideCaps(answered(), {TERM: 'tmux-256color', TMUX: tmux, TERM_PROGRAM: 'tmux', GHOSTTY_RESOURCES_DIR: '/x'}, {})).toMatchObject({protocol: 'blocks', tmux: true});
   });
 
   it('does not choose Kitty for an OK from a terminal it cannot name', () => {

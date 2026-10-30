@@ -1,13 +1,13 @@
 import type {DiffRange} from '../git.js';
 import type {ReviewFile, ReviewModel} from '../review/model.js';
-import type {MediaBackend, RenderRequest, RenderResult} from './backend.js';
+import type {Animation, JobFailure, MediaBackend, RenderRequest, RenderResult, VideoRequest} from './backend.js';
 import {blockRows} from './blocks.js';
 import {classifyMedia} from './classify.js';
 import {createImageRegistry} from './imageRegistry.js';
-import {staleReason, type BoxSpec} from './layout.js';
+import {staleReason, type BoxSpec, type DrawnFacts} from './layout.js';
 import {createLru} from './lru.js';
 import {openMedia, type OpenOutcome, type Opener} from './openExternal.js';
-import type {CompareMode, GraphicsCaps, MediaRef, MediaViewState, SideName, SideState} from './types.js';
+import type {CompareMode, GraphicsCaps, MediaRef, MediaViewState, SideName, SideState, VideoMeta} from './types.js';
 
 // The UI process's media state for the session: which review files are
 // media, what inspect found out about each side, the PNGs rendered for each
@@ -23,13 +23,25 @@ const BLOCK_CACHE_CHARS = 16 * 1024 * 1024;
 // The first files in tree order are inspected first.
 const FIRST_FILES = 10;
 const LIBRARY_MISSING = 'image library failed to load';
+// The columns between frames in a video strip, as the plan lays it out.
+const VIDEO_GAP_COLS = 1;
+// What one animation may cost: past either cap the worker draws its first
+// frame alone.
+const ANIMATION_LIMITS = {max: 100, maxBytes: 32 * 1024 * 1024};
+
+// A rendered image: its PNG, and the frames that follow when it animates.
+type Rendered = {png: Uint8Array; animation?: Animation};
+const renderedBytes = ({png, animation}: Rendered) => png.byteLength + (animation?.frames ?? []).reduce((sum, frame) => sum + frame.png.byteLength, 0);
 
 export type BoxState =
   | {status: 'loading'}
   | {status: 'kitty'; id: number}
   // One ANSI string per box row, each exactly the box's cols wide.
   | {status: 'blocks'; rows: readonly string[]}
-  | {status: 'error'; reason: string};
+  | {status: 'error'; reason: string}
+  // Nothing to draw, and why, in a quiet tone: a video's frames without
+  // ffmpeg, say.
+  | {status: 'note'; text: string};
 
 export type WantedBox = {fileKey: string; box: BoxSpec};
 
@@ -47,6 +59,8 @@ export type MediaServiceOptions = {
   platform?: NodeJS.Platform;
   // False under `--no-watch`, where no refresh brings a changed file back.
   watching?: boolean;
+  // False under `--no-animations`: an animated image shows its first frame.
+  animations?: boolean;
   now?: () => number;
   registry?: {maxLive?: number; maxBytes?: number; quarantineMs?: number; random?: () => number};
 };
@@ -54,9 +68,12 @@ export type MediaServiceOptions = {
 export type MediaService = ReturnType<typeof createMediaService>;
 
 // What the row builder reads from the service.
-export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'drawnFacts' | 'watching'>;
+export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'drawnFacts' | 'watching'> & Partial<Pick<MediaService, 'animates'>>;
 
-export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, now = Date.now, registry: registryOptions = {}}: MediaServiceOptions) {
+export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, animations = false, now = Date.now, registry: registryOptions = {}}: MediaServiceOptions) {
+  // Kitty terminals that run animations themselves loop an animated GIF or
+  // WebP; everywhere else it shows its first frame.
+  const animates = caps.protocol === 'kitty' && caps.animation && animations;
   const registry = createImageRegistry({write: (sequence) => sink.write(sequence), now, ...registryOptions});
   const listeners = new Set<() => void>();
   let context: MediaContext | null = null;
@@ -77,17 +94,27 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // The share of pixels that changed, by content key, from the drawn
   // difference.
   const changedRatios = new Map<string, number>();
-  // The same share by box key, kept while the box is cached anywhere. Content
+  // Why an animation shows its first frame only, by content key and side:
+  // one side of a changed GIF may run while the other is too large.
+  const stillNotes = new Map<string, Partial<Record<SideName, string>>>();
+  // Both facts by box key, kept while the box is cached anywhere. Content
   // that leaves the review and comes back (a file rewritten, then reverted)
-  // draws from the cache with no new render, so its label takes the share
-  // from here.
-  const boxRatios = new Map<string, {contentKey: string; ratio: number}>();
-  const pngs = createLru<Uint8Array>(PNG_CACHE_BYTES, (png) => png.byteLength);
+  // draws from the cache with no new render, so its label takes them from
+  // here.
+  const boxFacts = new Map<string, {contentKey: string; side?: SideName; ratio?: number; note?: string}>();
+  const pngs = createLru<Rendered>(PNG_CACHE_BYTES, renderedBytes);
   // Block previews never reach the terminal as images: a box is drawn from
   // its rows here, so nothing is sent and no id is used.
   const blockCache = createLru<readonly string[]>(BLOCK_CACHE_CHARS, (rows) => rows.reduce((sum, row) => sum + row.length, 0));
   // A box that failed is not tried again until its key changes.
   const boxErrors = new Map<string, string>();
+  // A box with nothing to draw and a reason that is no failure (a video's
+  // frames without ffmpeg), by box key, never asked again either.
+  const boxNotes = new Map<string, string>();
+  // What ffprobe found per video side, by side key (which names the
+  // content); null when it could not tell. Absent until a strip's job
+  // answers.
+  const videoMeta = new Map<string, VideoMeta | null>();
   // Side keys and box keys whose failure described the work tree file at
   // the time (gone, mid-write), not the content the id names. They are asked
   // again when a new review arrives, since the same id may now read fine.
@@ -143,9 +170,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
 
   const refFor = (file: ReviewFile): MediaRef | null => {
     if (!context || caps.protocol === 'none') return null;
-    const ref = classifyMedia(file, context.range);
-    // Still images and SVG; video keeps today's view.
-    return ref?.kind === 'raster' || ref?.kind === 'svg' ? ref : null;
+    return classifyMedia(file, context.range);
   };
 
   const inspect = (ref: MediaRef, side: SideName, priority: number) => {
@@ -189,6 +214,11 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     if (!sideRef) return {status: 'error', reason: `no ${side} side`};
     const state = sides.get(sideRef.key) ?? {status: 'pending'};
     if (turnedOff && state.status !== 'ready') return {status: 'error', reason: turnedOff};
+    if (state.status === 'ready' && videoMeta.has(sideRef.key)) {
+      // A video's pixel size is known only from its metadata.
+      const meta = videoMeta.get(sideRef.key)!;
+      return {status: 'ready', info: {...state.info, video: meta, ...(meta ? {width: meta.width, height: meta.height} : {})}};
+    }
     if (state.status !== 'pending') return state;
     return provisional.get(`${ref.fileKey}|${side}`) ?? state;
   };
@@ -207,7 +237,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     return undefined;
   };
 
-  const acquire = (box: BoxSpec, png: Uint8Array) => registry.acquire(box.imageKey, png, box.cols, box.rows);
+  const acquire = (box: BoxSpec, rendered: Rendered) => registry.acquire(box.imageKey, rendered.png, box.cols, box.rows, rendered.animation);
 
   // A box on screen found every id live or in quarantine. Nothing else may
   // re-render an idle session, so one timer re-renders once an id is free,
@@ -228,14 +258,39 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // would be evicted by the next sweep and sent again by the next want, a
   // loop of transmits. No row draws an off-screen box, so sending one needs
   // no re-render; the scroll that brings it on screen renders it.
-  const send = (box: BoxSpec, png: Uint8Array) => {
+  const send = (box: BoxSpec, rendered: Rendered) => {
     if (visibleKeys.has(box.imageKey)) {
-      if (acquire(box, png) !== null) return true;
+      if (acquire(box, rendered) !== null) return true;
       retryWhenIdFree();
       return false;
     }
-    if (registry.fits(png)) acquire(box, png);
+    if (registry.fits(rendered.png, rendered.animation)) acquire(box, rendered);
     return false;
+  };
+
+  // Whether a box draws an animated image whose frames the terminal can run.
+  const animatedBox = (ref: MediaRef, box: BoxSpec) => {
+    if (!animates || box.op !== 'fit' || ref.kind !== 'raster' || (ref.format !== 'gif' && ref.format !== 'webp') || !box.side) return false;
+    const state = sides.get(ref[box.side]?.key ?? '');
+    return state?.status === 'ready' && state.info.frames > 1;
+  };
+
+  // A fact drawing found out, for the label: set by content key, and kept by
+  // box key while the box is cached. True when the label changes.
+  const recordFact = (ref: MediaRef, box: BoxSpec, fact: {ratio?: number; note?: string}) => {
+    if (fact.ratio === undefined && fact.note === undefined) return false;
+    boxFacts.set(box.imageKey, {contentKey: ref.contentKey, ...(box.side ? {side: box.side} : {}), ...fact});
+    let changed = false;
+    if (fact.ratio !== undefined && changedRatios.get(ref.contentKey) !== fact.ratio) {
+      changedRatios.set(ref.contentKey, fact.ratio);
+      changed = true;
+    }
+    if (fact.note !== undefined && box.side && stillNotes.get(ref.contentKey)?.[box.side] !== fact.note) {
+      stillNotes.set(ref.contentKey, {...stillNotes.get(ref.contentKey), [box.side]: fact.note});
+      changed = true;
+    }
+    if (changed) planVersion += 1;
+    return changed;
   };
 
   // The sides a box draws from: one for a picture, both for a difference.
@@ -246,7 +301,97 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     return sideRef ? [sideRef] : null;
   };
 
+  // A box's job failed: its reason is cached so it is not asked again,
+  // except a failure that described the work tree file while a refresh
+  // looked at it, which the next want asks again.
+  // Whether a failed job described the file while a refresh looked at it,
+  // so it is asked again at once rather than cached.
+  const asksAgain = (result: JobFailure | null, started: number) => result !== null && (result.state === 'stale' || result.disk === true) && started !== keptReviews;
+
+  const failBox = (ref: MediaRef, box: BoxSpec, result: JobFailure | null, started: number) => {
+    const disk = result !== null && (result.state === 'stale' || result.disk === true);
+    if (asksAgain(result, started)) {
+      // As for inspect: nothing is cached, and the next want renders it.
+      notify();
+      return;
+    }
+    const reason = !result ? 'preview unavailable' : result.state === 'stale' ? staleReason(watching) : result.reason;
+    boxErrors.set(box.imageKey, reason);
+    // An SVG whose picture failed shows its source instead: its rows change.
+    if (ref.kind === 'svg') planVersion += 1;
+    if (disk) diskBoxes.add(box.imageKey);
+    if (result) noteFailure(result.reason);
+    notify();
+  };
+
+  // A video side's strip, and its metadata on the way: the metadata fills
+  // the table (the plan's text), the strip draws like any picture.
+  const renderVideo = (ref: MediaRef, box: BoxSpec, priority: number) => {
+    const sideRef = box.side ? ref[box.side] : undefined;
+    if (!context || !sideRef) return;
+    if (!backend.video) {
+      boxErrors.set(box.imageKey, 'video previews are not supported');
+      notify();
+      return;
+    }
+    const started = keptReviews;
+    const controller = new AbortController();
+    rendering.set(box.imageKey, controller);
+    // A block preview's strip is one pixel per column and two per row.
+    const blocks = caps.protocol === 'blocks';
+    const cell = blocks ? {w: 1, h: 2} : caps.cellPx;
+    const frameCount = box.frames === 4 ? 4 : 2;
+    const frameCols = Math.max(1, Math.floor((box.cols - (frameCount - 1) * VIDEO_GAP_COLS) / frameCount));
+    const request: VideoRequest = {
+      cwd: context.cwd,
+      side: sideRef,
+      format: ref.format,
+      frameCount,
+      framePx: {w: frameCols * cell.w, h: box.rows * cell.h},
+      stripCellPx: cell,
+      stripCols: box.cols,
+      stripRows: box.rows,
+      gapCols: VIDEO_GAP_COLS,
+      ...(blocks ? {blocks: true} : {}),
+    };
+    backend.video(request, controller.signal, priority).then((result) => {
+      if (controller.signal.aborted || disposed) return;
+      rendering.delete(box.imageKey);
+      if (!result.ok) {
+        // No metadata is coming for this content: the table's cells stop
+        // saying it is loading. A job asked again at once keeps them.
+        if (!asksAgain(result, started) && !videoMeta.has(sideRef.key)) {
+          videoMeta.set(sideRef.key, null);
+          planVersion += 1;
+        }
+        failBox(ref, box, result, started);
+        return;
+      }
+      const known = videoMeta.get(sideRef.key);
+      if (!videoMeta.has(sideRef.key) || JSON.stringify(known) !== JSON.stringify(result.meta)) {
+        videoMeta.set(sideRef.key, result.meta);
+        planVersion += 1;
+      }
+      if (result.cells) {
+        blockCache.set(box.imageKey, blockRows(result.cells, box.cols, box.rows, caps.colorDepth));
+      } else if (result.strip) {
+        const rendered: Rendered = {png: result.strip};
+        pngs.set(box.imageKey, rendered);
+        if (liveKeys.has(box.imageKey)) send(box, rendered);
+      } else {
+        boxNotes.set(box.imageKey, result.note ?? 'no frames to show');
+      }
+      notify();
+    }, () => {
+      // Aborted: the box left the review.
+    });
+  };
+
   const render = (ref: MediaRef, box: BoxSpec, priority: number) => {
+    if (box.op === 'video') {
+      renderVideo(ref, box, priority);
+      return;
+    }
     const sideRefs = boxSides(ref, box);
     if (!context || !sideRefs) return;
     const started = keptReviews;
@@ -264,48 +409,32 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       // Blocks flatten transparency onto the pane colour instead.
       checker: !blocks,
       ...(blocks ? {colorDepth: caps.colorDepth} : {}),
+      ...(animatedBox(ref, box) ? {frames: ANIMATION_LIMITS} : {}),
     };
     backend.render(request, controller.signal, priority).then((result: RenderResult) => {
       if (controller.signal.aborted || disposed) return;
       rendering.delete(box.imageKey);
-      if (result.ok && result.changedRatio !== undefined) boxRatios.set(box.imageKey, {contentKey: ref.contentKey, ratio: result.changedRatio});
       if (result.ok && 'cells' in result) {
         blockCache.set(box.imageKey, blockRows(result.cells, result.cols, result.rows, caps.colorDepth));
-        if (result.changedRatio !== undefined && changedRatios.get(ref.contentKey) !== result.changedRatio) {
-          changedRatios.set(ref.contentKey, result.changedRatio);
-          planVersion += 1;
-        }
+        recordFact(ref, box, {ratio: result.changedRatio});
         // Drawn by the next render of the pane, with nothing to send first.
         notify();
         return;
       }
       if (result.ok && 'png' in result) {
         const noted = result.passthrough ? noteFailure(LIBRARY_MISSING) : false;
-        pngs.set(box.imageKey, result.png);
-        if (result.changedRatio !== undefined && changedRatios.get(ref.contentKey) !== result.changedRatio) {
-          // The difference's label says how much changed: same rows, new text.
-          changedRatios.set(ref.contentKey, result.changedRatio);
-          planVersion += 1;
-        }
+        const rendered: Rendered = result.animation ? {png: result.png, animation: result.animation} : {png: result.png};
+        pngs.set(box.imageKey, rendered);
+        // The difference's label says how much changed, and an animation's
+        // why it stopped at one frame: same rows, new text.
+        const relabeled = recordFact(ref, box, {ratio: result.changedRatio, note: result.note});
         // Sent only while a row still names the box; otherwise it waits in
         // the cache until one does.
-        const drawn = liveKeys.has(box.imageKey) && send(box, result.png);
-        if (drawn || noted || result.changedRatio !== undefined) notify();
+        const drawn = liveKeys.has(box.imageKey) && send(box, rendered);
+        if (drawn || noted || relabeled || result.changedRatio !== undefined) notify();
         return;
       }
-      const disk = !result.ok && (result.state === 'stale' || result.disk === true);
-      if (disk && started !== keptReviews) {
-        // As for inspect: nothing is cached, and the next want renders it.
-        notify();
-        return;
-      }
-      const reason = result.ok ? 'preview unavailable' : result.state === 'stale' ? staleReason(watching) : result.reason;
-      boxErrors.set(box.imageKey, reason);
-      // An SVG whose picture failed shows its source instead: its rows change.
-      if (ref.kind === 'svg') planVersion += 1;
-      if (disk) diskBoxes.add(box.imageKey);
-      if (!result.ok) noteFailure(result.reason);
-      notify();
+      failBox(ref, box, result.ok ? null : result, started);
     }, () => {
       // Aborted: the box left the review.
     });
@@ -374,9 +503,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       forgetDiskFailures();
       const contentKeys = new Set([...nextRefs.values()].map((ref) => ref.contentKey));
       for (const key of changedRatios.keys()) if (!contentKeys.has(key)) changedRatios.delete(key);
-      for (const [key, {contentKey, ratio}] of boxRatios) {
-        if (!blockCache.has(key) && !pngs.has(key) && registry.idFor(key) === undefined) boxRatios.delete(key);
-        else if (contentKeys.has(contentKey) && !changedRatios.has(contentKey)) changedRatios.set(contentKey, ratio);
+      for (const key of stillNotes.keys()) if (!contentKeys.has(key)) stillNotes.delete(key);
+      for (const [key, {contentKey, side, ratio, note}] of boxFacts) {
+        if (!blockCache.has(key) && !pngs.has(key) && registry.idFor(key) === undefined) {
+          boxFacts.delete(key);
+          continue;
+        }
+        if (!contentKeys.has(contentKey)) continue;
+        if (ratio !== undefined && !changedRatios.has(contentKey)) changedRatios.set(contentKey, ratio);
+        if (note !== undefined && side && stillNotes.get(contentKey)?.[side] === undefined) stillNotes.set(contentKey, {...stillNotes.get(contentKey), [side]: note});
       }
       refs = nextRefs;
       planVersion += 1;
@@ -399,10 +534,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     refFor,
     sideState,
     viewState: (fileKey: string): MediaViewState => ({compare, flipSide: flippedToBefore.has(fileKey) ? 'before' : 'after', textView: textViews.has(fileKey)}),
+    /** Whether an animated GIF or WebP runs its frames here. */
+    animates,
+    /** The platform the viewer and player run on. */
+    platform: platform ?? process.platform,
     /** What drawing a file's boxes found out, for its labels. */
-    drawnFacts(ref: MediaRef): {changedRatio?: number} {
+    drawnFacts(ref: MediaRef): DrawnFacts {
       const changedRatio = changedRatios.get(ref.contentKey);
-      return changedRatio === undefined ? {} : {changedRatio};
+      const notes = stillNotes.get(ref.contentKey);
+      return {...(changedRatio === undefined ? {} : {changedRatio}), ...(notes === undefined ? {} : {stillNotes: notes})};
     },
     /**
      * The side `o` opens: the only one drawn when the other failed, else the
@@ -466,6 +606,8 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     boxState(box: BoxSpec): BoxState {
       const reason = boxErrors.get(box.imageKey);
       if (reason !== undefined) return {status: 'error', reason};
+      const note = boxNotes.get(box.imageKey);
+      if (note !== undefined) return {status: 'note', text: note};
       const rows = blockCache.get(box.imageKey);
       if (rows) return {status: 'blocks', rows};
       const id = registry.idFor(box.imageKey);
@@ -483,16 +625,16 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       let changed = false;
       for (const {fileKey, box} of boxes) {
         const key = box.imageKey;
-        if (boxErrors.has(key) || blockCache.has(key)) continue;
+        if (boxErrors.has(key) || boxNotes.has(key) || blockCache.has(key)) continue;
         if (registry.idFor(key) !== undefined) {
           registry.touch(key);
           continue;
         }
-        const png = pngs.get(key);
-        if (png) {
+        const rendered = pngs.get(key);
+        if (rendered) {
           // An image evicted off screen comes back from the cache, without
           // a new decode, once it is near the viewport again.
-          if (send(box, png)) changed = true;
+          if (send(box, rendered)) changed = true;
           continue;
         }
         if (rendering.has(key)) continue;

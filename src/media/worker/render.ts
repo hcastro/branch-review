@@ -1,4 +1,4 @@
-import type {JobFailure, RenderResult, RenderTarget} from '../backend.js';
+import type {Animation, JobFailure, RenderResult, RenderTarget} from '../backend.js';
 import {CLEAR_PIXEL} from '../blocks.js';
 import type {Sniffed} from './sniff.js';
 import {MAX_PIXELS, svgSize} from './sniff.js';
@@ -28,6 +28,13 @@ const DIFF_KEEP = 0.45;
 const DIFF_TINT = [0xd2, 0xa8, 0xff] as const;
 const DIFF_TINT_WEIGHT = 0.6;
 const MAX_SVG_DENSITY = 2400;
+// Every frame of an animation is decoded at once, so their pixels together
+// stay under this.
+const MAX_ANIMATION_PIXELS = 16_000_000;
+// A frame shown 10 ms or less is shown for 100 ms, as browsers do.
+const SHORT_FRAME_MS = 10;
+const SHORT_FRAME_SHOWN_MS = 100;
+export const ANIMATION_TOO_LARGE = 'animation too large';
 // Block previews show transparency over the dark pane colour of the
 // mockups; a terminal cell has one colour per half, with no alpha.
 const BLOCK_BACKGROUND = [0x0d, 0x11, 0x17] as const;
@@ -47,6 +54,9 @@ export function svgDensity(info: Partial<Pick<Sniffed, 'format' | 'width'>> & {p
 // Imported on first use, in the worker only: the library is large, slow to
 // load, and native.
 const defaultLoader: SharpLoader = async () => (await import('sharp')).default;
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const isPng = (bytes: Uint8Array) => PNG_SIGNATURE.every((byte, index) => bytes[index] === byte);
 
 function firstLine(error: unknown) {
   const message = error instanceof Error ? error.message : String(error);
@@ -234,6 +244,60 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
   }
 
   /**
+   * An animated image fitted into its box frame by frame, every frame the
+   * same padded size, with each frame's delay. Past `limits` (frames, PNG
+   * bytes) or the decoded pixel cap, the first frame alone with a note.
+   */
+  async function fitAnimated(bytes: Buffer, info: Sniffed, target: RenderTarget, checker: boolean, limits: {max: number; maxBytes: number}): Promise<RenderResult> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+    const {sharp} = loaded;
+    const still = async () => {
+      const first = await fit(bytes, info, target, checker);
+      return first.ok ? {...first, note: ANIMATION_TOO_LARGE} : first;
+    };
+
+    try {
+      const meta = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: -1}).metadata();
+      const pages = meta.pages ?? 1;
+      const width = meta.width ?? 0;
+      const pageHeight = meta.pageHeight ?? meta.height ?? 0;
+      if (pages < 2) return await fit(bytes, info, target, checker);
+      if (pages > limits.max || pages * width * pageHeight > MAX_ANIMATION_PIXELS) return await still();
+
+      const {data} = await sharp(bytes, {limitInputPixels: MAX_ANIMATION_PIXELS, failOn: 'error', pages: -1})
+        .timeout({seconds: DECODE_TIMEOUT_S})
+        .ensureAlpha()
+        .raw()
+        .toBuffer({resolveWithObject: true});
+      const frameBytes = width * pageHeight * 4;
+      const delays = meta.delay ?? [];
+      const delayOf = (page: number) => {
+        const delay = delays[page] ?? SHORT_FRAME_SHOWN_MS;
+        return delay <= SHORT_FRAME_MS ? SHORT_FRAME_SHOWN_MS : delay;
+      };
+      const drawn: Uint8Array[] = [];
+      let total = 0;
+      for (let page = 0; page < pages; page += 1) {
+        const raw = {data: data.subarray(page * frameBytes, (page + 1) * frameBytes), width, height: pageHeight};
+        // Every frame at full scale, so all of them share the first one's
+        // size; a frame too large to send makes the whole animation so.
+        const png = await fitOnce(sharp, {raw}, {hasAlpha: info.hasAlpha}, target, checker, 1);
+        total += png.byteLength;
+        if (png.byteLength > MAX_PNG_BYTES || total > limits.maxBytes) return await still();
+        drawn.push(png);
+      }
+      const animation: Animation = {
+        firstDelayMs: delayOf(0),
+        frames: drawn.slice(1).map((png, index) => ({png, delayMs: delayOf(index + 1)})),
+      };
+      return {ok: true, png: drawn[0]!, animation};
+    } catch {
+      return {ok: false, state: 'error', reason: 'could not decode image'};
+    }
+  }
+
+  /**
    * The image drawn at its own sniffed size as a plain PNG, with no padding
    * or checkerboard: the copy a viewer opens in place of an SVG.
    */
@@ -316,7 +380,83 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   }
 
-  return {fit, picture, difference, blocks, blocksDifference, available: async () => !('reason' in await sharpOrReason())};
+  /**
+   * A strip past the transmit cap, drawn again smaller the way `fitSource`
+   * does: the whole canvas shrinks, so the terminal scales it back into the
+   * same cells and every frame keeps its place.
+   */
+  async function underTransmitCap(sharp: SharpFactory, png: Buffer, width: number, height: number) {
+    let scale = 1;
+    let smaller = png;
+    for (let shrink = 0; shrink < MAX_SHRINKS && smaller.byteLength > MAX_PNG_BYTES; shrink += 1) {
+      scale *= SHRINK;
+      smaller = await sharp(png)
+        .resize(Math.max(1, Math.round(width * scale)), Math.max(1, Math.round(height * scale)), {fit: 'fill', kernel: 'lanczos3'})
+        .png({compressionLevel: 6})
+        .toBuffer();
+    }
+    return smaller;
+  }
+
+  /**
+   * A video's frames side by side as one strip: each letterboxed on black
+   * into its `framePx` box, `gapCols` cells apart, on a clear canvas of
+   * exactly `cols` × `rows` cells. A frame that could not be read (null, or
+   * bytes that are not a PNG) is a dim tile with an ×. As block cells when
+   * `blocks`, with `cellPx` then one pixel by two.
+   */
+  async function videoStrip(
+    frames: ReadonlyArray<Uint8Array | null>,
+    strip: {cols: number; rows: number; cellPx: {w: number; h: number}; framePx: {w: number; h: number}; gapCols: number},
+    blocks: boolean,
+  ): Promise<{ok: true; png: Buffer} | {ok: true; cells: Uint32Array; cols: number; rows: number} | JobFailure> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+    const {sharp} = loaded;
+    const width = Math.max(1, strip.cols * strip.cellPx.w);
+    const height = Math.max(1, strip.rows * strip.cellPx.h);
+    const frameW = Math.max(1, Math.min(width, Math.round(strip.framePx.w)));
+    const frameH = Math.max(1, Math.min(height, Math.round(strip.framePx.h)));
+
+    const failedTile = () => {
+      const size = Math.max(2, Math.floor(Math.min(frameW, frameH) / 4));
+      const [x0, y0] = [Math.floor((frameW - size) / 2), Math.floor((frameH - size) / 2)];
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${frameW}" height="${frameH}"><rect width="${frameW}" height="${frameH}" fill="#1b2129"/>`
+        + `<path d="M${x0} ${y0}L${x0 + size} ${y0 + size}M${x0 + size} ${y0}L${x0} ${y0 + size}" stroke="#6e7681" stroke-width="${Math.max(1, Math.round(size / 8))}"/></svg>`;
+      return sharp(Buffer.from(svg)).png().toBuffer();
+    };
+    const tileOf = async (png: Uint8Array | null) => {
+      if (!png || !isPng(png)) return failedTile();
+      try {
+        return await sharp(png, {limitInputPixels: MAX_PIXELS, failOn: 'error'})
+          .timeout({seconds: DECODE_TIMEOUT_S})
+          .resize(frameW, frameH, {fit: 'contain', background: {r: 0, g: 0, b: 0, alpha: 1}})
+          .png()
+          .toBuffer();
+      } catch {
+        return failedTile();
+      }
+    };
+
+    try {
+      const layers = [];
+      for (const [index, png] of frames.entries()) {
+        const left = index * (frameW + strip.gapCols * strip.cellPx.w);
+        if (left + frameW > width) break;
+        layers.push({input: await tileOf(png), left, top: 0});
+      }
+      const png = await sharp({create: {width, height, channels: 4, background: {r: 0, g: 0, b: 0, alpha: 0}}})
+        .composite(layers)
+        .png({compressionLevel: 6})
+        .toBuffer();
+      if (!blocks) return {ok: true, png: await underTransmitCap(sharp, png, width, height)};
+      return await blockCells(sharp, {bytes: png}, {hasAlpha: true, format: 'png'}, {cols: strip.cols, rows: strip.rows, cellPx: strip.cellPx, drawPx: {w: width, h: height}, nearest: false});
+    } catch {
+      return {ok: false, state: 'error', reason: 'could not draw the frames'};
+    }
+  }
+
+  return {fit, fitAnimated, videoStrip, picture, difference, blocks, blocksDifference, available: async () => !('reason' in await sharpOrReason())};
 }
 
 export type Renderer = ReturnType<typeof createRenderer>;

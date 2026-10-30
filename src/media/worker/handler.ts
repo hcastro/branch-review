@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type {ExportResult, InspectResult, RenderResult, WorkerRequest} from '../backend.js';
+import type {ExportResult, InspectResult, RenderResult, VideoResult, WorkerRequest} from '../backend.js';
 import type {MediaFormat, SideRef} from '../types.js';
 import {createSideReader, type SideReader} from './read.js';
 import {createRenderer, type SharpLoader} from './render.js';
 import {isFormat, magicFormat, notFormatReason, sniffImage} from './sniff.js';
+import {createVideoRunner, type VideoOptions} from './video.js';
 
 // The media worker's jobs, without the process around them, so tests can run
 // them in process.
@@ -20,16 +21,18 @@ const EXTENSIONS: Partial<Record<MediaFormat, string>> = {png: 'png', jpeg: 'jpg
 type HandlerOptions = {
   loadSharp?: SharpLoader;
   reader?: SideReader;
+  video?: VideoOptions;
 };
 
-export type WorkerResult = InspectResult | RenderResult | ExportResult;
+export type WorkerResult = InspectResult | RenderResult | VideoResult | ExportResult;
 
-export function createWorkerHandler({loadSharp, reader = createSideReader()}: HandlerOptions = {}) {
+export function createWorkerHandler({loadSharp, reader = createSideReader(), video: videoOptions}: HandlerOptions = {}) {
   const renderer = createRenderer(loadSharp ? {loadSharp} : {});
+  const videos = createVideoRunner(renderer, videoOptions);
   let exports = 0;
 
   async function inspect(request: Extract<WorkerRequest, {type: 'inspect'}>): Promise<InspectResult> {
-    if (request.kind === 'video') return {ok: false, state: 'error', reason: `${request.kind} previews are not supported`};
+    if (request.kind === 'video') return videos.inspect(request);
     const read = await reader.read(request.cwd, request.side, request.kind);
     if (!read.ok) return read;
     const sniffed = sniffImage(read.bytes, request.format);
@@ -73,16 +76,36 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
     // Blocks need decoded pixels, so without the image library there is no
     // passthrough for them.
     if (request.op === 'blocks') return renderer.blocks(bytes, sniffed, request.target);
-    const result = await renderer.fit(bytes, sniffed, request.target, request.checker);
+    // Only GIF and WebP animate: an APNG always shows its first frame.
+    const animate = request.frames && sniffed.frames > 1 && (format === 'gif' || format === 'webp');
+    const result = animate
+      ? await renderer.fitAnimated(bytes, sniffed, request.target, request.checker, request.frames!)
+      : await renderer.fit(bytes, sniffed, request.target, request.checker);
     if (!result.ok && result.state === 'unavailable' && format === 'png' && bytes.byteLength <= MAX_PASSTHROUGH_BYTES) {
       return {ok: true, png: bytes, passthrough: true};
     }
     return result;
   }
 
+  // A new `open-<n>` dir under `parent` for one copy.
+  const openDir = (parent: string) => {
+    for (;;) {
+      exports += 1;
+      const dir = path.join(parent, `open-${exports}`);
+      try {
+        fs.mkdirSync(dir, {mode: 0o700});
+        return dir;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+  };
+
   async function exportCopy(request: Extract<WorkerRequest, {type: 'exportCopy'}>): Promise<ExportResult> {
+    if (!path.isAbsolute(request.dir)) return {ok: false, state: 'error', reason: 'cannot open this file type'};
+    if (['mp4', 'mov', 'webm'].includes(request.format)) return videos.exportCopy(request, () => openDir(request.dir));
     const extension = EXTENSIONS[request.format];
-    if (!extension || !path.isAbsolute(request.dir)) return {ok: false, state: 'error', reason: 'cannot open this file type'};
+    if (!extension) return {ok: false, state: 'error', reason: 'cannot open this file type'};
     const read = await reader.read(request.cwd, request.side, request.format === 'svg' ? 'svg' : 'raster');
     if (!read.ok) return read;
     // Only an allow-listed format confirmed by its magic bytes (an SVG: its
@@ -105,18 +128,7 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
     }
 
     try {
-      let dir: string;
-      for (;;) {
-        exports += 1;
-        dir = path.join(request.dir, `open-${exports}`);
-        try {
-          fs.mkdirSync(dir, {mode: 0o700});
-          break;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-      }
-      const target = path.join(dir, name);
+      const target = path.join(openDir(request.dir), name);
       fs.writeFileSync(target, bytes, {flag: 'wx', mode: 0o600});
       return {ok: true, path: target};
     } catch (error) {
@@ -128,6 +140,7 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
     try {
       if (request.type === 'inspect') return await inspect(request);
       if (request.type === 'render') return await render(request);
+      if (request.type === 'video') return await videos.video(request);
       if (request.type === 'exportCopy') return await exportCopy(request);
       return {ok: false, state: 'error', reason: 'unknown media job'};
     } catch (error) {

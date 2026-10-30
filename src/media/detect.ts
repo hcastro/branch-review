@@ -1,6 +1,6 @@
 import {escapeHiddenCharacters} from '../controlChars.js';
 import {isColorDisabled} from '../git.js';
-import {KITTY_QUERY} from './kitty.js';
+import {KITTY_QUERY, tmuxWrap} from './kitty.js';
 import {NO_GRAPHICS, type GraphicsCaps, type GraphicsProtocol} from './types.js';
 
 // Finds out what the terminal can draw, once, before Ink owns stdin. One
@@ -8,6 +8,9 @@ import {NO_GRAPHICS, type GraphicsCaps, type GraphicsProtocol} from './types.js'
 // last, so its reply closes the window; a terminal that answers nothing is
 // given up on after a short timeout. Replies arrive on stdin, which is in raw
 // mode for the window, so Ctrl-C arrives as a byte here instead of SIGINT.
+// tmux answers DA1 itself at once, long before the outer terminal's answer to
+// the graphics query can make its way back, so under tmux a second DA1 rides
+// in the same passthrough as that query and the window waits for both.
 // Keys typed during the window go back on stdin for the app. A terminal that
 // misses the timeout may still be answering, so stdin then stays raw and ours
 // until the app takes it: a late reply never meets a cooked, echoing tty.
@@ -44,6 +47,9 @@ export type ParsedReplies = {
   cellPx?: {w: number; h: number};
   textAreaPx?: {w: number; h: number};
   da1: boolean;
+  // How many DA1 replies came: under tmux, tmux's own and the outer
+  // terminal's.
+  da1Count: number;
   // Everything that is not a reply: keys typed during the window.
   stray: string;
   // The start of a reply still arriving at the end of the buffer.
@@ -86,7 +92,7 @@ type DetectionIo = {
 
 /** Pure: the replies found in everything stdin delivered during the window. */
 export function parseReplies(buffer: string): ParsedReplies {
-  const parsed: ParsedReplies = {da1: false, stray: '', partial: ''};
+  const parsed: ParsedReplies = {da1: false, da1Count: 0, stray: '', partial: ''};
   const stray = buffer.replace(REPLY, (whole, keys?: string, message?: string, version?: string, cellH?: string, cellW?: string, areaH?: string, areaW?: string) => {
     if (keys !== undefined) {
       if (keys.split(',').includes('i=31')) parsed.graphics = message;
@@ -98,6 +104,7 @@ export function parseReplies(buffer: string): ParsedReplies {
       parsed.textAreaPx = {w: Number(areaW), h: Number(areaH)};
     } else if (whole.endsWith('c')) {
       parsed.da1 = true;
+      parsed.da1Count += 1;
     }
     return '';
   });
@@ -174,14 +181,18 @@ export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size:
   const forced = imagesSetting(env);
 
   let protocol: GraphicsProtocol;
-  if (tmux) {
-    // Until APCs are wrapped for tmux passthrough, tmux gets blocks, forced
-    // or not. tmux draws 256 colours whatever the outer terminal answers.
-    protocol = 'blocks';
-  } else if (forced === 'kitty' || forced === 'blocks') {
+  if (forced === 'kitty' || forced === 'blocks') {
     protocol = forced;
   } else if (replies.graphics === 'OK' && identity.name && !identity.denied) {
+    // Under tmux the query went out wrapped for passthrough, so an OK means
+    // tmux forwards graphics to a terminal that draws them. Only
+    // `allow-passthrough all` forwards them while the pane is hidden too;
+    // with `on`, an image sent then never arrives and its box stays blank.
     protocol = 'kitty';
+  } else if (tmux) {
+    // tmux draws color whatever the outer terminal answers, and a pane
+    // that passes no graphics through still shows half blocks.
+    protocol = 'blocks';
   } else if (replies.da1 && colors256) {
     protocol = 'blocks';
   } else {
@@ -214,7 +225,7 @@ function latin1(chunk: Buffer | string) {
 }
 
 /**
- * Starts detection and returns its result, which settles at the DA1 reply,
+ * Starts detection and returns its result, which settles at the last DA1 reply,
  * at the timeout, on Ctrl-C or on cancel(). When the terminal answers, or on
  * Ctrl-C or cancel(), raw mode is off and the listener is gone by then. After
  * a timeout the terminal may still be answering, so stdin stays raw and ours,
@@ -254,6 +265,7 @@ export function startGraphicsDetection(io: DetectionIo): {
   // 'closed' once raw mode is off and the listener gone.
   let state: 'open' | 'holding' | 'handedOff' | 'closed' = 'open';
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const da1Expected = env.TMUX ? 2 : 1;
 
   const rawModeOff = () => {
     try {
@@ -304,7 +316,7 @@ export function startGraphicsDetection(io: DetectionIo): {
       return;
     }
     buffer += text;
-    if (state === 'open' && parseReplies(buffer).da1) finish('answered');
+    if (state === 'open' && parseReplies(buffer).da1Count >= da1Expected) finish('answered');
   }
 
   const handOff = (): HandOff => {
@@ -334,8 +346,12 @@ export function startGraphicsDetection(io: DetectionIo): {
 
   stdin.on('data', onData);
   stdin.resume?.();
-  // tmux would swallow or misroute an unwrapped APC.
-  const graphicsQuery = env.TMUX ? '' : KITTY_QUERY;
+  // tmux would swallow or misroute an unwrapped APC; wrapped, it reaches
+  // the outer terminal only when tmux allows passthrough. The DA1 wrapped
+  // with it is answered by the outer terminal after its graphics reply, so
+  // that second DA1 closes the window. With passthrough off it never comes,
+  // and the window ends at the timeout with stdin still held.
+  const graphicsQuery = env.TMUX ? tmuxWrap(`${KITTY_QUERY}${DA1_QUERY}`) : KITTY_QUERY;
   try {
     stdout.write(`${graphicsQuery}${XTVERSION_QUERY}${CELL_SIZE_QUERY}${TEXT_AREA_QUERY}${DA1_QUERY}`);
   } catch {

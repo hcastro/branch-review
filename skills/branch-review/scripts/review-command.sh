@@ -281,6 +281,8 @@ command -v branch-review >/dev/null 2>&1 \
   || note "warning: branch-review is not on PATH — install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review"
 command -v delta >/dev/null 2>&1 \
   || note "warning: git-delta is not on PATH — diffs need it: brew install git-delta"
+command -v ffprobe >/dev/null 2>&1 \
+  || note "hint: ffprobe is not on PATH, so videos show their size only, without frames: brew install ffmpeg"
 [[ -n $tracked_error ]] \
   && note "warning: $tracked_error, so the tracked count is unknown"
 [[ -n ${changed:-} && $changed -eq 0 ]] \

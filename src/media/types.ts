@@ -52,6 +52,8 @@ export type SideInfo = {
   height: number;
   // 1 for stills; the frame count of an animated GIF, WebP or APNG.
   frames: number;
+  // An animated GIF or WebP: how long one pass of its frames takes.
+  durationMs?: number;
   hasAlpha: boolean;
   // Filled by the video job, not by inspect: undefined while it runs, null
   // when it failed or no ffprobe was found.

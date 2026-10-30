@@ -58,7 +58,7 @@ function planLines(ref: MediaRef, media: MediaRowInput, layout: MediaRowsLayout)
     ...(ref.before ? {before: media.sideState(ref, 'before')} : {}),
     ...(ref.after ? {after: media.sideState(ref, 'after')} : {}),
   };
-  const plan = planMedia(ref, sides, view, {...layout, caps: media.caps, watching: media.watching}, media.drawnFacts(ref));
+  const plan = planMedia(ref, sides, view, {...layout, caps: media.caps, watching: media.watching, animate: media.animates ?? false}, media.drawnFacts(ref));
   // The hidden flip side rides on every box row, so it is sent ahead
   // whenever the shown side is near the viewport.
   const prefetch = plan.prefetch.length > 0 ? {prefetch: plan.prefetch} : {};

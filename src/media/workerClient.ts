@@ -12,6 +12,8 @@ import type {
   MediaBackend,
   RenderRequest,
   RenderResult,
+  VideoRequest,
+  VideoResult,
   WorkerRequest,
 } from './backend.js';
 
@@ -23,12 +25,14 @@ import type {
 // the decoder can never make the app spin.
 
 type JobType = WorkerRequest['type'];
-type JobResult = InspectResult | RenderResult | ExportResult;
+type JobResult = InspectResult | RenderResult | VideoResult | ExportResult;
 
 const DEFAULT_DEADLINES_MS: Record<JobType, number> = {
   // Covers a partial clone fetching a blob it never had.
   inspect: 10_000,
   render: 8_000,
+  // A probe and up to four frames, each with its own shorter deadline.
+  video: 30_000,
   exportCopy: 30_000,
 };
 const DEFAULT_BACKOFF_MS = [1_000, 5_000, 30_000];
@@ -62,7 +66,7 @@ export type WorkerBackend = MediaBackend & {disabledReason(): string | null};
 type Job = {
   id: number;
   type: JobType;
-  request: InspectRequest | RenderRequest | ExportRequest;
+  request: InspectRequest | RenderRequest | VideoRequest | ExportRequest;
   priority: number;
   signal: AbortSignal;
   resolve: (result: JobResult) => void;
@@ -286,7 +290,12 @@ export function createWorkerBackend({
       }
 
       queue.sort((left, right) => left.priority - right.priority || left.id - right.id);
-      const job = queue.shift()!;
+      // One video job at a time: the worker runs one ffmpeg at a time, and a
+      // second video job sent now would wait there with its deadline running.
+      const videoBusy = [...inFlight.values()].some((each) => each.type === 'video');
+      const next = queue.findIndex((each) => !(videoBusy && each.type === 'video'));
+      if (next < 0) break;
+      const [job] = queue.splice(next, 1) as [Job];
       if (job.settled) continue;
       inFlight.set(job.id, job);
       job.timer = setTimeout(() => onDeadline(job), deadlines[job.type]);
@@ -340,6 +349,7 @@ export function createWorkerBackend({
   return {
     inspect: (request, signal, priority) => submit<InspectResult>('inspect', request, signal, priority),
     render: (request, signal, priority) => submit<RenderResult>('render', request, signal, priority),
+    video: (request, signal, priority) => submit<VideoResult>('video', request, signal, priority),
     exportCopy: (request, signal) => submit<ExportResult>('exportCopy', request, signal, -1),
     dispose() {
       if (disposed) return;

@@ -1,6 +1,6 @@
 import {cellWidth, truncateEnd} from '../ui/text.js';
 import {KITTY_DIACRITICS} from './kittyDiacritics.js';
-import type {GraphicsCaps, MediaFormat, MediaRef, MediaSpan, MediaViewState, SideInfo, SideName, SideState} from './types.js';
+import type {GraphicsCaps, MediaFormat, MediaRef, MediaSpan, MediaViewState, SideInfo, SideName, SideState, VideoMeta} from './types.js';
 
 // Where a media file's rows go and how big its boxes are. Pure: the plan is a
 // function of the file, what inspect found out about each side (pixel size,
@@ -15,7 +15,15 @@ export type Layout = {
   // False when the session does not watch the repo (`--no-watch`): no
   // refresh will bring a file that changed on disk back in. Defaults to true.
   watching?: boolean;
+  // The terminal runs an animated GIF or WebP's frames (Kitty animation,
+  // with animations on); otherwise one shows its first frame.
+  animate?: boolean;
 };
+
+// What drawing found out: the share of a difference's pixels that changed,
+// and why an animation shows its first frame only, per side. Label text
+// only.
+export type DrawnFacts = {changedRatio?: number; stillNotes?: Partial<Record<SideName, string>>};
 
 export type Box = {
   cols: number;
@@ -163,17 +171,25 @@ function fitBlocks(width: number, height: number, maxCols: number, maxRows: numb
   };
 }
 
-/** Byte counts as people read them: 232 KB, 6.1 KB, 4.1 MB. */
-export function formatBytes(bytes: number) {
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = Math.max(0, bytes);
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB'];
+
+function byteUnit(bytes: number) {
   let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
+  for (let value = Math.max(0, bytes); value >= 1000 && unit < BYTE_UNITS.length - 1; value /= 1000) unit += 1;
+  return unit;
+}
+
+/**
+ * Byte counts as people read them: 232 KB, 6.1 KB, 4.1 MB. With `like`, in
+ * that count's unit, so a change reads next to its size: 4.1 MB, −0.5 MB.
+ */
+export function formatBytes(bytes: number, like?: number) {
+  let unit = byteUnit(like ?? bytes);
+  // A change too small to show in that unit (0.0 MB) reads in its own.
+  if (like !== undefined && bytes > 0 && unit > 0 && bytes / 1000 ** unit < 0.05) unit = byteUnit(bytes);
+  const value = Math.max(0, bytes) / 1000 ** unit;
   const shown = unit === 0 || value >= 10 ? String(Math.round(value)) : value.toFixed(1);
-  return `${shown} ${units[unit]}`;
+  return `${shown} ${BYTE_UNITS[unit]}`;
 }
 
 const FORMAT_LABELS: Record<MediaFormat, string> = {
@@ -246,6 +262,21 @@ function shownNote(box: Box, caps: GraphicsCaps) {
   return `${box.drawPx.w} × ${box.drawPx.h} px shown`;
 }
 
+function seconds(ms: number) {
+  const value = ms / 1000;
+  return `${value < 10 ? Number(value.toFixed(1)) : Math.round(value)} s`;
+}
+
+// After a side's name: whether an animated image runs, or shows its first
+// frame only and why. Nothing for a still.
+function framesNote(info: SideInfo, side: SideName, layout: Layout, drawn: DrawnFacts): TextPart[] {
+  if (info.frames < 2) return [];
+  const stillNote = drawn.stillNotes?.[side];
+  const runs = layout.animate && (info.format === 'gif' || info.format === 'webp') && stillNote === undefined;
+  if (runs) return [part(` · animated · ${info.frames} frames${info.durationMs ? ` · ${seconds(info.durationMs)}` : ''}`, 'dim')];
+  return [part(` · first frame of ${info.frames}${stillNote ? ` · ${stillNote}` : ''}`, 'dim')];
+}
+
 // An added or deleted SVG has one picture; a modified one names its sides,
 // as an image does.
 function sideLabel(ref: MediaRef, side: SideName) {
@@ -278,9 +309,9 @@ function tabRow(view: MediaViewState): PlanTextRow {
 
 // One side alone: its label, then its box. `note` explains why only this
 // side shows when the file has two.
-function singlePlan(ref: MediaRef, side: SideName, info: SideInfo, layout: Layout, maxRows: number, note?: string): PlanRow[] {
+function singlePlan(ref: MediaRef, side: SideName, info: SideInfo, layout: Layout, maxRows: number, drawn: DrawnFacts, note?: string): PlanRow[] {
   const box = fitBox({w: info.width, h: info.height}, layout.innerWidth, maxRows, layout.caps);
-  const left = [sideLabel(ref, side)];
+  const left = [sideLabel(ref, side), ...framesNote(info, side, layout, drawn)];
   if (ref.kind === 'svg') left.push(part(' · rendered from the SVG source', 'dim'));
   if (note) left.push(part(` · ${note}`, 'error'));
   return [
@@ -289,10 +320,10 @@ function singlePlan(ref: MediaRef, side: SideName, info: SideInfo, layout: Layou
   ];
 }
 
-function sideBySidePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout: Layout): PlanRow[] {
+function sideBySidePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout: Layout, drawn: DrawnFacts): PlanRow[] {
   const {innerWidth: inner, viewportRows: vp, caps} = layout;
   const half = Math.floor((inner - SIDE_GAP) / 2);
-  const label = (side: SideName, info: SideInfo) => [sideLabel(ref, side), part(` ${pixels(info)} · ${formatBytes(info.bytes)}`, 'dim')];
+  const label = (side: SideName, info: SideInfo) => [sideLabel(ref, side), part(` ${pixels(info)} · ${formatBytes(info.bytes)}`, 'dim'), ...framesNote(info, side, layout, drawn)];
 
   if (half < MIN_HALF_COLS) {
     const rows = Math.max(3, Math.floor((vp - 4) / 2));
@@ -318,7 +349,7 @@ function sideBySidePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout
 
 // Both sides fitted on their own, then given the same box, so a swap only
 // changes which id the cells name.
-function flipPlan(ref: MediaRef, before: SideInfo, after: SideInfo, view: MediaViewState, layout: Layout): {rows: PlanRow[]; prefetch: BoxSpec[]} {
+function flipPlan(ref: MediaRef, before: SideInfo, after: SideInfo, view: MediaViewState, layout: Layout, drawn: DrawnFacts): {rows: PlanRow[]; prefetch: BoxSpec[]} {
   const rowsCap = Math.max(4, layout.viewportRows - 3);
   const boxes = {
     before: fitBox({w: before.width, h: before.height}, layout.innerWidth, rowsCap, layout.caps),
@@ -331,7 +362,7 @@ function flipPlan(ref: MediaRef, before: SideInfo, after: SideInfo, view: MediaV
   const hidden: SideName = shown === 'after' ? 'before' : 'after';
   return {
     rows: [
-      textRow('label', [sideLabel(ref, shown), part(' · 2 or click swaps', 'dim'), ...blockSuffix([geometry], layout.caps)]),
+      textRow('label', [sideLabel(ref, shown), ...framesNote(shown === 'after' ? after : before, shown, layout, drawn), part(' · 2 or click swaps', 'dim'), ...blockSuffix([geometry], layout.caps)]),
       ...boxRowsFor([boxSpec(ref, shown, boxes[shown], 0, layout, geometry)], {swap: true}),
     ],
     prefetch: [boxSpec(ref, hidden, boxes[hidden], 0, layout, geometry)],
@@ -369,6 +400,17 @@ function detailsPlan(ref: MediaRef, states: Partial<Record<SideName, SideState>>
     return state.status === 'ready' ? pick(state.info) : state.status === 'pending' ? '…' : reasonFor(state, watching);
   }).join(' → ');
   const row = (name: string, text: string) => textRow('details', [part(name.padEnd(9), 'dim'), part(text)]);
+  if (ref.kind === 'video') {
+    // Size and length come from ffprobe: … while it runs, – without it.
+    const fromMeta = (pick: (meta: VideoMeta) => string) => (info: SideInfo) => (info.video ? pick(info.video) : info.video === undefined ? '…' : '–');
+    return [
+      row('format', formatLabel(ref.format)),
+      row('pixels', value(fromMeta(pixels))),
+      row('bytes', value((info) => formatBytes(info.bytes))),
+      row('length', value(fromMeta((meta) => duration(meta.durationMs)))),
+      row('ids', present.map((side) => ref[side]!.abbrevId).join(' → ')),
+    ];
+  }
   return [
     row('format', formatLabel(ref.format)),
     row('pixels', value(pixels)),
@@ -421,7 +463,7 @@ function videoTable(ref: MediaRef, present: SideName[], infos: Partial<Record<Si
         if (delta !== 0) cells.length!.push(part(` ${signed(delta, `${Math.abs(delta)} s`)}`, delta < 0 ? 'smaller' : 'larger'));
       }
       const bytes = info.bytes - other.bytes;
-      if (bytes !== 0) cells.size!.push(part(` ${signed(bytes, formatBytes(Math.abs(bytes)))}`, bytes < 0 ? 'smaller' : 'larger'));
+      if (bytes !== 0) cells.size!.push(part(` ${signed(bytes, formatBytes(Math.abs(bytes), Math.max(info.bytes, other.bytes)))}`, bytes < 0 ? 'smaller' : 'larger'));
       if (meta && otherMeta && (meta.width !== otherMeta.width || meta.height !== otherMeta.height || meta.codec !== otherMeta.codec || Math.round(meta.fps) !== Math.round(otherMeta.fps))) {
         cells[columns.at(-1)!.name]!.push(part(' changed', 'changed'));
       }
@@ -441,10 +483,14 @@ type StripGeometry = {frames: 2 | 4; frameCols: number; cols: number; rows: numb
 // ffprobe; other aspects letterbox inside the frame.
 function stripGeometry(inner: number, caps: GraphicsCaps, oneStrip: boolean): StripGeometry {
   const frames: 2 | 4 = !oneStrip && inner >= 4 * VIDEO_MIN_FRAME_COLS + 3 * VIDEO_GAP ? 4 : 2;
-  const frameCols = Math.max(1, Math.floor((inner - (frames - 1) * VIDEO_GAP) / frames));
+  // Past the 297-cell cap the frames narrow, so the strip is still whole
+  // frames and gaps: the worker works the frame width out from the box's
+  // width, and the timestamps under the frames must use the same one.
+  const fits = (width: number) => Math.floor((width - (frames - 1) * VIDEO_GAP) / frames);
+  const frameCols = Math.max(1, Math.min(fits(inner), fits(MAX_BOX_CELLS)));
   const ideal = Math.round((frameCols * 9 / 16) * caps.cellPx.w / caps.cellPx.h);
   const rows = clamp(ideal, VIDEO_MIN_ROWS, oneStrip ? VIDEO_MAX_ROWS * 2 : VIDEO_MAX_ROWS);
-  return {frames, frameCols, cols: Math.min(MAX_BOX_CELLS, frames * frameCols + (frames - 1) * VIDEO_GAP), rows: Math.min(MAX_BOX_CELLS, rows)};
+  return {frames, frameCols, cols: frames * frameCols + (frames - 1) * VIDEO_GAP, rows: Math.min(MAX_BOX_CELLS, rows)};
 }
 
 function stripBox(ref: MediaRef, side: SideName, geometry: StripGeometry, caps: GraphicsCaps): BoxSpec {
@@ -507,9 +553,8 @@ export function planMedia(
   sides: Partial<Record<SideName, SideState>>,
   view: MediaViewState,
   layout: Layout,
-  // What drawing found out: the share of a difference's pixels that changed.
-  // It only changes label text, never the rows.
-  drawn: {changedRatio?: number} = {},
+  // What drawing found out. It only changes label text, never the rows.
+  drawn: DrawnFacts = {},
 ): MediaPlan {
   const present = (['before', 'after'] as const).filter((side) => ref[side]);
   const states = Object.fromEntries(present.map((side) => [side, sides[side] ?? {status: 'pending'}])) as Partial<Record<SideName, SideState>>;
@@ -533,7 +578,7 @@ export function planMedia(
   }
 
   if (present.length === 1) {
-    return {rows: singlePlan(ref, present[0]!, info(present[0]!), layout, Math.max(4, layout.viewportRows - 2)), prefetch: [], textView: false};
+    return {rows: singlePlan(ref, present[0]!, info(present[0]!), layout, Math.max(4, layout.viewportRows - 2), drawn), prefetch: [], textView: false};
   }
 
   const tabs = tabRow(view);
@@ -542,17 +587,17 @@ export function planMedia(
     const shown = ready[0]!;
     const failed = present.find((side) => side !== shown)!;
     const note = `${failed}: ${reasonFor(states[failed]!, layout.watching)}`;
-    return {rows: [tabs, ...singlePlan(ref, shown, info(shown), layout, rowsCap, note)], prefetch: [], textView: false};
+    return {rows: [tabs, ...singlePlan(ref, shown, info(shown), layout, rowsCap, drawn, note)], prefetch: [], textView: false};
   }
 
   const before = info('before');
   const after = info('after');
   if (view.compare === 'flip') {
-    const flip = flipPlan(ref, before, after, view, layout);
+    const flip = flipPlan(ref, before, after, view, layout, drawn);
     return {rows: [tabs, ...flip.rows], prefetch: flip.prefetch, textView: false};
   }
   if (view.compare === 'difference') return {rows: [tabs, ...differencePlan(ref, before, after, layout, drawn.changedRatio)], prefetch: [], textView: false};
-  return {rows: [tabs, ...sideBySidePlan(ref, before, after, layout)], prefetch: [], textView: false};
+  return {rows: [tabs, ...sideBySidePlan(ref, before, after, layout, drawn)], prefetch: [], textView: false};
 }
 
 /** A plan row's text without styling, `width` cells at most; box rows have none. */
