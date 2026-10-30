@@ -1,4 +1,4 @@
-import type {RenderResult, RenderTarget} from '../backend.js';
+import type {JobFailure, RenderResult, RenderTarget} from '../backend.js';
 import type {Sniffed} from './sniff.js';
 import {MAX_PIXELS, svgSize} from './sniff.js';
 
@@ -194,6 +194,24 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
   }
 
   /**
+   * The image drawn at its own sniffed size as a plain PNG, with no padding
+   * or checkerboard: the copy a viewer opens in place of an SVG.
+   */
+  async function picture(bytes: Buffer, info: Sniffed): Promise<{ok: true; png: Buffer} | JobFailure> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+
+    try {
+      const physical = info.format === 'svg' && Boolean(svgSize(bytes)?.physical);
+      const size = {w: info.width, h: info.height};
+      const target = {cols: size.w, rows: size.h, cellPx: {w: 1, h: 1}, drawPx: size, nearest: false};
+      return {ok: true, png: await fitOnce(loaded.sharp, {bytes}, {...info, physical}, target, false, 1)};
+    } catch {
+      return {ok: false, state: 'error', reason: 'could not decode image'};
+    }
+  }
+
+  /**
    * The two sides' difference fitted into its box, with the share of the
    * canvas that changed. `target` is fitted to the larger canvas.
    */
@@ -226,7 +244,7 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   }
 
-  return {fit, difference, available: async () => !('reason' in await sharpOrReason())};
+  return {fit, picture, difference, available: async () => !('reason' in await sharpOrReason())};
 }
 
 export type Renderer = ReturnType<typeof createRenderer>;

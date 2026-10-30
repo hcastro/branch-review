@@ -1,4 +1,7 @@
 import {randomBytes} from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import sharp from 'sharp';
 import stringWidth from 'string-width';
 import stripAnsi from 'strip-ansi';
 import {afterEach, describe, expect, it, vi} from 'vitest';
@@ -25,8 +28,10 @@ import {
   type FixtureFile,
 } from './ui-fixtures.js';
 import {tooltipCoversKittyRows} from '../src/ui/App.js';
-import type {MediaBackend, RenderResult} from '../src/media/backend.js';
+import type {ExportRequest, ExportResult, MediaBackend, RenderResult} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
+import {createWorkerHandler} from '../src/media/worker/handler.js';
+import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
 import {addMediaRows} from '../src/ui/mediaRows.js';
 import type {SectionRow} from '../src/sections.js';
 
@@ -36,6 +41,7 @@ import type {SectionRow} from '../src/sections.js';
 
 afterEach(() => {
   vi.useRealTimers();
+  cleanupTempDirs();
 });
 
 const SIZE = {columns: 120, rows: 30};
@@ -1387,18 +1393,76 @@ describe('SVG picture first', () => {
     instance.unmount();
   });
 
-  it('opens a temp copy of the SVG with o', async () => {
-    const {instance, opened, calls} = mediaApp([FLOW], {sides: SVG_SIDES});
+  const NS = 'xmlns="http://www.w3.org/2000/svg"';
+  const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  // The worker's own export job over `source` as the side's verified bytes,
+  // writing into a real session temp dir.
+  function workerExport(source: string) {
+    const handler = createWorkerHandler({reader: {read: async (_cwd, side) => ({ok: true, bytes: Buffer.from(source), oid: side.abbrevId.padEnd(40, '0')})}});
+    return {
+      tempDir: makeTempDir('branch-review-media-open-'),
+      exportCopy: (request: ExportRequest) => handler.handle({type: 'exportCopy', ...request}) as Promise<ExportResult>,
+    };
+  }
+  const filesUnder = (dir: string): string[] => fs.readdirSync(dir, {withFileTypes: true})
+    .flatMap((entry) => (entry.isDirectory() ? filesUnder(path.join(dir, entry.name)) : [path.join(dir, entry.name)]));
+
+  it('opens a PNG of the SVG picture at its own size with o', async () => {
+    const picture = workerExport(`<svg ${NS} width="200" height="100"><rect width="200" height="100" fill="#1e78c8"/></svg>`);
+    const {instance, opened, calls} = mediaApp([FLOW], {sides: SVG_SIDES, ...picture});
     await settle();
     instance.stdin.write('o');
-    await settle();
+    await vi.waitFor(() => expect(text(instance.lastFrame())).toMatch(/opened flow\.svg \(after\)|can't open/), {timeout: 20_000});
     const exported = calls.filter((call) => call.type === 'exportCopy');
     expect(exported).toHaveLength(1);
     expect(exported[0]!.request).toMatchObject({format: 'svg', side: {abbrevId: SVG_ID}});
     expect(opened).toHaveLength(1);
     expect(opened[0]!.command).toBe('/usr/bin/open');
-    expect(opened[0]!.args[0]!.startsWith('/')).toBe(true);
+    const file = opened[0]!.args[0]!;
+    expect(file.startsWith(`${picture.tempDir}${path.sep}`)).toBe(true);
+    expect(path.basename(file)).toBe(`${SVG_ID.padEnd(40, '0')}.png`);
+    const bytes = fs.readFileSync(file);
+    expect(bytes.subarray(0, 8)).toEqual(PNG_SIGNATURE);
+    const {data, info} = await sharp(bytes).ensureAlpha().raw().toBuffer({resolveWithObject: true});
+    expect(info).toMatchObject({format: 'raw', width: 200, height: 100});
+    const middle = (50 * 200 + 100) * 4;
+    expect([...data.subarray(middle, middle + 4)]).toEqual([0x1e, 0x78, 0xc8, 255]);
     expect(text(instance.lastFrame())).toContain('opened flow.svg (after)');
+    instance.unmount();
+  });
+
+  it('hands o and Quick Look a PNG, never the SVG, when the SVG carries a script', async () => {
+    const picture = workerExport(`<svg ${NS} width="40" height="30"><script>alert(document.cookie)</script><rect width="40" height="30" fill="#c83228"/></svg>`);
+    const {instance, opened} = mediaApp([FLOW], {sides: SVG_SIDES, ...picture});
+    await settle();
+    instance.stdin.write('o');
+    await vi.waitFor(() => expect(text(instance.lastFrame())).toMatch(/opened flow\.svg \(after\)|can't open/), {timeout: 20_000});
+    instance.stdin.write('O');
+    await vi.waitFor(() => expect(text(instance.lastFrame())).toMatch(/quick look flow\.svg \(after\)|can't open/), {timeout: 20_000});
+    expect(opened.map((each) => each.command)).toEqual(['/usr/bin/open', '/usr/bin/qlmanage']);
+    expect(opened[1]!.args[0]).toBe('-p');
+    for (const file of opened.map((each) => each.args.at(-1)!)) {
+      expect(file.endsWith('.png')).toBe(true);
+      expect(file.endsWith('.svg')).toBe(false);
+      const bytes = fs.readFileSync(file);
+      expect(bytes.subarray(0, 8)).toEqual(PNG_SIGNATURE);
+      expect(bytes.includes('<script')).toBe(false);
+      expect(await sharp(bytes).metadata()).toMatchObject({format: 'png', width: 40, height: 30});
+    }
+    // No copy of the SVG itself was written anywhere a viewer could reach.
+    expect(filesUnder(picture.tempDir).filter((file) => !file.endsWith('.png'))).toEqual([]);
+    instance.unmount();
+  });
+
+  it('opens nothing and says why when the SVG cannot be drawn', async () => {
+    const picture = workerExport(`<svg ${NS} width="40" height="30"><rect`);
+    const {instance, opened} = mediaApp([FLOW], {sides: SVG_SIDES, ...picture});
+    await settle();
+    instance.stdin.write('o');
+    await vi.waitFor(() => expect(text(instance.lastFrame())).toMatch(/opened flow\.svg|can't open/), {timeout: 20_000});
+    expect(text(instance.lastFrame())).toContain("can't open: could not decode image");
+    expect(opened).toEqual([]);
+    expect(filesUnder(picture.tempDir)).toEqual([]);
     instance.unmount();
   });
 

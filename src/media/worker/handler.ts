@@ -14,7 +14,8 @@ import {isFormat, magicFormat, notFormatReason, sniffImage} from './sniff.js';
 const MAX_PASSTHROUGH_BYTES = 4 * 1024 * 1024;
 
 // Copies for a viewer are named from this list only, never from the repo.
-const EXTENSIONS: Partial<Record<MediaFormat, string>> = {png: 'png', jpeg: 'jpg', gif: 'gif', webp: 'webp', avif: 'avif', svg: 'svg'};
+// An SVG's copy is a PNG of its picture (see exportCopy).
+const EXTENSIONS: Partial<Record<MediaFormat, string>> = {png: 'png', jpeg: 'jpg', gif: 'gif', webp: 'webp', avif: 'avif', svg: 'png'};
 
 type HandlerOptions = {
   loadSharp?: SharpLoader;
@@ -80,9 +81,22 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
     if (!read.ok) return read;
     // Only an allow-listed format confirmed by its magic bytes (an SVG: its
     // root element) is handed to a viewer, so opening it never launches an
-    // app or a shell script. An SVG is a document, though: the default
-    // viewer may be a browser, which runs any script inside it.
+    // app or a shell script.
     if (!isFormat(read.bytes, request.format)) return {ok: false, state: 'error', reason: notFormatReason(request.format)};
+    let bytes: Buffer = read.bytes;
+    let name = `${request.side.side}.${extension}`;
+    if (request.format === 'svg') {
+      // An SVG is a document, and the default viewer may be a browser, which
+      // runs any script inside it. The viewer gets a PNG of the picture
+      // instead, drawn at the SVG's own size; one that cannot be drawn opens
+      // nothing.
+      const sniffed = sniffImage(read.bytes, 'svg');
+      if (!sniffed.ok) return {ok: false, state: 'error', reason: sniffed.reason};
+      const drawn = await renderer.picture(read.bytes, sniffed);
+      if (!drawn.ok) return drawn;
+      bytes = drawn.png;
+      name = `${read.oid}.${extension}`;
+    }
 
     try {
       let dir: string;
@@ -96,8 +110,8 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
           if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         }
       }
-      const target = path.join(dir, `${request.side.side}.${extension}`);
-      fs.writeFileSync(target, read.bytes, {flag: 'wx', mode: 0o600});
+      const target = path.join(dir, name);
+      fs.writeFileSync(target, bytes, {flag: 'wx', mode: 0o600});
       return {ok: true, path: target};
     } catch (error) {
       return {ok: false, state: 'error', reason: (error instanceof Error ? error.message : String(error)).split('\n')[0]!};

@@ -13,7 +13,7 @@ import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
-import type {ExportRequest, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
+import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
 import type {SideInfo} from '../src/media/types.js';
 import {KITTY_CAPS, pngFixture} from './media-helpers.js';
 
@@ -397,12 +397,14 @@ type FakeSide = SideInfo | {error: string; state?: 'stale' | 'error'};
 
 /**
  * An in-process media backend: canned side facts by object id, and a PNG of
- * the box's canvas size for every render. Every call is recorded.
+ * the box's canvas size for every render. Every call is recorded. `exportCopy`
+ * answers the export job instead of the canned path (the worker's own job, say).
  */
-export function fakeMediaBackend({sides = {}, render, exportDir}: {
+export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy}: {
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
   exportDir?: string;
+  exportCopy?: (request: ExportRequest) => Promise<ExportResult>;
 } = {}) {
   const calls: FakeBackendCall[] = [];
   let disposed = 0;
@@ -422,6 +424,7 @@ export function fakeMediaBackend({sides = {}, render, exportDir}: {
     },
     async exportCopy(request) {
       calls.push({type: 'exportCopy', request});
+      if (exportCopy) return exportCopy(request);
       return {ok: true, path: `${exportDir ?? request.dir}/open-1/${request.side.side}.png`};
     },
     dispose() {
@@ -436,24 +439,26 @@ export function fakeMediaBackend({sides = {}, render, exportDir}: {
  * (kept apart from the frames, so a frame is never an escape) and a
  * recording opener.
  */
-export function fakeMediaService({caps = KITTY_CAPS, sides, render, env = {}, review, includeWorktree = false, watching, registry}: {
+export function fakeMediaService({caps = KITTY_CAPS, sides, render, exportCopy, tempDir = '/tmp/branch-review-media-test', env = {}, review, includeWorktree = false, watching, registry}: {
   caps?: GraphicsCaps;
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
+  exportCopy?: (request: ExportRequest) => Promise<ExportResult>;
+  tempDir?: string;
   env?: NodeJS.ProcessEnv;
   review?: ReviewModel;
   includeWorktree?: boolean;
   watching?: boolean;
   registry?: Parameters<typeof createMediaService>[0]['registry'];
 } = {}) {
-  const fake = fakeMediaBackend({sides, render});
+  const fake = fakeMediaBackend({sides, render, ...(exportCopy ? {exportCopy} : {})});
   const graphicsWrites: string[] = [];
   const opened: Array<{command: string; args: string[]}> = [];
   const service = createMediaService({
     caps,
     backend: fake.backend,
     sink: {write: (sequence) => graphicsWrites.push(sequence)},
-    tempDir: () => '/tmp/branch-review-media-test',
+    tempDir: () => tempDir,
     opener: (command, args) => opened.push({command, args}),
     env,
     platform: 'darwin',

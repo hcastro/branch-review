@@ -986,7 +986,7 @@ describe('SVG pictures in the media worker', {timeout: 60_000}, () => {
     expect(result).toMatchObject({ok: true, changedRatio: 0.5});
   });
 
-  it('exports a copy of a verified SVG for a viewer, and nothing for bytes that are not one', async () => {
+  it('exports a PNG of a verified SVG picture for a viewer, and nothing for bytes that are not one', async () => {
     const cwd = initRepo();
     const source = `<svg ${NS} width="4" height="4"/>`;
     fs.writeFileSync(path.join(cwd, 'icon.svg'), source);
@@ -998,8 +998,11 @@ describe('SVG pictures in the media worker', {timeout: 60_000}, () => {
     const result = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'icon.svg'), format: 'svg', dir});
     expect(result).toMatchObject({ok: true});
     if (!result.ok || !('path' in result)) return;
-    expect(path.basename(result.path)).toBe('after.svg');
-    expect(fs.readFileSync(result.path, 'utf8')).toBe(source);
+    const oid = git(cwd, 'rev-parse', 'HEAD:icon.svg').trim();
+    expect(path.basename(result.path)).toBe(`${oid}.png`);
+    expect(result.path.startsWith(`${dir}${path.sep}`)).toBe(true);
+    expect(fs.statSync(result.path).mode & 0o777).toBe(0o600);
+    expect(await sharp(fs.readFileSync(result.path)).metadata()).toMatchObject({format: 'png', width: 4, height: 4});
 
     const fake = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'fake.svg'), format: 'svg', dir: makeTempDir('branch-review-media-export-')});
     expect(fake).toEqual({ok: false, state: 'error', reason: 'not an SVG image'});
