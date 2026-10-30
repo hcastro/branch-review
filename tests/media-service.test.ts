@@ -1,6 +1,6 @@
 import {randomBytes} from 'node:crypto';
 import {describe, expect, it} from 'vitest';
-import type {InspectResult, MediaBackend, RenderResult} from '../src/media/backend.js';
+import type {InspectResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
 import {planMedia, type BoxSpec} from '../src/media/layout.js';
 import {createMediaService} from '../src/media/service.js';
 import type {MediaRef} from '../src/media/types.js';
@@ -337,5 +337,150 @@ describe('media service', () => {
     service.sweep(keys, keys);
     await flush(4);
     expect(service.boxState(wanted!.box as BoxSpec)).toEqual({status: 'error', reason: 'changed on disk · restart to see it'});
+  });
+});
+
+// Compare modes: a session-wide choice of view for modified images, a flip
+// side per file, and the difference rendered from both sides.
+describe('media service compare modes', () => {
+  function modifiedReview(...pairs: Array<[string, string]>): ReviewModel {
+    return buildFixture(pairs.map(([before, after], index) => binaryMediaFile(`img/${index}.png`, 'modified', [before, after]))).review;
+  }
+
+  function planOf(service: ReturnType<typeof serviceOver>['service'], ref: MediaRef) {
+    return planMedia(
+      ref,
+      {before: service.sideState(ref, 'before'), after: service.sideState(ref, 'after')},
+      service.viewState(ref.fileKey),
+      {innerWidth: 100, viewportRows: 20, caps: KITTY_CAPS},
+      service.drawnFacts(ref),
+    );
+  }
+
+  it('keeps the compare mode for every file and across reviews, and the flip side per file until reset', async () => {
+    const {backend} = scriptedBackend();
+    const {service, notified} = serviceOver(backend);
+    const model = modifiedReview(['1111111', '2222222'], ['3333333', '4444444']);
+    service.setReview(model, range);
+    const [first, second] = model.files.map((file) => service.refFor(file) as MediaRef);
+    expect(service.viewState(first!.fileKey)).toEqual({compare: 'sideBySide', flipSide: 'after', textView: false});
+
+    const plans = service.planVersion();
+    const before = notified();
+    service.setCompare('flip');
+    expect(service.planVersion()).toBeGreaterThan(plans);
+    expect(notified()).toBeGreaterThan(before);
+    expect(service.viewState(first!.fileKey).compare).toBe('flip');
+    expect(service.viewState(second!.fileKey).compare).toBe('flip');
+
+    // The same mode again changes nothing.
+    const unchanged = service.planVersion();
+    service.setCompare('flip');
+    expect(service.planVersion()).toBe(unchanged);
+
+    service.swapFlip(first!.fileKey);
+    expect(service.viewState(first!.fileKey).flipSide).toBe('before');
+    expect(service.viewState(second!.fileKey).flipSide).toBe('after');
+    service.swapFlip(first!.fileKey);
+    expect(service.viewState(first!.fileKey).flipSide).toBe('after');
+    service.swapFlip(first!.fileKey);
+
+    // A refresh keeps both the mode and the side.
+    service.setReview(modifiedReview(['1111111', '2222222'], ['3333333', '5555555']), range);
+    expect(service.viewState(first!.fileKey)).toMatchObject({compare: 'flip', flipSide: 'before'});
+
+    service.resetFlip();
+    expect(service.viewState(first!.fileKey)).toMatchObject({compare: 'flip', flipSide: 'after'});
+    // Nothing to reset: no new plan.
+    const reset = service.planVersion();
+    service.resetFlip();
+    expect(service.planVersion()).toBe(reset);
+  });
+
+  it('shows the flip side, the before side of a deleted file, and otherwise the after side', () => {
+    const {backend} = scriptedBackend();
+    const {service} = serviceOver(backend);
+    const model = buildFixture([
+      binaryMediaFile('img/m.png', 'modified', ['1111111', '2222222']),
+      binaryMediaFile('img/d.png', 'deleted', ['3333333', '0000000']),
+    ]).review;
+    service.setReview(model, range);
+    const [modified, deleted] = model.files.map((file) => service.refFor(file) as MediaRef);
+    expect(service.shownSide(modified!)).toBe('after');
+    expect(service.shownSide(deleted!)).toBe('before');
+    service.setCompare('flip');
+    service.swapFlip(modified!.fileKey);
+    expect(service.shownSide(modified!)).toBe('before');
+    // Flipping means nothing for a file with one side.
+    expect(service.shownSide(deleted!)).toBe('before');
+  });
+
+  it('renders the difference from both sides once both are inspected, and keeps the changed ratio for the label', async () => {
+    const requests: RenderRequest[] = [];
+    const backend: MediaBackend = {
+      ...scriptedBackend().backend,
+      async render(request) {
+        requests.push(request);
+        const {cols, rows, cellPx} = request.target;
+        return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h), changedRatio: 0.31};
+      },
+    };
+    const {service, writes} = serviceOver(backend);
+    const model = modifiedReview(['1111111', '2222222']);
+    service.setReview(model, range);
+    service.setCompare('difference');
+    const ref = service.refFor(model.files[0]!) as MediaRef;
+    await flush(4);
+
+    const plan = planOf(service, ref);
+    const box = plan.rows.find((row): row is Extract<typeof row, {type: 'box'}> => row.type === 'box')!.boxes[0]!;
+    expect(box).toMatchObject({role: 'diff', op: 'difference'});
+    const keys = new Set([box.imageKey]);
+    const plans = service.planVersion();
+    service.want([{fileKey: ref.fileKey, box}], keys);
+    service.sweep(keys, keys);
+    await flush(4);
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({op: 'difference', kind: 'raster', format: 'png'});
+    expect(requests[0]!.sides.map((side) => [side.side, side.abbrevId])).toEqual([['before', '1111111'], ['after', '2222222']]);
+    expect(service.boxState(box)).toMatchObject({status: 'kitty'});
+    expect(parseApc(writes).filter((command) => command.a === 't')).toHaveLength(1);
+    expect(service.drawnFacts(ref)).toEqual({changedRatio: 0.31});
+    // The label changes, so the rows are built again.
+    expect(service.planVersion()).toBeGreaterThan(plans);
+    expect(planOf(service, ref).rows.length).toBe(plan.rows.length);
+  });
+
+  it('waits for both sides before rendering a difference, and never renders one with a failed side', async () => {
+    const gate: {open?: () => void} = {};
+    const {backend, renders} = scriptedBackend({inspect: {
+      '1111111': () => ({ok: false, state: 'error', reason: 'could not decode image'}),
+    }});
+    const slow: MediaBackend = {
+      ...backend,
+      async inspect(request, signal) {
+        if (request.side.abbrevId === '2222222') await new Promise<void>((resolve) => { gate.open = resolve; });
+        return backend.inspect(request, signal);
+      },
+    };
+    const {service} = serviceOver(slow);
+    const model = modifiedReview(['1111111', '2222222']);
+    service.setReview(model, range);
+    service.setCompare('difference');
+    const ref = service.refFor(model.files[0]!) as MediaRef;
+    await flush(4);
+    // A diff box with the after side still pending: nothing to render.
+    const box: BoxSpec = {imageKey: `${ref.contentKey}|diff|10x5|10x20`, role: 'diff', cols: 10, rows: 5, leftPad: 0, drawPx: {w: 100, h: 100}, nearest: false, op: 'difference'};
+    const keys = new Set([box.imageKey]);
+    service.want([{fileKey: ref.fileKey, box}], keys);
+    await flush(4);
+    expect(renders).toEqual([]);
+
+    gate.open!();
+    await flush(4);
+    service.want([{fileKey: ref.fileKey, box}], keys);
+    await flush(4);
+    expect(renders).toEqual([]);
   });
 });

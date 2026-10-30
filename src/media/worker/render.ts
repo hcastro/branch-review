@@ -18,6 +18,14 @@ const MAX_SHRINKS = 2;
 const DECODE_TIMEOUT_S = 6;
 const CHECK_PX = 8;
 const CHECK_TONES = [[0x1b, 0x21, 0x29], [0x14, 0x19, 0x20]] as const;
+// The difference view: a pixel changed when any channel moved by more than
+// this, so a lossy re-encode's noise does not light up the whole picture.
+const CHANGE_THRESHOLD = 8;
+// The after image under the marks keeps 45% of its brightness, and a
+// changed pixel is 60% of this tint over it.
+const DIFF_KEEP = 0.45;
+const DIFF_TINT = [0xd2, 0xa8, 0xff] as const;
+const DIFF_TINT_WEIGHT = 0.6;
 
 // Imported on first use, in the worker only: the library is large, slow to
 // load, and native.
@@ -43,6 +51,47 @@ function checkerboard(width: number, height: number) {
   return pixels;
 }
 
+type RawImage = {data: Buffer; width: number; height: number};
+
+// The difference of two decoded RGBA images aligned top-left on a canvas of
+// the larger width and height. A pixel only one side covers counts against
+// transparency, so sizes that differ show as change. Two pixels that are both
+// transparent, or within the threshold of it, look the same whatever colour
+// they hold, and PNG optimizers rewrite that colour freely, so only their
+// alpha is compared.
+export function differenceImage(before: RawImage, after: RawImage): RawImage & {changedRatio: number; hasAlpha: boolean} {
+  const width = Math.max(before.width, after.width);
+  const height = Math.max(before.height, after.height);
+  const data = Buffer.alloc(width * height * 4);
+  const empty = [0, 0, 0, 0];
+  let changed = 0;
+  let hasAlpha = false;
+  const channelOf = (at: number, pixels: Buffer, channel: number) => (at < 0 ? empty[channel]! : pixels[at + channel]!);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const a = x < before.width && y < before.height ? (y * before.width + x) * 4 : -1;
+      const b = x < after.width && y < after.height ? (y * after.width + x) * 4 : -1;
+      const invisible = channelOf(a, before.data, 3) <= CHANGE_THRESHOLD && channelOf(b, after.data, 3) <= CHANGE_THRESHOLD;
+      let differs = false;
+      for (let channel = invisible ? 3 : 0; channel < 4 && !differs; channel += 1) {
+        differs = Math.abs(channelOf(a, before.data, channel) - channelOf(b, after.data, channel)) > CHANGE_THRESHOLD;
+      }
+      const at = (y * width + x) * 4;
+      const alpha = b < 0 ? 0 : after.data[b + 3]!;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const dark = (b < 0 ? 0 : after.data[b + channel]!) * DIFF_KEEP;
+        // Marked over the darkened pixel as it shows on black, so a mark on
+        // a transparent pixel is the tint itself.
+        data[at + channel] = Math.round(differs ? dark * (alpha / 255) * (1 - DIFF_TINT_WEIGHT) + DIFF_TINT[channel]! * DIFF_TINT_WEIGHT : dark);
+      }
+      data[at + 3] = differs ? 255 : alpha;
+      if (differs) changed += 1;
+      else if (alpha < 255) hasAlpha = true;
+    }
+  }
+  return {data, width, height, changedRatio: changed / (width * height), hasAlpha};
+}
+
 export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLoader} = {}) {
   // Loaded once, on first use; a failed load is remembered for the worker's
   // life rather than retried per image.
@@ -61,7 +110,11 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   };
 
-  async function fitOnce(sharp: SharpFactory, bytes: Buffer, info: Sniffed, target: RenderTarget, checker: boolean, scale: number) {
+  // The source is encoded bytes, or a raw RGBA image made here (the
+  // difference view).
+  type Source = {bytes: Buffer} | {raw: RawImage};
+
+  async function fitOnce(sharp: SharpFactory, source: Source, info: Pick<Sniffed, 'hasAlpha'>, target: RenderTarget, checker: boolean, scale: number) {
     const canvasW = Math.max(1, Math.round(target.cols * target.cellPx.w * scale));
     const canvasH = Math.max(1, Math.round(target.rows * target.cellPx.h * scale));
     const drawW = Math.min(canvasW, Math.max(1, Math.round(target.drawPx.w * scale)));
@@ -69,7 +122,10 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
 
     // The input is always a buffer, never a path; one page, so an animation
     // shows its first frame.
-    const resized = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
+    const input = 'bytes' in source
+      ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
+      : sharp(source.raw.data, {limitInputPixels: MAX_PIXELS, raw: {width: source.raw.width, height: source.raw.height, channels: 4}});
+    const resized = await input
       .timeout({seconds: DECODE_TIMEOUT_S})
       .resize(drawW, drawH, {fit: 'fill', kernel: target.nearest ? 'nearest' : 'lanczos3'})
       .ensureAlpha()
@@ -93,19 +149,23 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
       .toBuffer();
   }
 
+  async function fitSource(sharp: SharpFactory, source: Source, info: Pick<Sniffed, 'hasAlpha'>, target: RenderTarget, checker: boolean) {
+    let scale = 1;
+    let png = await fitOnce(sharp, source, info, target, checker, scale);
+    for (let shrink = 0; shrink < MAX_SHRINKS && png.byteLength > MAX_PNG_BYTES; shrink += 1) {
+      scale *= SHRINK;
+      png = await fitOnce(sharp, source, info, target, checker, scale);
+    }
+    return png;
+  }
+
   /** The image fitted into its box as a padded PNG. */
   async function fit(bytes: Buffer, info: Sniffed, target: RenderTarget, checker: boolean): Promise<RenderResult> {
     const loaded = await sharpOrReason();
     if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
 
     try {
-      let scale = 1;
-      let png = await fitOnce(loaded.sharp, bytes, info, target, checker, scale);
-      for (let shrink = 0; shrink < MAX_SHRINKS && png.byteLength > MAX_PNG_BYTES; shrink += 1) {
-        scale *= SHRINK;
-        png = await fitOnce(loaded.sharp, bytes, info, target, checker, scale);
-      }
-      return {ok: true, png};
+      return {ok: true, png: await fitSource(loaded.sharp, {bytes}, info, target, checker)};
     } catch {
       // A corrupt file, or one caught half-written: tried again only when its
       // content id changes.
@@ -113,7 +173,40 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   }
 
-  return {fit, available: async () => !('reason' in await sharpOrReason())};
+  /**
+   * The two sides' difference fitted into its box, with the share of the
+   * canvas that changed. `target` is fitted to the larger canvas.
+   */
+  async function difference(before: Buffer, after: Buffer, target: RenderTarget, checker: boolean): Promise<RenderResult> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+
+    const {sharp} = loaded;
+    const decode = async (bytes: Buffer): Promise<RawImage> => {
+      const {data, info} = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
+        .timeout({seconds: DECODE_TIMEOUT_S})
+        .ensureAlpha()
+        .raw()
+        .toBuffer({resolveWithObject: true});
+      return {data, width: info.width, height: info.height};
+    };
+    try {
+      const [left, right] = await Promise.all([decode(before), decode(after)]);
+      // Each side passed the pixel cap; their combined canvas must too.
+      const width = Math.max(left.width, right.width);
+      const height = Math.max(left.height, right.height);
+      if (width * height > MAX_PIXELS) return {ok: false, state: 'error', reason: `image too large to preview (${width} × ${height})`};
+      const diff = differenceImage(left, right);
+      const png = await fitSource(sharp, {raw: diff}, diff, target, checker);
+      return {ok: true, png, changedRatio: diff.changedRatio};
+    } catch {
+      // A corrupt file, or one caught half-written: tried again only when its
+      // content id changes.
+      return {ok: false, state: 'error', reason: 'could not decode image'};
+    }
+  }
+
+  return {fit, difference, available: async () => !('reason' in await sharpOrReason())};
 }
 
 export type Renderer = ReturnType<typeof createRenderer>;

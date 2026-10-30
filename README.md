@@ -103,6 +103,7 @@ Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` 
 | `o` | Open the image on screen in the default viewer |
 | `O` | Quick Look the image on macOS. Elsewhere it works like `o`. |
 | `v` | Switch the image to a details table and back |
+| `1` / `2` / `3` | Compare a modified image side by side, by flipping between its versions, or as a difference. `2` again flips to the other version. |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 
 The focused block is the one at the top of the diff pane, and it's marked. The footer keeps a short hint of these keys.
@@ -181,7 +182,9 @@ Some copies fail on purpose, and the toast names the reason:
 
 ### Images
 
-In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. A modified image shows its new version. An animated GIF or WebP shows its first frame.
+In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. An animated GIF or WebP shows its first frame.
+
+A modified image opens with its old and new versions side by side. `2` (or the tab row above the picture) switches to flip mode, which shows one version at a time: press `2` again or click the picture to swap. `3` shows the difference, with changed pixels marked over a darkened copy of the new version and the share of the image that changed. The mode you pick stays for the rest of the session. The metrics row shows both versions' sizes and the change in bytes.
 
 | Terminal | Images |
 | --- | --- |

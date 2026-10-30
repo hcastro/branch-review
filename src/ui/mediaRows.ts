@@ -51,29 +51,22 @@ export function styledPlanRow(row: PlanTextRow, width: number) {
   return truncateAnsi(out, width);
 }
 
-// A modified image's picture shows its after side alone; side by side, flip
-// and difference views build on this with both sides. The text view's
-// details list both sides, before → after.
-function shownRef(ref: MediaRef, textView: boolean): MediaRef {
-  if (textView || !ref.before || !ref.after) return ref;
-  const {before: _before, ...afterOnly} = ref;
-  return afterOnly;
-}
-
 function planLines(ref: MediaRef, media: MediaRowInput, layout: MediaRowsLayout) {
   const view = media.viewState(ref.fileKey);
-  const shown = shownRef(ref, view.textView);
   const sides = {
-    ...(shown.before ? {before: media.sideState(shown, 'before')} : {}),
-    ...(shown.after ? {after: media.sideState(shown, 'after')} : {}),
+    ...(ref.before ? {before: media.sideState(ref, 'before')} : {}),
+    ...(ref.after ? {after: media.sideState(ref, 'after')} : {}),
   };
-  const plan = planMedia(shown, sides, view, {...layout, caps: media.caps, watching: media.watching});
+  const plan = planMedia(ref, sides, view, {...layout, caps: media.caps, watching: media.watching}, media.drawnFacts(ref));
+  // The hidden flip side rides on every box row, so it is sent ahead
+  // whenever the shown side is near the viewport.
+  const prefetch = plan.prefetch.length > 0 ? {prefetch: plan.prefetch} : {};
   const lines: string[] = [];
   const rows: SectionRow[] = [];
   for (const row of plan.rows as PlanRow[]) {
     if (row.type === 'box') {
       lines.push('');
-      rows.push({block: -1, kind: 'media', continuation: false, media: {fileKey: ref.fileKey, boxes: row.boxes, boxRow: row.boxRow, ...(row.swap ? {swap: true} : {})}});
+      rows.push({block: -1, kind: 'media', continuation: false, media: {fileKey: ref.fileKey, boxes: row.boxes, boxRow: row.boxRow, ...(row.swap ? {swap: true} : {}), ...prefetch}});
     } else {
       lines.push(styledPlanRow(row, layout.innerWidth));
       rows.push({block: -1, kind: 'media', continuation: false, media: {fileKey: ref.fileKey, ...(row.spans ? {spans: row.spans} : {})}});

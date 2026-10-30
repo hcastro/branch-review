@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type {ExportResult, InspectResult, RenderResult, WorkerRequest} from '../backend.js';
 import {formatLabel} from '../layout.js';
-import type {MediaFormat} from '../types.js';
+import type {MediaFormat, SideRef} from '../types.js';
 import {createSideReader, type SideReader} from './read.js';
 import {createRenderer, type SharpLoader} from './render.js';
 import {magicFormat, sniffImage} from './sniff.js';
@@ -38,21 +38,38 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
     return {ok: true, info: {oid: read.oid, bytes: read.bytes.byteLength, ...facts}};
   }
 
-  async function render(request: Extract<WorkerRequest, {type: 'render'}>): Promise<RenderResult> {
-    if (request.op !== 'fit' || request.kind !== 'raster' || request.sides.length !== 1) {
-      return {ok: false, state: 'error', reason: `${request.op} view is not supported for ${request.kind} files`};
-    }
-    const side = request.sides[0]!;
+  // A side's bytes, verified, with the facts their header gives.
+  async function readImage(request: Extract<WorkerRequest, {type: 'render'}>, side: SideRef) {
     const read = await reader.read(request.cwd, side, request.kind);
     if (!read.ok) return read;
     const format = request.format ?? magicFormat(read.bytes);
-    if (!format) return {ok: false, state: 'error', reason: 'not an image'};
+    if (!format) return {ok: false as const, state: 'error' as const, reason: 'not an image'};
     const sniffed = sniffImage(read.bytes, format);
-    if (!sniffed.ok) return {ok: false, state: 'error', reason: sniffed.reason};
+    if (!sniffed.ok) return {ok: false as const, state: 'error' as const, reason: sniffed.reason};
+    return {ok: true as const, bytes: read.bytes, format, sniffed};
+  }
 
-    const result = await renderer.fit(read.bytes, sniffed, request.target, request.checker);
-    if (!result.ok && result.state === 'unavailable' && format === 'png' && read.bytes.byteLength <= MAX_PASSTHROUGH_BYTES) {
-      return {ok: true, png: read.bytes, passthrough: true};
+  async function render(request: Extract<WorkerRequest, {type: 'render'}>): Promise<RenderResult> {
+    const sides = request.op === 'difference' ? 2 : 1;
+    if ((request.op !== 'fit' && request.op !== 'difference') || request.kind !== 'raster' || request.sides.length !== sides) {
+      return {ok: false, state: 'error', reason: `${request.op} view is not supported for ${request.kind} files`};
+    }
+
+    if (request.op === 'difference') {
+      const before = await readImage(request, request.sides[0]!);
+      if (!before.ok) return before;
+      const after = await readImage(request, request.sides[1]!);
+      if (!after.ok) return after;
+      // No passthrough here: the terminal can draw a PNG, not compare two.
+      return renderer.difference(before.bytes, after.bytes, request.target, request.checker);
+    }
+
+    const image = await readImage(request, request.sides[0]!);
+    if (!image.ok) return image;
+    const {bytes, format, sniffed} = image;
+    const result = await renderer.fit(bytes, sniffed, request.target, request.checker);
+    if (!result.ok && result.state === 'unavailable' && format === 'png' && bytes.byteLength <= MAX_PASSTHROUGH_BYTES) {
+      return {ok: true, png: bytes, passthrough: true};
     }
     return result;
   }

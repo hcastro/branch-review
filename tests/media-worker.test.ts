@@ -574,3 +574,182 @@ describe('the media worker client', {timeout: 30_000}, () => {
     expect(Date.now() - answeredAt).toBeLessThan(10_000);
   }, 60_000);
 });
+
+// The difference view: both sides decoded in the worker onto one canvas,
+// changed pixels counted and marked, then fitted into the box like any
+// picture.
+describe('the difference view in the real media worker', {timeout: 60_000}, () => {
+  const BLUE = [30, 120, 200, 255] as const;
+  const RED = [220, 40, 40, 255] as const;
+
+  async function differenceOf(beforePng: Buffer, afterPng: Buffer, maxCols = 40, maxRows = 20) {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'before.png'), beforePng);
+    fs.writeFileSync(path.join(cwd, 'after.png'), afterPng);
+    commitAll(cwd, 'add both sides');
+    const before: SideRef = {...blobSide(cwd, 'before.png'), side: 'before'};
+    const after = blobSide(cwd, 'after.png');
+    const [a, b] = await Promise.all([sharp(beforePng).metadata(), sharp(afterPng).metadata()]);
+    const canvas = {w: Math.max(a.width!, b.width!), h: Math.max(a.height!, b.height!)};
+    const box = fitBox(canvas, maxCols, maxRows, KITTY_CAPS);
+    const request: RenderRequest = {
+      cwd,
+      op: 'difference',
+      sides: [before, after],
+      kind: 'raster',
+      format: 'png',
+      checker: false,
+      target: {cols: box.cols, rows: box.rows, cellPx: CELL, drawPx: box.drawPx, nearest: box.nearest},
+    };
+    const {backend} = backendFor();
+    const result = await backend.render(request, never);
+    return {result, request};
+  }
+
+  async function pixelAt(png: Uint8Array, request: RenderRequest, x: number, y: number) {
+    const {data, info} = await sharp(png).raw().toBuffer({resolveWithObject: true});
+    const left = Math.floor((info.width - request.target.drawPx.w) / 2);
+    const top = Math.floor((info.height - request.target.drawPx.h) / 2);
+    const at = ((top + y) * info.width + left + x) * info.channels;
+    return [...data.subarray(at, at + 4)];
+  }
+
+  it('counts the changed pixels, marks them, and darkens the rest, at the padded cell size', async () => {
+    // The left quarter of a 100 × 40 picture turns red.
+    const before = pngFixture(100, 40, BLUE);
+    const after = pngFixture(100, 40, (x) => (x < 25 ? RED : BLUE));
+    const {result, request} = await differenceOf(before, after);
+    if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+    expect(result.changedRatio).toBe(0.25);
+    const meta = await sharp(result.png).metadata();
+    expect([meta.width, meta.height]).toEqual([request.target.cols * CELL.w, request.target.rows * CELL.h]);
+    expect(request.target.drawPx).toEqual({w: 100, h: 40});
+
+    // A changed pixel is tinted towards #d2a8ff; an unchanged one is the
+    // after image darkened by 55%.
+    const changed = await pixelAt(result.png, request, 10, 20);
+    expect(changed[3]).toBe(255);
+    expect(changed[0]).toBeGreaterThan(150);
+    expect(changed[2]).toBeGreaterThan(150);
+    const kept = await pixelAt(result.png, request, 70, 20);
+    expect(kept).toEqual([Math.round(30 * 0.45), Math.round(120 * 0.45), Math.round(200 * 0.45), 255]);
+  });
+
+  it('finds no visible change in a re-encode of the same pixels', async () => {
+    const pixels = (x: number, y: number) => [(x * 7) % 256, (y * 13) % 256, 90, 255] as const;
+    const raw = Buffer.alloc(64 * 48 * 4);
+    for (let y = 0; y < 48; y += 1) for (let x = 0; x < 64; x += 1) raw.set(pixels(x, y), (y * 64 + x) * 4);
+    const before = await sharp(raw, {raw: {width: 64, height: 48, channels: 4}}).png({compressionLevel: 0}).toBuffer();
+    const after = await sharp(raw, {raw: {width: 64, height: 48, channels: 4}}).png({compressionLevel: 9}).toBuffer();
+    expect(Buffer.compare(before, after)).not.toBe(0);
+    const {result} = await differenceOf(before, after);
+    expect(result).toMatchObject({ok: true, changedRatio: 0});
+  });
+
+  it('ignores a channel moving by 8 levels or less, and counts one moving by 9', async () => {
+    const shifted = (by: number) => pngFixture(20, 10, [BLUE[0] + by, BLUE[1], BLUE[2], 255]);
+    expect((await differenceOf(pngFixture(20, 10, BLUE), shifted(8))).result).toMatchObject({ok: true, changedRatio: 0});
+    expect((await differenceOf(pngFixture(20, 10, BLUE), shifted(9))).result).toMatchObject({ok: true, changedRatio: 1});
+  });
+
+  it('aligns sides of different sizes top-left on the larger canvas, counting the area only one side covers', async () => {
+    const {result, request} = await differenceOf(pngFixture(100, 40, BLUE), pngFixture(100, 80, BLUE), 60, 20);
+    if (!result.ok || !('png' in result)) throw new Error('no png');
+    expect(result.changedRatio).toBe(0.5);
+    // The box is fitted to the 100 × 80 canvas.
+    expect(request.target.drawPx).toEqual({w: 100, h: 80});
+    const meta = await sharp(result.png).metadata();
+    expect([meta.width, meta.height]).toEqual([request.target.cols * CELL.w, request.target.rows * CELL.h]);
+  });
+
+  it('compares the smaller side against the larger one from the top-left corner', async () => {
+    // A 40 × 20 red before; an 80 × 40 after, red in its top-left 40 × 20
+    // and blue elsewhere. Aligned top-left, only the area the before side
+    // never covered changed.
+    const before = pngFixture(40, 20, RED);
+    const after = pngFixture(80, 40, (x, y) => (x < 40 && y < 20 ? RED : BLUE));
+    const {result, request} = await differenceOf(before, after);
+    if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+    expect(request.target.drawPx).toEqual({w: 80, h: 40});
+    expect(result.changedRatio).toBe(0.75);
+    const kept = [Math.round(220 * 0.45), Math.round(40 * 0.45), Math.round(40 * 0.45), 255];
+    // The before side's corners line up with the after side's red corner.
+    expect(await pixelAt(result.png, request, 0, 0)).toEqual(kept);
+    expect(await pixelAt(result.png, request, 39, 0)).toEqual(kept);
+    expect(await pixelAt(result.png, request, 0, 19)).toEqual(kept);
+    // Right of it and below it is change, down to the bottom edge: the tint
+    // over the darkened blue.
+    const marked = [0, 1, 2].map((channel) => Math.round(BLUE[channel]! * 0.45 * 0.4 + [0xd2, 0xa8, 0xff][channel]! * 0.6));
+    for (const [x, y] of [[40, 0], [79, 0], [0, 20], [0, 39], [79, 39]] as const) {
+      expect(await pixelAt(result.png, request, x, y)).toEqual([...marked, 255]);
+    }
+  });
+
+  it('counts a change of alpha alone', async () => {
+    const faded = pngFixture(20, 10, [BLUE[0], BLUE[1], BLUE[2], 200]);
+    expect((await differenceOf(pngFixture(20, 10, BLUE), faded)).result).toMatchObject({ok: true, changedRatio: 1});
+  });
+
+  it('ignores the colour of pixels transparent on both sides', async () => {
+    // An optimizer rewrote the colour under the transparent right half.
+    const hidden = (rgb: number) => pngFixture(40, 20, (x) => (x < 20 ? BLUE : [rgb, rgb, rgb, 0]));
+    expect((await differenceOf(hidden(255), hidden(0))).result).toMatchObject({ok: true, changedRatio: 0});
+    // The same holds where only the larger side covers the canvas.
+    expect((await differenceOf(pngFixture(20, 20, BLUE), hidden(255))).result).toMatchObject({ok: true, changedRatio: 0});
+    // A transparent pixel turning visible still counts.
+    expect((await differenceOf(hidden(255), pngFixture(40, 20, BLUE))).result).toMatchObject({ok: true, changedRatio: 0.5});
+  });
+
+  it('refuses a combined canvas over the pixel cap before drawing the difference', async () => {
+    // Each side passes the cap; together they span 16384 × 16384.
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'before.png'), pngFixture(16_384, 100, BLUE));
+    fs.writeFileSync(path.join(cwd, 'after.png'), pngFixture(100, 16_384, BLUE));
+    commitAll(cwd, 'add both sides');
+    const handler = createWorkerHandler();
+    const result = await handler.handle({
+      type: 'render',
+      cwd,
+      op: 'difference',
+      sides: [{...blobSide(cwd, 'before.png'), side: 'before'}, blobSide(cwd, 'after.png')],
+      kind: 'raster',
+      format: 'png',
+      checker: false,
+      target: {cols: 20, rows: 10, cellPx: CELL, drawPx: {w: 200, h: 200}, nearest: false},
+    });
+    expect(result).toEqual({ok: false, state: 'error', reason: 'image too large to preview (16384 × 16384)'});
+  });
+
+  it('says the image library is missing rather than passing either side through', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'before.png'), pngFixture(8, 8, BLUE));
+    fs.writeFileSync(path.join(cwd, 'after.png'), pngFixture(8, 8, RED));
+    commitAll(cwd, 'add both sides');
+    const handler = createWorkerHandler({loadSharp: async () => {
+      throw new Error('Cannot find module sharp');
+    }});
+    const result = await handler.handle({
+      type: 'render',
+      cwd,
+      op: 'difference',
+      sides: [{...blobSide(cwd, 'before.png'), side: 'before'}, blobSide(cwd, 'after.png')],
+      kind: 'raster',
+      format: 'png',
+      checker: false,
+      target: {cols: 1, rows: 1, cellPx: CELL, drawPx: {w: 8, h: 8}, nearest: false},
+    });
+    expect(result).toEqual({ok: false, state: 'unavailable', reason: 'image library failed to load (Cannot find module sharp)'});
+  });
+
+  it('refuses a difference without exactly two sides', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'after.png'), pngFixture(8, 8, RED));
+    commitAll(cwd, 'add one side');
+    const handler = createWorkerHandler();
+    const result = await handler.handle({
+      type: 'render', cwd, op: 'difference', sides: [blobSide(cwd, 'after.png')], kind: 'raster', format: 'png', checker: false,
+      target: {cols: 1, rows: 1, cellPx: CELL, drawPx: {w: 8, h: 8}, nearest: false},
+    });
+    expect(result).toMatchObject({ok: false, state: 'error'});
+  });
+});

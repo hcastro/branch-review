@@ -238,6 +238,29 @@ describe('planMedia', () => {
     expect(planRowText(plan.rows[1]!, 100)).toMatch(/^difference\s+changed pixels marked · sizes differ, aligned top-left/);
   });
 
+  it('says how much of the image changed once the difference is drawn, and when no pixel did', () => {
+    const r = ref('raster', {before: true, after: true});
+    const same = {before: ready(1280, 400), after: ready(1280, 400)};
+    const view = {...VIEW, compare: 'difference' as const};
+    const pending = planMedia(r, same, view, layout(100, 30));
+    expect(planRowText(pending.rows[1]!, 100)).toMatch(/^difference\s+changed pixels marked$/);
+
+    const drawn = planMedia(r, same, view, layout(100, 30), {changedRatio: 0.31});
+    expect(planRowText(drawn.rows[1]!, 100)).toMatch(/^difference\s+changed pixels marked · 31% of the image$/);
+    // A sliver of change never reads as none.
+    const sliver = planMedia(r, same, view, layout(100, 30), {changedRatio: 0.001});
+    expect(planRowText(sliver.rows[1]!, 100)).toMatch(/changed pixels marked · under 1% of the image$/);
+
+    const none = planMedia(r, same, view, layout(100, 30), {changedRatio: 0});
+    expect(planRowText(none.rows[1]!, 100)).toMatch(/^difference\s+no visible pixel change \(bytes differ\)$/);
+
+    const sized = planMedia(r, {before: ready(1280, 400), after: ready(1000, 480)}, view, layout(100, 30), {changedRatio: 0.5});
+    expect(planRowText(sized.rows[1]!, 100)).toMatch(/changed pixels marked · 50% of the image · sizes differ, aligned top-left$/);
+    // The ratio changes only the label: the rows and boxes stay the same.
+    expect(drawn.rows.length).toBe(pending.rows.length);
+    expect(boxRows(drawn)[0]!.boxes).toEqual(boxRows(pending)[0]!.boxes);
+  });
+
   it('falls back to the available side when the other one failed', () => {
     const plan = planMedia(ref('raster', {before: true, after: true}), {before: {status: 'error', reason: 'could not decode image'}, after: ready(500, 300)}, {...VIEW, compare: 'difference'}, layout(100, 30));
     expect(boxRows(plan)[0]!.boxes!.map((box) => box.role)).toEqual(['after']);

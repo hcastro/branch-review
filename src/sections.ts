@@ -48,6 +48,9 @@ export type MediaRowInfo = {
   spans?: readonly MediaSpan[];
   // A click anywhere on the row swaps the side flip mode shows.
   swap?: boolean;
+  // Boxes no row draws in this view but that are sent ahead with this
+  // row's: the hidden flip side, so a swap draws at once.
+  prefetch?: readonly BoxSpec[];
 };
 
 export type DiffSection = {

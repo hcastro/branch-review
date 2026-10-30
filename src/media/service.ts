@@ -6,7 +6,7 @@ import {createImageRegistry} from './imageRegistry.js';
 import {staleReason, type BoxSpec} from './layout.js';
 import {createLru} from './lru.js';
 import {openMedia, type OpenOutcome, type Opener} from './openExternal.js';
-import type {GraphicsCaps, MediaRef, MediaViewState, SideName, SideState} from './types.js';
+import type {CompareMode, GraphicsCaps, MediaRef, MediaViewState, SideName, SideState} from './types.js';
 
 // The UI process's media state for the session: which review files are
 // media, what inspect found out about each side, the PNGs rendered for each
@@ -48,7 +48,7 @@ export type MediaServiceOptions = {
 export type MediaService = ReturnType<typeof createMediaService>;
 
 // What the row builder reads from the service.
-export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'watching'>;
+export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'drawnFacts' | 'watching'>;
 
 export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, now = Date.now, registry: registryOptions = {}}: MediaServiceOptions) {
   const registry = createImageRegistry({write: (sequence) => sink.write(sequence), now, ...registryOptions});
@@ -62,6 +62,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // is inspected, so a box keeps its size through a watch refresh.
   const provisional = new Map<string, Extract<SideState, {status: 'ready'}>>();
   const textViews = new Set<string>();
+  // How modified images are compared, chosen once for the whole session:
+  // reviewing twenty icons in flip mode should not take twenty key presses.
+  let compare: CompareMode = 'sideBySide';
+  // Files whose flip view shows the before side; every other shows after.
+  // Cleared whenever the active file changes.
+  const flippedToBefore = new Set<string>();
+  // The share of pixels that changed, by content key, from the drawn
+  // difference.
+  const changedRatios = new Map<string, number>();
   const pngs = createLru<Uint8Array>(PNG_CACHE_BYTES, (png) => png.byteLength);
   // A box that failed is not tried again until its key changes.
   const boxErrors = new Map<string, string>();
@@ -170,6 +179,20 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     return provisional.get(`${ref.fileKey}|${side}`) ?? state;
   };
 
+  // The one side a modified file draws when its other side failed. The plan
+  // then shows that side alone in every compare mode, so it is what `o`
+  // opens and there is nothing to swap. Undefined while both sides draw, or
+  // while one is still loading and nothing draws yet.
+  const loneSide = (ref: MediaRef): SideName | undefined => {
+    if (!ref.before || !ref.after) return undefined;
+    const before = sideState(ref, 'before').status;
+    const after = sideState(ref, 'after').status;
+    if (before === 'pending' || after === 'pending') return undefined;
+    if (before === 'ready' && after !== 'ready') return 'before';
+    if (after === 'ready' && before !== 'ready') return 'after';
+    return undefined;
+  };
+
   const acquire = (box: BoxSpec, png: Uint8Array) => registry.acquire(box.imageKey, png, box.cols, box.rows);
 
   // A box on screen found every id live or in quarantine. Nothing else may
@@ -201,17 +224,24 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     return false;
   };
 
+  // The sides a box draws from: one for a picture, both for a difference.
+  const boxSides = (ref: MediaRef | undefined, box: BoxSpec) => {
+    if (!ref) return null;
+    if (box.role === 'diff') return ref.before && ref.after ? [ref.before, ref.after] : null;
+    const sideRef = box.side ? ref[box.side] : undefined;
+    return sideRef ? [sideRef] : null;
+  };
+
   const render = (ref: MediaRef, box: BoxSpec, priority: number) => {
-    if (!context || !box.side) return;
-    const sideRef = ref[box.side];
-    if (!sideRef) return;
+    const sideRefs = boxSides(ref, box);
+    if (!context || !sideRefs) return;
     const started = keptReviews;
     const controller = new AbortController();
     rendering.set(box.imageKey, controller);
     const request = {
       cwd: context.cwd,
-      op: 'fit' as const,
-      sides: [sideRef],
+      op: box.role === 'diff' ? 'difference' as const : 'fit' as const,
+      sides: sideRefs,
       kind: ref.kind,
       format: ref.format,
       target: {cols: box.cols, rows: box.rows, cellPx: caps.cellPx, drawPx: box.drawPx, nearest: box.nearest},
@@ -223,10 +253,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       if (result.ok && 'png' in result) {
         const noted = result.passthrough ? noteFailure(LIBRARY_MISSING) : false;
         pngs.set(box.imageKey, result.png);
+        if (result.changedRatio !== undefined && changedRatios.get(ref.contentKey) !== result.changedRatio) {
+          // The difference's label says how much changed: same rows, new text.
+          changedRatios.set(ref.contentKey, result.changedRatio);
+          planVersion += 1;
+        }
         // Sent only while a row still names the box; otherwise it waits in
         // the cache until one does.
         const drawn = liveKeys.has(box.imageKey) && send(box, result.png);
-        if (drawn || noted) notify();
+        if (drawn || noted || result.changedRatio !== undefined) notify();
         return;
       }
       const disk = !result.ok && (result.state === 'stale' || result.disk === true);
@@ -306,6 +341,8 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       // depend only on the content (not an image, too large, undecodable)
       // stay cached, so nothing is retried until the content changes.
       forgetDiskFailures();
+      const contentKeys = new Set([...nextRefs.values()].map((ref) => ref.contentKey));
+      for (const key of changedRatios.keys()) if (!contentKeys.has(key)) changedRatios.delete(key);
       refs = nextRefs;
       planVersion += 1;
       version += 1;
@@ -326,7 +363,47 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     },
     refFor,
     sideState,
-    viewState: (fileKey: string): MediaViewState => ({compare: 'sideBySide', flipSide: 'after', textView: textViews.has(fileKey)}),
+    viewState: (fileKey: string): MediaViewState => ({compare, flipSide: flippedToBefore.has(fileKey) ? 'before' : 'after', textView: textViews.has(fileKey)}),
+    /** What drawing a file's boxes found out, for its labels. */
+    drawnFacts(ref: MediaRef): {changedRatio?: number} {
+      const changedRatio = changedRatios.get(ref.contentKey);
+      return changedRatio === undefined ? {} : {changedRatio};
+    },
+    /**
+     * The side `o` opens: the only one drawn when the other failed, else the
+     * one flip shows, else after, else before.
+     */
+    shownSide(ref: MediaRef): SideName {
+      const lone = loneSide(ref);
+      if (lone) return lone;
+      if (ref.before && ref.after) return compare === 'flip' && flippedToBefore.has(ref.fileKey) ? 'before' : 'after';
+      return ref.after ? 'after' : 'before';
+    },
+    /**
+     * Whether the file shows a flip view that `2` or a click can swap: both
+     * sides must draw, since the plan shows one side alone otherwise.
+     */
+    canSwap(ref: MediaRef): boolean {
+      return compare === 'flip' && Boolean(ref.before && ref.after)
+        && sideState(ref, 'before').status === 'ready' && sideState(ref, 'after').status === 'ready';
+    },
+    setCompare(mode: CompareMode) {
+      if (mode === compare) return;
+      compare = mode;
+      planChanged();
+    },
+    /** Shows the other side of one file's flip view. */
+    swapFlip(fileKey: string) {
+      if (flippedToBefore.has(fileKey)) flippedToBefore.delete(fileKey);
+      else flippedToBefore.add(fileKey);
+      planChanged();
+    },
+    /** Every flip view back to the after side, when the active file changes. */
+    resetFlip() {
+      if (flippedToBefore.size === 0) return;
+      flippedToBefore.clear();
+      planChanged();
+    },
     toggleTextView(fileKey: string) {
       if (textViews.has(fileKey)) textViews.delete(fileKey);
       else textViews.add(fileKey);
@@ -365,10 +442,10 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
         }
         if (rendering.has(key)) continue;
         const ref = refs.get(fileKey);
-        const sideRef = box.side ? ref?.[box.side] : undefined;
-        // Rendered once inspect has proved the side; until then the box is
-        // sized from the last known dimensions and drawn blank.
-        if (!ref || !sideRef || sides.get(sideRef.key)?.status !== 'ready') continue;
+        const sideRefs = boxSides(ref, box);
+        // Rendered once inspect has proved every side it draws from; until
+        // then the box is sized from the last known dimensions and drawn blank.
+        if (!ref || !sideRefs || sideRefs.some((sideRef) => sides.get(sideRef.key)?.status !== 'ready')) continue;
         render(ref, box, visible.has(key) ? 0 : 1);
       }
       if (changed) notify();

@@ -34,7 +34,7 @@ import {fileKey, type FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
-import type {GraphicsCaps, MediaRef} from '../media/types.js';
+import type {CompareMode, GraphicsCaps, MediaRef} from '../media/types.js';
 import {createLoneEscapeGuard} from '../media/replyGuard.js';
 import {placeholderRun} from '../media/kitty.js';
 import {formatBytes, formatLabel} from '../media/layout.js';
@@ -122,6 +122,15 @@ const RASTER_FILE_ACTIONS: readonly FileAction[] = [
   {id: 'copy.fileDiff', label: 'Copy diff'},
 ];
 const RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'o open', 'v text', 'j/k scroll', 'y d copy', 't tree'];
+const MODIFIED_RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', 'o open', 'v text', 'j/k scroll', 't tree'];
+const FLIP_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', '1/2/3 compare', '2 swap', 'o open', 'v text', 'j/k scroll', 't tree'];
+// The compare view each digit picks, and each tab on the tab row.
+const COMPARE_KEYS: Record<string, CompareMode | undefined> = {1: 'sideBySide', 2: 'flip', 3: 'difference'};
+const COMPARE_SPANS: Record<string, CompareMode | undefined> = {
+  'compare.sideBySide': 'sideBySide',
+  'compare.flip': 'flip',
+  'compare.difference': 'difference',
+};
 // The screen row of the diff pane's first line: the top bar's three rows,
 // then the pane's top border and its two header rows.
 const DIFF_FIRST_SCREEN_ROW = 6;
@@ -1912,11 +1921,41 @@ const noMediaUpdates = () => () => undefined;
 const noMediaVersion = () => 0;
 
 // The metrics row for a media file once its shown side is inspected: format,
-// pixel size and bytes in place of line counts.
+// pixel size and bytes in place of line counts. A modified file with both
+// sides inspected reads before → after, the byte change yellow when the file
+// grew and green when it shrank.
 function mediaMetricsText(media: MediaService, ref: MediaRef) {
-  const state = media.sideState(ref, ref.after ? 'after' : 'before');
-  if (state.status !== 'ready') return null;
-  return `${formatLabel(ref.format)} · ${state.info.width} × ${state.info.height} px · ${formatBytes(state.info.bytes)}`;
+  const format = formatLabel(ref.format);
+  const before = ref.before ? media.sideState(ref, 'before') : null;
+  const after = ref.after ? media.sideState(ref, 'after') : null;
+  if (before?.status === 'ready' && after?.status === 'ready') {
+    const [old, next] = [before.info, after.info];
+    const oldSize = `${old.width} × ${old.height}`;
+    const nextSize = `${next.width} × ${next.height}`;
+    const size = oldSize === nextSize ? nextSize : `${oldSize} → ${nextSize}`;
+    const delta = next.bytes - old.bytes;
+    const change = delta === 0
+      ? ''
+      : ` ${delta > 0 ? ANSI_YELLOW : ANSI_GREEN}${delta > 0 ? '+' : '−'}${formatBytes(Math.abs(delta))}${ANSI_RESET}`;
+    return `${format} · ${size} px · ${formatBytes(old.bytes)} → ${formatBytes(next.bytes)}${change}`;
+  }
+  const state = after ?? before;
+  if (state?.status !== 'ready') return null;
+  return `${format} · ${state.info.width} × ${state.info.height} px · ${formatBytes(state.info.bytes)}`;
+}
+
+// The footer's key hints for the active file.
+function mediaHintItems(media: MediaService | undefined, ref: MediaRef | null): ReadonlyArray<string> {
+  if (!media || !ref) return KEY_HINT_ITEMS;
+  if (!ref.before || !ref.after) return RASTER_KEY_HINT_ITEMS;
+  return media.canSwap(ref) ? FLIP_KEY_HINT_ITEMS : MODIFIED_RASTER_KEY_HINT_ITEMS;
+}
+
+// What the media keys do, for the top bar while the pointer is over a
+// media row.
+function mediaHoverHint(ref: MediaRef, row: SectionRow) {
+  if (row.media?.swap) return 'click to swap · o open';
+  return ref.before && ref.after ? 'o open · v text · 1/2/3 compare' : 'o open · v text';
 }
 
 /**
@@ -2211,6 +2250,11 @@ function AppContent({
     sectionIndex: 0,
     anchor: {text: 0, atTop: true},
   });
+  // The offset the remap below asked for in this commit, when it moves the
+  // view. Until a commit draws it, the file at the top is whichever one now
+  // sits at the old offset, so effects that act on a change of the active
+  // file wait for it.
+  const remapTargetRef = useRef<number | null>(null);
   const arrivalSnapshotRef = useRef<ArrivalSnapshot | null>(null);
   const [arrivalAnimations, setArrivalAnimations] = useState<ArrivalAnimations>(() => ({
     files: new Map(),
@@ -2395,6 +2439,7 @@ function AppContent({
       scrollCeiling,
     );
 
+    remapTargetRef.current = nextOffset === diffOffset ? null : nextOffset;
     setDiffOffset((current) => current === nextOffset ? current : nextOffset);
   }, [allDiffRows, sections, scrollCeiling]);
 
@@ -2547,6 +2592,14 @@ function AppContent({
           wanted.push({fileKey: row.media!.fileKey, box});
         }
       }
+      // The hidden flip side is never drawn, but is sent with the shown one.
+      for (const box of row.media!.prefetch ?? []) {
+        live.add(box.imageKey);
+        if (index >= nearStart && index < nearEnd && !seen.has(box.imageKey)) {
+          seen.add(box.imageKey);
+          wanted.push({fileKey: row.media!.fileKey, box});
+        }
+      }
     }
     media.want(wanted, visible);
     media.sweep(live, visible);
@@ -2560,9 +2613,23 @@ function AppContent({
 
   const openMediaFile = useCallback(async (ref: MediaRef, how: 'open' | 'quickLook') => {
     if (!media) return;
-    const outcome = await media.open(ref, ref.after ? 'after' : 'before', how);
+    const outcome = await media.open(ref, media.shownSide(ref), how);
     showToast(outcome.message, undefined, outcome.kind);
   }, [media, showToast]);
+
+  // Flip mode shows each file's after side first, so moving to another file
+  // never opens it on a side left over from the last one. A refresh or a mode
+  // change first draws the new rows at the old offset, which can name another
+  // file for one commit; resetting there would rebuild the rows before the
+  // view is put back, and send it to that file.
+  const flipFileKeyRef = useRef(activeFileKey);
+  useEffect(() => {
+    const target = remapTargetRef.current;
+    remapTargetRef.current = null;
+    if ((target !== null && target !== diffOffset) || flipFileKeyRef.current === activeFileKey) return;
+    flipFileKeyRef.current = activeFileKey;
+    if (mediaOn) media!.resetFlip();
+  }, [activeFileKey, diffOffset, media, mediaOn]);
 
   const toggleTree = useCallback(() => {
     if (treeAutoCollapsed) {
@@ -2999,6 +3066,10 @@ function AppContent({
           const diffLineIndex = diffOffset + relativeY - 3;
           const blockLineIndex = allDiffRows[diffLineIndex]?.headerLine ?? null;
           nextHoveredBlockLineIndex = blockLineIndex;
+          const hoveredRow = allDiffRows[diffLineIndex];
+          const hoveredFile = hoveredRow?.kind === 'media' && media ? sections[hoveredRow.sectionIndex]?.file : undefined;
+          const hoveredRef = hoveredFile ? media!.refFor(hoveredFile) : null;
+          if (hoveredRef && diffLineIndex < diffOffset + visibleDiffRows) nextInfoTip = mediaHoverHint(hoveredRef, hoveredRow!);
           if (blockLineIndex !== null && diffLineIndex === blockLineIndex) {
             const actionId = spanAt(blockHeaderSpans(blockLineIndex), relativeX - 2);
             if (actionId) {
@@ -3038,10 +3109,13 @@ function AppContent({
     getTreeRowHit,
     hoveredAction,
     hoveredBlockLineIndex,
+    media,
     mouse,
     scheduleTreeTooltip,
+    sections,
     terminalRows,
     treeCollapsed,
+    visibleDiffRows,
     worktreeBranchName,
   ]);
 
@@ -3218,6 +3292,13 @@ function AppContent({
 
       const diffLineIndex = diffOffset + relativeY - 3;
       const row = allDiffRows[diffLineIndex];
+      if (row?.kind === 'media' && media && diffLineIndex < diffOffset + visibleDiffRows) {
+        // A tab picks its compare view; in flip mode the picture swaps sides.
+        const mode = COMPARE_SPANS[spanAt(row.media?.spans ?? [], relativeX - 2) ?? ''];
+        if (mode) media.setCompare(mode);
+        else if (row.media?.swap) media.swapFlip(row.media.fileKey);
+        return;
+      }
       if (row?.kind !== 'header' || !row.target) return;
 
       const blockTarget = row.target;
@@ -3238,6 +3319,8 @@ function AppContent({
   }, [
     activeFile,
     activeMediaRef,
+    media,
+    visibleDiffRows,
     openMediaFile,
     allDiffRows,
     blockHeaderSpans,
@@ -3327,6 +3410,19 @@ function AppContent({
       return;
     }
 
+    // Compare views for a modified image: 1 side by side, 2 flip (and 2
+    // again swaps the side), 3 difference. Nothing on any other file.
+    const compareMode = COMPARE_KEYS[input];
+    if (mediaOn && compareMode) {
+      if (!activeMediaRef?.before || !activeMediaRef.after) return;
+      // With one side failed, flip shows the other alone and 2 again has
+      // nothing to swap.
+      if (compareMode === 'flip' && media!.viewState(activeMediaRef.fileKey).compare === 'flip') {
+        if (media!.canSwap(activeMediaRef)) media!.swapFlip(activeMediaRef.fileKey);
+      } else media!.setCompare(compareMode);
+      return;
+    }
+
     // Media keys, only while media draws: o open, O Quick Look, v text view.
     if (mediaOn && (input === 'o' || input === 'O' || input === 'v')) {
       if (input === 'v') {
@@ -3395,7 +3491,7 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeMediaRef ? RASTER_KEY_HINT_ITEMS : KEY_HINT_ITEMS), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
   const footerLine = composeBar(
     [footerStatus],
     {text: `${displayBase}...${displayBranch}`, style: ANSI_GRAY},

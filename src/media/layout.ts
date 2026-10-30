@@ -322,14 +322,26 @@ function flipPlan(ref: MediaRef, before: SideInfo, after: SideInfo, view: MediaV
   };
 }
 
-function differencePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout: Layout): PlanRow[] {
+// The share of the image that changed, as people read it: a sliver of
+// change never rounds down to none.
+function changedShare(ratio: number) {
+  const percent = Math.round(ratio * 100);
+  return percent === 0 ? 'under 1% of the image' : `${percent}% of the image`;
+}
+
+function differencePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout: Layout, changedRatio?: number): PlanRow[] {
   const canvas = {w: Math.max(before.width, after.width), h: Math.max(before.height, after.height)};
   const box = fitBox(canvas, layout.innerWidth, Math.max(4, layout.viewportRows - 3), layout.caps);
   const sizesDiffer = before.width !== after.width || before.height !== after.height;
+  // The ratio comes with the drawn difference; until then the label says
+  // only what the marks mean.
+  const note = changedRatio === 0
+    ? 'no visible pixel change (bytes differ)'
+    : `changed pixels marked${changedRatio === undefined ? '' : ` · ${changedShare(changedRatio)}`}${sizesDiffer ? ' · sizes differ, aligned top-left' : ''}`;
+  // Next to the label rather than flush right, so a narrow pane cuts the
+  // note short instead of dropping it.
   return [
-    textRow('label', [part('difference', 'difference')], {
-      right: [part(`changed pixels marked${sizesDiffer ? ' · sizes differ, aligned top-left' : ''}`, 'dim')],
-    }),
+    textRow('label', [part('difference', 'difference'), part(`  ${note}`, 'dim')]),
     ...boxRowsFor([boxSpec(ref, 'diff', box, 0, layout)]),
   ];
 }
@@ -479,6 +491,9 @@ export function planMedia(
   sides: Partial<Record<SideName, SideState>>,
   view: MediaViewState,
   layout: Layout,
+  // What drawing found out: the share of a difference's pixels that changed.
+  // It only changes label text, never the rows.
+  drawn: {changedRatio?: number} = {},
 ): MediaPlan {
   const present = (['before', 'after'] as const).filter((side) => ref[side]);
   const states = Object.fromEntries(present.map((side) => [side, sides[side] ?? {status: 'pending'}])) as Partial<Record<SideName, SideState>>;
@@ -520,7 +535,7 @@ export function planMedia(
     const flip = flipPlan(ref, before, after, view, layout);
     return {rows: [tabs, ...flip.rows], prefetch: flip.prefetch, textView: false};
   }
-  if (view.compare === 'difference') return {rows: [tabs, ...differencePlan(ref, before, after, layout)], prefetch: [], textView: false};
+  if (view.compare === 'difference') return {rows: [tabs, ...differencePlan(ref, before, after, layout, drawn.changedRatio)], prefetch: [], textView: false};
   return {rows: [tabs, ...sideBySidePlan(ref, before, after, layout)], prefetch: [], textView: false};
 }
 

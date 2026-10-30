@@ -26,6 +26,8 @@ import {
 import {tooltipCoversKittyRows} from '../src/ui/App.js';
 import type {MediaBackend, RenderResult} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
+import {addMediaRows} from '../src/ui/mediaRows.js';
+import type {SectionRow} from '../src/sections.js';
 
 // Kitty still images in the diff pane: placeholder rows in place of the
 // `binary file changed` line, drawn from a media service over a fake
@@ -493,15 +495,15 @@ describe('Kitty still images', () => {
     instance.unmount();
   });
 
-  it('shows a modified image\'s after side alone, with no tab row', async () => {
+  it('shows a modified image\'s two sides side by side under the tab row', async () => {
     const modified = binaryMediaFile('docs/logo.png', 'modified', ['029ace0', '97fa3ee']);
     const {instance, calls} = mediaApp([modified], {sides: {...SIDES, '029ace0': sideInfo({width: 100, height: 100})}});
     await settle();
     const text = frameLines(instance.lastFrame()).join('\n');
-    expect(text).toContain('after');
-    expect(text).not.toContain('Side by side');
-    expect(calls.filter((call) => call.type === 'render').map((call) => (call.request as {sides: Array<{side: string}>}).sides[0]!.side)).toEqual(['after']);
-    expect(decodePlaceholders(instance.lastFrame())).toHaveLength(100);
+    expect(text).toContain('[1 Side by side]  2 Flip  3 Difference');
+    expect(calls.filter((call) => call.type === 'render').map((call) => (call.request as {sides: Array<{side: string}>}).sides[0]!.side).sort()).toEqual(['after', 'before']);
+    // 10 × 5 cells before, 20 × 5 after.
+    expect(decodePlaceholders(instance.lastFrame())).toHaveLength(150);
     instance.unmount();
   });
 
@@ -643,3 +645,505 @@ describe('Kitty still images', () => {
     none.unmount();
   });
 });
+
+// Compare modes for a modified image: side by side, flip and difference,
+// chosen with 1, 2 and 3 or the tab row, kept for the session.
+describe('compare modes', () => {
+  const BEFORE_ID = '029ace0';
+  const AFTER_ID = '97fa3ee';
+  const MODIFIED = binaryMediaFile('docs/logo.png', 'modified', [BEFORE_ID, AFTER_ID]);
+  // 100 × 100 px before (10 × 5 cells), 200 × 100 px after (20 × 5 cells).
+  const BOTH = {[AFTER_ID]: sideInfo({width: 200, height: 100, bytes: 232_000}), [BEFORE_ID]: sideInfo({width: 100, height: 100, bytes: 1_000})};
+
+  const transmits = (writes: readonly string[]) => parseApc(writes).filter((command) => command.a === 't');
+  const idsOn = (frame: string | undefined) => {
+    const byLine = new Map<number, Set<number>>();
+    for (const cell of decodePlaceholders(frame)) {
+      byLine.set(cell.line, (byLine.get(cell.line) ?? new Set()).add(cell.id));
+    }
+    return byLine;
+  };
+  const text = (frame: string | undefined) => frameLines(frame).join('\n');
+
+  it('draws both sides on the same rows with their sizes, each with its own id', async () => {
+    const {instance, graphicsWrites} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    const frame = instance.lastFrame();
+    const label = frameLines(frame).find((line) => line.includes('before') && line.includes('after'))!;
+    expect(label).toMatch(/before 100 × 100 · 1\.0 KB\s+after 200 × 100 · 232 KB/);
+    const lines = idsOn(frame);
+    expect(lines.size).toBe(5);
+    const ids = [...lines.values()];
+    for (const each of ids) expect(each.size).toBe(2);
+    expect(new Set(ids.map((each) => [...each].sort().join(','))).size).toBe(1);
+    // Before on the left, after on the right, with the gap between them.
+    const row = decodePlaceholders(frame).filter((cell) => cell.line === [...lines.keys()][0]);
+    const [leftId, rightId] = [row[0]!.id, row.at(-1)!.id];
+    expect(row.filter((cell) => cell.id === leftId)).toHaveLength(10);
+    expect(row.filter((cell) => cell.id === rightId)).toHaveLength(20);
+    const placements = parseApc(graphicsWrites).filter((command) => command.a === 'p');
+    expect(placements.find((command) => command.i === leftId)).toMatchObject({c: 10, r: 5});
+    expect(placements.find((command) => command.i === rightId)).toMatchObject({c: 20, r: 5});
+    instance.unmount();
+  });
+
+  it('flips with 2, sending the hidden side ahead, and swaps with 2 again or a click without sending anything', async () => {
+    const {instance, graphicsWrites} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    let frame = instance.lastFrame();
+    expect(text(frame)).toContain('1 Side by side  [2 Flip]  3 Difference');
+    expect(text(frame)).toMatch(/after · 2 or click swaps/);
+    const shownIds = new Set(decodePlaceholders(frame).map((cell) => cell.id));
+    expect(shownIds.size).toBe(1);
+    const [afterId] = [...shownIds];
+    // Both flip sides share one 20 × 5 box and were both sent.
+    const flipPlacements = parseApc(graphicsWrites).filter((command) => command.a === 'p' && command.c === 20 && command.r === 5);
+    expect(new Set(flipPlacements.map((command) => command.i)).size).toBeGreaterThanOrEqual(2);
+    const sent = transmits(graphicsWrites).length;
+    const writesBefore = graphicsWrites.length;
+
+    instance.stdin.write('2');
+    await settle();
+    frame = instance.lastFrame();
+    expect(text(frame)).toMatch(/before · 2 or click swaps/);
+    const beforeIds = new Set(decodePlaceholders(frame).map((cell) => cell.id));
+    expect(beforeIds.size).toBe(1);
+    const [beforeId] = [...beforeIds];
+    expect(beforeId).not.toBe(afterId);
+    expect(decodePlaceholders(frame)).toHaveLength(100);
+    expect(flipPlacements.map((command) => command.i)).toContain(beforeId);
+    expect(graphicsWrites).toHaveLength(writesBefore);
+
+    // A click on the picture swaps back.
+    const cell = decodePlaceholders(frame)[0]!;
+    await emitMousePressAt(cell.column, cell.line);
+    await settle();
+    frame = instance.lastFrame();
+    expect(text(frame)).toMatch(/after · 2 or click swaps/);
+    expect(new Set(decodePlaceholders(frame).map((each) => each.id))).toEqual(new Set([afterId]));
+    expect(transmits(graphicsWrites)).toHaveLength(sent);
+    expect(graphicsWrites).toHaveLength(writesBefore);
+    instance.unmount();
+  });
+
+  it('switches modes from the tab row', async () => {
+    const {instance, calls} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    const difference = cellPosition(instance.lastFrame(), ['Side by side'], '3 Difference', 2);
+    await emitMousePressAt(difference.column, difference.row);
+    await settle();
+    expect(text(instance.lastFrame())).toContain('1 Side by side  2 Flip  [3 Difference]');
+    expect(calls.some((call) => call.type === 'render' && call.request.op === 'difference')).toBe(true);
+
+    const flip = cellPosition(instance.lastFrame(), ['Side by side'], '2 Flip', 1);
+    await emitMousePressAt(flip.column, flip.row);
+    await settle();
+    expect(text(instance.lastFrame())).toContain('[2 Flip]');
+
+    const sideBySide = cellPosition(instance.lastFrame(), ['Side by side'], '1 Side', 1);
+    await emitMousePressAt(sideBySide.column, sideBySide.row);
+    await settle();
+    expect(text(instance.lastFrame())).toContain('[1 Side by side]');
+    instance.unmount();
+  });
+
+  it('renders the difference from both sides and labels it with the share that changed', async () => {
+    const draw = (changedRatio: number) => (request: Parameters<NonNullable<Parameters<typeof fakeMediaService>[0]>['render'] & {}>[0]): RenderResult => {
+      const {cols, rows, cellPx} = request.target;
+      return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h), ...(request.op === 'difference' ? {changedRatio} : {})};
+    };
+    const changed = mediaApp([MODIFIED], {sides: BOTH, render: draw(0.31)}, {columns: 140, rows: 30});
+    await settle();
+    changed.instance.stdin.write('3');
+    await settle();
+    const frame = changed.instance.lastFrame();
+    expect(text(frame)).toMatch(/difference\s+changed pixels marked · 31% of the image · sizes differ, aligned top-left/);
+    const request = changed.calls.find((call) => call.type === 'render' && call.request.op === 'difference')!.request as RenderRequestLike;
+    expect(request.sides.map((side) => side.abbrevId)).toEqual([BEFORE_ID, AFTER_ID]);
+    expect(new Set(decodePlaceholders(frame).map((cell) => cell.id)).size).toBe(1);
+    expect(decodePlaceholders(frame)).toHaveLength(100);
+    changed.instance.unmount();
+
+    const sameSize = {[AFTER_ID]: sideInfo({width: 200, height: 100}), [BEFORE_ID]: sideInfo({width: 200, height: 100, bytes: 5_000})};
+    const none = mediaApp([MODIFIED], {sides: sameSize, render: draw(0)});
+    await settle();
+    none.instance.stdin.write('3');
+    await settle();
+    expect(text(none.instance.lastFrame())).toMatch(/difference\s+no visible pixel change \(bytes differ\)/);
+    none.instance.unmount();
+  });
+
+  it('builds stacked rows, before above after, when a half of the pane would be under 16 columns', async () => {
+    // The pane is never narrower than 36 inner columns today, so this runs
+    // the row builder the pane uses at the width where stacking starts.
+    const fixture = buildFixture([MODIFIED]);
+    const fake = fakeMediaService({sides: BOTH, review: fixture.review});
+    await settle();
+    const section = {
+      path: 'docs/logo.png',
+      metrics: {path: 'docs/logo.png', additions: 0, deletions: 0, changedLines: 0},
+      lines: ['binary file changed', ''],
+      rows: [{block: -1, kind: 'body', continuation: false}, {block: -1, kind: 'body', continuation: false}] as SectionRow[],
+      startLine: 0,
+      endLineExclusive: 2,
+      file: fixture.review.files[0]!,
+    };
+    const shape = (innerWidth: number) => {
+      const [built] = addMediaRows([section], fake.service, {innerWidth, viewportRows: 30});
+      return built!.rows.map((row, index) => (row.media?.boxes ? `box:${row.media.boxes.map((box) => box.role).join(',')}` : stripAnsi(built!.lines[index]!)));
+    };
+
+    const wide = shape(35);
+    expect(wide.filter((row) => row === 'box:before,after')).toHaveLength(5);
+
+    const narrow = shape(34);
+    expect(narrow[0]).toContain('[1 Side by side]');
+    expect(narrow[1]).toMatch(/^before 100 × 100/);
+    const afterLabel = narrow.findIndex((row) => /^after 200 × 100/.test(row));
+    expect(afterLabel).toBeGreaterThan(2);
+    expect(narrow.slice(2, afterLabel)).toEqual(Array(afterLabel - 2).fill('box:before'));
+    expect(narrow.slice(afterLabel + 1, -1).every((row) => row === 'box:after')).toBe(true);
+    expect(narrow.slice(afterLabel + 1, -1).length).toBeGreaterThan(0);
+    expect(narrow.at(-1)).toBe('');
+  });
+
+  it('keeps Space for folding: it never swaps a flip, and still folds the focused block', async () => {
+    const {instance, graphicsWrites} = mediaApp([MODIFIED, textFile('src/b.ts', 6)], {sides: BOTH}, {columns: 120, rows: 40});
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    const flipped = text(instance.lastFrame());
+    expect(flipped).toMatch(/after · 2 or click swaps/);
+    const cells = decodePlaceholders(instance.lastFrame());
+    const writes = graphicsWrites.length;
+    instance.stdin.write(' ');
+    await settle();
+    expect(text(instance.lastFrame())).toMatch(/after · 2 or click swaps/);
+    expect(decodePlaceholders(instance.lastFrame()).filter((cell) => cell.line < 20).map((cell) => cell.id)).toEqual(cells.filter((cell) => cell.line < 20).map((cell) => cell.id));
+    expect(graphicsWrites).toHaveLength(writes);
+
+    instance.stdin.write('\u001B[B');
+    await settle();
+    expect(text(instance.lastFrame())).toContain('src/b.ts line 4');
+    instance.stdin.write(' ');
+    await settle();
+    expect(text(instance.lastFrame())).not.toContain('src/b.ts line 4');
+    instance.unmount();
+  });
+
+  it('keeps the compare mode across files, and shows each file\'s after side again when the active file changes', async () => {
+    const second = binaryMediaFile('docs/icon.png', 'modified', ['1111111', '2222222']);
+    const sides = {...BOTH, '1111111': sideInfo({width: 100, height: 100}), '2222222': sideInfo({width: 100, height: 100})};
+    const {instance} = mediaApp([MODIFIED, second], {sides}, {columns: 120, rows: 24});
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    expect(text(instance.lastFrame())).toMatch(/before · 2 or click swaps/);
+
+    instance.stdin.write('\u001B[B');
+    await settle();
+    let frame = text(instance.lastFrame());
+    expect(frame).toContain('docs/icon.png');
+    // Flip is kept; the new file shows its after side.
+    expect(frame).toContain('[2 Flip]');
+    expect(frame).toMatch(/after · 2 or click swaps/);
+    expect(frame).not.toMatch(/before · 2 or click swaps/);
+
+    instance.stdin.write('\u001B[A');
+    await settle();
+    frame = text(instance.lastFrame());
+    expect(frame).toContain('[2 Flip]');
+    expect(frame).toMatch(/after · 2 or click swaps/);
+    expect(frame).not.toMatch(/before · 2 or click swaps/);
+    instance.unmount();
+  });
+
+  it('keeps the view on the picture when modes change its rows, and the text above it in place', async () => {
+    const {instance} = mediaApp([MODIFIED, textFile('src/z.ts', 30)], {sides: BOTH}, {columns: 120, rows: 24});
+    await settle();
+    const paneTop = (frame: string | undefined) => {
+      const lines = frameLines(frame);
+      return lines[lines.findIndex((line) => line.includes('file 1/2')) + 1];
+    };
+    // The file's top stays the top in every mode.
+    for (const key of ['2', '3', '1']) {
+      instance.stdin.write(key);
+      await settle();
+      expect(paneTop(instance.lastFrame()), key).toMatch(/Side by side/);
+    }
+
+    // Scrolled into the picture, the view stays inside it: the file stays
+    // active and the next file's text does not jump into view at the top.
+    instance.stdin.write('j');
+    instance.stdin.write('j');
+    await settle();
+    for (const key of ['2', '3', '1']) {
+      instance.stdin.write(key);
+      await settle();
+      expect(text(instance.lastFrame()), key).toContain('file 1/2');
+      expect(paneTop(instance.lastFrame()), key).not.toMatch(/src\/z\.ts/);
+    }
+    instance.unmount();
+
+    // A picture below the text at the top changes mode from its tab row:
+    // the text at the top does not move.
+    const below = mediaApp([textFile('src/a.ts', 3), MODIFIED], {sides: BOTH}, {columns: 120, rows: 30});
+    await settle();
+    const textRows = (frame: string | undefined) => {
+      const lines = frameLines(frame);
+      const first = lines.findIndex((line) => line.includes('file 1/2'));
+      const last = lines.findIndex((line) => line.includes('src/a.ts line 2'));
+      return {first, last, lines: lines.slice(first, last + 1)};
+    };
+    const top = textRows(below.instance.lastFrame());
+    expect(top.first).toBeGreaterThan(0);
+    expect(top.last).toBeGreaterThan(top.first);
+    const flip = cellPosition(below.instance.lastFrame(), ['Side by side'], '2 Flip', 1);
+    await emitMousePressAt(flip.column, flip.row);
+    await settle();
+    expect(text(below.instance.lastFrame())).toContain('[2 Flip]');
+    expect(textRows(below.instance.lastFrame())).toEqual(top);
+    below.instance.unmount();
+  });
+
+  it('keeps the view on the picture\'s last row when a mode with fewer rows replaces it', async () => {
+    // A wide after side: half the pane in side by side keeps it short, the
+    // whole pane in flip makes it taller.
+    const wide = {...BOTH, [AFTER_ID]: sideInfo({width: 1000, height: 200})};
+    const {instance} = mediaApp([MODIFIED, textFile('src/z.ts', 30)], {sides: wide}, {columns: 120, rows: 24});
+    await settle();
+    const boxRows = (frame: string | undefined) => new Set(decodePlaceholders(frame).map((cell) => cell.row)).size;
+    // The image row of the cells on the pane's top line, if it is a box row.
+    const topBoxRows = (frame: string | undefined) => {
+      const line = frameLines(frame).findIndex((each) => each.includes('file 1/2')) + 1;
+      return new Set(decodePlaceholders(frame).filter((cell) => cell.line === line).map((cell) => cell.row));
+    };
+    const sideBySide = boxRows(instance.lastFrame());
+    instance.stdin.write('2');
+    await settle();
+    const flip = boxRows(instance.lastFrame());
+    expect(flip).toBeGreaterThan(sideBySide);
+
+    // Past the tab and label rows to flip's last box row, below the last row
+    // side by side has.
+    for (let step = 0; step < flip + 1; step += 1) {
+      instance.stdin.write('j');
+      await settle(2);
+    }
+    await settle();
+    expect(topBoxRows(instance.lastFrame())).toEqual(new Set([flip - 1]));
+    expect(text(instance.lastFrame())).toContain('2 swap');
+
+    instance.stdin.write('1');
+    await settle();
+    const frame = instance.lastFrame();
+    expect(text(frame)).toContain('file 1/2');
+    expect(topBoxRows(frame)).toEqual(new Set([sideBySide - 1]));
+    // Flip's swap hint is gone with flip.
+    expect(text(frame)).not.toContain('2 swap');
+    instance.unmount();
+  });
+
+  it('keeps a swapped flip on its side when a mode with fewer rows shows and goes, scrolled into the picture', async () => {
+    const wide = {...BOTH, [AFTER_ID]: sideInfo({width: 1000, height: 200})};
+    const {instance} = mediaApp([MODIFIED, textFile('src/z.ts', 30)], {sides: wide}, {columns: 120, rows: 24});
+    await settle();
+    const sideBySide = new Set(decodePlaceholders(instance.lastFrame()).map((cell) => cell.row)).size;
+    instance.stdin.write('2');
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    expect(text(instance.lastFrame())).toMatch(/before · 2 or click swaps/);
+    const flip = new Set(decodePlaceholders(instance.lastFrame()).map((cell) => cell.row)).size;
+    expect(flip).toBeGreaterThan(sideBySide);
+
+    // To flip's last box row. Side by side puts the next file's text there
+    // for the one commit before the view is put back.
+    for (let step = 0; step < flip + 1; step += 1) {
+      instance.stdin.write('j');
+      await settle(2);
+    }
+    await settle();
+    instance.stdin.write('1');
+    await settle();
+    expect(text(instance.lastFrame())).toContain('file 1/2');
+    instance.stdin.write('2');
+    await settle();
+    // Still the same file, so the swap holds: scroll back up to its label.
+    for (let step = 0; step < flip + 1; step += 1) {
+      instance.stdin.write('k');
+      await settle(2);
+    }
+    await settle();
+    const frame = text(instance.lastFrame());
+    expect(frame).toContain('file 1/2');
+    expect(frame).toMatch(/before · 2 or click swaps/);
+    instance.unmount();
+  });
+
+  it('does nothing with the digits on an added image or a text file', async () => {
+    const {instance, calls} = mediaApp([LOGO, textFile('src/b.ts'), MODIFIED], {sides: {...SIDES, ...BOTH}}, {columns: 120, rows: 16});
+    await settle();
+    const frame = instance.lastFrame();
+    const renders = calls.filter((call) => call.type === 'render').length;
+    const pressDigits = async () => {
+      for (const key of ['1', '2', '3']) {
+        instance.stdin.write(key);
+        await settle(3);
+      }
+    };
+    // On the added image.
+    await pressDigits();
+    expect(instance.lastFrame()).toBe(frame);
+    // On the text file.
+    instance.stdin.write('\u001B[B');
+    await settle();
+    const textFrame = instance.lastFrame();
+    await pressDigits();
+    expect(instance.lastFrame()).toBe(textFrame);
+    expect(calls.filter((call) => call.type === 'render')).toHaveLength(renders);
+    // The modified image still opens in the default view.
+    instance.stdin.write('\u001B[B');
+    await settle();
+    expect(text(instance.lastFrame())).toContain('[1 Side by side]');
+    instance.unmount();
+  });
+
+  it('keeps today\'s frames exactly under the compare keys and clicks when the protocol is none', async () => {
+    const files = [MODIFIED, textFile('src/b.ts')];
+    const plain = renderFixture(buildFixture(files), SIZE);
+    await settle();
+    const fixture = buildFixture(files);
+    const fake = fakeMediaService({caps: {...KITTY_CAPS, protocol: 'none'}, sides: BOTH, review: fixture.review});
+    const none = renderFixture({...fixture, media: fake.service}, SIZE);
+    await settle();
+    const line = cellPosition(plain.lastFrame(), ['binary file changed'], 'binary file changed');
+    for (const step of ['1', '2', '2', '3', 'click', 'move']) {
+      if (step === 'click') await emitMousePressAt(line.column, line.row);
+      else if (step === 'move') await emitMouseMoveAt(line.column, line.row);
+      else {
+        plain.stdin.write(step);
+        none.stdin.write(step);
+      }
+      await settle(3);
+    }
+    expect(none.frames).toEqual(plain.frames);
+    expect(fake.graphicsWrites).toEqual([]);
+    expect(fake.calls).toEqual([]);
+    plain.unmount();
+    none.unmount();
+  });
+
+  it('shows what the keys do when hovering a picture', async () => {
+    const {instance} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    let cell = decodePlaceholders(instance.lastFrame())[0]!;
+    await emitMouseMoveAt(cell.column, cell.line);
+    await settle();
+    expect(frameLines(instance.lastFrame())[1]).toContain('o open · v text · 1/2/3 compare');
+
+    instance.stdin.write('2');
+    await settle();
+    cell = decodePlaceholders(instance.lastFrame())[0]!;
+    await emitMouseMoveAt(cell.column, cell.line);
+    await settle();
+    expect(frameLines(instance.lastFrame())[1]).toContain('click to swap · o open');
+    instance.unmount();
+
+    const added = mediaApp([LOGO]);
+    await settle();
+    cell = decodePlaceholders(added.instance.lastFrame())[0]!;
+    await emitMouseMoveAt(cell.column, cell.line);
+    await settle();
+    expect(frameLines(added.instance.lastFrame())[1]).toContain('o open · v text');
+    expect(frameLines(added.instance.lastFrame())[1]).not.toContain('compare');
+    added.instance.unmount();
+  });
+
+  it('shows both sides\' size and bytes in the metrics row, the byte change coloured', async () => {
+    const {instance} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    const frame = instance.lastFrame() ?? '';
+    expect(text(frame)).toContain('PNG · 100 × 100 → 200 × 100 px · 1.0 KB → 232 KB +231 KB  file 1/1');
+    // Larger in yellow.
+    expect(frame).toContain('\u001B[33m+231 KB');
+    instance.unmount();
+
+    const smaller = {[AFTER_ID]: sideInfo({width: 200, height: 100, bytes: 88_000}), [BEFORE_ID]: sideInfo({width: 200, height: 100, bytes: 102_000})};
+    const shrunk = mediaApp([MODIFIED], {sides: smaller});
+    await settle();
+    const shrunkFrame = shrunk.instance.lastFrame() ?? '';
+    expect(text(shrunkFrame)).toContain('PNG · 200 × 100 px · 102 KB → 88 KB −14 KB  file 1/1');
+    expect(shrunkFrame).toContain('\u001B[32m−14 KB');
+    shrunk.instance.unmount();
+  });
+
+  it('gives a modified image its own footer hints, with 2 swap in flip mode', async () => {
+    const {instance} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    expect(frameLines(instance.lastFrame()).at(-2)).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • o open • v text • j/k scroll • t tree');
+    instance.stdin.write('2');
+    await settle();
+    expect(frameLines(instance.lastFrame()).at(-2)).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • 2 swap • o open • v text');
+    instance.unmount();
+  });
+
+  it('opens the side flip mode shows', async () => {
+    const {instance, calls} = mediaApp([MODIFIED], {sides: BOTH});
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    instance.stdin.write('o');
+    await settle();
+    const exports = calls.filter((call) => call.type === 'exportCopy');
+    expect(exports).toHaveLength(1);
+    expect(exports[0]!.request).toMatchObject({side: {side: 'before', abbrevId: BEFORE_ID}});
+    expect(text(instance.lastFrame())).toContain('opened logo.png (before)');
+    instance.unmount();
+  });
+
+  it('opens the side on screen when the other side failed, side by side', async () => {
+    const {instance, calls} = mediaApp([MODIFIED], {sides: {[BEFORE_ID]: BOTH[BEFORE_ID]!, [AFTER_ID]: {error: 'could not decode image'}}});
+    await settle();
+    expect(text(instance.lastFrame())).toContain('before · after: could not decode image');
+    instance.stdin.write('o');
+    await settle();
+    const exports = calls.filter((call) => call.type === 'exportCopy');
+    expect(exports).toHaveLength(1);
+    expect(exports[0]!.request).toMatchObject({side: {side: 'before', abbrevId: BEFORE_ID}});
+    expect(text(instance.lastFrame())).toContain('opened logo.png (before)');
+    instance.unmount();
+  });
+
+  it('has nothing to swap in flip when one side failed, and opens the side on screen', async () => {
+    const {instance, calls, graphicsWrites} = mediaApp([MODIFIED], {sides: {[BEFORE_ID]: {error: 'could not decode image'}, [AFTER_ID]: BOTH[AFTER_ID]!}});
+    await settle();
+    instance.stdin.write('2');
+    await settle();
+    const flipped = instance.lastFrame();
+    expect(text(flipped)).toContain('after · before: could not decode image');
+    // The footer offers no swap the view cannot make.
+    expect(frameLines(flipped).at(-2)).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • o open • v text');
+    expect(frameLines(flipped).at(-2)).not.toContain('2 swap');
+    const writesBefore = graphicsWrites.length;
+    instance.stdin.write('2');
+    await settle();
+    expect(instance.lastFrame()).toBe(flipped);
+    expect(graphicsWrites).toHaveLength(writesBefore);
+    instance.stdin.write('o');
+    await settle();
+    const exports = calls.filter((call) => call.type === 'exportCopy');
+    expect(exports).toHaveLength(1);
+    expect(exports[0]!.request).toMatchObject({side: {side: 'after', abbrevId: AFTER_ID}});
+    expect(text(instance.lastFrame())).toContain('opened logo.png (after)');
+    instance.unmount();
+  });
+});
+
+type RenderRequestLike = {sides: Array<{abbrevId: string}>};

@@ -1158,6 +1158,110 @@ describe('ReviewController with media previews', {timeout: 20_000}, () => {
     media.dispose();
   });
 
+  it('keeps the compare mode and the flip side through a refresh of the file on screen', async () => {
+    const modifiedReview = (afterId: string, version: string): ReviewModel => {
+      const model = mediaReview(null, version);
+      model.files.unshift({
+        path: 'docs/logo.png',
+        status: 'modified',
+        metrics: {path: 'docs/logo.png', additions: 0, deletions: 0, changedLines: 0},
+        rawDiff: `diff --git a/docs/logo.png b/docs/logo.png\nindex aaaaaaa..${afterId} 100644\nBinary files a/docs/logo.png and b/docs/logo.png differ\n`,
+        renderedLines: ['binary file changed'],
+        blocks: [],
+      });
+      return model;
+    };
+    const sides = {aaaaaaa: sideInfo({width: 100, height: 100}), bbbbbbb: sideInfo({width: 200, height: 100}), ccccccc: sideInfo({width: 200, height: 100})};
+    const {instance, watchers} = await mediaController([modifiedReview('bbbbbbb', 'v1'), modifiedReview('ccccccc', 'v2')], sides);
+    await waitForFrame(instance, (text) => text.includes('[1 Side by side]') && idsIn(instance.lastFrame()).length === 2);
+
+    instance.stdin.write('2');
+    await waitForFrame(instance, (text) => text.includes('after · 2 or click swaps'));
+    instance.stdin.write('2');
+    await waitForFrame(instance, (text) => text.includes('before · 2 or click swaps'));
+
+    watchers.current.options.onChange();
+    const frame = await waitForFrame(instance, (text) => text.includes('review v2') && !text.includes('refreshing') && idsIn(instance.lastFrame()).length === 1);
+    expect(frame).toContain('[2 Flip]');
+    expect(frame).toContain('before · 2 or click swaps');
+
+    instance.unmount();
+  });
+
+  it('keeps the view and the flip side on a swapped picture when a refresh adds lines to the file above it', async () => {
+    const reviewWith = (lines: number, version: string): ReviewModel => {
+      const model = mediaReview(null, version);
+      model.files[0]!.renderedLines = [`review ${version}`, ...Array.from({length: lines - 1}, (_, index) => `review ${version} line ${index + 1}`)];
+      // The top bar shows the count, so a test can see the refresh land.
+      model.metrics.additions = lines;
+      model.files.push({
+        path: 'docs/logo.png',
+        status: 'modified',
+        metrics: {path: 'docs/logo.png', additions: 0, deletions: 0, changedLines: 0},
+        rawDiff: 'diff --git a/docs/logo.png b/docs/logo.png\nindex aaaaaaa..bbbbbbb 100644\nBinary files a/docs/logo.png and b/docs/logo.png differ\n',
+        renderedLines: ['binary file changed'],
+        blocks: [],
+      });
+      return model;
+    };
+    const sides = {aaaaaaa: sideInfo({width: 100, height: 100}), bbbbbbb: sideInfo({width: 200, height: 100})};
+    const {instance, watchers} = await mediaController([reviewWith(3, 'v1'), reviewWith(20, 'v2')], sides);
+    await waitForFrame(instance, (text) => text.includes('file 1/2') && idsIn(instance.lastFrame()).length === 2);
+
+    instance.stdin.write('\u001B[B');
+    await waitForFrame(instance, (text) => text.includes('file 2/2') && text.includes('[1 Side by side]'));
+    // Keys read the active file from the handler the drawn frame installs.
+    await flush(5);
+    instance.stdin.write('2');
+    await waitForFrame(instance, (text) => text.includes('after · 2 or click swaps'));
+    instance.stdin.write('2');
+    await waitForFrame(instance, (text) => text.includes('before · 2 or click swaps'));
+
+    // The lines above shift the picture down; the view follows it, and a
+    // refresh is no move to another file, so the picture stays swapped.
+    watchers.current.options.onChange();
+    const frame = await waitForFrame(instance, (text) => text.includes('• +20 •') && !text.includes('refreshing'), 5_000);
+    expect(frame).toContain('• +20 •');
+    await flush(20);
+    const last = stripAnsi(instance.lastFrame() ?? '');
+    expect(last).toContain('file 2/2');
+    expect(last).toContain('[2 Flip]');
+    expect(last).toContain('before · 2 or click swaps');
+
+    instance.unmount();
+  });
+
+  it('ignores 2 again while flip shows one side alone, so the after side shows once both draw', async () => {
+    const modifiedReview = (afterId: string, version: string): ReviewModel => {
+      const model = mediaReview(null, version);
+      model.files.unshift({
+        path: 'docs/logo.png',
+        status: 'modified',
+        metrics: {path: 'docs/logo.png', additions: 0, deletions: 0, changedLines: 0},
+        rawDiff: `diff --git a/docs/logo.png b/docs/logo.png\nindex aaaaaaa..${afterId} 100644\nBinary files a/docs/logo.png and b/docs/logo.png differ\n`,
+        renderedLines: ['binary file changed'],
+        blocks: [],
+      });
+      return model;
+    };
+    const sides = {aaaaaaa: sideInfo({width: 100, height: 100}), bbbbbbb: {error: 'could not decode image'}, ccccccc: sideInfo({width: 200, height: 100})};
+    const {instance, watchers} = await mediaController([modifiedReview('bbbbbbb', 'v1'), modifiedReview('ccccccc', 'v2')], sides);
+    await waitForFrame(instance, (text) => text.includes('before · after: could not decode image') && idsIn(instance.lastFrame()).length === 1);
+
+    instance.stdin.write('2');
+    await waitForFrame(instance, (text) => text.includes('[2 Flip]'));
+    // The before side shows alone: 2 again has nothing to swap.
+    instance.stdin.write('2');
+
+    // The after side is fixed on disk; flip opens on it, as it would have
+    // had both sides drawn from the start.
+    watchers.current.options.onChange();
+    const frame = await waitForFrame(instance, (text) => text.includes('review v2') && !text.includes('refreshing') && text.includes('2 or click swaps'));
+    expect(frame).toContain('after · 2 or click swaps');
+
+    instance.unmount();
+  });
+
   it('shows a failing backend as a reason row while the refresh status stays fine', async () => {
     const {instance, watchers} = await mediaController(
       [mediaReview('aaaaaaa', 'v1'), mediaReview('bbbbbbb', 'v2')],
