@@ -1018,35 +1018,84 @@ describe('runCli media previews', () => {
     await waitFor(() => !isAlive(pid), 3_000);
   }, 40_000);
 
-  it('starts no media for a terminal without Kitty placeholders, or with --no-images', async () => {
-    for (const [argv, reply] of [[['HEAD', 'main', '--no-watch'], '\x1B[?62c'], [['HEAD', 'main', '--no-watch', '--no-images'], KITTY_REPLY]] as const) {
-      const cwd = initRepo({'a.txt': 'one\n'});
-      writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
-      const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from(reply, 'latin1')));
-      const proc = new FakeProcess();
-      let tree: React.ReactElement | undefined;
-      let markRendered!: () => void;
-      const rendered = new Promise<void>((resolve) => {
-        markRendered = resolve;
-      });
-      void runCli({
-        argv: [...argv],
-        cwd,
-        proc,
-        env: GHOSTTY_ENV,
-        stdin: terminal.stdin,
-        stdout: terminal.stdout,
-        stderr: {write: () => true},
-        render: (next) => {
-          tree = next;
-          markRendered();
-          return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
-        },
-      });
-      await withTimeout(rendered, 20_000);
-      expect(controllerOf(tree).props.media, argv.join(' ')).toBeUndefined();
+  // A runCli session on a fake terminal answering `reply`, up to the first
+  // render: its controller's props and the terminal's writes. `files` are
+  // written to the worktree as they are, untracked.
+  async function startedSession(argv: readonly string[], reply: string, env: NodeJS.ProcessEnv, files: Record<string, Buffer> = {}) {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+    for (const [name, bytes] of Object.entries(files)) fs.writeFileSync(path.join(cwd, name), bytes);
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from(reply, 'latin1')));
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+    void runCli({
+      argv: [...argv],
+      cwd,
+      proc,
+      env,
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: (next) => {
+        tree = next;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+    const props = controllerOf(tree).props as {media?: import('../src/media/service.js').MediaService; initialReview: import('../src/review/model.js').ReviewModel; range: import('../src/git.js').DiffRange};
+    return {props, proc, terminal, cwd};
+  }
+
+  it('starts block previews for a colour terminal without Kitty placeholders, sending no image at any point', async () => {
+    const appleTerminal = {...GHOSTTY_ENV, TERM_PROGRAM: 'Apple_Terminal', TERM_PROGRAM_VERSION: '455'};
+    // A terminal that answers only DA1, in 256 colours or more, whoever it is.
+    const {planMedia} = await import('../src/media/layout.js');
+    for (const env of [GHOSTTY_ENV, appleTerminal]) {
+      const tmpParent = makeTempDir('branch-review-media-parent-');
+      const {props, proc, terminal, cwd} = await startedSession(['HEAD', '--no-watch'], '\x1B[?62c', {...env, BRANCH_REVIEW_TMPDIR: tmpParent}, {'logo.png': pngFixture(4, 2)});
+      const media = props.media!;
+      expect(media.caps.protocol, String(env.TERM_PROGRAM)).toBe('blocks');
+
+      // Draw the PNG the way the pane would, through the real worker, so a
+      // picture is on screen when the session ends.
+      media.setReview(props.initialReview, {cwd, range: props.range});
+      const ref = media.refFor(props.initialReview.files.find((entry) => entry.path === 'logo.png')!)!;
+      await waitFor(() => media.sideState(ref, 'after').status !== 'pending', 20_000);
+      const plan = planMedia(ref, {after: media.sideState(ref, 'after')}, media.viewState(ref.fileKey), {innerWidth: 80, viewportRows: 30, caps: media.caps});
+      const box = plan.rows.flatMap((row) => row.type === 'box' ? row.boxes : [])[0]!;
+      const keys = new Set([box.imageKey]);
+      media.want([{fileKey: ref.fileKey, box}], keys);
+      media.sweep(keys, keys);
+      await waitFor(() => media.boxState(box).status !== 'loading', 20_000);
+      const drawn = media.boxState(box);
+
+      proc.emit('exit', 0);
+      // Only the detection query was an APC: no transmit, place or delete,
+      // and the restore write is the plain restore.
+      expect(terminal.writes.filter((write) => write.includes('\x1B_G') && !write.includes('i=31'))).toEqual([]);
+      expect(terminal.writes.at(-1)).toBe(TERMINAL_RESTORE_SEQUENCE);
+      expect(drawn.status).toBe('blocks');
+      expect(fs.readdirSync(tmpParent)).toEqual([]);
+    }
+  }, 60_000);
+
+  it('starts no media with --no-images, with colour off, or in a terminal of fewer than 256 colours', async () => {
+    const sixteenColours = {...GHOSTTY_ENV, TERM: 'xterm', TERM_PROGRAM: undefined, TERM_PROGRAM_VERSION: undefined, COLORTERM: undefined};
+    for (const [argv, reply, env] of [
+      [['HEAD', 'main', '--no-watch', '--no-images'], KITTY_REPLY, GHOSTTY_ENV],
+      [['HEAD', 'main', '--no-watch'], KITTY_REPLY, {...GHOSTTY_ENV, NO_COLOR: '1'}],
+      [['HEAD', 'main', '--no-watch'], KITTY_REPLY, {...GHOSTTY_ENV, NO_COLOR: '1', BRANCH_REVIEW_IMAGES: 'blocks'}],
+      [['HEAD', 'main', '--no-watch'], '\x1B[?62c', sixteenColours],
+    ] as const) {
+      const {props, proc, terminal} = await startedSession(argv, reply, env);
+      expect(props.media, `${argv.join(' ')} ${JSON.stringify({NO_COLOR: env.NO_COLOR, TERM: env.TERM})}`).toBeUndefined();
       proc.emit('exit', 0);
       expect(terminal.writes.at(-1)).toBe(TERMINAL_RESTORE_SEQUENCE);
     }
-  }, 40_000);
+  }, 60_000);
 });

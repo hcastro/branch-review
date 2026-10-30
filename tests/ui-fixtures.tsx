@@ -17,7 +17,7 @@ import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBa
 import type {SideInfo} from '../src/media/types.js';
 import {KITTY_CAPS, pngFixture} from './media-helpers.js';
 
-export {decodePlaceholders, KITTY_CAPS, parseApc, pngFixture, sgrCodeNames, sideInfo} from './media-helpers.js';
+export {BLOCKS_CAPS, decodePlaceholders, KITTY_CAPS, parseApc, pngFixture, sgrCodeNames, sideInfo} from './media-helpers.js';
 
 // Shared fixtures for the ui-* test files: a review model built from raw
 // unified diffs plus delta-shaped rendered lines, and SGR mouse input.
@@ -420,6 +420,12 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy}: {
       calls.push({type: 'render', request});
       if (render) return render(request);
       const {cols, rows, cellPx} = request.target;
+      if (request.op === 'blocks' || request.op === 'blocksDifference') {
+        // Every cell blue over red: the top pixel then the bottom one.
+        const cells = new Uint32Array(cols * rows * 2);
+        for (let at = 0; at < cells.length; at += 2) cells.set([0x1e78c8, 0xc82828], at);
+        return {ok: true, cells, cols, rows};
+      }
       return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h, [30, 120, 200, 255])};
     },
     async exportCopy(request) {

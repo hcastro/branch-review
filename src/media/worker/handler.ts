@@ -50,23 +50,29 @@ export function createWorkerHandler({loadSharp, reader = createSideReader()}: Ha
   }
 
   async function render(request: Extract<WorkerRequest, {type: 'render'}>): Promise<RenderResult> {
-    const sides = request.op === 'difference' ? 2 : 1;
-    if ((request.op !== 'fit' && request.op !== 'difference') || request.kind === 'video' || request.sides.length !== sides) {
+    const compare = request.op === 'difference' || request.op === 'blocksDifference';
+    const known = ['fit', 'difference', 'blocks', 'blocksDifference'].includes(request.op);
+    if (!known || request.kind === 'video' || request.sides.length !== (compare ? 2 : 1)) {
       return {ok: false, state: 'error', reason: `${request.op} view is not supported for ${request.kind} files`};
     }
 
-    if (request.op === 'difference') {
+    if (compare) {
       const before = await readImage(request, request.sides[0]!);
       if (!before.ok) return before;
       const after = await readImage(request, request.sides[1]!);
       if (!after.ok) return after;
       // No passthrough here: the terminal can draw a PNG, not compare two.
-      return renderer.difference(before.bytes, after.bytes, request.target, request.checker);
+      return request.op === 'blocksDifference'
+        ? renderer.blocksDifference(before.bytes, after.bytes, request.target)
+        : renderer.difference(before.bytes, after.bytes, request.target, request.checker);
     }
 
     const image = await readImage(request, request.sides[0]!);
     if (!image.ok) return image;
     const {bytes, format, sniffed} = image;
+    // Blocks need decoded pixels, so without the image library there is no
+    // passthrough for them.
+    if (request.op === 'blocks') return renderer.blocks(bytes, sniffed, request.target);
     const result = await renderer.fit(bytes, sniffed, request.target, request.checker);
     if (!result.ok && result.state === 'unavailable' && format === 'png' && bytes.byteLength <= MAX_PASSTHROUGH_BYTES) {
       return {ok: true, png: bytes, passthrough: true};

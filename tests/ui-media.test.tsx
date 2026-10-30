@@ -15,6 +15,7 @@ import {
   emitMousePressAt,
   fakeMediaBackend,
   fakeMediaService,
+  BLOCKS_CAPS,
   KITTY_CAPS,
   flush,
   frameLines,
@@ -28,11 +29,12 @@ import {
   type FixtureFile,
 } from './ui-fixtures.js';
 import {tooltipCoversKittyRows} from '../src/ui/App.js';
-import type {ExportRequest, ExportResult, MediaBackend, RenderResult} from '../src/media/backend.js';
+import type {ExportRequest, ExportResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
 import {createWorkerHandler} from '../src/media/worker/handler.js';
 import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
 import {addMediaRows} from '../src/ui/mediaRows.js';
+import {sgrCodes} from './media-helpers.js';
 import type {SectionRow} from '../src/sections.js';
 
 // Kitty still images in the diff pane: placeholder rows in place of the
@@ -1485,5 +1487,285 @@ describe('SVG picture first', () => {
     expect(fake.calls).toEqual([]);
     plain.unmount();
     none.unmount();
+  });
+});
+
+describe('block preview', () => {
+  const BEFORE_ID = '029ace0';
+  const AFTER_ID = '97fa3ee';
+  const MODIFIED = binaryMediaFile('docs/logo.png', 'modified', [BEFORE_ID, AFTER_ID]);
+  const BOTH = {[AFTER_ID]: sideInfo({width: 200, height: 100, bytes: 232_000}), [BEFORE_ID]: sideInfo({width: 100, height: 100, bytes: 1_000})};
+  const text = (frame: string | undefined) => frameLines(frame).join('\n');
+  // Screen lines with their escapes, which frameLines strips.
+  const rawLines = (frame: string | undefined) => (frame ?? '').split('\n');
+  // Screen lines that hold half-block cells, and how many each holds.
+  const blockLines = (frame: string | undefined) => frameLines(frame).flatMap((line, index) => {
+    const count = [...stripAnsi(line)].filter((char) => char === '▀' || char === '▄').length;
+    return count > 0 ? [{index, count}] : [];
+  });
+  // The run of a line from the colours before its first half block to the
+  // reset after its last: the box's own escapes, without the pane's.
+  const boxRun = (line: string) => /(?:\u001B\[[0-9;]*m)*[▀▄][\s\S]*[▀▄](?:\u001B\[[0-9;]*m)*/.exec(line)?.[0] ?? '';
+  const blocksApp = (files: FixtureFile[], options: Parameters<typeof fakeMediaService>[0] = {}, size = SIZE) => mediaApp(files, {caps: BLOCKS_CAPS, ...options}, size);
+
+  it('draws an added PNG as half-block rows within 60 × 20 cells, and sends nothing to the terminal', async () => {
+    const {instance, graphicsWrites, calls} = blocksApp([textFile('src/a.ts', 3), LOGO]);
+    await settle();
+    instance.stdin.write('\u001B[B');
+    await settle();
+
+    const frame = instance.lastFrame();
+    // 200 × 100 px at one pixel per column and two per row: 60 × 15 cells.
+    const lines = blockLines(frame);
+    expect(lines).toHaveLength(15);
+    for (const line of lines) expect(line.count).toBe(60);
+    expect(lines.at(-1)!.index - lines[0]!.index).toBe(14);
+    for (const {index} of lines) {
+      const plain = stripAnsi(frameLines(frame)[index]!);
+      expect(stringWidth(plain)).toBe(SIZE.columns);
+      expect(plain.trimEnd().endsWith('│')).toBe(true);
+      // Every cell is blue over red, as the fake drew it, in 24-bit colour.
+      expect(boxRun(rawLines(frame)[index]!)).toContain('38;2;30;120;200');
+      expect(boxRun(rawLines(frame)[index]!)).toContain('48;2;200;40;40');
+    }
+    expect(text(frame)).toContain('block preview · 60 × 15 cells · o opens the real image');
+    expect(text(frame)).not.toContain('binary file changed');
+    expect(decodePlaceholders(frame)).toEqual([]);
+    expect(frame).not.toContain('\u{10EEEE}');
+
+    const render = calls.find((call) => call.type === 'render')!.request as RenderRequestLike & {op: string; colorDepth?: number; target: {cols: number; rows: number}};
+    expect(render).toMatchObject({op: 'blocks', colorDepth: 3, target: {cols: 60, rows: 15}});
+    // No Kitty image ever exists, so nothing reaches the graphics sink, not
+    // even at exit.
+    expect(graphicsWrites).toEqual([]);
+    instance.unmount();
+  });
+
+  it('says no image support was detected on the footer\'s right while a media file is active', async () => {
+    const {instance} = blocksApp([textFile('src/a.ts', 3), LOGO]);
+    await settle();
+    const range = frameLines(instance.lastFrame()).at(-2)!;
+    expect(range).not.toContain('no image support detected');
+    instance.stdin.write('\u001B[B');
+    await settle();
+    const footer = frameLines(instance.lastFrame()).at(-2)!;
+    expect(footer).toMatch(/q quit .*no image support detected/);
+    expect(stringWidth(stripAnsi(footer))).toBe(SIZE.columns);
+    instance.unmount();
+
+    // Kitty mode keeps the range there.
+    const kitty = mediaApp([LOGO]);
+    await settle();
+    expect(frameLines(kitty.instance.lastFrame()).at(-2)).not.toContain('no image support detected');
+    kitty.instance.unmount();
+  });
+
+  it('uses only 256-colour codes at colour depth 2', async () => {
+    const {instance} = blocksApp([LOGO], {caps: {...BLOCKS_CAPS, colorDepth: 2}});
+    await settle();
+    const frame = instance.lastFrame();
+    const lines = blockLines(frame);
+    expect(lines).toHaveLength(15);
+    for (const {index} of lines) {
+      const run = boxRun(rawLines(frame)[index]!);
+      const codes = [...run.matchAll(/\u001B\[([0-9;]*)m/g)].flatMap((match) => sgrCodes(match[1]!));
+      expect(codes.length).toBeGreaterThan(0);
+      for (const code of codes) {
+        if (code[0] === '38' || code[0] === '48') expect(code[1]).toBe('5');
+        else expect(['0', '39', '49']).toContain(code[0]);
+      }
+      // Blue #1e78c8 and red #c82828 in the 256-colour cube.
+      expect(run).toMatch(/38;5;32[m;]/);
+      expect(run).toMatch(/48;5;160[m;]/);
+    }
+    instance.unmount();
+  });
+
+  it('draws the tree tooltip over block rows and leaves the rest of them intact', async () => {
+    const longName = `assets/${'deeply-nested-folder-name/'.repeat(3)}hero-banner-with-a-long-name.png`;
+    const file = binaryMediaFile(longName, 'added', ['0000000', '97fa3ee']);
+    const {instance} = blocksApp([file], {}, {columns: 120, rows: 30});
+    await settle();
+    const frameBefore = instance.lastFrame();
+    const before = frameLines(frameBefore).map((line) => stripAnsi(line));
+    const boxBefore = blockLines(frameBefore);
+    expect(boxBefore.length).toBeGreaterThan(0);
+
+    const label = cellPosition(frameBefore, ['• hero'], 'hero');
+    await emitMouseMoveAt(label.column, label.row);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    await settle();
+
+    const frame = instance.lastFrame();
+    const after = frameLines(frame).map((line) => stripAnsi(line));
+    // The tooltip is drawn (not moved to the top bar), over the picture.
+    const tip = after.findIndex((line) => line.includes('hero-banner-with-a-long-name.png │'));
+    expect(tip).toBe(label.row + 2);
+    expect(boxBefore.map((line) => line.index)).toContain(tip);
+    expect(after[1]).not.toContain('hero-banner-with-a-long-name.png');
+    const tipRight = after[tip]!.indexOf('│', after[tip]!.indexOf('hero-banner-with-a-long-name.png'));
+    // The diff pane starts after the tree's right border; the hovered tree
+    // row itself gains its copy buttons.
+    const pane = before[boxBefore[0]!.index]!.indexOf('││') + 1;
+    expect(tipRight).toBeGreaterThan(pane);
+    for (const {index} of boxBefore) {
+      expect(stringWidth(after[index]!)).toBe(120);
+      if (index >= tip - 1 && index <= tip + 1) {
+        // Under the tooltip's rows, every cell right of it is as it was.
+        expect(after[index]!.slice(tipRight + 1)).toBe(before[index]!.slice(tipRight + 1));
+      } else {
+        expect(after[index]!.slice(pane)).toBe(before[index]!.slice(pane));
+      }
+    }
+    instance.unmount();
+  });
+
+  it('compares a modified image side by side, by flipping and as a difference, in blocks', async () => {
+    // Each side in its own colour, so the frame says which one shows.
+    const render = (request: RenderRequest): RenderResult => {
+      const {cols, rows} = request.target;
+      const colour = request.op === 'blocksDifference' ? 0xd2a8ff : request.sides[0]!.side === 'before' ? 0xc82828 : 0x1e78c8;
+      return {ok: true, cells: new Uint32Array(cols * rows * 2).fill(colour), cols, rows, ...(request.op === 'blocksDifference' ? {changedRatio: 0.31} : {})};
+    };
+    const {instance, calls, graphicsWrites} = blocksApp([MODIFIED], {sides: BOTH, render}, {columns: 160, rows: 34});
+    await settle();
+    let frame = instance.lastFrame();
+    expect(text(frame)).toContain('[1 Side by side]  2 Flip  3 Difference');
+    // Every compare label says the pictures are block previews. This pane
+    // is too narrow for the whole note, so it is cut from its end and both
+    // side labels stay whole.
+    expect(text(frame)).toMatch(/before 100 × 100 · 1\.0 KB\s+after 200 × 100 · 232 KB · block preview · 40 × 20 and +│/);
+    // Both sides on the same rows, red before on the left, blue after on the right.
+    const sideBySide = blockLines(frame);
+    expect(sideBySide.length).toBeGreaterThan(0);
+    const row = rawLines(frame)[sideBySide[0]!.index]!;
+    expect(row.indexOf('48;2;200;40;40')).toBeGreaterThan(-1);
+    expect(row.indexOf('48;2;30;120;200')).toBeGreaterThan(row.indexOf('48;2;200;40;40'));
+
+    instance.stdin.write('2');
+    await settle();
+    frame = instance.lastFrame();
+    expect(text(frame)).toMatch(/after · 2 or click swaps · block preview · 60 × 20 cells · o opens the real image/);
+    expect(frame).not.toContain('48;2;200;40;40');
+    expect(blockLines(frame).every(({index}) => rawLines(frame)[index]!.includes('48;2;30;120;200'))).toBe(true);
+    const rendersAfterFlip = calls.filter((call) => call.type === 'render').length;
+
+    // Both flip sides were drawn ahead: swapping renders nothing new.
+    instance.stdin.write('2');
+    await settle();
+    frame = instance.lastFrame();
+    expect(text(frame)).toMatch(/before · 2 or click swaps · block preview · 60 × 20 cells · o opens the real image/);
+    expect(blockLines(frame).every(({index}) => rawLines(frame)[index]!.includes('48;2;200;40;40'))).toBe(true);
+    expect(calls.filter((call) => call.type === 'render')).toHaveLength(rendersAfterFlip);
+
+    instance.stdin.write('3');
+    await settle();
+    frame = instance.lastFrame();
+    expect(text(frame)).toMatch(/difference\s+changed pixels marked · 31% of the image · sizes differ, aligned top-left · block preview · 60 × 15 c/);
+    expect(blockLines(frame).every(({index}) => rawLines(frame)[index]!.includes('48;2;210;168;255'))).toBe(true);
+    const difference = calls.find((call) => call.type === 'render' && call.request.op === 'blocksDifference')!.request as RenderRequestLike;
+    expect(difference.sides.map((side) => side.abbrevId)).toEqual([BEFORE_ID, AFTER_ID]);
+    expect(calls.some((call) => call.type === 'render' && (call.request.op === 'fit' || call.request.op === 'difference'))).toBe(false);
+    expect(graphicsWrites).toEqual([]);
+    instance.unmount();
+  });
+
+  it('opens an added SVG on its block picture, with its source folded under it', async () => {
+    const sides = {'35ecfd6': sideInfo({format: 'svg', width: 200, height: 100, bytes: 1_200, hasAlpha: true})};
+    const {instance, calls, graphicsWrites} = blocksApp([svgMediaFile('docs/flow.svg'), textFile('src/b.ts', 3)], {sides});
+    await settle();
+    const frame = instance.lastFrame();
+    const lines = frameLines(frame);
+    const label = lines.findIndex((line) => line.includes('picture · rendered from the SVG source'));
+    const header = lines.findIndex((line) => line.includes('▸ docs/flow.svg:1 · 6 lines folded'));
+    expect(label).toBeGreaterThan(0);
+    expect(header).toBeGreaterThan(label);
+    const boxes = blockLines(frame);
+    expect(boxes.length).toBeGreaterThan(0);
+    expect(boxes[0]!.index).toBeGreaterThan(label);
+    expect(boxes.at(-1)!.index).toBeLessThan(header);
+    for (const each of instance.frames) expect(stripAnsi(each)).not.toContain('h0-0');
+    expect(calls.find((call) => call.type === 'render')!.request).toMatchObject({op: 'blocks', kind: 'svg'});
+    expect(graphicsWrites).toEqual([]);
+    instance.unmount();
+  });
+
+  it('opens the real image with o', async () => {
+    const {instance, opened} = blocksApp([LOGO]);
+    await settle();
+    instance.stdin.write('o');
+    await settle();
+    expect(text(instance.lastFrame())).toContain('opened logo.png (after)');
+    expect(opened).toEqual([{command: '/usr/bin/open', args: ['/tmp/branch-review-media-test/open-1/after.png']}]);
+    instance.unmount();
+  });
+
+  it('says once that previews are unavailable when the image library is missing', async () => {
+    const reason = 'image library failed to load (dlopen failed)';
+    const second = binaryMediaFile('docs/icon.png', 'added', ['0000000', 'abc1234']);
+    const fixture = buildFixture([LOGO, second]);
+    const {service, calls} = fakeMediaService({
+      caps: BLOCKS_CAPS,
+      sides: {...SIDES, abc1234: sideInfo({width: 40, height: 40})},
+      review: fixture.review,
+      render: () => ({ok: false, state: 'unavailable', reason}),
+    });
+    // Every notice the app is handed, so a repeat cannot hide behind a toast
+    // that is still showing.
+    const taken: string[] = [];
+    const takeNotices = service.takeNotices.bind(service);
+    service.takeNotices = () => {
+      const notices = takeNotices();
+      taken.push(...notices);
+      return notices;
+    };
+    const instance = renderFixture({...fixture, media: service}, SIZE, []);
+    await settle();
+    // Both pictures failed, and the library was named only once.
+    expect(calls.filter((call) => call.type === 'render')).toHaveLength(2);
+    expect(taken).toEqual(['image previews unavailable: image library failed to load']);
+    expect(instance.frames.some((each) => stripAnsi(each).includes('image previews unavailable: image library failed to load'))).toBe(true);
+    expect(text(instance.lastFrame())).toContain(`preview unavailable: ${reason}`);
+    expect(service.takeNotices()).toEqual([]);
+    instance.unmount();
+  });
+
+  it('gives every copy key the same payload with block previews on and off', async () => {
+    const files = [LOGO, textFile('src/b.ts', 3)];
+    const run = async (withMedia: boolean) => {
+      const fixture = buildFixture(files);
+      const fake = fakeMediaService({caps: BLOCKS_CAPS, sides: SIDES, review: fixture.review});
+      const writes: string[] = [];
+      const instance = renderFixture({
+        ...fixture,
+        readFileContent: (file) => {
+          if (file.path.endsWith('.png')) throw new Error(`${file.path} is not UTF-8 text`);
+          return 'contents\n';
+        },
+        resolveAbsolutePath: (file) => `/repo/${file.path}`,
+        ...(withMedia ? {media: fake.service} : {}),
+      }, SIZE, writes);
+      await settle();
+      const toasts: string[] = [];
+      for (const file of [0, 1]) {
+        for (const key of ['y', 'Y', 'd', 'f', 'c', 'p', 'b', 'T']) {
+          instance.stdin.write(key);
+          await settle(3);
+          toasts.push((frameLines(instance.lastFrame()).at(-2) ?? '').replace(/│/g, '').trim().split('  ')[0]!);
+        }
+        if (file === 0) {
+          instance.stdin.write('\u001B[B');
+          await settle(3);
+        }
+      }
+      instance.unmount();
+      return {writes, toasts};
+    };
+
+    const on = await run(true);
+    const off = await run(false);
+    expect(on.writes.length).toBeGreaterThan(5);
+    expect(on.writes).toEqual(off.writes);
+    expect(on.toasts).toEqual(off.toasts);
   });
 });

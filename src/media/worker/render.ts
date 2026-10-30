@@ -1,4 +1,5 @@
 import type {JobFailure, RenderResult, RenderTarget} from '../backend.js';
+import {CLEAR_PIXEL} from '../blocks.js';
 import type {Sniffed} from './sniff.js';
 import {MAX_PIXELS, svgSize} from './sniff.js';
 
@@ -27,6 +28,9 @@ const DIFF_KEEP = 0.45;
 const DIFF_TINT = [0xd2, 0xa8, 0xff] as const;
 const DIFF_TINT_WEIGHT = 0.6;
 const MAX_SVG_DENSITY = 2400;
+// Block previews show transparency over the dark pane colour of the
+// mockups; a terminal cell has one colour per half, with no alpha.
+const BLOCK_BACKGROUND = [0x0d, 0x11, 0x17] as const;
 
 // An SVG is drawn at a density (dots per inch, where 72 is its own size) that
 // makes it `drawW` pixels wide, so it is never drawn small and scaled up;
@@ -128,15 +132,12 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
   type Source = {bytes: Buffer} | {raw: RawImage};
   type SourceInfo = Pick<Sniffed, 'hasAlpha'> & Partial<Pick<Sniffed, 'format' | 'width'>> & {physical?: boolean};
 
-  async function fitOnce(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget, checker: boolean, scale: number) {
-    const canvasW = Math.max(1, Math.round(target.cols * target.cellPx.w * scale));
-    const canvasH = Math.max(1, Math.round(target.rows * target.cellPx.h * scale));
-    const drawW = Math.min(canvasW, Math.max(1, Math.round(target.drawPx.w * scale)));
-    const drawH = Math.min(canvasH, Math.max(1, Math.round(target.drawPx.h * scale)));
-
+  // The source drawn at its picture size as RGBA, the first step of both a
+  // PNG and a block preview. An SVG is drawn at the size the box needs, so
+  // its edges stay sharp.
+  async function drawPicture(sharp: SharpFactory, source: Source, info: SourceInfo, drawW: number, drawH: number, nearest: boolean) {
     // The input is always a buffer, never a path; one page, so an animation
-    // shows its first frame. An SVG is drawn at the size the box needs, so
-    // its edges stay sharp.
+    // shows its first frame.
     const input = 'bytes' in source
       ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1, ...svgDensity(info, drawW)})
       : sharp(source.raw.data, {limitInputPixels: MAX_PIXELS, raw: {width: source.raw.width, height: source.raw.height, channels: 4}});
@@ -144,12 +145,21 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     // another shape than its box: it keeps its own, letterboxed on clear
     // pixels, rather than being stretched.
     const fit = info.format === 'svg' ? {fit: 'contain' as const, background: {r: 0, g: 0, b: 0, alpha: 0}} : {fit: 'fill' as const};
-    const resized = await input
+    return input
       .timeout({seconds: DECODE_TIMEOUT_S})
-      .resize(drawW, drawH, {...fit, kernel: target.nearest ? 'nearest' : 'lanczos3'})
+      .resize(drawW, drawH, {...fit, kernel: nearest ? 'nearest' : 'lanczos3'})
       .ensureAlpha()
       .raw()
       .toBuffer();
+  }
+
+  async function fitOnce(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget, checker: boolean, scale: number) {
+    const canvasW = Math.max(1, Math.round(target.cols * target.cellPx.w * scale));
+    const canvasH = Math.max(1, Math.round(target.rows * target.cellPx.h * scale));
+    const drawW = Math.min(canvasW, Math.max(1, Math.round(target.drawPx.w * scale)));
+    const drawH = Math.min(canvasH, Math.max(1, Math.round(target.drawPx.h * scale)));
+
+    const resized = await drawPicture(sharp, source, info, drawW, drawH, target.nearest);
 
     const raw = {width: drawW, height: drawH, channels: 4 as const};
     let picture = resized;
@@ -166,6 +176,36 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
       .extend({top, bottom: canvasH - drawH - top, left, right: canvasW - drawW - left, background: {r: 0, g: 0, b: 0, alpha: 0}})
       .png({compressionLevel: 6})
       .toBuffer();
+  }
+
+  /**
+   * The source as block preview cells: one pixel per column and two per row
+   * of `target`'s cols × rows, the picture centred at `drawPx` and the rest
+   * clear, transparency flattened onto the pane colour.
+   */
+  async function blockCells(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget) {
+    const cols = Math.max(1, target.cols);
+    const rows = Math.max(1, target.rows);
+    const drawW = Math.min(cols, Math.max(1, Math.round(target.drawPx.w)));
+    const drawH = Math.min(rows * 2, Math.max(1, Math.round(target.drawPx.h)));
+    const picture = await drawPicture(sharp, source, info, drawW, drawH, target.nearest);
+
+    const cells = new Uint32Array(cols * rows * 2).fill(CLEAR_PIXEL);
+    const left = Math.floor((cols - drawW) / 2);
+    const top = Math.floor((rows * 2 - drawH) / 2);
+    for (let y = 0; y < drawH; y += 1) {
+      for (let x = 0; x < drawW; x += 1) {
+        const at = (y * drawW + x) * 4;
+        const alpha = picture[at + 3]! / 255;
+        let rgb = 0;
+        for (let channel = 0; channel < 3; channel += 1) {
+          rgb = (rgb << 8) | Math.round(picture[at + channel]! * alpha + BLOCK_BACKGROUND[channel]! * (1 - alpha));
+        }
+        const py = top + y;
+        cells[((py >> 1) * cols + left + x) * 2 + (py & 1)] = rgb;
+      }
+    }
+    return {ok: true as const, cells, cols, rows};
   }
 
   async function fitSource(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget, checker: boolean) {
@@ -211,15 +251,8 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   }
 
-  /**
-   * The two sides' difference fitted into its box, with the share of the
-   * canvas that changed. `target` is fitted to the larger canvas.
-   */
-  async function difference(before: Buffer, after: Buffer, target: RenderTarget, checker: boolean): Promise<RenderResult> {
-    const loaded = await sharpOrReason();
-    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
-
-    const {sharp} = loaded;
+  // Both sides decoded and compared, or why they could not be.
+  async function decodedDifference(sharp: SharpFactory, before: Buffer, after: Buffer): Promise<ReturnType<typeof differenceImage> | JobFailure> {
     const decode = async (bytes: Buffer): Promise<RawImage> => {
       const {data, info} = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
         .timeout({seconds: DECODE_TIMEOUT_S})
@@ -228,14 +261,26 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
         .toBuffer({resolveWithObject: true});
       return {data, width: info.width, height: info.height};
     };
+    const [left, right] = await Promise.all([decode(before), decode(after)]);
+    // Each side passed the pixel cap; their combined canvas must too.
+    const width = Math.max(left.width, right.width);
+    const height = Math.max(left.height, right.height);
+    if (width * height > MAX_PIXELS) return {ok: false, state: 'error', reason: `image too large to preview (${width} × ${height})`};
+    return differenceImage(left, right);
+  }
+
+  /**
+   * The two sides' difference fitted into its box, with the share of the
+   * canvas that changed. `target` is fitted to the larger canvas.
+   */
+  async function difference(before: Buffer, after: Buffer, target: RenderTarget, checker: boolean): Promise<RenderResult> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+
     try {
-      const [left, right] = await Promise.all([decode(before), decode(after)]);
-      // Each side passed the pixel cap; their combined canvas must too.
-      const width = Math.max(left.width, right.width);
-      const height = Math.max(left.height, right.height);
-      if (width * height > MAX_PIXELS) return {ok: false, state: 'error', reason: `image too large to preview (${width} × ${height})`};
-      const diff = differenceImage(left, right);
-      const png = await fitSource(sharp, {raw: diff}, diff, target, checker);
+      const diff = await decodedDifference(loaded.sharp, before, after);
+      if ('ok' in diff) return diff;
+      const png = await fitSource(loaded.sharp, {raw: diff}, diff, target, checker);
       return {ok: true, png, changedRatio: diff.changedRatio};
     } catch {
       // A corrupt file, or one caught half-written: tried again only when its
@@ -244,7 +289,34 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     }
   }
 
-  return {fit, picture, difference, available: async () => !('reason' in await sharpOrReason())};
+  /** The image as block preview cells. */
+  async function blocks(bytes: Buffer, info: Sniffed, target: RenderTarget): Promise<RenderResult> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+
+    try {
+      const physical = info.format === 'svg' && Boolean(svgSize(bytes)?.physical);
+      return await blockCells(loaded.sharp, {bytes}, {...info, physical}, target);
+    } catch {
+      return {ok: false, state: 'error', reason: 'could not decode image'};
+    }
+  }
+
+  /** The two sides' difference as block preview cells, with the share that changed. */
+  async function blocksDifference(before: Buffer, after: Buffer, target: RenderTarget): Promise<RenderResult> {
+    const loaded = await sharpOrReason();
+    if ('reason' in loaded) return {ok: false, state: 'unavailable', reason: loaded.reason};
+
+    try {
+      const diff = await decodedDifference(loaded.sharp, before, after);
+      if ('ok' in diff) return diff;
+      return {...await blockCells(loaded.sharp, {raw: diff}, diff, target), changedRatio: diff.changedRatio};
+    } catch {
+      return {ok: false, state: 'error', reason: 'could not decode image'};
+    }
+  }
+
+  return {fit, picture, difference, blocks, blocksDifference, available: async () => !('reason' in await sharpOrReason())};
 }
 
 export type Renderer = ReturnType<typeof createRenderer>;

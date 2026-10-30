@@ -189,12 +189,15 @@ A modified image opens with its old and new versions side by side. `2` (or the t
 | Terminal | Images |
 | --- | --- |
 | Ghostty, cmux, Kitty | Drawn as pictures |
-| iTerm2, WezTerm, VS Code, Warp, Konsole, Apple Terminal, others | The usual `binary file changed` line |
-| Inside tmux | The usual line |
+| Apple Terminal, Alacritty, iTerm2, WezTerm, VS Code, Warp, Konsole, and any other terminal with 256 colours or more | A block preview |
+| Inside tmux | A block preview |
+| Terminals with fewer than 256 colours, or that don't answer the startup query | The usual `binary file changed` line |
+
+A block preview draws the picture in coloured half-block characters, two pixels to a cell and at most 60 × 20 cells. That's enough to tell which image you're looking at and roughly what changed, in every compare mode. `o` opens the real image, and the footer says `no image support detected` while one is on screen.
 
 The file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
 
-Images stay off when colour is off (`NO_COLOR` and the rest of the colour rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognised.
+Images stay off when colour is off (`NO_COLOR` and the rest of the colour rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognised, and `BRANCH_REVIEW_IMAGES=blocks` forces the block preview.
 
 Every image is read in a separate background process. Bytes are checked against the object id in Git's diff before anything is drawn, so a file that changed on disk or that a Git filter rewrites never shows as a stale or wrong picture. A file that can't be previewed shows the reason in its place. If that process keeps failing or hanging, previews turn off for the session and the review carries on.
 

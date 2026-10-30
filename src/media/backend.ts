@@ -41,8 +41,9 @@ export type RenderResult =
   // `passthrough`: the source PNG as it is, because the image library is
   // missing; the terminal scales it into the box.
   | {ok: true; png: Uint8Array; passthrough?: true; changedRatio?: number}
-  // Block previews: per cell the top pixel's RGB then the bottom pixel's.
-  | {ok: true; cells: Uint32Array; cols: number; rows: number}
+  // Block previews: per cell the top pixel's RGB then the bottom pixel's, as
+  // 0xRRGGBB, or CLEAR_PIXEL (blocks.ts) outside the picture.
+  | {ok: true; cells: Uint32Array; cols: number; rows: number; changedRatio?: number}
   | JobFailure;
 
 export type ExportRequest = {cwd: string; side: SideRef; format: MediaFormat; dir: string};

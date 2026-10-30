@@ -58,6 +58,17 @@ export const KITTY_CAPS: GraphicsCaps = {
   terminal: 'ghostty 1.3.2',
 };
 
+// A colour terminal without Kitty placeholders (Apple Terminal, say):
+// pictures draw as coloured half blocks.
+export const BLOCKS_CAPS: GraphicsCaps = {
+  ...NO_GRAPHICS,
+  protocol: 'blocks',
+  cellPx: {w: 10, h: 20},
+  cellPxSource: 'csi16',
+  colorDepth: 3,
+  terminal: 'Apple_Terminal',
+};
+
 export function sideInfo(overrides: Partial<SideInfo> = {}): SideInfo {
   return {oid: '97fa3ee'.padEnd(40, '0'), bytes: 232_000, format: 'png', width: 200, height: 100, frames: 1, hasAlpha: false, ...overrides};
 }

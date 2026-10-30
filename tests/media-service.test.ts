@@ -5,7 +5,7 @@ import {planMedia, type BoxSpec} from '../src/media/layout.js';
 import {createMediaService} from '../src/media/service.js';
 import type {MediaRef} from '../src/media/types.js';
 import type {ReviewModel} from '../src/review/model.js';
-import {KITTY_CAPS, parseApc, pngFixture, sideInfo} from './media-helpers.js';
+import {BLOCKS_CAPS, KITTY_CAPS, parseApc, pngFixture, sideInfo} from './media-helpers.js';
 import {binaryMediaFile, buildFixture, flush} from './ui-fixtures.js';
 
 // The media service on its own, over a scripted backend: what it sends to
@@ -451,6 +451,57 @@ describe('media service compare modes', () => {
     expect(service.planVersion()).toBeGreaterThan(plans);
     expect(planOf(service, ref).rows.length).toBe(plan.rows.length);
   });
+
+  for (const caps of [KITTY_CAPS, BLOCKS_CAPS]) {
+    it(`keeps a cached difference's changed ratio when its content leaves the review and comes back (${caps.protocol})`, async () => {
+      // A file rewritten and then reverted under watch: the first content
+      // comes back and draws from the cache, with no new render to say how
+      // much changed.
+      const ratios: Record<string, number> = {'2222222': 0, '3333333': 0.5};
+      const requests: RenderRequest[] = [];
+      const backend: MediaBackend = {
+        ...scriptedBackend().backend,
+        async render(request) {
+          requests.push(request);
+          const {cols, rows, cellPx} = request.target;
+          const changedRatio = ratios[request.sides[1]!.abbrevId]!;
+          if (request.op === 'blocksDifference') return {ok: true, cells: new Uint32Array(cols * rows * 2), cols, rows, changedRatio};
+          return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h), changedRatio};
+        },
+      };
+      const {service} = serviceOver(backend, {caps});
+      service.setCompare('difference');
+      const draw = async (model: ReviewModel) => {
+        service.setReview(model, range);
+        await flush(4);
+        const ref = service.refFor(model.files[0]!) as MediaRef;
+        const states = {before: service.sideState(ref, 'before'), after: service.sideState(ref, 'after')};
+        const layout = {innerWidth: 100, viewportRows: 20, caps};
+        const box = planMedia(ref, states, service.viewState(ref.fileKey), layout, service.drawnFacts(ref))
+          .rows.find((row): row is Extract<typeof row, {type: 'box'}> => row.type === 'box')!.boxes[0]!;
+        const keys = new Set([box.imageKey]);
+        service.want([{fileKey: ref.fileKey, box}], keys);
+        service.sweep(keys, keys);
+        await flush(4);
+        const label = planMedia(ref, states, service.viewState(ref.fileKey), layout, service.drawnFacts(ref)).rows.find((row) => row.type === 'text' && row.role === 'label');
+        return {facts: service.drawnFacts(ref), label: JSON.stringify(label)};
+      };
+
+      const first = await draw(modifiedReview(['1111111', '2222222']));
+      expect(first.facts).toEqual({changedRatio: 0});
+      expect(first.label).toContain('no visible pixel change (bytes differ)');
+      const second = await draw(modifiedReview(['1111111', '3333333']));
+      expect(second.facts).toEqual({changedRatio: 0.5});
+      expect(requests).toHaveLength(2);
+
+      const third = await draw(modifiedReview(['1111111', '2222222']));
+      // Drawn from the cache: no new render, and the label still holds.
+      expect(requests).toHaveLength(2);
+      expect(third.facts).toEqual({changedRatio: 0});
+      expect(third.label).toContain('no visible pixel change (bytes differ)');
+      expect(third.label).not.toContain('changed pixels marked');
+    });
+  }
 
   it('waits for both sides before rendering a difference, and never renders one with a failed side', async () => {
     const gate: {open?: () => void} = {};

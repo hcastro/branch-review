@@ -225,9 +225,22 @@ function boxRowsFor(boxes: BoxSpec[], extra: Partial<PlanBoxRow> = {}): PlanBoxR
   return Array.from({length: height}, (_, boxRow) => ({type: 'box', boxes, boxRow, ...extra}));
 }
 
+// Half blocks are only a sketch of the picture, so every block label says so
+// and points at the real image.
+function blockNote(boxes: Array<{cols: number; rows: number}>) {
+  const sizes = [...new Set(boxes.map((box) => `${box.cols} × ${box.rows}`))];
+  return `block preview · ${sizes.join(' and ')} cells · o opens the real image`;
+}
+
+// The block note at the end of a compare label, after the side labels, so a
+// narrow pane cuts the note and never a side's name. Nothing in Kitty mode.
+function blockSuffix(boxes: Array<{cols: number; rows: number}>, caps: GraphicsCaps): TextPart[] {
+  return caps.protocol === 'blocks' ? [part(` · ${blockNote(boxes)}`, 'dim')] : [];
+}
+
 // The dim note after a picture's label: how big it is drawn.
 function shownNote(box: Box, caps: GraphicsCaps) {
-  if (caps.protocol === 'blocks') return `block preview · ${box.cols} × ${box.rows} cells · o opens the real image`;
+  if (caps.protocol === 'blocks') return blockNote([box]);
   if (box.upscale > 1) return `shown at ${box.upscale}×`;
   if (box.scale === 1) return 'shown at 100%';
   return `${box.drawPx.w} × ${box.drawPx.h} px shown`;
@@ -286,9 +299,9 @@ function sideBySidePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout
     const beforeBox = fitBox({w: before.width, h: before.height}, inner, rows, caps);
     const afterBox = fitBox({w: after.width, h: after.height}, inner, rows, caps);
     return [
-      textRow('label', label('before', before)),
+      textRow('label', [...label('before', before), ...blockSuffix([beforeBox], caps)]),
       ...boxRowsFor([boxSpec(ref, 'before', beforeBox, 0, layout)]),
-      textRow('label', label('after', after)),
+      textRow('label', [...label('after', after), ...blockSuffix([afterBox], caps)]),
       ...boxRowsFor([boxSpec(ref, 'after', afterBox, 0, layout)]),
     ];
   }
@@ -298,7 +311,7 @@ function sideBySidePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout
   const afterBox = fitBox({w: after.width, h: after.height}, half, rows, caps);
   const right = half + SIDE_GAP;
   return [
-    {type: 'text', role: 'label', pieces: [{at: 0, parts: label('before', before)}, {at: right, parts: label('after', after)}]},
+    {type: 'text', role: 'label', pieces: [{at: 0, parts: label('before', before)}, {at: right, parts: [...label('after', after), ...blockSuffix([beforeBox, afterBox], caps)]}]},
     ...boxRowsFor([boxSpec(ref, 'before', beforeBox, 0, layout), boxSpec(ref, 'after', afterBox, right, layout)]),
   ];
 }
@@ -318,7 +331,7 @@ function flipPlan(ref: MediaRef, before: SideInfo, after: SideInfo, view: MediaV
   const hidden: SideName = shown === 'after' ? 'before' : 'after';
   return {
     rows: [
-      textRow('label', [sideLabel(ref, shown), part(' · 2 or click swaps', 'dim')]),
+      textRow('label', [sideLabel(ref, shown), part(' · 2 or click swaps', 'dim'), ...blockSuffix([geometry], layout.caps)]),
       ...boxRowsFor([boxSpec(ref, shown, boxes[shown], 0, layout, geometry)], {swap: true}),
     ],
     prefetch: [boxSpec(ref, hidden, boxes[hidden], 0, layout, geometry)],
@@ -344,7 +357,7 @@ function differencePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout
   // Next to the label rather than flush right, so a narrow pane cuts the
   // note short instead of dropping it.
   return [
-    textRow('label', [part('difference', 'difference'), part(`  ${note}`, 'dim')]),
+    textRow('label', [part('difference', 'difference'), part(`  ${note}`, 'dim'), ...blockSuffix([box], layout.caps)]),
     ...boxRowsFor([boxSpec(ref, 'diff', box, 0, layout)]),
   ];
 }

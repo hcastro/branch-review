@@ -88,10 +88,11 @@ const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIG
 type SessionLike = ReturnType<typeof createTerminalSession>;
 
 /**
- * The media service for a terminal that draws Kitty images, with its exit
- * work in place: the restore write deletes every image sent, before the alt
- * screen is left, and the exit hooks kill the media worker and remove the
- * session's temp dir. Nothing is sent before the UI enters the alt screen.
+ * The media service for a terminal that draws Kitty images or block
+ * previews, with its exit work in place: the restore write deletes every
+ * image sent (none for blocks), before the alt screen is left, and the exit
+ * hooks kill the media worker and remove the session's temp dir. Nothing is
+ * sent before the UI enters the alt screen.
  */
 function startMedia({caps, cwd, env, proc, session, watching}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean}): MediaService {
   sweepStaleMediaDirs({env});
@@ -182,8 +183,9 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
   if (startupBuild.signal.aborted) return;
   const {keys, replyHead} = detection.handOff();
   const graphics = replyHead ? {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : caps;
-  // Pictures need Kitty placeholders; other terminals keep today's view.
-  const media = caps.protocol === 'kitty' ? startMedia({caps, cwd, env, proc, session, watching: options.watch}) : undefined;
+  // Kitty terminals draw pictures and other colour terminals block previews;
+  // with no graphics the app is exactly as it is without media.
+  const media = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch}) : undefined;
 
   await runInkApp(session, (guard) => render(guard(
     React.createElement(ReviewController, {

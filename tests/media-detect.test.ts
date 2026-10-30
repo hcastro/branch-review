@@ -536,6 +536,28 @@ describe('decideCaps', () => {
     expect(decideCaps(answered(`${OK}${xtversion('ghostty 1.4.2')}`), {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty'}, {}).animation).toBe(true);
   });
 
+  // The whole outcome table, one row per terminal the README names: what
+  // each one answers and what it gets.
+  for (const [name, env, replies, expected] of [
+    ['Ghostty (cmux)', {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2'}, `${OK}${DA1}`, {protocol: 'kitty', colorDepth: 3}],
+    ['Kitty', {TERM: 'xterm-kitty'}, `${OK}${DA1}`, {protocol: 'kitty', colorDepth: 3}],
+    ['iTerm2, until a probe confirms placeholders', {TERM: 'xterm-256color', TERM_PROGRAM: 'iTerm.app'}, `${OK}${DA1}`, {protocol: 'blocks', colorDepth: 2}],
+    ['WezTerm', {TERM: 'xterm-256color', TERM_PROGRAM: 'WezTerm'}, `${OK}${DA1}`, {protocol: 'blocks'}],
+    ['VS Code', {TERM: 'xterm-256color', TERM_PROGRAM: 'vscode', COLORTERM: 'truecolor'}, `${OK}${DA1}`, {protocol: 'blocks', colorDepth: 3}],
+    ['Warp', {TERM: 'xterm-256color', TERM_PROGRAM: 'WarpTerminal'}, `${OK}${DA1}`, {protocol: 'blocks'}],
+    ['Konsole', {TERM: 'xterm-256color', KONSOLE_VERSION: '230800'}, `${OK}${DA1}`, {protocol: 'blocks'}],
+    ['Apple Terminal', {TERM: 'xterm-256color', TERM_PROGRAM: 'Apple_Terminal'}, DA1, {protocol: 'blocks', colorDepth: 2}],
+    ['Alacritty', {TERM: 'alacritty', COLORTERM: 'truecolor'}, DA1, {protocol: 'blocks', colorDepth: 3}],
+    ['tmux', {TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0'}, DA1, {protocol: 'blocks', tmux: true}],
+    ['a forced block preview in Ghostty', {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', BRANCH_REVIEW_IMAGES: 'blocks'}, `${OK}${DA1}`, {protocol: 'blocks', colorDepth: 3}],
+    ['a 16-colour xterm', {TERM: 'xterm'}, DA1, {protocol: 'none'}],
+    ['a terminal that never answers', {TERM: 'xterm-256color'}, '', {protocol: 'none', detectionTimedOut: true}],
+  ] as const) {
+    it(`gives ${name} ${expected.protocol === 'none' ? 'no graphics' : expected.protocol}`, () => {
+      expect(decideCaps(parseReplies(replies), env, {})).toMatchObject(expected);
+    });
+  }
+
   it('ignores a cell size that is zero or absurd', () => {
     const caps = decideCaps(answered(`${OK}${ESC}[6;0;0t`), GHOSTTY, {columns: 0, rows: 0});
     expect(caps).toMatchObject({cellPx: {w: 10, h: 20}, cellPxSource: 'default'});

@@ -2022,8 +2022,9 @@ export function tooltipCoversKittyRows(
 }
 
 // One row of the boxes a media row crosses, at most `inner` cells: the
-// placeholder cells of a box whose image the terminal has, blank cells while
-// it loads, or the reason on the first row of a box that failed. Built at
+// placeholder cells of a box whose image the terminal has, the box's row of
+// half blocks in a block preview, blank cells while it loads, or the reason
+// on the first row of a box that failed. Built at
 // the full width here so nothing later has to cut through a placeholder run.
 function renderBoxRow(info: NonNullable<SectionRow['media']>, media: MediaService, inner: number) {
   const boxRow = info.boxRow ?? 0;
@@ -2040,6 +2041,12 @@ function renderBoxRow(info: NonNullable<SectionRow['media']>, media: MediaServic
     const state = boxRow < box.rows ? media.boxState(box) : null;
     if (state?.status === 'kitty') {
       out += placeholderRun(state.id, boxRow, 0, width);
+      used += width;
+    } else if (state?.status === 'blocks') {
+      // Each row is the box's cols wide; a pane narrower than the box since
+      // the plan was made cuts it.
+      const shown = truncateAnsi(state.rows[boxRow] ?? '', width);
+      out += `${shown}${' '.repeat(Math.max(0, width - visibleWidth(shown)))}`;
       used += width;
     } else if (state?.status === 'error' && boxRow === 0) {
       // The reason may run past a narrow box, up to the next one.
@@ -3599,9 +3606,12 @@ function AppContent({
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
     : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+  // A block preview is rough on purpose; while one is on screen the footer
+  // says why the picture is not drawn properly.
+  const footerRight = activeMediaRef && media?.caps.protocol === 'blocks' ? 'no image support detected' : `${displayBase}...${displayBranch}`;
   const footerLine = composeBar(
     [footerStatus],
-    {text: `${displayBase}...${displayBranch}`, style: ANSI_GRAY},
+    {text: footerRight, style: ANSI_GRAY},
     Math.max(1, columns - 4),
     truncateStart,
   );

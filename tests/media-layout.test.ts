@@ -275,6 +275,28 @@ describe('planMedia', () => {
     expect(boxRows(diff)[0]!.boxes![0]!.op).toBe('blocksDifference');
   });
 
+  it('says it is a block preview in every compare mode, cutting the note before any side label', () => {
+    const r = ref('raster', {before: true, after: true});
+    const sides = {before: ready(100, 100), after: ready(200, 100)};
+    const label = (compare: MediaViewState['compare'], inner = 200, caps = BLOCKS) => planRowText(planMedia(r, sides, {...VIEW, compare}, layout(inner, 30, caps)).rows[1]!, inner);
+    // Square half-cells within 60 × 20: 100 × 100 px takes 40 × 20 cells and 200 × 100 px 60 × 15.
+    expect(label('sideBySide')).toMatch(/^before 100 × 100 · 232 KB\s+after 200 × 100 · 232 KB · block preview · 40 × 20 and 60 × 15 cells · o opens the real image$/);
+    // Flip shares one box wide and tall enough for either side; difference
+    // draws the 200 × 100 canvas.
+    expect(label('flip')).toBe('after · 2 or click swaps · block preview · 60 × 20 cells · o opens the real image');
+    expect(label('difference')).toBe('difference  changed pixels marked · sizes differ, aligned top-left · block preview · 60 × 15 cells · o opens the real image');
+    // A narrow pane cuts the note from its end; both side labels stay whole.
+    expect(label('sideBySide', 70)).toMatch(/^before 100 × 100 · 232 KB\s+after 200 × 100 · 232 KB · block/);
+    // Stacked halves each name their own box.
+    const stacked = planMedia(r, sides, VIEW, layout(30, 30, BLOCKS)).rows.filter((row) => row.type === 'text' && row.role === 'label').map((row) => planRowText(row, 200));
+    expect(stacked).toEqual([
+      'before 100 × 100 · 232 KB · block preview · 26 × 13 cells · o opens the real image',
+      'after 200 × 100 · 232 KB · block preview · 30 × 8 cells · o opens the real image',
+    ]);
+    // Kitty labels carry no block note.
+    for (const compare of ['sideBySide', 'flip', 'difference'] as const) expect(label(compare, 200, KITTY)).not.toContain('block preview');
+  });
+
   it('labels an SVG picture as rendered from its source', () => {
     const plan = planMedia(ref('svg', {after: true}), {after: ready(300, 150, {format: 'svg'})}, VIEW, layout(100, 30));
     expect(planRowText(plan.rows[0]!, 100)).toMatch(/^picture · rendered from the SVG source/);

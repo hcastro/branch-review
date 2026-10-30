@@ -1,6 +1,7 @@
 import type {DiffRange} from '../git.js';
 import type {ReviewFile, ReviewModel} from '../review/model.js';
-import type {MediaBackend, RenderResult} from './backend.js';
+import type {MediaBackend, RenderRequest, RenderResult} from './backend.js';
+import {blockRows} from './blocks.js';
 import {classifyMedia} from './classify.js';
 import {createImageRegistry} from './imageRegistry.js';
 import {staleReason, type BoxSpec} from './layout.js';
@@ -10,12 +11,15 @@ import type {CompareMode, GraphicsCaps, MediaRef, MediaViewState, SideName, Side
 
 // The UI process's media state for the session: which review files are
 // media, what inspect found out about each side, the PNGs rendered for each
-// box, and which terminal image id each box is drawn with. Section rows only
+// box, and which terminal image id each box is drawn with (or, for the block
+// preview, the half-block rows each box draws as). Section rows only
 // describe geometry; the pane asks this service for a box's pixels when it
 // draws the row, so a picture arriving re-renders the pane without
 // rebuilding the sections.
 
 const PNG_CACHE_BYTES = 64 * 1024 * 1024;
+// A box of block rows is at most 60 × 20 cells, tens of KB of SGR text.
+const BLOCK_CACHE_CHARS = 16 * 1024 * 1024;
 // The first files in tree order are inspected first.
 const FIRST_FILES = 10;
 const LIBRARY_MISSING = 'image library failed to load';
@@ -23,6 +27,8 @@ const LIBRARY_MISSING = 'image library failed to load';
 export type BoxState =
   | {status: 'loading'}
   | {status: 'kitty'; id: number}
+  // One ANSI string per box row, each exactly the box's cols wide.
+  | {status: 'blocks'; rows: readonly string[]}
   | {status: 'error'; reason: string};
 
 export type WantedBox = {fileKey: string; box: BoxSpec};
@@ -71,7 +77,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // The share of pixels that changed, by content key, from the drawn
   // difference.
   const changedRatios = new Map<string, number>();
+  // The same share by box key, kept while the box is cached anywhere. Content
+  // that leaves the review and comes back (a file rewritten, then reverted)
+  // draws from the cache with no new render, so its label takes the share
+  // from here.
+  const boxRatios = new Map<string, {contentKey: string; ratio: number}>();
   const pngs = createLru<Uint8Array>(PNG_CACHE_BYTES, (png) => png.byteLength);
+  // Block previews never reach the terminal as images: a box is drawn from
+  // its rows here, so nothing is sent and no id is used.
+  const blockCache = createLru<readonly string[]>(BLOCK_CACHE_CHARS, (rows) => rows.reduce((sum, row) => sum + row.length, 0));
   // A box that failed is not tried again until its key changes.
   const boxErrors = new Map<string, string>();
   // Side keys and box keys whose failure described the work tree file at
@@ -128,7 +142,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   };
 
   const refFor = (file: ReviewFile): MediaRef | null => {
-    if (!context || caps.protocol !== 'kitty') return null;
+    if (!context || caps.protocol === 'none') return null;
     const ref = classifyMedia(file, context.range);
     // Still images and SVG; video keeps today's view.
     return ref?.kind === 'raster' || ref?.kind === 'svg' ? ref : null;
@@ -238,18 +252,33 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     const started = keptReviews;
     const controller = new AbortController();
     rendering.set(box.imageKey, controller);
-    const request = {
+    const op: RenderRequest['op'] = box.op === 'blocks' || box.op === 'blocksDifference' ? box.op : box.role === 'diff' ? 'difference' : 'fit';
+    const blocks = op === 'blocks' || op === 'blocksDifference';
+    const request: RenderRequest = {
       cwd: context.cwd,
-      op: box.role === 'diff' ? 'difference' as const : 'fit' as const,
+      op,
       sides: sideRefs,
       kind: ref.kind,
       format: ref.format,
       target: {cols: box.cols, rows: box.rows, cellPx: caps.cellPx, drawPx: box.drawPx, nearest: box.nearest},
-      checker: true,
+      // Blocks flatten transparency onto the pane colour instead.
+      checker: !blocks,
+      ...(blocks ? {colorDepth: caps.colorDepth} : {}),
     };
     backend.render(request, controller.signal, priority).then((result: RenderResult) => {
       if (controller.signal.aborted || disposed) return;
       rendering.delete(box.imageKey);
+      if (result.ok && result.changedRatio !== undefined) boxRatios.set(box.imageKey, {contentKey: ref.contentKey, ratio: result.changedRatio});
+      if (result.ok && 'cells' in result) {
+        blockCache.set(box.imageKey, blockRows(result.cells, result.cols, result.rows, caps.colorDepth));
+        if (result.changedRatio !== undefined && changedRatios.get(ref.contentKey) !== result.changedRatio) {
+          changedRatios.set(ref.contentKey, result.changedRatio);
+          planVersion += 1;
+        }
+        // Drawn by the next render of the pane, with nothing to send first.
+        notify();
+        return;
+      }
       if (result.ok && 'png' in result) {
         const noted = result.passthrough ? noteFailure(LIBRARY_MISSING) : false;
         pngs.set(box.imageKey, result.png);
@@ -345,6 +374,10 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       forgetDiskFailures();
       const contentKeys = new Set([...nextRefs.values()].map((ref) => ref.contentKey));
       for (const key of changedRatios.keys()) if (!contentKeys.has(key)) changedRatios.delete(key);
+      for (const [key, {contentKey, ratio}] of boxRatios) {
+        if (!blockCache.has(key) && !pngs.has(key) && registry.idFor(key) === undefined) boxRatios.delete(key);
+        else if (contentKeys.has(contentKey) && !changedRatios.has(contentKey)) changedRatios.set(contentKey, ratio);
+      }
       refs = nextRefs;
       planVersion += 1;
       version += 1;
@@ -433,6 +466,8 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     boxState(box: BoxSpec): BoxState {
       const reason = boxErrors.get(box.imageKey);
       if (reason !== undefined) return {status: 'error', reason};
+      const rows = blockCache.get(box.imageKey);
+      if (rows) return {status: 'blocks', rows};
       const id = registry.idFor(box.imageKey);
       if (id === undefined && turnedOff) return {status: 'error', reason: turnedOff};
       return id === undefined ? {status: 'loading'} : {status: 'kitty', id};
@@ -448,7 +483,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       let changed = false;
       for (const {fileKey, box} of boxes) {
         const key = box.imageKey;
-        if (boxErrors.has(key)) continue;
+        if (boxErrors.has(key) || blockCache.has(key)) continue;
         if (registry.idFor(key) !== undefined) {
           registry.touch(key);
           continue;
