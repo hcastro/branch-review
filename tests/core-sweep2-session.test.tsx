@@ -9,6 +9,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {runCli} from '../src/startup.js';
 import {INK_RENDER_OPTIONS, TERMINAL_RESTORE_SEQUENCE, createTerminalSession, runInkApp} from '../src/terminalSession.js';
 import {cleanupTempDirs, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
+import {pngFixture} from './media-helpers.js';
 
 // Each test builds real repos or spawns the CLI.
 vi.setConfig({testTimeout: 30_000});
@@ -863,3 +864,189 @@ async function waitForPid(pidLog: string, ms: number) {
   recordedPids.push(pid);
   return pid;
 }
+
+describe('runCli media previews', () => {
+  const KITTY_REPLY = '\x1B_Gi=31;OK\x1B\\\x1B[6;20;10t\x1B[?62c';
+
+  function controllerOf(tree: React.ReactElement | undefined) {
+    return (tree!.props as {children: React.ReactElement<Record<string, unknown>>}).children;
+  }
+
+  it('starts media for a Kitty terminal, deletes its images in the restore write, and removes its temp dir', async () => {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    const png = pngFixture(4, 2);
+    fs.writeFileSync(path.join(cwd, 'logo.png'), png);
+    const tmpParent = makeTempDir('branch-review-media-parent-');
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from(KITTY_REPLY, 'latin1')));
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+
+    void runCli({
+      argv: ['HEAD', '--no-watch'],
+      cwd,
+      proc,
+      env: {...GHOSTTY_ENV, BRANCH_REVIEW_TMPDIR: tmpParent},
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: (next) => {
+        tree = next;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    const props = controllerOf(tree).props as {media?: import('../src/media/service.js').MediaService; initialReview: import('../src/review/model.js').ReviewModel; range: import('../src/git.js').DiffRange};
+    const media = props.media!;
+    expect(media.caps).toMatchObject({protocol: 'kitty', cellPx: {w: 10, h: 20}});
+
+    // Draw the PNG the way the pane would, through the real worker.
+    media.setReview(props.initialReview, {cwd, range: props.range});
+    const file = props.initialReview.files.find((entry) => entry.path === 'logo.png')!;
+    const ref = media.refFor(file)!;
+    expect(ref).toMatchObject({kind: 'raster', after: {source: 'worktree'}});
+    const {planMedia} = await import('../src/media/layout.js');
+    const waitFor = async (predicate: () => boolean) => {
+      const deadline = Date.now() + 20_000;
+      while (!predicate()) {
+        if (Date.now() > deadline) throw new Error('timed out waiting');
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+    await waitFor(() => media.sideState(ref, 'after').status !== 'pending');
+    expect(media.sideState(ref, 'after')).toMatchObject({status: 'ready', info: {width: 4, height: 2}});
+    const plan = planMedia(ref, {after: media.sideState(ref, 'after')}, media.viewState(ref.fileKey), {innerWidth: 80, viewportRows: 30, caps: media.caps});
+    const box = plan.rows.flatMap((row) => row.type === 'box' ? row.boxes : [])[0]!;
+    const keys = new Set([box.imageKey]);
+    media.want([{fileKey: ref.fileKey, box}], keys);
+    media.sweep(keys, keys);
+    await waitFor(() => media.boxState(box).status !== 'loading');
+    const state = media.boxState(box);
+    expect(state.status).toBe('kitty');
+    const id = (state as {id: number}).id;
+
+    const enterAt = terminal.writes.indexOf(ENTER);
+    const transmitAt = terminal.writes.findIndex((write) => write.includes(`\x1B_Ga=t,f=100,t=d,i=${id},`));
+    expect(enterAt).toBeGreaterThanOrEqual(0);
+    expect(transmitAt).toBeGreaterThan(enterAt);
+    const [sessionDir] = fs.readdirSync(tmpParent);
+    expect(sessionDir).toMatch(/^branch-review-media-/);
+
+    proc.emit('exit', 0);
+    expect(terminal.writes.at(-1)).toBe(`\x1B_Ga=d,d=I,i=${id},q=2\x1B\\${TERMINAL_RESTORE_SEQUENCE}`);
+    expect(fs.readdirSync(tmpParent)).toEqual([]);
+  }, 40_000);
+
+  // A runCli session with a live media worker. The worker's git goes
+  // through a shim that logs its parent, the worker, so the test records
+  // the worker's pid itself. `quit` ends the UI the way q does.
+  async function mediaSession() {
+    const cwd = initRepo({'a.txt': 'one\n'});
+    fs.writeFileSync(path.join(cwd, 'logo.png'), pngFixture(4, 2));
+    const tmpParent = makeTempDir('branch-review-media-parent-');
+    const bin = makeTempDir('branch-review-mediagit-');
+    const pidLog = path.join(bin, 'worker.pid');
+    const realGit = spawnSync('/usr/bin/which', ['git'], {encoding: 'utf8'}).stdout.trim();
+    writeExecutable(path.join(bin, 'git'), [
+      '#!/bin/sh',
+      `case "$*" in *--show-object-format*) echo $PPID >> '${pidLog}';; esac`,
+      `exec '${realGit}' "$@"`,
+      '',
+    ].join('\n'));
+    const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from(KITTY_REPLY, 'latin1')));
+    const proc = new FakeProcess();
+    let tree: React.ReactElement | undefined;
+    let quit!: () => void;
+    const exited = new Promise<void>((resolve) => {
+      quit = resolve;
+    });
+    let markRendered!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+    const run = runCli({
+      argv: ['HEAD', '--no-watch'],
+      cwd,
+      proc,
+      // Only the media worker runs git with this env; the build uses the
+      // test process's own.
+      env: {...GHOSTTY_ENV, BRANCH_REVIEW_TMPDIR: tmpParent, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`},
+      stdin: terminal.stdin,
+      stdout: terminal.stdout,
+      stderr: {write: () => true},
+      render: (next) => {
+        tree = next;
+        markRendered();
+        return {waitUntilExit: () => exited, unmount: () => {}};
+      },
+    });
+    await withTimeout(rendered, 20_000);
+
+    const props = controllerOf(tree).props as {media?: import('../src/media/service.js').MediaService; initialReview: import('../src/review/model.js').ReviewModel; range: import('../src/git.js').DiffRange};
+    const media = props.media!;
+    // --no-watch: a file that changes on disk says a restart shows it.
+    expect(media.watching).toBe(false);
+    media.setReview(props.initialReview, {cwd, range: props.range});
+    const ref = media.refFor(props.initialReview.files.find((entry) => entry.path === 'logo.png')!)!;
+    await waitFor(() => media.sideState(ref, 'after').status === 'ready', 20_000);
+    const pid = Number(fs.readFileSync(pidLog, 'utf8').trim().split('\n')[0]);
+    expect(pid).toBeGreaterThan(0);
+    expect(pid).not.toBe(process.pid);
+    recordedPids.push(pid);
+    expect(isAlive(pid)).toBe(true);
+    return {pid, proc, quit, run};
+  }
+
+  it('ends the media worker as soon as the UI exits, without waiting for an exit event', async () => {
+    const {pid, proc, quit, run} = await mediaSession();
+    quit();
+    await withTimeout(run, 10_000);
+    // q never calls exit: the process ends when its event loop drains, so
+    // nothing of the worker may still be running to hold it up.
+    await waitFor(() => !isAlive(pid), 3_000);
+    expect(proc.exits).toEqual([]);
+  }, 40_000);
+
+  it('kills the media worker at exit', async () => {
+    const {pid, proc} = await mediaSession();
+    proc.emit('exit', 0);
+    await waitFor(() => !isAlive(pid), 3_000);
+  }, 40_000);
+
+  it('starts no media for a terminal without Kitty placeholders, or with --no-images', async () => {
+    for (const [argv, reply] of [[['HEAD', 'main', '--no-watch'], '\x1B[?62c'], [['HEAD', 'main', '--no-watch', '--no-images'], KITTY_REPLY]] as const) {
+      const cwd = initRepo({'a.txt': 'one\n'});
+      writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
+      const terminal = detectingTerminal((stdin) => stdin.emit('data', Buffer.from(reply, 'latin1')));
+      const proc = new FakeProcess();
+      let tree: React.ReactElement | undefined;
+      let markRendered!: () => void;
+      const rendered = new Promise<void>((resolve) => {
+        markRendered = resolve;
+      });
+      void runCli({
+        argv: [...argv],
+        cwd,
+        proc,
+        env: GHOSTTY_ENV,
+        stdin: terminal.stdin,
+        stdout: terminal.stdout,
+        stderr: {write: () => true},
+        render: (next) => {
+          tree = next;
+          markRendered();
+          return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
+        },
+      });
+      await withTimeout(rendered, 20_000);
+      expect(controllerOf(tree).props.media, argv.join(' ')).toBeUndefined();
+      proc.emit('exit', 0);
+      expect(terminal.writes.at(-1)).toBe(TERMINAL_RESTORE_SEQUENCE);
+    }
+  }, 40_000);
+});

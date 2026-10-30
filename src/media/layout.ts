@@ -8,7 +8,14 @@ import type {GraphicsCaps, MediaFormat, MediaRef, MediaSpan, MediaViewState, Sid
 // drawn, so a picture arriving never changes the row count and never moves
 // the text around it.
 
-export type Layout = {innerWidth: number; viewportRows: number; caps: GraphicsCaps};
+export type Layout = {
+  innerWidth: number;
+  viewportRows: number;
+  caps: GraphicsCaps;
+  // False when the session does not watch the repo (`--no-watch`): no
+  // refresh will bring a file that changed on disk back in. Defaults to true.
+  watching?: boolean;
+};
 
 export type Box = {
   cols: number;
@@ -181,8 +188,13 @@ const pixels = (info: Pick<SideInfo, 'width' | 'height'>) => `${info.width} × $
 const part = (text: string, tone: Tone = 'plain'): TextPart => ({text, tone});
 const textRow = (role: PlanTextRow['role'], parts: TextPart[], extra: Partial<PlanTextRow> = {}): PlanTextRow => ({type: 'text', role, pieces: [{at: 0, parts}], ...extra});
 
-function reasonFor(state: SideState) {
-  if (state.status === 'stale') return 'changed on disk · refreshing';
+/** What a side whose bytes changed on disk after the build says. */
+export function staleReason(watching = true) {
+  return watching ? 'changed on disk · refreshing' : 'changed on disk · restart to see it';
+}
+
+function reasonFor(state: SideState, watching?: boolean) {
+  if (state.status === 'stale') return staleReason(watching);
   if (state.status === 'error') return state.reason;
   return '';
 }
@@ -322,11 +334,11 @@ function differencePlan(ref: MediaRef, before: SideInfo, after: SideInfo, layout
   ];
 }
 
-function detailsPlan(ref: MediaRef, states: Partial<Record<SideName, SideState>>): PlanRow[] {
+function detailsPlan(ref: MediaRef, states: Partial<Record<SideName, SideState>>, watching?: boolean): PlanRow[] {
   const present = (['before', 'after'] as const).filter((side) => ref[side]);
   const value = (pick: (info: SideInfo) => string) => present.map((side) => {
     const state = states[side] ?? {status: 'pending'};
-    return state.status === 'ready' ? pick(state.info) : state.status === 'pending' ? '…' : reasonFor(state);
+    return state.status === 'ready' ? pick(state.info) : state.status === 'pending' ? '…' : reasonFor(state, watching);
   }).join(' → ');
   const row = (name: string, text: string) => textRow('details', [part(name.padEnd(9), 'dim'), part(text)]);
   return [
@@ -451,7 +463,7 @@ function videoPlan(ref: MediaRef, present: SideName[], states: Partial<Record<Si
   for (const side of shown) {
     const info = infos[side];
     if (info) rows.push(...stripRows(ref, side, info, geometry, layout));
-    else rows.push(textRow('reason', [part(`${side} · ${reasonFor(states[side]!)}`, 'error')]));
+    else rows.push(textRow('reason', [part(`${side} · ${reasonFor(states[side]!, layout.watching)}`, 'error')]));
   }
   const hidden = oneStrip ? present.find((side) => side !== view.flipSide) : undefined;
   return {rows, prefetch: hidden ? [stripBox(ref, hidden, geometry, layout.caps)] : []};
@@ -472,7 +484,7 @@ export function planMedia(
   const states = Object.fromEntries(present.map((side) => [side, sides[side] ?? {status: 'pending'}])) as Partial<Record<SideName, SideState>>;
 
   if (view.textView) {
-    return {rows: ref.kind === 'svg' ? [] : detailsPlan(ref, states), prefetch: [], textView: true};
+    return {rows: ref.kind === 'svg' ? [] : detailsPlan(ref, states, layout.watching), prefetch: [], textView: true};
   }
 
   if (present.some((side) => states[side]!.status === 'pending')) {
@@ -486,7 +498,7 @@ export function planMedia(
   if (ready.length === 0) {
     const failed = present[0]!;
     const prefix = present.length === 2 ? `${failed}: ` : '';
-    return {rows: [textRow('reason', [part(`${prefix}${reasonFor(states[failed]!)}`, 'error')])], prefetch: [], textView: false};
+    return {rows: [textRow('reason', [part(`${prefix}${reasonFor(states[failed]!, layout.watching)}`, 'error')])], prefetch: [], textView: false};
   }
 
   if (present.length === 1) {
@@ -498,7 +510,7 @@ export function planMedia(
   if (ready.length === 1) {
     const shown = ready[0]!;
     const failed = present.find((side) => side !== shown)!;
-    const note = `${failed}: ${reasonFor(states[failed]!)}`;
+    const note = `${failed}: ${reasonFor(states[failed]!, layout.watching)}`;
     return {rows: [tabs, ...singlePlan(ref, shown, info(shown), layout, rowsCap, note)], prefetch: [], textView: false};
   }
 

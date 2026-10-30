@@ -12,6 +12,12 @@ import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
 import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
+import {createMediaService, type MediaService} from '../src/media/service.js';
+import type {ExportRequest, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
+import type {SideInfo} from '../src/media/types.js';
+import {KITTY_CAPS, pngFixture} from './media-helpers.js';
+
+export {decodePlaceholders, KITTY_CAPS, parseApc, pngFixture, sgrCodeNames, sideInfo} from './media-helpers.js';
 
 // Shared fixtures for the ui-* test files: a review model built from raw
 // unified diffs plus delta-shaped rendered lines, and SGR mouse input.
@@ -104,6 +110,7 @@ export type AppFixtureProps = {
   resolveAbsolutePath?: (file: ReviewFile) => string | null;
   graphics?: GraphicsCaps;
   addMediaRows?: MediaRowsHook;
+  media?: MediaService;
 };
 
 export function appElement(
@@ -125,6 +132,7 @@ export function appElement(
       dimensions={dimensions}
       {...(fixture.graphics ? {graphics: fixture.graphics} : {})}
       {...(fixture.addMediaRows ? {addMediaRows: fixture.addMediaRows} : {})}
+      {...(fixture.media ? {media: fixture.media} : {})}
     />
   );
 }
@@ -345,4 +353,80 @@ export function svgSourceFile(path: string): FixtureFile {
     rawDiff: [`diff --git a/${path} b/${path}`, 'index b284849..35ecfd6 100644', `--- a/${path}`, `+++ b/${path}`, '@@ -1 +1,2 @@', '-<svg/>', '+<svg>', '+</svg>', ''].join('\n'),
     rendered: [`• ${path}:1: `, `   1 ⋮     │<svg/>`, `${gutter(1)}<svg>`, `${gutter(2)}</svg>`],
   };
+}
+
+export type FakeBackendCall =
+  | {type: 'inspect'; request: InspectRequest}
+  | {type: 'render'; request: RenderRequest}
+  | {type: 'exportCopy'; request: ExportRequest};
+
+type FakeSide = SideInfo | {error: string; state?: 'stale' | 'error'};
+
+/**
+ * An in-process media backend: canned side facts by object id, and a PNG of
+ * the box's canvas size for every render. Every call is recorded.
+ */
+export function fakeMediaBackend({sides = {}, render, exportDir}: {
+  sides?: Record<string, FakeSide>;
+  render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
+  exportDir?: string;
+} = {}) {
+  const calls: FakeBackendCall[] = [];
+  let disposed = 0;
+  const backend: MediaBackend = {
+    async inspect(request) {
+      calls.push({type: 'inspect', request});
+      const side = sides[request.side.abbrevId];
+      if (!side) return {ok: false, state: 'error', reason: `no fake side ${request.side.abbrevId}`};
+      if ('error' in side) return {ok: false, state: side.state ?? 'error', reason: side.error} as InspectResult;
+      return {ok: true, info: side};
+    },
+    async render(request) {
+      calls.push({type: 'render', request});
+      if (render) return render(request);
+      const {cols, rows, cellPx} = request.target;
+      return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h, [30, 120, 200, 255])};
+    },
+    async exportCopy(request) {
+      calls.push({type: 'exportCopy', request});
+      return {ok: true, path: `${exportDir ?? request.dir}/open-1/${request.side.side}.png`};
+    },
+    dispose() {
+      disposed += 1;
+    },
+  };
+  return {backend, calls, disposedCount: () => disposed};
+}
+
+/**
+ * A real media service over the fake backend, with a recording graphics sink
+ * (kept apart from the frames, so a frame is never an escape) and a
+ * recording opener.
+ */
+export function fakeMediaService({caps = KITTY_CAPS, sides, render, env = {}, review, includeWorktree = false, watching, registry}: {
+  caps?: GraphicsCaps;
+  sides?: Record<string, FakeSide>;
+  render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
+  env?: NodeJS.ProcessEnv;
+  review?: ReviewModel;
+  includeWorktree?: boolean;
+  watching?: boolean;
+  registry?: Parameters<typeof createMediaService>[0]['registry'];
+} = {}) {
+  const fake = fakeMediaBackend({sides, render});
+  const graphicsWrites: string[] = [];
+  const opened: Array<{command: string; args: string[]}> = [];
+  const service = createMediaService({
+    caps,
+    backend: fake.backend,
+    sink: {write: (sequence) => graphicsWrites.push(sequence)},
+    tempDir: () => '/tmp/branch-review-media-test',
+    opener: (command, args) => opened.push({command, args}),
+    env,
+    platform: 'darwin',
+    ...(watching === undefined ? {} : {watching}),
+    ...(registry ? {registry} : {}),
+  });
+  if (review) service.setReview(review, {cwd: '/repo', range: {includeWorktree}});
+  return {service, graphicsWrites, opened, calls: fake.calls, disposedCount: fake.disposedCount};
 }

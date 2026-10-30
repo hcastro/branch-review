@@ -10,6 +10,7 @@ import {refreshReviewInWorker} from '../review/workerRefresh.js';
 import {debounce} from '../watch/debounce.js';
 import {App} from './App.js';
 import type {GraphicsCaps} from '../media/types.js';
+import type {MediaService} from '../media/service.js';
 
 type WatchState =
   | {state: 'off'}
@@ -35,6 +36,8 @@ export type ReviewControllerProps = {
   animations?: boolean;
   // What startup detection found the terminal can draw.
   graphics?: GraphicsCaps;
+  // Draws media files as pictures; absent when the terminal cannot.
+  media?: MediaService;
   copyWriter?: ClipboardWriter;
   dimensions?: {columns: number; rows: number};
   initialFingerprint?: string;
@@ -113,6 +116,7 @@ export function ReviewController({
   watchPoll = false,
   animations = true,
   graphics,
+  media,
   copyWriter,
   dimensions,
   initialFingerprint,
@@ -144,8 +148,8 @@ export function ReviewController({
   const mountedRef = useRef(true);
   // Read through a ref so a resize or a new callback prop does not recreate
   // the watcher, which would drop changes it had not reported yet.
-  const latestRef = useRef({buildReview, modelWidth, range, refreshInWorker, requestedBase, requestedBranch, resolveRange});
-  latestRef.current = {buildReview, modelWidth, range, refreshInWorker, requestedBase, requestedBranch, resolveRange};
+  const latestRef = useRef({buildReview, media, modelWidth, range, refreshInWorker, requestedBase, requestedBranch, resolveRange});
+  latestRef.current = {buildReview, media, modelWidth, range, refreshInWorker, requestedBase, requestedBranch, resolveRange};
 
   useEffect(() => {
     mountedRef.current = true;
@@ -216,6 +220,10 @@ export function ReviewController({
           setActiveRange(nextRange);
           fingerprintRef.current = nextFingerprint;
           builtWidthRef.current = width;
+        } else if (mountedRef.current) {
+          // The same review, but a picture read while its file was being
+          // written may read fine now.
+          latestRef.current.media?.retryDisk();
         }
 
         if (mountedRef.current) {
@@ -295,6 +303,10 @@ export function ReviewController({
   }, [watchStatus]);
 
   const sections = useMemo(() => buildReviewSections(review), [review]);
+  // Before App renders the review, so its first frame of a new review
+  // already knows which files are media. setReview only starts work and
+  // notifies nobody, so calling it while rendering is safe.
+  useMemo(() => media?.setReview(review, {cwd, range: activeRange}), [activeRange, cwd, media, review]);
   const footerStatus = watcherError && watchStatus.state === 'watching'
     ? `watch error: ${watcherError}`
     : formatWatchFooterStatus(watchStatus);
@@ -316,6 +328,7 @@ export function ReviewController({
       emptyStateHint={watch ? 'Watching for repo updates...' : 'Run again after making changes.'}
       animations={animations}
       graphics={graphics}
+      media={media}
     />
   );
 }

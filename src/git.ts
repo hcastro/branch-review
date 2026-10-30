@@ -98,6 +98,9 @@ type RunToolOptions = {
   env?: NodeJS.ProcessEnv;
   input?: string;
   maxBuffer?: number;
+  // false: keep stdout as bytes only. Image bytes are never text, and a
+  // second string copy of a 16 MB blob is memory for nothing.
+  decode?: false;
 };
 
 function firstLine(text: string) {
@@ -124,12 +127,12 @@ function outputTooLarge(command: string, maxBuffer: number) {
   return new OutputTooLargeError(`${command} output is larger than ${Math.floor(maxBuffer / MIB)} MB`);
 }
 
-function toolResult(stdout: Buffer, stderr: Buffer, status: number | null, signal: NodeJS.Signals | null): ToolResult {
+function toolResult(stdout: Buffer, stderr: Buffer, status: number | null, signal: NodeJS.Signals | null, decode?: false): ToolResult {
   if (signal && INTERRUPT_SIGNALS.has(signal)) throw new InterruptedError(signal);
   return {
-    stdout: stdout.toString('utf8'),
+    stdout: decode === false ? '' : stdout.toString('utf8'),
     stdoutBytes: stdout,
-    stdoutIsUtf8: isUtf8(stdout),
+    stdoutIsUtf8: decode === false ? false : isUtf8(stdout),
     stderr: stderr.toString('utf8'),
     status,
     signal,
@@ -155,7 +158,7 @@ function runTool(command: string, args: string[], options: RunToolOptions): Tool
     throw spawnError(command, options.cwd, result.error);
   }
 
-  return toolResult(result.stdout, result.stderr, result.status, result.signal);
+  return toolResult(result.stdout, result.stderr, result.status, result.signal, options.decode);
 }
 
 type AsyncControl = {
@@ -268,7 +271,7 @@ function runToolAsync(command: string, args: string[], options: RunToolOptions, 
     child.on('error', (error) => settle(() => reject(spawnError(command, options.cwd, error))));
     child.on('close', (status, exitSignal) => settle(() => {
       try {
-        resolve(toolResult(Buffer.concat(stdout), Buffer.concat(stderr), status, exitSignal));
+        resolve(toolResult(Buffer.concat(stdout), Buffer.concat(stderr), status, exitSignal, options.decode));
       } catch (error) {
         reject(error);
       }
@@ -297,6 +300,7 @@ type ToolStep = {
   env?: NodeJS.ProcessEnv;
   input?: string;
   maxBuffer?: number;
+  decode?: false;
 };
 type ProgressStep = {kind: 'progress'};
 type OperationStep = ToolStep | ProgressStep;
@@ -500,6 +504,7 @@ type RunGitOptions = {
   /** `git diff --no-index` exits 1 when the files differ. */
   allowDiffExit?: boolean;
   maxBuffer?: number;
+  decode?: false;
 };
 
 function* gitResultOperation(cwd: string, args: string[], options: RunGitOptions = {}): GitOperation<ToolResult> {
@@ -508,6 +513,7 @@ function* gitResultOperation(cwd: string, args: string[], options: RunGitOptions
     args: [...GIT_SAFETY_ARGS, ...args],
     cwd,
     maxBuffer: options.maxBuffer,
+    ...(options.decode === false ? {decode: false as const} : {}),
   });
   if (result.status === 0) return result;
 
@@ -961,7 +967,7 @@ export function getRawFileDiff(
   return readRawFileDiff(cwd, range, filePath, untrackedFiles, oldPath).text;
 }
 
-const OPEN_REGULAR_FLAGS = fs.constants.O_RDONLY
+export const OPEN_REGULAR_FLAGS = fs.constants.O_RDONLY
   // A FIFO opened without O_NONBLOCK blocks until a writer appears.
   | (fs.constants.O_NONBLOCK ?? 0)
   // Fails if the path was swapped for a symlink after lstat.
@@ -1058,6 +1064,103 @@ export function getReviewFileContents(
       throw new Error(`${file.path} is larger than ${Math.floor(MAX_FILE_CONTENT_BYTES / MIB)} MB`);
     }
     throw error;
+  }
+}
+
+export type ObjectFormat = 'sha1' | 'sha256';
+
+/**
+ * The repo's object id hash. Git before 2.29 has no `--show-object-format`
+ * and only knows sha1.
+ */
+export function* objectFormatOperation(cwd: string): GitOperation<ObjectFormat> {
+  const format = yield* tryGitOperation(cwd, ['rev-parse', '--show-object-format']);
+  return format === 'sha256' ? 'sha256' : 'sha1';
+}
+
+/** The object id git gives `bytes` stored as a blob. */
+export function gitBlobId(bytes: Uint8Array, format: ObjectFormat) {
+  return createHash(format).update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
+}
+
+const OBJECT_ID = /^[0-9a-f]{7,64}$/;
+
+/**
+ * A blob's bytes by its (abbreviated) id, at most `limit` bytes. cat-file
+ * reads only the object store: no index, no lock, no filter. An id that
+ * names a commit or tree as well as a blob resolves to the blob.
+ */
+export function* catFileBlobOperation(cwd: string, abbrevId: string, limit: number, displayPath = abbrevId): GitOperation<Buffer> {
+  if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
+  try {
+    const result = yield* gitResultOperation(cwd, ['-c', 'core.disambiguate=blob', 'cat-file', 'blob', abbrevId], {maxBuffer: limit, decode: false});
+    return result.stdoutBytes;
+  } catch (error) {
+    if (error instanceof OutputTooLargeError) throw new Error(`${displayPath} is larger than ${Math.floor(limit / MIB)} MB`);
+    throw error;
+  }
+}
+
+/**
+ * A work tree file over the read limit. Unlike the other ways a work tree
+ * read fails, this one follows from the content itself: the same content is
+ * always too large.
+ */
+export class FileTooLargeError extends Error {}
+
+/**
+ * A work tree file's bytes, at most `limit`, read the way nothing outside
+ * the repo can be pulled in: a symlink is refused, the parent directory must
+ * resolve inside the repo, and the open itself refuses a symlink swapped in
+ * after the check and a FIFO or device. The bytes are not checked for UTF-8.
+ */
+export async function readWorktreeBytes(cwd: string, filePath: string, limit: number): Promise<Buffer> {
+  const absolutePath = path.join(cwd, filePath);
+  let stat: fs.Stats;
+  try {
+    stat = await fs.promises.lstat(absolutePath);
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`${filePath} no longer exists`);
+    throw error;
+  }
+  if (stat.isSymbolicLink()) throw new Error('symlink, not previewed');
+  if (!stat.isFile()) throw new Error(`${filePath} is not a regular file`);
+
+  const [root, parent] = await Promise.all([
+    fs.promises.realpath(cwd),
+    fs.promises.realpath(path.dirname(absolutePath)),
+  ]);
+  if (parent !== root && !parent.startsWith(`${root}${path.sep}`)) throw new Error(`${filePath} is outside the repository`);
+
+  const tooLarge = () => new FileTooLargeError(`${filePath} is larger than ${Math.floor(limit / MIB)} MB`);
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fs.promises.open(absolutePath, OPEN_REGULAR_FLAGS);
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === 'ELOOP' || code === 'EMLINK') throw new Error('symlink, not previewed');
+    if (code === 'ENOENT' || code === 'ENOTDIR') throw new Error(`${filePath} no longer exists`);
+    throw error;
+  }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) throw new Error(`${filePath} is not a regular file`);
+    if (opened.size > limit) throw tooLarge();
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(64 * 1024);
+      const {bytesRead} = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > limit) throw tooLarge();
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
   }
 }
 

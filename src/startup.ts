@@ -6,6 +6,12 @@ import {escapeHiddenCharacters} from './controlChars.js';
 import {ReviewController, getModelWidth} from './ui/ReviewController.js';
 import {INK_RENDER_OPTIONS, createTerminalSession, runInkApp} from './terminalSession.js';
 import {startGraphicsDetection, type TtyInput} from './media/detect.js';
+import type {GraphicsCaps} from './media/types.js';
+import {tmuxWrap} from './media/kitty.js';
+import {createMediaService, type MediaService} from './media/service.js';
+import {createWorkerBackend} from './media/workerClient.js';
+import {createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
+import {defaultOpener} from './media/openExternal.js';
 
 type PrepareStartupOptions = {
   /** Where the CLI was started; any directory inside the work tree. */
@@ -79,6 +85,33 @@ export type CliIo = {
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIGTERM: 143};
 
+type SessionLike = ReturnType<typeof createTerminalSession>;
+
+/**
+ * The media service for a terminal that draws Kitty images, with its exit
+ * work in place: the restore write deletes every image sent, before the alt
+ * screen is left, and the exit hooks kill the media worker and remove the
+ * session's temp dir. Nothing is sent before the UI enters the alt screen.
+ */
+function startMedia({caps, cwd, env, proc, session, watching}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean}): MediaService {
+  sweepStaleMediaDirs({env});
+  const tempDir = createMediaTempDir({env});
+  const backend = createWorkerBackend({tempDir: tempDir.get, env, cwd});
+  const media = createMediaService({
+    caps,
+    backend,
+    sink: {write: (sequence) => session.writeGraphics(caps.tmux ? tmuxWrap(sequence) : sequence)},
+    tempDir: tempDir.get,
+    opener: defaultOpener,
+    env,
+    watching,
+  });
+  session.setRestorePrefix(() => media.restoreSequence());
+  proc.on('exit', () => media.dispose());
+  proc.on('exit', tempDir.remove);
+  return media;
+}
+
 /**
  * The whole CLI run: parse arguments, build the first review and run the UI.
  * The restore and cleanup handlers go in before the startup build, and the
@@ -143,13 +176,14 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
   proc.on('exit', detection.cancel);
 
   // Settles at the terminal's last reply, usually within milliseconds, or a
-  // short timeout. Nothing draws media yet: the answer only lets the UI tell
-  // late replies from keys.
+  // short timeout. The answer also lets the UI tell late replies from keys.
   const caps = await detection.result;
   // Ctrl-C during the window, or a signal, has already exited.
   if (startupBuild.signal.aborted) return;
   const {keys, replyHead} = detection.handOff();
   const graphics = replyHead ? {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : caps;
+  // Pictures need Kitty placeholders; other terminals keep today's view.
+  const media = caps.protocol === 'kitty' ? startMedia({caps, cwd, env, proc, session, watching: options.watch}) : undefined;
 
   await runInkApp(session, (guard) => render(guard(
     React.createElement(ReviewController, {
@@ -162,8 +196,13 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
       watchPoll: options.watchPoll,
       animations: options.animations,
       graphics,
+      ...(media ? {media} : {}),
       requestedBranch,
       requestedBase,
     }),
   ), INK_RENDER_OPTIONS));
+  // The UI is gone and the terminal restored. On q nothing calls exit: the
+  // process ends once its event loop drains, so the worker is stopped here
+  // rather than left to its idle timer.
+  media?.dispose();
 }

@@ -15,6 +15,9 @@ import {
   type CreateRepoWatcherOptions,
 } from '../src/watch/repoWatcher.js';
 import {formatWatchFooterStatus, getModelWidth, ReviewController} from '../src/ui/ReviewController.js';
+import {decodePlaceholders, fakeMediaService, KITTY_CAPS, parseApc, pngFixture, sideInfo} from './ui-fixtures.js';
+import type {MediaBackend} from '../src/media/backend.js';
+import {createMediaService} from '../src/media/service.js';
 
 const tempDirs: string[] = [];
 const originalPath = process.env.PATH;
@@ -1003,4 +1006,171 @@ describe('ReviewController with the real refresh worker', () => {
 
     instance.unmount();
   }, 30_000);
+});
+
+// A review with one added PNG (content id `pngId`) and a text file whose drawn
+// line names the review's version, so a frame tells which review it shows.
+function mediaReview(pngId: string | null, version: string): ReviewModel {
+  const files: ReviewModel['files'] = [{
+    path: 'src/one.ts',
+    status: 'modified',
+    metrics: {path: 'src/one.ts', additions: 1, deletions: 0, changedLines: 1},
+    rawDiff: '',
+    renderedLines: [`review ${version}`],
+    blocks: [],
+  }];
+  if (pngId) {
+    files.push({
+      path: 'docs/logo.png',
+      status: 'added',
+      metrics: {path: 'docs/logo.png', additions: 0, deletions: 0, changedLines: 0},
+      rawDiff: `diff --git a/docs/logo.png b/docs/logo.png\nnew file mode 100644\nindex 0000000..${pngId}\nBinary files /dev/null and b/docs/logo.png differ\n`,
+      renderedLines: ['binary file changed'],
+      blocks: [],
+    });
+  }
+  return {base: 'development', branch: 'HEAD', label: 'development...HEAD', metrics: {filesChanged: files.length, additions: 1, deletions: 0, changedLines: 1}, files};
+}
+
+describe('ReviewController with media previews', {timeout: 20_000}, () => {
+  async function mediaController(reviews: ReviewModel[], sides: NonNullable<Parameters<typeof fakeMediaService>[0]>['sides'], options: NonNullable<Parameters<typeof fakeMediaService>[0]> = {}) {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const watchers = fakeWatcherFactory();
+    let refreshes = 0;
+    const refreshInWorker = vi.fn(async () => {
+      refreshes += 1;
+      return {range, fingerprint: `media-${refreshes}`, branchName: 'feature/watch', review: reviews[refreshes]!};
+    });
+    const media = fakeMediaService({sides, ...options});
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={reviews[0]!}
+        initialFingerprint="media-0"
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 30}}
+        media={media.service}
+      />,
+    );
+    return {instance, watchers, media};
+  }
+
+  const idsIn = (frame: string | undefined) => [...new Set(decodePlaceholders(frame).map((cell) => cell.id))];
+
+  it('gives a rewritten PNG a new id, never shows the old id with the new review, and deletes the old one', async () => {
+    const sides = {aaaaaaa: sideInfo({width: 200, height: 100}), bbbbbbb: sideInfo({width: 200, height: 100})};
+    const {instance, watchers, media} = await mediaController([mediaReview('aaaaaaa', 'v1'), mediaReview('bbbbbbb', 'v2'), mediaReview(null, 'v3')], sides);
+
+    await waitForFrame(instance, () => idsIn(instance.lastFrame()).length === 1);
+    const [first] = idsIn(instance.lastFrame());
+
+    watchers.current.options.onChange();
+    await waitForFrame(instance, (text) => text.includes('review v2') && idsIn(instance.lastFrame()).length === 1 && idsIn(instance.lastFrame())[0] !== first);
+    const [second] = idsIn(instance.lastFrame());
+    expect(second).not.toBe(first);
+    for (const frame of instance.frames) {
+      if (stripAnsi(frame).includes('review v2')) expect(idsIn(frame)).not.toContain(first);
+    }
+    const deletes = () => parseApc(media.graphicsWrites).filter((command) => command.a === 'd');
+    expect(deletes()).toEqual([{a: 'd', d: 'I', i: first, q: 2, payloadBytes: 0}]);
+    expect(parseApc(media.graphicsWrites).filter((command) => command.a === 't').map((command) => command.i)).toEqual([first, second]);
+
+    // The file leaves the review: its id is deleted too.
+    watchers.current.options.onChange();
+    await waitForFrame(instance, (text) => text.includes('review v3') && !text.includes('refreshing'));
+    await flush(20);
+    expect(deletes().map((command) => command.i)).toEqual([first, second]);
+    expect(idsIn(instance.lastFrame())).toEqual([]);
+
+    instance.unmount();
+  });
+
+  it('sends nothing new when a refresh leaves the PNG unchanged', async () => {
+    const sides = {aaaaaaa: sideInfo({width: 200, height: 100})};
+    const {instance, watchers, media} = await mediaController([mediaReview('aaaaaaa', 'v1'), mediaReview('aaaaaaa', 'v2')], sides);
+    await waitForFrame(instance, () => idsIn(instance.lastFrame()).length === 1);
+    const [id] = idsIn(instance.lastFrame());
+    const sent = media.graphicsWrites.length;
+
+    watchers.current.options.onChange();
+    await waitForFrame(instance, (text) => text.includes('review v2') && !text.includes('refreshing'));
+    await flush(20);
+    expect(idsIn(instance.lastFrame())).toEqual([id]);
+    expect(media.graphicsWrites).toHaveLength(sent);
+    expect(media.calls.filter((call) => call.type === 'inspect')).toHaveLength(1);
+
+    instance.unmount();
+  });
+
+  it('asks again about a picture caught mid-write when a refresh finds the same fingerprint', async () => {
+    const cwd = createRepo();
+    const range = resolveRefs(cwd, 'HEAD', 'development');
+    const watchers = fakeWatcherFactory();
+    const model = mediaReview('aaaaaaa', 'v1');
+    // The file was rewritten with the bytes it had: same id, same fingerprint.
+    const refreshInWorker = vi.fn(async () => ({range, fingerprint: 'media-0', branchName: 'feature/watch', review: model}));
+    let inspects = 0;
+    const backend: MediaBackend = {
+      async inspect() {
+        inspects += 1;
+        return inspects === 1
+          ? {ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true}
+          : {ok: true, info: sideInfo({width: 200, height: 100})};
+      },
+      async render(request) {
+        const {cols, rows, cellPx} = request.target;
+        return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h)};
+      },
+      exportCopy: async () => ({ok: false, state: 'error', reason: 'not used'}),
+      dispose() {},
+    };
+    const media = createMediaService({caps: KITTY_CAPS, backend, sink: {write: () => undefined}, opener: () => undefined, env: {}});
+    const instance = render(
+      <ReviewController
+        cwd={cwd}
+        range={range}
+        initialReview={model}
+        initialFingerprint="media-0"
+        watch
+        requestedBranch="HEAD"
+        requestedBase="development"
+        refreshInWorker={refreshInWorker}
+        createWatcher={watchers.createWatcher}
+        dimensions={{columns: 120, rows: 30}}
+        media={media}
+      />,
+    );
+    await waitForFrame(instance, (text) => text.includes('changed on disk · refreshing'));
+
+    watchers.current.options.onChange();
+    await waitForFrame(instance, () => idsIn(instance.lastFrame()).length === 1);
+    expect(refreshInWorker).toHaveBeenCalledTimes(1);
+    expect(inspects).toBe(2);
+    expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('changed on disk');
+
+    instance.unmount();
+    media.dispose();
+  });
+
+  it('shows a failing backend as a reason row while the refresh status stays fine', async () => {
+    const {instance, watchers} = await mediaController(
+      [mediaReview('aaaaaaa', 'v1'), mediaReview('bbbbbbb', 'v2')],
+      {aaaaaaa: sideInfo(), bbbbbbb: {error: 'media worker exited (signal SIGSEGV)'}},
+    );
+    await waitForFrame(instance, () => idsIn(instance.lastFrame()).length === 1);
+
+    watchers.current.options.onChange();
+    const frame = await waitForFrame(instance, (text) => text.includes('review v2') && text.includes('media worker exited (signal SIGSEGV)') && !text.includes('refreshing'));
+    expect(frame).toContain('updated');
+    expect(frame).not.toContain('watch error');
+    expect(idsIn(instance.lastFrame())).toEqual([]);
+
+    instance.unmount();
+  });
 });

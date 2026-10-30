@@ -84,6 +84,7 @@ branch-review my-feature release/2026.04
 | `--no-watch` | Open a frozen snapshot. Handy while an agent is mid-write and the view would churn. |
 | `--watch-poll` | Poll instead of using filesystem events. Use it on network mounts and container bind mounts. |
 | `--no-animations` | Skip the arrival highlights. Useful on slow or remote terminals. |
+| `--no-images` | Show image files as text, the way terminals without image support do. `--images` turns them back on. |
 
 Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` is `0` or `false`, or when `TERM=dumb`. The same rule covers delta's diffs and the app's own chrome. Diffs keep their `+` and `-` markers.
 
@@ -99,6 +100,9 @@ Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` 
 | `[` / `]` | Previous / next diff block |
 | `Enter` / `Space` | Collapse or expand the focused block |
 | `t` | Show or hide the file tree |
+| `o` | Open the image on screen in the default viewer |
+| `O` | Quick Look the image on macOS. Elsewhere it works like `o`. |
+| `v` | Switch the image to a details table and back |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 
 The focused block is the one at the top of the diff pane, and it's marked. The footer keeps a short hint of these keys.
@@ -174,6 +178,24 @@ Some copies fail on purpose, and the toast names the reason:
 - When a file's diff failed to load, its diff and block copies report that failure as the reason. `Copy file` and `f` still work, since they read the file itself.
 - A file whose name isn't valid UTF-8 can't be copied at all, its path included. Every copy of it reports "file name is not UTF-8".
 - `Copy tree` and `T` copy nothing when any one file name in the review isn't valid UTF-8. The tree is refused whole, and the toast names that file.
+
+### Images
+
+In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. A modified image shows its new version. An animated GIF or WebP shows its first frame.
+
+| Terminal | Images |
+| --- | --- |
+| Ghostty, cmux, Kitty | Drawn as pictures |
+| iTerm2, WezTerm, VS Code, Warp, Konsole, Apple Terminal, others | The usual `binary file changed` line |
+| Inside tmux | The usual line |
+
+The file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
+
+Images stay off when colour is off (`NO_COLOR` and the rest of the colour rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognised.
+
+Every image is read in a separate background process. Bytes are checked against the object id in Git's diff before anything is drawn, so a file that changed on disk or that a Git filter rewrites never shows as a stale or wrong picture. A file that can't be previewed shows the reason in its place. If that process keeps failing or hanging, previews turn off for the session and the review carries on.
+
+Images are decoded with [sharp](https://sharp.pixelplumbing.com/), which ships prebuilt binaries of libvips. libvips is licensed under LGPL-3.0. Temp files go in one private directory under the system temp directory, and it is removed when the app exits.
 
 ### Small terminals
 

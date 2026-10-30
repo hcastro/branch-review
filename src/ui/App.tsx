@@ -1,4 +1,4 @@
-import React, {memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
+import React, {memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore} from 'react';
 import {Box, DOMElement, Text, useApp, useInput, useStdout} from 'ink';
 import {
   MouseProvider,
@@ -34,8 +34,12 @@ import {fileKey, type FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
-import type {GraphicsCaps} from '../media/types.js';
+import type {GraphicsCaps, MediaRef} from '../media/types.js';
 import {createLoneEscapeGuard} from '../media/replyGuard.js';
+import {placeholderRun} from '../media/kitty.js';
+import {formatBytes, formatLabel} from '../media/layout.js';
+import type {MediaService, WantedBox} from '../media/service.js';
+import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 
 /**
  * Adds media rows to the wrapped sections, before blocks are folded, and may
@@ -63,6 +67,8 @@ type AppProps = {
   // What startup detection found the terminal can draw.
   graphics?: GraphicsCaps;
   addMediaRows?: MediaRowsHook;
+  // Draws media files as pictures, when the terminal can.
+  media?: MediaService;
 };
 
 const SCROLL_STEP = 3;
@@ -103,11 +109,22 @@ const KEY_HINT_SEPARATOR = ' • ';
 const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
 const TREE_EXPAND_LABEL = '›';
-const FILE_ACTIONS = [
+type FileAction = {readonly id: string; readonly label: string};
+const FILE_ACTIONS: readonly FileAction[] = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
   {id: 'copy.fileContents', label: 'Copy file'},
-] as const;
+];
+// An image's full contents are not text, so Copy file gives way to Open.
+const RASTER_FILE_ACTIONS: readonly FileAction[] = [
+  {id: 'copy.path', label: 'Copy path'},
+  {id: 'media.open', label: 'Open'},
+  {id: 'copy.fileDiff', label: 'Copy diff'},
+];
+const RASTER_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'o open', 'v text', 'j/k scroll', 'y d copy', 't tree'];
+// The screen row of the diff pane's first line: the top bar's three rows,
+// then the pane's top border and its two header rows.
+const DIFF_FIRST_SCREEN_ROW = 6;
 const ABSOLUTE_PATH_ACTION = {id: 'copy.absolutePath', label: 'Copy absolute path'} as const;
 // Keyboard copy: file commands act on the file in view, block commands on the
 // focused block.
@@ -253,6 +270,7 @@ function getBounds(ref: React.RefObject<DOMElement>) {
 
 type Bounds = {left: number; top: number; width: number; height: number};
 type TreeTooltip = {text: string; left: number; top: number; width: number};
+const TREE_TOOLTIP_HEIGHT = 3;
 
 function isInside(bounds: Bounds | null, x: number, y: number) {
   if (!bounds) return false;
@@ -499,7 +517,7 @@ function isTreeToggleTarget(panelBounds: Bounds | null, x: number, y: number, co
 function buildTreeTooltip(text: string, bounds: Bounds, columns: number, terminalRows: number): TreeTooltip {
   const maxWidth = Math.max(12, columns - 4);
   const width = clamp(visibleWidth(text) + 4, 12, maxWidth);
-  const tooltipHeight = 3;
+  const tooltipHeight = TREE_TOOLTIP_HEIGHT;
   const preferredLeft = bounds.left + bounds.width + 1;
   const left = preferredLeft + width <= columns
     ? preferredLeft
@@ -578,6 +596,7 @@ function copyActionHint(actionId: string) {
   if (actionId === 'copy.blockDiff') return 'copies block diff';
   if (actionId === 'copy.blockPrompt') return 'copies block with file and line context';
   if (actionId === 'copy.tree') return 'copies changed-file tree';
+  if (actionId === 'media.open') return 'opens the image in the default viewer';
   return null;
 }
 
@@ -850,7 +869,7 @@ function isFileActionCopied(actionId: string, copiedAction?: string) {
   return actionId === copiedAction || (actionId === 'copy.path' && copiedAction === ABSOLUTE_PATH_ACTION.id);
 }
 
-function fileActions(actions: ReadonlyArray<(typeof FILE_ACTIONS)[number]>, hoveredAction?: string, copiedAction?: string) {
+function fileActions(actions: ReadonlyArray<FileAction>, hoveredAction?: string, copiedAction?: string) {
   return actions
     .map((action) => actionButton(action.label, action.id === hoveredAction, isFileActionCopied(action.id, copiedAction)))
     .join(' ');
@@ -1189,6 +1208,7 @@ function buildDiffHeader({
   path,
   status,
   showActions,
+  actions = FILE_ACTIONS,
   hoveredAction,
   copiedAction,
   metricsCore,
@@ -1197,6 +1217,7 @@ function buildDiffHeader({
   path: string;
   status: FileStatus | undefined;
   showActions: boolean;
+  actions?: readonly FileAction[];
   hoveredAction?: string;
   copiedAction?: string;
   metricsCore: string;
@@ -1205,11 +1226,11 @@ function buildDiffHeader({
   const statusText = ansiStatus(status);
   const statusWidth = statusText ? visibleWidth(statusText) + 1 : 0;
   const displayPath = toDisplayText(path || ' ');
-  const buttonWidth = (action: (typeof FILE_ACTIONS)[number]) => visibleWidth(isFileActionCopied(action.id, copiedAction) ? successLabel(action.label) : action.label) + 4;
+  const buttonWidth = (action: FileAction) => visibleWidth(isFileActionCopied(action.id, copiedAction) ? successLabel(action.label) : action.label) + 4;
   // The file name keeps its room first; buttons that don't fit beside it are
   // left out, and with them their click targets.
   const drawnActions = showActions
-    ? fittingActions(FILE_ACTIONS, buttonWidth, 1, width - statusWidth - reservedNameWidth(displayPath) - 1)
+    ? fittingActions(actions, buttonWidth, 1, width - statusWidth - reservedNameWidth(displayPath) - 1)
     : [];
   const right = drawnActions.length > 0 ? fileActions(drawnActions, hoveredAction, copiedAction) : '';
   const rightWidth = visibleWidth(right);
@@ -1458,7 +1479,7 @@ function isTreeHeaderCopyTarget(panelBounds: Bounds | null, x: number, y: number
 
 type SelectionSource = {
   lines: string[];
-  rows: ReadonlyArray<Pick<SectionRow, 'kind'>>;
+  rows: ReadonlyArray<Pick<SectionRow, 'kind' | 'block'>>;
   sections: ReadonlyArray<Pick<KeyedSection, 'key' | 'startLine' | 'endLineExclusive'>>;
 };
 
@@ -1542,24 +1563,55 @@ function textAnchorsEqual(left: TextAnchor, right: TextAnchor) {
   return left.text === right.text && left.mediaInto === right.mediaInto;
 }
 
+// The non-media lines from `start` to `end`, both included: what a selection
+// over that range can copy, since media rows never hold selectable text.
+// Pictures sit between a file's blocks, never inside one, so media rows that
+// split a block mean the block itself was rebuilt: null then, and the
+// selection is dropped as for any other change to its lines.
+function textLinesBetween(source: SelectionSource, start: number, end: number) {
+  const lines: string[] = [];
+  let lastText = -1;
+  let afterMedia = false;
+  for (let lineIndex = start; lineIndex <= end; lineIndex += 1) {
+    const row = source.rows[lineIndex];
+    if (row?.kind === 'media') {
+      afterMedia = true;
+      continue;
+    }
+    const above = lastText >= 0 ? source.rows[lastText] : undefined;
+    if (afterMedia && above && row && above.block >= 0 && above.block === row.block
+      && getSectionIndexForLine(source.sections, lastText) === getSectionIndexForLine(source.sections, lineIndex)) {
+      return null;
+    }
+    afterMedia = false;
+    lastText = lineIndex;
+    lines.push(source.lines[lineIndex] ?? '');
+  }
+  return lines;
+}
+
 // Moves a selection to where its lines went after the rendered lines were
 // rebuilt, or returns null when any selected line changed or moved apart.
+// Each end follows its own text anchor, so a picture inside the selection
+// that grows, shrinks or appears moves the far end and keeps the selection.
 function remapCodeSelection(selection: CodeSelection, previous: SelectionSource, next: SelectionSource): CodeSelection | null {
-  const {start, end} = normalizeCodeSelection(selection);
-  const mappedStart = remapLineIndex(start.lineIndex, previous, next);
-  const mappedEnd = remapLineIndex(end.lineIndex, previous, next);
-  if (mappedStart === null || mappedEnd === null) return null;
+  const anchorLine = remapLineIndex(selection.anchor.lineIndex, previous, next);
+  const focusLine = remapLineIndex(selection.focus.lineIndex, previous, next);
+  if (anchorLine === null || focusLine === null) return null;
 
-  const shift = mappedStart - start.lineIndex;
-  if (mappedEnd - end.lineIndex !== shift) return null;
-  for (let lineIndex = start.lineIndex; lineIndex <= end.lineIndex; lineIndex += 1) {
-    if (previous.lines[lineIndex] !== next.lines[lineIndex + shift]) return null;
-  }
+  const {start, end} = normalizeCodeSelection(selection);
+  const forward = start === selection.anchor;
+  const mappedStart = forward ? anchorLine : focusLine;
+  const mappedEnd = forward ? focusLine : anchorLine;
+  if (mappedEnd < mappedStart) return null;
+  const before = textLinesBetween(previous, start.lineIndex, end.lineIndex);
+  const after = textLinesBetween(next, mappedStart, mappedEnd);
+  if (!before || !after || before.length !== after.length || before.some((line, index) => line !== after[index])) return null;
 
   return {
     ...selection,
-    anchor: {...selection.anchor, lineIndex: selection.anchor.lineIndex + shift},
-    focus: {...selection.focus, lineIndex: selection.focus.lineIndex + shift},
+    anchor: {...selection.anchor, lineIndex: anchorLine},
+    focus: {...selection.focus, lineIndex: focusLine},
     lines: next.lines,
   };
 }
@@ -1851,7 +1903,76 @@ type DiffPaneBodyProps = {
   hoveredAction: HoveredAction;
   copiedAction: CopiedAction | null;
   selection: CodeSelection | null;
+  media?: MediaService;
 };
+
+const LOADING_LABEL = 'loading preview…';
+
+const noMediaUpdates = () => () => undefined;
+const noMediaVersion = () => 0;
+
+// The metrics row for a media file once its shown side is inspected: format,
+// pixel size and bytes in place of line counts.
+function mediaMetricsText(media: MediaService, ref: MediaRef) {
+  const state = media.sideState(ref, ref.after ? 'after' : 'before');
+  if (state.status !== 'ready') return null;
+  return `${formatLabel(ref.format)} · ${state.info.width} × ${state.info.height} px · ${formatBytes(state.info.bytes)}`;
+}
+
+/**
+ * Whether the tree tooltip would cover a Kitty image row: drawn over one, it
+ * would break the row's placeholder cells, so the tooltip is not drawn.
+ */
+export function tooltipCoversKittyRows(
+  tooltip: Pick<TreeTooltip, 'left' | 'top' | 'width'>,
+  diffPaneLeft: number,
+  isImageRow: (screenRow: number) => boolean,
+) {
+  if (tooltip.left + tooltip.width <= diffPaneLeft) return false;
+  for (let row = tooltip.top; row < tooltip.top + TREE_TOOLTIP_HEIGHT; row += 1) {
+    if (isImageRow(row)) return true;
+  }
+  return false;
+}
+
+// One row of the boxes a media row crosses, at most `inner` cells: the
+// placeholder cells of a box whose image the terminal has, blank cells while
+// it loads, or the reason on the first row of a box that failed. Built at
+// the full width here so nothing later has to cut through a placeholder run.
+function renderBoxRow(info: NonNullable<SectionRow['media']>, media: MediaService, inner: number) {
+  const boxRow = info.boxRow ?? 0;
+  const boxes = [...(info.boxes ?? [])].sort((left, right) => left.leftPad - right.leftPad);
+  let out = '';
+  let used = 0;
+  for (const [index, box] of boxes.entries()) {
+    if (box.leftPad > used) {
+      out += ' '.repeat(Math.min(box.leftPad, inner) - used);
+      used = Math.min(box.leftPad, inner);
+    }
+    const width = Math.max(0, Math.min(box.cols, inner - used));
+    if (width === 0) break;
+    const state = boxRow < box.rows ? media.boxState(box) : null;
+    if (state?.status === 'kitty') {
+      out += placeholderRun(state.id, boxRow, 0, width);
+      used += width;
+    } else if (state?.status === 'error' && boxRow === 0) {
+      // The reason may run past a narrow box, up to the next one.
+      const limit = Math.max(width, (boxes[index + 1]?.leftPad ?? inner) - used - 1);
+      const text = state.reason.startsWith('preview') ? state.reason : `preview unavailable: ${state.reason}`;
+      const shown = truncateEnd(toDisplayText(text), limit);
+      out += `${ANSI_RED}${shown}${ANSI_RESET}${' '.repeat(Math.max(0, width - visibleWidth(shown)))}`;
+      used += Math.max(width, visibleWidth(shown));
+    } else if (state?.status === 'loading' && boxRow === Math.floor((box.rows - 1) / 2) && width >= LOADING_LABEL.length) {
+      const before = Math.floor((width - LOADING_LABEL.length) / 2);
+      out += `${' '.repeat(before)}${ANSI_GRAY}${LOADING_LABEL}${ANSI_RESET}${' '.repeat(width - before - LOADING_LABEL.length)}`;
+      used += width;
+    } else {
+      out += ' '.repeat(width);
+      used += width;
+    }
+  }
+  return out;
+}
 
 // The diff pane's rows. It renders inside DiffErrorBoundary, so a throw while
 // drawing one file's diff stays in the pane.
@@ -1876,6 +1997,7 @@ function DiffPaneBody({
   hoveredAction,
   copiedAction,
   selection,
+  media,
 }: DiffPaneBodyProps) {
   const inner = Math.max(1, paneWidth - 4);
   const rows: string[] = [
@@ -1896,6 +2018,16 @@ function DiffPaneBody({
       ? arrivalAnimations.blocks.get(blockAnimationKey(reviewFileKey(blockTarget.file), blockTarget.block))
       : undefined;
     let visibleLine = line || ' ';
+    // With the focused block's header scrolled off the top, the top row's
+    // pane border turns heavy, so the block that block keys act on stays marked.
+    const marksFocus = index === 0 && focusedBlockLineIndex !== null && focusedBlockLineIndex < diffOffset;
+    if (row?.kind === 'media') {
+      // Media rows hold no code: no selection highlight and no arrival wash,
+      // which would put colour codes between placeholder cells.
+      const mediaRow = frameLine(row.media?.boxes && media ? renderBoxRow(row.media, media, inner) : visibleLine, inner, borderAnsi);
+      rows.push(marksFocus ? mediaRow.replace('│', FOCUS_BAR) : mediaRow);
+      continue;
+    }
     if (row?.kind === 'header') {
       const showActions = actionBlockLineIndex === absoluteLineIndex;
       visibleLine = renderBlockHeaderRow(
@@ -1915,9 +2047,6 @@ function DiffPaneBody({
     const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
     const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
     const paneRow = frameLine(arrivalLine, inner, borderAnsi);
-    // With the focused block's header scrolled off the top, the top row's
-    // pane border turns heavy, so the block that block keys act on stays marked.
-    const marksFocus = index === 0 && focusedBlockLineIndex !== null && focusedBlockLineIndex < diffOffset;
     rows.push(marksFocus ? paneRow.replace('│', FOCUS_BAR) : paneRow);
   }
   // A diff shorter than the pane still draws the pane's full height, so the
@@ -1949,6 +2078,7 @@ function AppContent({
   animations = false,
   graphics,
   addMediaRows,
+  media,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -1985,9 +2115,21 @@ function AppContent({
     () => wrapSectionsWithCache(displaySections, wrapWidth, wrappedSectionCacheRef.current),
     [displaySections, wrapWidth],
   );
+  // Media draws only when the terminal can; otherwise the app is exactly as
+  // without it.
+  const mediaOn = Boolean(media && media.caps.protocol !== 'none');
+  const mediaVersion = useSyncExternalStore(media ? media.subscribe : noMediaUpdates, media ? media.getVersion : noMediaVersion);
+  const mediaPlanVersion = mediaOn ? media!.planVersion() : 0;
+  // Boxes are sized to the viewport once it holds still, like the wrap width.
+  const mediaViewportRows = useSettledValue(mediaOn ? visibleDiffRows : 0, WRAP_SETTLE_MS);
   const mediaSections = useMemo(
-    () => addMediaRows ? addMediaRows(wrappedSections, {innerWidth: wrapWidth, viewportRows: visibleDiffRows}) : wrappedSections,
-    [addMediaRows, visibleDiffRows, wrapWidth, wrappedSections],
+    () => {
+      if (addMediaRows) return addMediaRows(wrappedSections, {innerWidth: wrapWidth, viewportRows: visibleDiffRows});
+      if (mediaOn) return addMediaRowsTo(wrappedSections, media!, {innerWidth: wrapWidth, viewportRows: mediaViewportRows});
+      return wrappedSections;
+    },
+    // The plan version stands for the media state the rows are built from.
+    [addMediaRows, media, mediaOn, mediaPlanVersion, mediaViewportRows, visibleDiffRows, wrapWidth, wrappedSections],
   );
   const sections = useMemo(
     () => applyCollapsedBlocks(mediaSections, collapsedBlockIds),
@@ -2001,6 +2143,8 @@ function AppContent({
   const rows = useMemo(() => applyTreeCollapse(allTreeRows, collapsedTreePaths), [allTreeRows, collapsedTreePaths]);
   const allDiffLines = useMemo(() => flattenSectionLines(sections), [sections]);
   const allDiffRows = useMemo(() => buildDiffRows(sections), [sections]);
+  // The rows that draw part of a picture, so scrolling never walks every row.
+  const boxRowIndexes = useMemo(() => allDiffRows.flatMap((row, index) => (row.media?.boxes ? [index] : [])), [allDiffRows]);
   // Counts rebuilds of the rendered sections, so a render failure in the diff
   // pane is retried after every refresh.
   const sectionsRevisionRef = useRef(0);
@@ -2111,16 +2255,19 @@ function AppContent({
   const displayBranch = toDisplayText(branch);
   const displayBase = toDisplayText(base);
 
+  const activeMediaRef = mediaOn && activeFile ? media!.refFor(activeFile) : null;
+  const activeMediaMetrics = activeMediaRef ? mediaMetricsText(media!, activeMediaRef) : null;
   const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
   const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
   const diffHeader = buildDiffHeader({
     path: activeFilePath,
     status: activeFile?.status,
     showActions: Boolean(review) && sections.length > 0,
+    actions: activeMediaRef?.kind === 'raster' ? RASTER_FILE_ACTIONS : FILE_ACTIONS,
     hoveredAction: fileHover,
     copiedAction: fileCopied,
     metricsCore: activeSection
-      ? `${formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+      ? `${activeMediaMetrics ?? formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
       : `${ANSI_GRAY}No changes to review${ANSI_RESET}`,
     width: diffContentWidth,
   });
@@ -2376,6 +2523,46 @@ function AppContent({
   const showToast = useCallback((message: string, hint?: string, kind: ToastKind = 'success') => {
     setToast({text: toDisplayText(makeToast(message, hint)), kind});
   }, []);
+
+  // After each commit: send the images of boxes near the viewport, render
+  // the ones not yet rendered, and free the ids no row names any more. Rows
+  // name an id only once its image was sent, so this runs before any frame
+  // can draw it.
+  useEffect(() => {
+    if (!media || !mediaOn) return;
+    const visibleEnd = diffOffset + visibleDiffRows;
+    const nearStart = diffOffset - visibleDiffRows;
+    const nearEnd = diffOffset + 2 * visibleDiffRows;
+    const wanted: WantedBox[] = [];
+    const seen = new Set<string>();
+    const live = new Set<string>();
+    const visible = new Set<string>();
+    for (const index of boxRowIndexes) {
+      const row = allDiffRows[index]!;
+      for (const box of row.media!.boxes!) {
+        live.add(box.imageKey);
+        if (index >= diffOffset && index < visibleEnd) visible.add(box.imageKey);
+        if (index >= nearStart && index < nearEnd && !seen.has(box.imageKey)) {
+          seen.add(box.imageKey);
+          wanted.push({fileKey: row.media!.fileKey, box});
+        }
+      }
+    }
+    media.want(wanted, visible);
+    media.sweep(live, visible);
+  }, [allDiffRows, boxRowIndexes, diffOffset, media, mediaOn, mediaVersion, visibleDiffRows]);
+
+  // Failures that end every preview are said once, in the footer.
+  useEffect(() => {
+    const notices = media?.takeNotices() ?? [];
+    if (notices.length > 0) showToast(notices.at(-1)!, undefined, 'info');
+  }, [media, mediaVersion, showToast]);
+
+  const openMediaFile = useCallback(async (ref: MediaRef, how: 'open' | 'quickLook') => {
+    if (!media) return;
+    const outcome = await media.open(ref, ref.after ? 'after' : 'before', how);
+    showToast(outcome.message, undefined, outcome.kind);
+  }, [media, showToast]);
 
   const toggleTree = useCallback(() => {
     if (treeAutoCollapsed) {
@@ -3021,7 +3208,9 @@ function AppContent({
       if (relativeY === 1 || relativeY === 2) {
         const header = diffHeaderRef.current;
         const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
-        if (actionId) {
+        if (actionId === 'media.open') {
+          if (activeMediaRef) void openMediaFile(activeMediaRef, 'open');
+        } else if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
         }
         return;
@@ -3048,6 +3237,8 @@ function AppContent({
     return () => mouse.events.off('click', handleClick);
   }, [
     activeFile,
+    activeMediaRef,
+    openMediaFile,
     allDiffRows,
     blockHeaderSpans,
     clearTreeTooltip,
@@ -3136,6 +3327,20 @@ function AppContent({
       return;
     }
 
+    // Media keys, only while media draws: o open, O Quick Look, v text view.
+    if (mediaOn && (input === 'o' || input === 'O' || input === 'v')) {
+      if (input === 'v') {
+        if (activeMediaRef) media!.toggleTextView(activeMediaRef.fileKey);
+        return;
+      }
+      if (!activeMediaRef) {
+        showToast('o opens images and video', undefined, 'info');
+        return;
+      }
+      void openMediaFile(activeMediaRef, input === 'O' ? 'quickLook' : 'open');
+      return;
+    }
+
     const fileCommand = FILE_KEY_COMMANDS[input];
     if (fileCommand) {
       void runCopyCommand(fileCommand, activeFile, focusedBlock, {kind: 'file-header', id: fileCommand});
@@ -3161,6 +3366,14 @@ function AppContent({
     }
   });
 
+  // A tooltip over a picture would break its placeholder cells; its text goes
+  // to the top bar instead.
+  const tooltipOverImage = Boolean(treeTooltip && media?.caps.protocol === 'kitty' && tooltipCoversKittyRows(treeTooltip, leftWidth, (screenRow) => {
+    const line = diffOffset + screenRow - DIFF_FIRST_SCREEN_ROW;
+    return line >= diffOffset && line < diffOffset + visibleDiffRows && Boolean(allDiffRows[line]?.media?.boxes);
+  }));
+  const shownInfoTip = infoTip ?? (tooltipOverImage ? treeTooltip!.text : null);
+
   const topBarLine = composeBar(
     [
       {text: 'branch-review', style: ANSI_CYAN_BOLD},
@@ -3169,20 +3382,20 @@ function AppContent({
       {text: ' against ', style: ANSI_GRAY},
       {text: displayBase, style: ANSI_YELLOW},
     ],
-    infoTip
-      ? {text: infoTip, style: ANSI_CYAN_BOLD}
+    shownInfoTip
+      ? {text: shownInfoTip, style: ANSI_CYAN_BOLD}
       : {
         text: `${branchMetrics.filesChanged} files • +${branchMetrics.additions} • -${branchMetrics.deletions} • ${branchMetrics.changedLines} changed`,
         style: ANSI_MAGENTA_BRIGHT,
       },
     Math.max(1, columns - 4),
-    infoTip ? truncateStart : truncateEnd,
+    shownInfoTip ? truncateStart : truncateEnd,
   );
   const footerStatus: BarPart = toast
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4)), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeMediaRef ? RASTER_KEY_HINT_ITEMS : KEY_HINT_ITEMS), style: ANSI_GRAY};
   const footerLine = composeBar(
     [footerStatus],
     {text: `${displayBase}...${displayBranch}`, style: ANSI_GRAY},
@@ -3295,6 +3508,7 @@ function AppContent({
               hoveredAction={hoveredAction}
               copiedAction={copiedAction}
               selection={codeSelection?.lines === allDiffLines ? codeSelection : null}
+              media={mediaOn ? media : undefined}
             />
           </DiffErrorBoundary>
         </DiffPane>
@@ -3303,7 +3517,7 @@ function AppContent({
       <Box width={columns} borderStyle="round" borderColor={palette.ink('gray')} paddingX={1}>
         <Text wrap="truncate">{footerLine}</Text>
       </Box>
-      {treeTooltip ? <TreeTooltipOverlay tooltip={treeTooltip} /> : null}
+      {treeTooltip && !tooltipOverImage ? <TreeTooltipOverlay tooltip={treeTooltip} /> : null}
     </Box>
   );
 }

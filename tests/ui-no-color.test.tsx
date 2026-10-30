@@ -11,15 +11,20 @@ const previousEnv = vi.hoisted(() => {
 });
 
 const {
+  binaryMediaFile,
   buildFixture,
   cellPosition,
+  decodePlaceholders,
   emitMouseDragAt,
   emitMouseMoveAt,
   emitMousePressAt,
+  fakeMediaService,
   flush,
   frameLines,
   renderFixture,
+  sideInfo,
 } = await import('./ui-fixtures.js');
+const {startGraphicsDetection} = await import('../src/media/detect.js');
 
 for (const [key, value] of Object.entries(previousEnv)) {
   if (value === undefined) {
@@ -162,6 +167,45 @@ describe('NO_COLOR', () => {
     await flush(2);
 
     expect(writes).toEqual(['crlf line\r\n\tindented();']);
+
+    instance.unmount();
+  });
+
+  it('draws no media and sends no graphics, even in a terminal that could draw them', async () => {
+    // A Ghostty that would answer every query; NO_COLOR stops detection first.
+    const queries: string[] = [];
+    const stdin = Object.assign(new (await import('node:events')).EventEmitter(), {
+      isTTY: true,
+      setRawMode: () => undefined,
+      pause: () => undefined,
+      unshift: () => undefined,
+    });
+    const detection = startGraphicsDetection({
+      stdin,
+      stdout: {isTTY: true, columns: 120, rows: 24, write: (text: string) => queries.push(text)},
+      env: {NO_COLOR: '1', TERM_PROGRAM: 'ghostty', TERM: 'xterm-ghostty', COLORTERM: 'truecolor'},
+      options: {images: 'auto'},
+      onInterrupt: () => undefined,
+    });
+    const caps = await detection.result;
+    expect(caps.protocol).toBe('none');
+    expect(queries).toEqual([]);
+
+    const fixture = buildFixture([...plainFixture().review.files.map((file) => ({path: file.path, rawDiff: file.rawDiff, rendered: file.renderedLines})), binaryMediaFile('docs/logo.png', 'added')]);
+    const media = fakeMediaService({caps, sides: {'97fa3ee': sideInfo()}, review: fixture.review});
+    const instance = renderFixture({...fixture, media: media.service}, {columns: 120, rows: 24});
+    await flush(4);
+    for (const key of ['\u001B[B', '\u001B[B', 'o', 'v']) {
+      instance.stdin.write(key);
+      await flush(3);
+    }
+
+    const frame = instance.lastFrame() ?? '';
+    expect(frameLines(frame).join('\n')).toContain('binary file changed');
+    expect(decodePlaceholders(frame)).toEqual([]);
+    expect(media.graphicsWrites).toEqual([]);
+    expect(media.calls).toEqual([]);
+    expect(instance.frames.every((each) => colourCodes(each).length === 0)).toBe(true);
 
     instance.unmount();
   });
