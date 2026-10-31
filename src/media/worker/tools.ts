@@ -6,26 +6,63 @@ import path from 'node:path';
 // outside the reviewed repo count, and no shell or `which` is ever asked, so
 // a repo can never plant a program that we run.
 
+// Whether `dir` is the directory `root` names, or inside it: the same device
+// and inode as `dir` or one of its ancestors. Spelling does not matter, so a
+// case-insensitive file system cannot pass a repo dir off as another. True on
+// a stat error, so a dir that cannot be checked is never used.
+function insideRoot(dir: string, root: {dev: number; ino: number}) {
+  let current = dir;
+  for (;;) {
+    try {
+      const stat = fs.statSync(current);
+      if (stat.dev === root.dev && stat.ino === root.ino) return true;
+    } catch {
+      return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+/**
+ * The entries of a search path such as PATH or LD_LIBRARY_PATH that are safe
+ * to search: absolute, existing, and outside the repo, each with symlinks
+ * resolved. Empty and relative entries, which name the cwd, and any entry in
+ * the repo are dropped, so a repo can never plant a program or a library.
+ */
+export function searchDirs(value: string | undefined, repoRoot: string) {
+  let root: string;
+  let rootId: {dev: number; ino: number} | null = null;
+  try {
+    root = fs.realpathSync.native(repoRoot);
+    const stat = fs.statSync(root);
+    rootId = {dev: stat.dev, ino: stat.ino};
+  } catch {
+    root = path.resolve(repoRoot);
+  }
+  const dirs: string[] = [];
+  for (const entry of (value ?? '').split(path.delimiter)) {
+    if (!entry || !path.isAbsolute(entry)) continue;
+    let dir: string;
+    try {
+      dir = fs.realpathSync.native(entry);
+    } catch {
+      continue;
+    }
+    if (dir === root || dir.startsWith(`${root}${path.sep}`)) continue;
+    if (rootId && insideRoot(dir, rootId)) continue;
+    dirs.push(dir);
+  }
+  return dirs;
+}
+
 /**
  * The first regular executable named `name` on PATH, skipping relative
  * entries and any inside the repo (after resolving symlinks), or null.
  */
 export function findTool(name: string, env: NodeJS.ProcessEnv, repoRoot: string) {
-  let root: string;
-  try {
-    root = fs.realpathSync(repoRoot);
-  } catch {
-    root = path.resolve(repoRoot);
-  }
-  for (const entry of (env.PATH ?? '').split(path.delimiter)) {
-    if (!entry || !path.isAbsolute(entry)) continue;
-    let dir: string;
-    try {
-      dir = fs.realpathSync(entry);
-    } catch {
-      continue;
-    }
-    if (dir === root || dir.startsWith(`${root}${path.sep}`)) continue;
+  for (const dir of searchDirs(env.PATH, repoRoot)) {
     const candidate = path.join(dir, name);
     try {
       fs.accessSync(candidate, fs.constants.X_OK);

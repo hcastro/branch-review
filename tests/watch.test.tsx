@@ -15,7 +15,7 @@ import {
   type CreateRepoWatcherOptions,
 } from '../src/watch/repoWatcher.js';
 import {formatWatchFooterStatus, getModelWidth, ReviewController} from '../src/ui/ReviewController.js';
-import {buildFixture, decodePlaceholders, fakeMediaService, KITTY_CAPS, parseApc, pngFixture, sideInfo, svgMediaFile} from './ui-fixtures.js';
+import {buildFixture, decodePlaceholders, expectTransmitBeforeUse, fakeMediaService, KITTY_CAPS, parseApc, pngFixture, recordFramesInto, sideInfo, svgMediaFile} from './ui-fixtures.js';
 import type {MediaBackend} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
 
@@ -1058,6 +1058,8 @@ describe('ReviewController with media previews', {timeout: 20_000}, () => {
         media={media.service}
       />,
     );
+    // Frames join the graphics escapes on one timeline.
+    recordFramesInto(media.timeline, instance.stdout as unknown as {frames: string[]; write: (frame: string) => unknown});
     return {instance, watchers, media};
   }
 
@@ -1087,7 +1089,45 @@ describe('ReviewController with media previews', {timeout: 20_000}, () => {
     await flush(20);
     expect(deletes().map((command) => command.i)).toEqual([first, second]);
     expect(idsIn(instance.lastFrame())).toEqual([]);
+    expectTransmitBeforeUse(media.timeline);
 
+    instance.unmount();
+  });
+
+  it('keeps a rewritten PNG\'s box at its last size while the new content is inspected', async () => {
+    // A text file after the picture, whose header marks where its section ends.
+    const withTail = (model: ReviewModel) => ({...model, files: [...model.files, {
+      path: 'zz/tail.ts',
+      status: 'modified' as const,
+      metrics: {path: 'zz/tail.ts', additions: 1, deletions: 0, changedLines: 1},
+      rawDiff: '',
+      renderedLines: ['tail marker'],
+      blocks: [],
+    }]});
+    const sides = {aaaaaaa: sideInfo({width: 200, height: 100}), bbbbbbb: sideInfo({width: 200, height: 100})};
+    // The new content's inspect answers on a later macrotask.
+    const {instance, watchers} = await mediaController([withTail(mediaReview('aaaaaaa', 'v1')), withTail(mediaReview('bbbbbbb', 'v2'))], sides, {inspectDelayMs: {bbbbbbb: 150}});
+    await waitForFrame(instance, () => idsIn(instance.lastFrame()).length === 1);
+    // The picture's section, in screen rows: from the line before it to
+    // the line after it.
+    const sectionRows = (frame: string) => {
+      const lines = stripAnsi(frame).split('\n');
+      return lines.findIndex((line) => line.includes('tail marker')) - lines.findIndex((line) => /review v\d/.test(line));
+    };
+    const before = sectionRows(instance.lastFrame()!);
+    expect(before, stripAnsi(instance.lastFrame()!)).toBeGreaterThan(5);
+    const seen = instance.frames.length;
+
+    watchers.current.options.onChange();
+    await waitForFrame(instance, (text) => text.includes('review v2') && idsIn(instance.lastFrame()).length === 1);
+    await flush(20);
+    const after = instance.frames.slice(seen).filter((frame) => stripAnsi(frame).includes('review v2'));
+    expect(after.length).toBeGreaterThan(1);
+    for (const frame of after) {
+      const text = stripAnsi(frame);
+      if (text.includes('loading preview…')) expect(text).toContain('shown at');
+      expect(sectionRows(frame)).toBe(before);
+    }
     instance.unmount();
   });
 

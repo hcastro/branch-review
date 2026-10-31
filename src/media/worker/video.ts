@@ -24,7 +24,7 @@ import {createLru} from '../lru.js';
 import type {MediaFormat, SideRef, VideoMeta} from '../types.js';
 import {FILTER_REASON, STALE_REASON} from './read.js';
 import type {Renderer} from './render.js';
-import {createToolFinder} from './tools.js';
+import {createToolFinder, searchDirs} from './tools.js';
 
 // Video for the media worker: metadata from ffprobe and a strip of frames
 // from ffmpeg, both found on PATH outside the repo and optional. A repo file
@@ -49,7 +49,11 @@ const FRAME_STDOUT_BYTES = 8 * 1024 * 1024;
 const CACHE_BYTES = 48 * 1024 * 1024;
 const REREAD_DELAY_MS = 500;
 const MAX_TEXT = 16;
-const PROBE_FIELDS = 'format=duration,size,bit_rate:stream=codec_type,codec_name,width,height,avg_frame_rate,channels';
+// A work tree file that is no longer the one checked, as an open says it.
+const CHANGED_REASON = 'the file changed on disk';
+// `stream_side_data=rotation` is the display matrix's rotation, side data
+// rather than a tag: tags are never requested.
+const PROBE_FIELDS = 'format=duration,size,bit_rate:stream=codec_type,codec_name,width,height,avg_frame_rate,channels:stream_side_data=rotation';
 
 type Container = 'mov' | 'matroska';
 
@@ -110,10 +114,16 @@ export function parseProbe(json: string): VideoMeta | null {
   const audio = streams.find((stream) => stream?.codec_type === 'audio');
   const seconds = count(parsed.format?.duration) ?? 0;
   const bitRate = count(parsed.format?.bit_rate);
+  const coded = {width: Math.round(count(video.width) ?? 0), height: Math.round(count(video.height) ?? 0)};
+  // A display matrix turning the picture a quarter shows it with width and
+  // height swapped, as players and ffmpeg's own frames do.
+  const sideData = Array.isArray(video.side_data_list) ? video.side_data_list as Array<Record<string, unknown>> : [];
+  const rotation = sideData.map((entry) => (typeof entry?.rotation === 'number' ? entry.rotation : typeof entry?.rotation === 'string' ? Number(entry.rotation) : NaN)).find(Number.isFinite);
+  const quarterTurn = rotation !== undefined && Math.abs(Math.round(rotation)) % 180 === 90;
   return {
     durationMs: Math.round(seconds * 1000),
-    width: Math.round(count(video.width) ?? 0),
-    height: Math.round(count(video.height) ?? 0),
+    width: quarterTurn ? coded.height : coded.width,
+    height: quarterTurn ? coded.width : coded.height,
     codec: cleanText(video.codec_name),
     fps: frameRate(video.avg_frame_rate),
     ...(bitRate === undefined ? {} : {bitRate: Math.round(bitRate)}),
@@ -121,27 +131,65 @@ export function parseProbe(json: string): VideoMeta | null {
   };
 }
 
-type ToolRun = {ok: true; stdout: Buffer} | {ok: false; reason: string};
+// `opened: false`: the verified file could not be opened again, so the tool
+// never ran. `machine: true`: the tool failed to start or to load its
+// libraries, a fact about this machine that says nothing about the file.
+type ToolRun = {ok: true; stdout: Buffer} | {ok: false; reason: string; opened?: false; machine?: true};
+
+// The only variables ffprobe and ffmpeg see. Everything else is dropped:
+// FFREPORT would make ffmpeg write a log file into its cwd, and AV_LOG_FORCE_*
+// and FFMPEG_* change what it does. The loader paths stay, since some ffmpeg
+// installs (a self-built prefix, an environment module) find their libav*
+// libraries only through them, but only their entries findTool would search:
+// absolute and outside the repo, so a library the work tree holds never loads.
+const TOOL_ENV_KEYS = ['PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE'] as const;
+const LOADER_PATH_KEYS = ['LD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH'] as const;
+
+// What a tool that could not load prints: the Linux loader's message, or
+// dyld's on macOS.
+const LOAD_FAILURE = /error while loading shared libraries|Library not loaded|^dyld(\[\d+\])?:/m;
+
+function toolEnv(env: NodeJS.ProcessEnv, repoRoot: string): NodeJS.ProcessEnv {
+  const kept: NodeJS.ProcessEnv = {};
+  for (const key of TOOL_ENV_KEYS) {
+    if (env[key] !== undefined) kept[key] = env[key];
+  }
+  for (const key of LOADER_PATH_KEYS) {
+    const dirs = searchDirs(env[key], repoRoot);
+    if (dirs.length > 0) kept[key] = dirs.join(path.delimiter);
+  }
+  return kept;
+}
+
+// Where the tools run: the worker's temp dir in the session dir, so nothing
+// they write lands in the repo, which is the worker's own cwd. The OS temp
+// dir when the worker runs outside a session (forked directly in tests).
+function toolCwd(env: NodeJS.ProcessEnv) {
+  const session = env.BRANCH_REVIEW_MEDIA_TMP || process.env.BRANCH_REVIEW_MEDIA_TMP;
+  const dir = session ? path.join(session, 'worker') : '';
+  return dir && path.isAbsolute(dir) && fs.existsSync(dir) ? dir : os.tmpdir();
+}
 
 // One ffprobe or ffmpeg call: an argument array, no shell, stdin closed,
 // the input descriptor (if any) as fd 3, killed at its deadline or when its
 // output passes the cap.
-function runTool(command: string, args: string[], {fd, timeoutMs, maxStdout, env}: {fd?: number; timeoutMs: number; maxStdout: number; env: NodeJS.ProcessEnv}): Promise<ToolRun> {
+function runTool(command: string, args: string[], {fd, timeoutMs, maxStdout, env, repoRoot}: {fd?: number; timeoutMs: number; maxStdout: number; env: NodeJS.ProcessEnv; repoRoot: string}): Promise<ToolRun> {
   return new Promise((resolve) => {
     const name = path.basename(command);
     const stdio: Array<'ignore' | 'pipe' | number> = ['ignore', 'pipe', 'pipe'];
     if (fd !== undefined) stdio.push(fd);
     let child;
     try {
-      child = spawn(command, args, {stdio, env});
+      child = spawn(command, args, {stdio, env: toolEnv(env, repoRoot), cwd: toolCwd(env)});
     } catch (error) {
-      resolve({ok: false, reason: `${name} failed to start (${error instanceof Error ? error.message.split('\n')[0] : String(error)})`});
+      resolve({ok: false, reason: `${name} failed to start (${error instanceof Error ? error.message.split('\n')[0] : String(error)})`, machine: true});
       return;
     }
     const chunks: Buffer[] = [];
     let total = 0;
     let stderr = '';
     let failure: string | null = null;
+    let startFailed = false;
     const stop = (reason: string) => {
       failure ??= reason;
       child.kill('SIGKILL');
@@ -156,12 +204,17 @@ function runTool(command: string, args: string[], {fd, timeoutMs, maxStdout, env
       stderr = (stderr + chunk.toString('utf8')).slice(-2048);
     });
     child.on('error', (error) => {
+      if (failure === null) startFailed = true;
       failure ??= `${name} failed to start (${error.message.split('\n')[0]})`;
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (failure) resolve({ok: false, reason: failure});
-      else if (code !== 0) resolve({ok: false, reason: `${name} failed (${escapeHiddenCharacters(stderr.split('\n').map((line) => line.trim()).find(Boolean) ?? `exit code ${code}`).slice(0, 120)})`});
+      if (failure) resolve({ok: false, reason: failure, ...(startFailed ? {machine: true as const} : {})});
+      else if (code !== 0) {
+        // 126 and 127: the shell's codes for a program that could not run.
+        const machine = code === 126 || code === 127 || LOAD_FAILURE.test(stderr);
+        resolve({ok: false, reason: `${name} failed (${escapeHiddenCharacters(stderr.split('\n').map((line) => line.trim()).find(Boolean) ?? `exit code ${code}`).slice(0, 120)})`, ...(machine ? {machine: true as const} : {})});
+      }
       else resolve({ok: true, stdout: Buffer.concat(chunks, total)});
     });
   });
@@ -261,8 +314,10 @@ export function createVideoRunner(renderer: Renderer, {
         verifiedFiles.set(side.key, again);
         return {ok: true, ...again};
       }
+      // A filter is a verdict on the file as it is on disk, not on the
+      // content the id names: asked again on the next review.
       return again.oid === first.oid
-        ? {ok: false, state: 'error', reason: FILTER_REASON}
+        ? {ok: false, state: 'error', reason: FILTER_REASON, disk: true, filter: true}
         : {ok: false, state: 'stale', reason: STALE_REASON, disk: true};
     } catch (error) {
       if (error instanceof FileTooLargeError) return {ok: false, state: 'error', reason: reasonOf(error)};
@@ -354,29 +409,29 @@ export function createVideoRunner(renderer: Renderer, {
   // right before the input.
   const common = (input: VideoInput) => ['-hide_banner', '-v', 'error', '-protocol_whitelist', 'file', ...(input.container === 'mov' ? ['-enable_drefs', '0'] : [])];
 
-  async function callWith(input: VideoInput, command: string, args: string[], timeoutMs: number, maxStdout: number): Promise<ToolRun> {
+  async function callWith(input: VideoInput, repoRoot: string, command: string, args: string[], timeoutMs: number, maxStdout: number): Promise<ToolRun> {
     let handle: fs.promises.FileHandle | undefined;
     try {
       if (input.open) handle = await input.open();
     } catch (error) {
-      return {ok: false, reason: reasonOf(error)};
+      return {ok: false, reason: reasonOf(error), opened: false};
     }
     try {
-      return await runTool(command, args, {fd: handle?.fd, timeoutMs, maxStdout, env});
+      return await runTool(command, args, {fd: handle?.fd, timeoutMs, maxStdout, env, repoRoot});
     } finally {
       await handle?.close();
     }
   }
 
-  async function probe(input: VideoInput, ffprobe: string, timeoutMs: number): Promise<{meta: VideoMeta | null; reason?: string}> {
+  async function probe(input: VideoInput, repoRoot: string, ffprobe: string, timeoutMs: number): Promise<{meta: VideoMeta | null; reason?: string; opened?: false; machine?: true}> {
     const args = [...common(input), '-show_entries', PROBE_FIELDS, '-of', 'json', '-f', input.container, '-i', input.arg];
-    const run = await callWith(input, ffprobe, args, timeoutMs, PROBE_STDOUT_BYTES);
-    if (!run.ok) return {meta: null, reason: run.reason};
+    const run = await callWith(input, repoRoot, ffprobe, args, timeoutMs, PROBE_STDOUT_BYTES);
+    if (!run.ok) return {meta: null, reason: run.reason, ...(run.opened === false ? {opened: false as const} : {}), ...(run.machine ? {machine: true as const} : {})};
     const meta = parseProbe(run.stdout.toString('utf8'));
     return meta ? {meta} : {meta: null, reason: 'no video stream'};
   }
 
-  async function frame(input: VideoInput, ffmpeg: string, atMs: number, width: number, timeoutMs: number): Promise<{png: Buffer | null; timedOut: boolean}> {
+  async function frame(input: VideoInput, repoRoot: string, ffmpeg: string, atMs: number, width: number, timeoutMs: number): Promise<{png: Buffer | null; timedOut: boolean}> {
     const args = [
       '-nostdin', ...common(input),
       '-ss', (atMs / 1000).toFixed(3),
@@ -384,7 +439,7 @@ export function createVideoRunner(renderer: Renderer, {
       '-frames:v', '1', '-vf', `scale=${Math.max(2, Math.round(width))}:-2`, '-threads', '1',
       '-f', 'image2pipe', '-c:v', 'png', 'pipe:1',
     ];
-    const run = await callWith(input, ffmpeg, args, timeoutMs, FRAME_STDOUT_BYTES);
+    const run = await callWith(input, repoRoot, ffmpeg, args, timeoutMs, FRAME_STDOUT_BYTES);
     if (!run.ok) return {png: null, timedOut: run.reason.endsWith('timed out')};
     return {png: run.stdout.length > 0 ? run.stdout : null, timedOut: false};
   }
@@ -408,12 +463,21 @@ export function createVideoRunner(renderer: Renderer, {
       let meta = probes.get(request.side.key);
       let probeReason: string | undefined;
       if (meta === undefined) {
-        const probed = await probe(input, ffprobe, Math.max(1, Math.min(probeTimeoutMs, timeLeft())));
+        const probed = await probe(input, request.cwd, ffprobe, Math.max(1, Math.min(probeTimeoutMs, timeLeft())));
         meta = probed.meta;
         probeReason = probed.reason;
-        // A timeout may be the machine's load, not the file: asked again
-        // next time.
-        if (meta || !probed.reason?.endsWith('timed out')) probes.set(request.side.key, meta);
+        if (!meta) {
+          // A failure is a fact about the content only when ffprobe read the
+          // verified file and the file is still that file: one that changed
+          // on disk is asked again on the next review.
+          if (probed.opened === false || !(await input.done())) return {ok: false, state: 'stale', reason: STALE_REASON, disk: true};
+          // A timeout may be the machine's load, and a tool that could not
+          // start or load is the machine's setup, not the file: both asked
+          // again next time.
+          if (!probed.reason?.endsWith('timed out') && !probed.machine) probes.set(request.side.key, null);
+        } else {
+          probes.set(request.side.key, meta);
+        }
       }
       if (!meta || meta.durationMs <= 0) {
         return {ok: true, meta, strip: null, times: [], note: `could not read the video (${probeReason ?? 'no duration'})`};
@@ -430,7 +494,7 @@ export function createVideoRunner(renderer: Renderer, {
           frames.push(null);
           continue;
         }
-        const drawn = await frame(input, ffmpeg, at, request.framePx.w, Math.min(frameTimeoutMs, left));
+        const drawn = await frame(input, request.cwd, ffmpeg, at, request.framePx.w, Math.min(frameTimeoutMs, left));
         if (drawn.timedOut) gaveUp = true;
         frames.push(drawn.png);
       }
@@ -454,26 +518,83 @@ export function createVideoRunner(renderer: Renderer, {
     }
   }
 
+  // A work tree video copied out of the verified file into `dir()`, for a
+  // player that must not be handed the repo path. The copy is the bytes that
+  // hashed to the id: the descriptor is the verified file, and its size and
+  // modification time must not change while it is read.
+  async function copyWorktreeVideo(cwd: string, side: SideRef, format: MediaFormat, extension: string, dir: () => string): Promise<ExportResult> {
+    try {
+      const {handle, stat} = await openWorktreeFile(cwd, side.path);
+      await handle.close();
+      if (stat.size > MAX_BLOB_VIDEO_BYTES) return {ok: false, state: 'error', reason: `too large to open safely (over ${Math.floor(MAX_BLOB_VIDEO_BYTES / (1024 * 1024))} MB)`};
+    } catch (error) {
+      return {ok: false, state: 'error', reason: reasonOf(error), disk: true};
+    }
+    const verified = await verifyWorktree(cwd, side);
+    if (!verified.ok) return verified;
+    if (!containerFor(verified.head, format)) return {ok: false, state: 'error', reason: notVideoReason(format)};
+    if (verified.stat.size > MAX_BLOB_VIDEO_BYTES) return {ok: false, state: 'error', reason: `too large to open safely (over ${Math.floor(MAX_BLOB_VIDEO_BYTES / (1024 * 1024))} MB)`};
+    let source: fs.promises.FileHandle;
+    try {
+      source = await openVerifiedVideoFd(cwd, side.path, verified.stat);
+    } catch {
+      return {ok: false, state: 'stale', reason: CHANGED_REASON, disk: true};
+    }
+    // Named from the id and an extension from the allow list.
+    const target = path.join(dir(), `${verified.oid.slice(0, 12)}-${side.side}.${extension}`);
+    let out: fs.promises.FileHandle | undefined;
+    try {
+      // Read-only, as every copy a viewer gets.
+      out = await fs.promises.open(target, 'wx', 0o400);
+      const chunk = Buffer.allocUnsafe(1024 * 1024);
+      let position = 0;
+      while (position < verified.stat.size) {
+        const {bytesRead} = await source.read(chunk, 0, Math.min(chunk.length, verified.stat.size - position), position);
+        if (bytesRead === 0) break;
+        await out.write(chunk.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      const after = await source.stat();
+      if (position !== verified.stat.size || after.size !== verified.stat.size || after.mtimeMs !== verified.stat.mtimeMs) {
+        throw new Error(CHANGED_REASON);
+      }
+      await out.close();
+      out = undefined;
+      return {ok: true, path: target};
+    } catch (error) {
+      await out?.close().catch(() => undefined);
+      await fs.promises.rm(target, {force: true});
+      const changed = error instanceof Error && error.message === CHANGED_REASON;
+      return changed ? {ok: false, state: 'stale', reason: CHANGED_REASON, disk: true} : {ok: false, state: 'error', reason: reasonOf(error)};
+    } finally {
+      await source.close();
+    }
+  }
+
   /**
-   * The file a player opens: a work tree video itself, after the regular
-   * file and container checks (players never write, and copying gigabytes
-   * would be slow); a committed one as a verified copy in `dir`.
+   * The file a player opens. A work tree video is the file itself, after the
+   * regular file and container checks, with the dev and ino checked (players
+   * never write, and copying gigabytes would be slow), or with `copy` a
+   * verified copy; a committed one is always a verified copy in `dir`.
    */
-  async function exportCopy(request: {cwd: string; side: SideRef; format: MediaFormat}, dir: () => string): Promise<ExportResult> {
+  async function exportCopy(request: {cwd: string; side: SideRef; format: MediaFormat; copy?: true}, dir: () => string): Promise<ExportResult> {
     const {cwd, side, format} = request;
     const extension = VIDEO_EXTENSIONS[format];
     if (!extension) return {ok: false, state: 'error', reason: 'cannot open this file type'};
     if (side.source === 'worktree') {
+      if (request.copy) return copyWorktreeVideo(cwd, side, format, extension, dir);
       try {
         const {handle, absolutePath} = await openWorktreeFile(cwd, side.path);
         const head = Buffer.alloc(64);
+        let opened: fs.Stats;
         try {
           await handle.read(head, 0, head.length, 0);
+          opened = await handle.stat();
         } finally {
           await handle.close();
         }
         if (!containerFor(head, format)) return {ok: false, state: 'error', reason: notVideoReason(format)};
-        return {ok: true, path: absolutePath};
+        return {ok: true, path: absolutePath, dev: opened.dev, ino: opened.ino};
       } catch (error) {
         return {ok: false, state: 'error', reason: reasonOf(error), disk: true};
       }
@@ -484,6 +605,8 @@ export function createVideoRunner(renderer: Renderer, {
       if (!containerFor(await readBlobHead(cwd, facts.oid), format)) return {ok: false, state: 'error', reason: notVideoReason(format)};
       const target = path.join(dir(), `${side.side}.${extension}`);
       await writeBlobToFile(cwd, facts, target, await formatFor(cwd));
+      // Read-only, as every copy a viewer gets.
+      await fs.promises.chmod(target, 0o400);
       return {ok: true, path: target};
     } catch (error) {
       return {ok: false, state: 'error', reason: reasonOf(error)};

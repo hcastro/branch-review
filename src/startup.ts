@@ -5,12 +5,12 @@ import {refreshReview} from './review/build.js';
 import {escapeHiddenCharacters} from './controlChars.js';
 import {ReviewController, getModelWidth} from './ui/ReviewController.js';
 import {INK_RENDER_OPTIONS, createTerminalSession, runInkApp} from './terminalSession.js';
-import {startGraphicsDetection, type TtyInput} from './media/detect.js';
+import {queryTmuxClient, startGraphicsDetection, type TmuxClient, type TtyInput} from './media/detect.js';
 import type {GraphicsCaps} from './media/types.js';
 import {tmuxPassthrough} from './media/kitty.js';
 import {createMediaService, type MediaService} from './media/service.js';
 import {createWorkerBackend} from './media/workerClient.js';
-import {createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
+import {claimKittyTmux, createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
 import {defaultOpener} from './media/openExternal.js';
 
 type PrepareStartupOptions = {
@@ -81,11 +81,16 @@ export type CliIo = {
   stderr: {write(text: string): unknown};
   render: (tree: React.ReactElement, options: typeof INK_RENDER_OPTIONS) => InkInstance;
   env?: NodeJS.ProcessEnv;
+  // Under tmux, which terminal the attached client runs in. By default tmux
+  // is asked; tests answer in its place.
+  queryTmuxClient?: () => Promise<TmuxClient | null>;
 };
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIGTERM: 143};
 
 type SessionLike = ReturnType<typeof createTerminalSession>;
+
+const TMUX_SHARED_NOTICE = 'another branch-review draws images in this tmux server · block previews here';
 
 /**
  * The media service for a terminal that draws Kitty images or block
@@ -94,9 +99,25 @@ type SessionLike = ReturnType<typeof createTerminalSession>;
  * hooks kill the media worker and remove the session's temp dir. Nothing is
  * sent before the UI enters the alt screen.
  */
-function startMedia({caps, cwd, env, proc, session, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean; animations: boolean}): MediaService {
+function startMedia({caps: detected, cwd, env, proc, session, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean; animations: boolean}): {media: MediaService; caps: GraphicsCaps} {
   sweepStaleMediaDirs({env});
   const tempDir = createMediaTempDir({env});
+  // Every pane of a tmux server draws on the one outer terminal and its one
+  // table of image ids, so only the first session there draws Kitty images.
+  let caps = detected;
+  const notices: string[] = [];
+  if (caps.tmux && caps.protocol === 'kitty' && env.TMUX) {
+    let claimed = false;
+    try {
+      claimed = claimKittyTmux(tempDir.get(), env.TMUX, {env});
+    } catch {
+      // No session dir to claim from: blocks, which need none.
+    }
+    if (!claimed) {
+      caps = {...caps, protocol: 'blocks'};
+      notices.push(TMUX_SHARED_NOTICE);
+    }
+  }
   const backend = createWorkerBackend({tempDir: tempDir.get, env, cwd});
   // Inside tmux every graphics command, the exit deletes too, goes through
   // passthrough to the outer terminal.
@@ -110,11 +131,12 @@ function startMedia({caps, cwd, env, proc, session, watching, animations}: {caps
     env,
     watching,
     animations,
+    notices,
   });
   session.setRestorePrefix(() => forTerminal(media.restoreSequence()));
   proc.on('exit', () => media.dispose());
   proc.on('exit', tempDir.remove);
-  return media;
+  return {media, caps};
 }
 
 /**
@@ -124,7 +146,8 @@ function startMedia({caps, cwd, env, proc, session, watching, animations}: {caps
  * exit hooks kill the git or delta the build is running, remove the private
  * index copy, and the UI is never mounted.
  */
-export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env}: CliIo) {
+export async function runCli(io: CliIo) {
+  const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env} = io;
   const options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
   const terminalWidth = stdout.columns ?? 160;
 
@@ -173,6 +196,7 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
     stdout,
     env,
     options: {images: options.images ?? 'auto'},
+    queryTmuxClient: io.queryTmuxClient ?? (() => queryTmuxClient(env, cwd)),
     onInterrupt: () => {
       session.restore();
       proc.exit(130);
@@ -186,10 +210,12 @@ export async function runCli({argv, cwd: startDir, proc, stdin, stdout, stderr, 
   // Ctrl-C during the window, or a signal, has already exited.
   if (startupBuild.signal.aborted) return;
   const {keys, replyHead} = detection.handOff();
-  const graphics = replyHead ? {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : caps;
-  // Kitty terminals draw pictures and other colour terminals block previews;
+  // Kitty terminals draw pictures and other color terminals block previews;
   // with no graphics the app is exactly as it is without media.
-  const media = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch, animations: options.animations}) : undefined;
+  const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch, animations: options.animations}) : undefined;
+  const media = started?.media;
+  const drawCaps = started?.caps ?? caps;
+  const graphics = replyHead ? {...drawCaps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : drawCaps;
 
   await runInkApp(session, (guard) => render(guard(
     React.createElement(ReviewController, {

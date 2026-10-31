@@ -75,8 +75,11 @@ export function createImageRegistry({
   const liveIds = new Set<number>();
   const releasedAt = new Map<number, number>();
   let liveBytes = 0;
-  // A random start keeps two sessions in one terminal from starting on the
-  // same ids.
+  // A random start only staggers where a session's ids begin. It does not
+  // keep two sessions drawing on one terminal apart: each knows only its own
+  // ids, so sooner or later one writes over or deletes the other's. Under
+  // tmux, where every pane draws on the same outer terminal, only one
+  // session per server draws (claimKittyTmux).
   let cursor = 1 + Math.min(MAX_ID - 1, Math.floor(random() * MAX_ID));
 
   const freeId = () => {

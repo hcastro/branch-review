@@ -84,9 +84,9 @@ branch-review my-feature release/2026.04
 | `--no-watch` | Open a frozen snapshot. Handy while an agent is mid-write and the view would churn. |
 | `--watch-poll` | Poll instead of using filesystem events. Use it on network mounts and container bind mounts. |
 | `--no-animations` | Skip the arrival highlights. Useful on slow or remote terminals. |
-| `--no-images` | Show image files as text, the way terminals without image support do. `--images` turns them back on. |
+| `--no-images` | Show image, SVG and video files as plain diffs, as before media previews. `--images` cancels an earlier `--no-images`; `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn previews off. |
 
-Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` is `0` or `false`, or when `TERM=dumb`. The same rule covers delta's diffs and the app's own chrome. Diffs keep their `+` and `-` markers.
+Color is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` is `0` or `false`, or when `TERM=dumb`. The same rule covers delta's diffs and the app's own chrome. Diffs keep their `+` and `-` markers.
 
 ## Reviewing
 
@@ -102,7 +102,7 @@ Colour is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` 
 | `t` | Show or hide the file tree |
 | `o` | Open the image on screen in the default viewer |
 | `O` | Quick Look the image on macOS. Elsewhere it works like `o`. |
-| `v` | Switch the image to a details table and back |
+| `v` | Switch an image or video to a details table and back. On an SVG, show its source only, and back. |
 | `1` / `2` / `3` | Compare a modified image side by side, by flipping between its versions, or as a difference. `2` again flips to the other version. |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 
@@ -186,20 +186,26 @@ In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, Web
 
 A modified image opens with its old and new versions side by side. `2` (or the tab row above the picture) switches to flip mode, which shows one version at a time: press `2` again or click the picture to swap. `3` shows the difference, with changed pixels marked over a darkened copy of the new version and the share of the image that changed. The mode you pick stays for the rest of the session. The metrics row shows both versions' sizes and the change in bytes.
 
+An SVG shows its rendered picture first, with its source blocks folded under it. `Enter` or `Space` unfolds a block like any other, and a block you unfolded stays unfolded through refreshes. `v` shows the source only. The header keeps `Copy path · Copy diff · Copy file`. `o` and `O` open a PNG rendered from the SVG, never the SVG itself, so no script in it ever runs.
+
 | Terminal | Images |
 | --- | --- |
 | Ghostty, cmux, Kitty | Drawn as pictures |
-| Apple Terminal, Alacritty, iTerm2, WezTerm, VS Code, Warp, Konsole, and any other terminal with 256 colours or more | A block preview |
+| Apple Terminal, Alacritty, iTerm2, WezTerm, VS Code, Warp, Konsole, and any other terminal with 256 colors or more | A block preview |
 | Inside tmux | Drawn as pictures when tmux passes graphics through to Ghostty or Kitty (`set -g allow-passthrough all`), a block preview otherwise |
-| Terminals with fewer than 256 colours, or that don't answer the startup query | The usual `binary file changed` line |
+| Terminals with fewer than 256 colors, or that don't answer the startup query | The usual `binary file changed` line |
 
-A block preview draws the picture in coloured half-block characters, two pixels to a cell and at most 60 × 20 cells. That's enough to tell which image you're looking at and roughly what changed, in every compare mode. `o` opens the real image, and the footer says `no image support detected` while one is on screen.
+A block preview draws the picture in colored half-block characters, two pixels to a cell and at most 60 × 20 cells. That's enough to tell which image you're looking at and roughly what changed, in every compare mode. `o` opens the real image, and the footer says `no image support detected` while one is on screen.
 
 Inside tmux, every graphics command goes out wrapped for tmux's passthrough, the startup query and the deletes at exit included. Pictures are used only when the wrapped query gets an answer back, so a tmux that blocks passthrough gets the block preview and never shows stray text.
 
 Use `allow-passthrough all`, not `on`. With `on`, tmux drops graphics sent while the pane is hidden behind another window, so a picture redrawn by a refresh then comes back as empty cells, and a quit from a hidden pane leaves its images in the terminal. With passthrough off, startup waits up to a second for an answer that never comes.
 
-tmux answers the question of which terminal it runs in by itself, so inside tmux branch-review knows the outer terminal only from the variables the tmux server started with. A server started from Ghostty and later attached from WezTerm still looks like Ghostty, and the pictures there can show as empty cells. In that case set `BRANCH_REVIEW_IMAGES=blocks`, or start a new tmux server from the terminal you're using.
+tmux answers the question of which terminal it runs in by itself, and its environment describes the terminal the server started in. So inside tmux, branch-review asks tmux which terminal the attached client runs in, and draws pictures only when that is Ghostty or Kitty. When tmux can't say, you get the block preview.
+
+Only the first branch-review session in a tmux server draws images, since every pane draws on the same outer terminal; later ones show block previews.
+
+For a raster image, the file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
 
 #### Video
 
@@ -207,11 +213,9 @@ An added, deleted or changed MP4, MOV or WebM shows a table of its length, size,
 
 The metadata and frames come from `ffprobe` and `ffmpeg` on your `PATH` (`brew install ffmpeg`). They're optional: without them a video shows its size, and the strip says what to install. Only a program outside the repo is ever run. It reads the video through a checked file descriptor, or a checked temp copy for a committed version, with the container forced and every input but plain files refused.
 
-`o` plays the video in the default player. On macOS the header has `Play` and `Quick Look` buttons, and `O` opens Quick Look. A video in the work tree opens as the file itself, since players don't write to it. A committed version opens from a temp copy.
+A video's header is `Copy path · Play · Quick Look` on macOS and `Copy path · Open` elsewhere, with no `Copy diff`. `o` plays the video. On macOS, `o` plays a work tree MP4 or MOV in QuickTime as the file itself, and `O` previews any work tree video in Quick Look as the file itself. The path is checked again right before either one starts. Every other `o` on a work tree video, and every open of a committed version, uses a verified read-only temp copy.
 
-The file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
-
-Images stay off when colour is off (`NO_COLOR` and the rest of the colour rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognised, and `BRANCH_REVIEW_IMAGES=blocks` forces the block preview.
+Images stay off when color is off (`NO_COLOR` and the rest of the color rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognized, `BRANCH_REVIEW_IMAGES=blocks` forces the block preview, and `BRANCH_REVIEW_IMAGES=auto` (the default) detects what the terminal can draw.
 
 Every image is read in a separate background process. Bytes are checked against the object id in Git's diff before anything is drawn, so a file that changed on disk or that a Git filter rewrites never shows as a stale or wrong picture. A file that can't be previewed shows the reason in its place. If that process keeps failing or hanging, previews turn off for the session and the review carries on.
 

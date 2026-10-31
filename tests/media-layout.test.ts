@@ -50,7 +50,7 @@ describe('fitBox', () => {
     expect(box.leftPad).toBe(0);
   });
 
-  it('is capped by the rows available, then centred in the columns', () => {
+  it('is capped by the rows available, then centered in the columns', () => {
     const box = fitBox({w: 1000, h: 1000}, 80, 10, KITTY);
     expect(box).toMatchObject({cols: 20, rows: 10, drawPx: {w: 200, h: 200}});
     expect(box.leftPad).toBe(30);
@@ -68,7 +68,7 @@ describe('fitBox', () => {
     expect(fitBox({w: 81, h: 20}, 80, 30, KITTY)).toMatchObject({cols: 9, rows: 1, drawPx: {w: 81, h: 20}, scale: 1, upscale: 1});
   });
 
-  it('upscales a tiny icon by a whole factor, nearest-neighbour, within the caps', () => {
+  it('upscales a tiny icon by a whole factor, nearest-neighbor, within the caps', () => {
     expect(fitBox({w: 16, h: 16}, 80, 30, KITTY)).toMatchObject({upscale: 5, nearest: true, drawPx: {w: 80, h: 80}, cols: 8, rows: 4});
     expect(fitBox({w: 4, h: 4}, 80, 30, KITTY)).toMatchObject({upscale: 8, drawPx: {w: 32, h: 32}});
     // The rows cap holds the factor down.
@@ -106,7 +106,7 @@ describe('planMedia', () => {
     expect(boxes).toHaveLength(28);
     expect(boxes.map((row) => row.boxRow)).toEqual([...Array(28).keys()]);
     expect(boxes[0]!.boxes).toEqual([expect.objectContaining({
-      imageKey: 'png|-|blob|img/a.png|97fa3ee|after|56x28|10x20',
+      imageKey: 'png|-|blob|img/a.png|97fa3ee|after|56x28|10x20|560x560',
       role: 'after',
       side: 'after',
       cols: 56,
@@ -205,7 +205,7 @@ describe('planMedia', () => {
     expect(boxRows(afterPlan).every((row) => row.swap)).toBe(true);
   });
 
-  it('centres the shared flip box in the pane', () => {
+  it('centers the shared flip box in the pane', () => {
     const r = ref('raster', {before: true, after: true});
     const plan = planMedia(r, {before: ready(400, 300), after: ready(300, 400)}, {...VIEW, compare: 'flip'}, layout(100, 30));
     const shown = boxRows(plan)[0]!.boxes![0]!;

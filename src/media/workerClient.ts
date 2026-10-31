@@ -74,6 +74,9 @@ type Job = {
   requeued: boolean;
   settled: boolean;
   timer?: NodeJS.Timeout;
+  // The worker this job was last sent to, so a deadline that outlives it
+  // never touches a later worker.
+  child?: ChildProcess;
   onAbort?: () => void;
 };
 
@@ -140,9 +143,11 @@ export function createWorkerBackend({
   let disposed = false;
 
   const settle = (job: Job, result: JobResult) => {
+    // An aborted job is settled with its timer still armed; clearing it here
+    // first means no path that finishes a job leaves its deadline running.
+    clearTimeout(job.timer);
     if (job.settled) return;
     job.settled = true;
-    clearTimeout(job.timer);
     if (job.onAbort) job.signal.removeEventListener('abort', job.onAbort);
     job.resolve(result);
   };
@@ -202,6 +207,7 @@ export function createWorkerBackend({
     const reason = `media worker exited (${signal ? `signal ${signal}` : `code ${code}`})${detail ? `: ${detail}` : ''}`;
     for (const job of [...inFlight.values()]) {
       inFlight.delete(job.id);
+      clearTimeout(job.timer);
       settle(job, {ok: false, state: 'error', reason});
     }
     recordFailure(reason);
@@ -255,6 +261,9 @@ export function createWorkerBackend({
 
   // A job dropped by the UI still counts: the worker missed its deadline.
   const onDeadline = (job: Job) => {
+    // A deadline whose job is no longer in flight in the current worker is
+    // stale: it must not kill a later worker or count as a failure.
+    if (!inFlight.has(job.id) || job.child !== child) return;
     inFlight.delete(job.id);
     settle(job, {ok: false, state: 'error', reason: 'timed out'});
     stopChild();
@@ -298,6 +307,7 @@ export function createWorkerBackend({
       const [job] = queue.splice(next, 1) as [Job];
       if (job.settled) continue;
       inFlight.set(job.id, job);
+      job.child = child;
       job.timer = setTimeout(() => onDeadline(job), deadlines[job.type]);
       job.timer.unref();
       try {
@@ -357,7 +367,10 @@ export function createWorkerBackend({
       clearTimeout(forkTimer);
       clearTimeout(idleTimer);
       stopChild();
-      for (const job of [...queue.splice(0), ...inFlight.values()]) settle(job, {ok: false, state: 'unavailable', reason: 'previews turned off'});
+      for (const job of [...queue.splice(0), ...inFlight.values()]) {
+        clearTimeout(job.timer);
+        settle(job, {ok: false, state: 'unavailable', reason: 'previews turned off'});
+      }
       inFlight.clear();
     },
     disabledReason: () => disabled,

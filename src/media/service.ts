@@ -6,7 +6,8 @@ import {classifyMedia} from './classify.js';
 import {createImageRegistry} from './imageRegistry.js';
 import {staleReason, type BoxSpec, type DrawnFacts} from './layout.js';
 import {createLru} from './lru.js';
-import {openMedia, type OpenOutcome, type Opener} from './openExternal.js';
+import {escapeHiddenCharacters} from '../controlChars.js';
+import {openMedia, sideToOpen, type ExportedCopy, type OpenOutcome, type Opener} from './openExternal.js';
 import type {CompareMode, GraphicsCaps, MediaRef, MediaViewState, SideName, SideState, VideoMeta} from './types.js';
 
 // The UI process's media state for the session: which review files are
@@ -63,6 +64,8 @@ export type MediaServiceOptions = {
   animations?: boolean;
   now?: () => number;
   registry?: {maxLive?: number; maxBytes?: number; quarantineMs?: number; random?: () => number};
+  // Messages for the footer from before the service existed.
+  notices?: readonly string[];
 };
 
 export type MediaService = ReturnType<typeof createMediaService>;
@@ -70,7 +73,7 @@ export type MediaService = ReturnType<typeof createMediaService>;
 // What the row builder reads from the service.
 export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'drawnFacts' | 'watching'> & Partial<Pick<MediaService, 'animates'>>;
 
-export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, animations = false, now = Date.now, registry: registryOptions = {}}: MediaServiceOptions) {
+export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, animations = false, now = Date.now, registry: registryOptions = {}, notices: startupNotices = []}: MediaServiceOptions) {
   // Kitty terminals that run animations themselves loop an animated GIF or
   // WebP; everywhere else it shows its first frame.
   const animates = caps.protocol === 'kitty' && caps.animation && animations;
@@ -120,6 +123,15 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // again when a new review arrives, since the same id may now read fine.
   const diskSides = new Set<string>();
   const diskBoxes = new Set<string>();
+  // Side keys and box keys a git filter changes on disk. Only a write can
+  // change that, and a write brings a new review, so they are asked again by
+  // a new review alone, never by a refresh that kept the review.
+  const filterSides = new Set<string>();
+  const filterBoxes = new Set<string>();
+  // The last settled state of each side asked again after a disk failure,
+  // shown while the new answer is on its way, so the drawn view keeps its
+  // rows instead of dropping to `loading preview…`.
+  const reasking = new Map<string, SideState>();
   // Counts refreshes that found the review unchanged. A job that started
   // before one and then failed on the file's state is asked again at once:
   // the refresh looked at the file after the job did, and brings no new
@@ -128,7 +140,11 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   const rendering = new Map<string, AbortController>();
   let liveKeys: ReadonlySet<string> = new Set();
   let visibleKeys: ReadonlySet<string> = new Set();
-  const notices: string[] = [];
+  const notices: string[] = [...startupNotices];
+  // Opens running, by side key and kind; copies exported for a viewer, by
+  // side key, reused while they last.
+  const opening = new Set<string>();
+  const copies = new Map<string, ExportedCopy>();
   const noticed = new Set<string>();
   let planVersion = 0;
   let version = 0;
@@ -173,6 +189,10 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     return classifyMedia(file, context.range);
   };
 
+  // A failure that described the file at the moment it was read, asked
+  // again on any refresh. A filter verdict waits for a new review.
+  const diskFailure = (result: JobFailure) => result.state === 'stale' || (result.disk === true && !result.filter);
+
   const inspect = (ref: MediaRef, side: SideName, priority: number) => {
     const sideRef = ref[side]!;
     if (!context || sides.has(sideRef.key)) return;
@@ -184,7 +204,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     backend.inspect({cwd, side: sideRef, kind: ref.kind, format: ref.format}, controller.signal, priority).then((result) => {
       if (controller.signal.aborted || disposed) return;
       inspecting.delete(sideRef.key);
-      const disk = !result.ok && (result.state === 'stale' || result.disk === true);
+      const disk = !result.ok && diskFailure(result);
       if (disk && started !== keptReviews) {
         // The file was settling while a refresh looked at it: ask again now.
         sides.delete(sideRef.key);
@@ -202,7 +222,9 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
         noteFailure(result.reason);
       }
       if (disk) diskSides.add(sideRef.key);
+      else if (!result.ok && result.filter) filterSides.add(sideRef.key);
       sides.set(sideRef.key, state);
+      reasking.delete(sideRef.key);
       planChanged();
     }, () => {
       // Aborted: the side left the review.
@@ -220,7 +242,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       return {status: 'ready', info: {...state.info, video: meta, ...(meta ? {width: meta.width, height: meta.height} : {})}};
     }
     if (state.status !== 'pending') return state;
-    return provisional.get(`${ref.fileKey}|${side}`) ?? state;
+    return reasking.get(sideRef.key) ?? provisional.get(`${ref.fileKey}|${side}`) ?? state;
   };
 
   // The one side a modified file draws when its other side failed. The plan
@@ -306,10 +328,10 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   // looked at it, which the next want asks again.
   // Whether a failed job described the file while a refresh looked at it,
   // so it is asked again at once rather than cached.
-  const asksAgain = (result: JobFailure | null, started: number) => result !== null && (result.state === 'stale' || result.disk === true) && started !== keptReviews;
+  const asksAgain = (result: JobFailure | null, started: number) => result !== null && diskFailure(result) && started !== keptReviews;
 
   const failBox = (ref: MediaRef, box: BoxSpec, result: JobFailure | null, started: number) => {
-    const disk = result !== null && (result.state === 'stale' || result.disk === true);
+    const disk = result !== null && diskFailure(result);
     if (asksAgain(result, started)) {
       // As for inspect: nothing is cached, and the next want renders it.
       notify();
@@ -320,6 +342,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     // An SVG whose picture failed shows its source instead: its rows change.
     if (ref.kind === 'svg') planVersion += 1;
     if (disk) diskBoxes.add(box.imageKey);
+    else if (result?.filter) filterBoxes.add(box.imageKey);
     if (result) noteFailure(result.reason);
     notify();
   };
@@ -406,7 +429,7 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
       kind: ref.kind,
       format: ref.format,
       target: {cols: box.cols, rows: box.rows, cellPx: caps.cellPx, drawPx: box.drawPx, nearest: box.nearest},
-      // Blocks flatten transparency onto the pane colour instead.
+      // Blocks flatten transparency onto the pane color instead.
       checker: !blocks,
       ...(blocks ? {colorDepth: caps.colorDepth} : {}),
       ...(animatedBox(ref, box) ? {frames: ANIMATION_LIMITS} : {}),
@@ -441,13 +464,25 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
   };
 
   // Forgets failures that described the work tree file at the time, so its
-  // sides and boxes are asked again. False when there were none.
-  const forgetDiskFailures = () => {
-    if (diskSides.size === 0 && diskBoxes.size === 0) return false;
-    for (const key of diskSides) sides.delete(key);
+  // sides and boxes are asked again, and with `filters` the git filter
+  // verdicts too. A forgotten side shows its last state until the answer
+  // lands. False when there were none.
+  const forgetDiskFailures = (filters: boolean) => {
+    const sideKeys = filters ? [...diskSides, ...filterSides] : [...diskSides];
+    const boxKeys = filters ? [...diskBoxes, ...filterBoxes] : [...diskBoxes];
+    if (sideKeys.length === 0 && boxKeys.length === 0) return false;
+    for (const key of sideKeys) {
+      const state = sides.get(key);
+      if (state && state.status !== 'pending') reasking.set(key, state);
+      sides.delete(key);
+    }
     diskSides.clear();
-    for (const key of diskBoxes) boxErrors.delete(key);
+    for (const key of boxKeys) boxErrors.delete(key);
     diskBoxes.clear();
+    if (filters) {
+      filterSides.clear();
+      filterBoxes.clear();
+    }
     return true;
   };
 
@@ -497,10 +532,13 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
         sides.delete(key);
       }
       // A file read mid-write or while gone: this review may name the same
-      // content again, so its sides and boxes are asked again. Failures that
-      // depend only on the content (not an image, too large, undecodable)
-      // stay cached, so nothing is retried until the content changes.
-      forgetDiskFailures();
+      // content again, so its sides and boxes are asked again, and so are
+      // files a git filter changes, since a new review may mean one was
+      // written. Failures that depend only on the content (not an image, too
+      // large, undecodable) stay cached, so nothing is retried until the
+      // content changes.
+      forgetDiskFailures(true);
+      for (const key of reasking.keys()) if (!wanted.has(key)) reasking.delete(key);
       const contentKeys = new Set([...nextRefs.values()].map((ref) => ref.contentKey));
       for (const key of changedRatios.keys()) if (!contentKeys.has(key)) changedRatios.delete(key);
       for (const key of stillNotes.keys()) if (!contentKeys.has(key)) stillNotes.delete(key);
@@ -527,7 +565,9 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
     retryDisk() {
       if (disposed) return;
       keptReviews += 1;
-      if (!forgetDiskFailures()) return;
+      // A git filter's verdict stands: the file was not written, or the
+      // review would have changed.
+      if (!forgetDiskFailures(false)) return;
       inspectAll();
       planChanged();
     },
@@ -662,7 +702,16 @@ export function createMediaService({caps, backend, sink, tempDir, opener, env, p
 
     open(ref: MediaRef, which: SideName, how: 'open' | 'quickLook'): Promise<OpenOutcome> {
       if (!context || !tempDir) return Promise.resolve({message: 'no program to open media found', kind: 'error'});
-      return openMedia({backend, cwd: context.cwd, tempDir, env, opener, ...(platform ? {platform} : {})}, ref, which, how);
+      // One open per side and kind at a time: presses while one is running
+      // start no second export or player.
+      const side = ref[sideToOpen(ref, which)];
+      const key = side ? `${side.key}|${how}` : '';
+      if (side && opening.has(key)) {
+        return Promise.resolve({message: `still opening ${escapeHiddenCharacters(side.path.split('/').at(-1) ?? side.path)}`, kind: 'info'});
+      }
+      if (side) opening.add(key);
+      const done = openMedia({backend, cwd: context.cwd, tempDir, env, opener, copies, ...(platform ? {platform} : {})}, ref, which, how);
+      return side ? done.finally(() => opening.delete(key)) : done;
     },
 
     /** Messages for the footer, once each per session. */

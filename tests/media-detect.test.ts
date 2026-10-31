@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {spawn} from 'node:child_process';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {decideCaps, parseReplies, startGraphicsDetection} from '../src/media/detect.js';
+import {decideCaps, parseReplies, queryTmuxClient, startGraphicsDetection, type TmuxClient} from '../src/media/detect.js';
 import {KITTY_QUERY, tmuxWrap} from '../src/media/kitty.js';
 import {NO_GRAPHICS} from '../src/media/types.js';
 
@@ -46,7 +46,7 @@ class FakeStdin extends EventEmitter {
   }
 }
 
-function setup(env: NodeJS.ProcessEnv, options: {images: 'auto' | 'off'} = {images: 'auto'}, overrides: {stdin?: FakeStdin | null; stdoutTTY?: boolean} = {}) {
+function setup(env: NodeJS.ProcessEnv, options: {images: 'auto' | 'off'} = {images: 'auto'}, overrides: {stdin?: FakeStdin | null; stdoutTTY?: boolean; tmuxClient?: () => Promise<TmuxClient | null>} = {}) {
   const stdin = overrides.stdin === null ? undefined : overrides.stdin ?? new FakeStdin();
   const writes: string[] = [];
   const onInterrupt = vi.fn();
@@ -56,12 +56,16 @@ function setup(env: NodeJS.ProcessEnv, options: {images: 'auto' | 'off'} = {imag
     env,
     options,
     onInterrupt,
+    ...(overrides.tmuxClient ? {queryTmuxClient: overrides.tmuxClient} : {}),
   });
   return {stdin: stdin as FakeStdin, writes, onInterrupt, detection};
 }
 
 const GHOSTTY = {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2-HEAD-+cb1ef70'};
 const TMUX_ENV = {TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', TERM_PROGRAM: 'tmux'};
+// What tmux says the attached client runs in, for Ghostty 1.3.2.
+const GHOSTTY_CLIENT: TmuxClient = {termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'};
+const ghosttyClient = () => Promise.resolve(GHOSTTY_CLIENT);
 // Under tmux the graphics query and a DA1 of its own go out in one
 // passthrough, so the outer terminal answers both; tmux answers the rest.
 const TMUX_QUERY = `${tmuxWrap(`${KITTY_QUERY}${ESC}[c`)}${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`;
@@ -106,7 +110,7 @@ describe('startGraphicsDetection', () => {
     expect(await detection.result).toMatchObject({protocol: 'kitty', terminal: 'kitty', animation: true, colorDepth: 3});
   });
 
-  it('chooses blocks when only DA1 answers in a 256-colour terminal', async () => {
+  it('chooses blocks when only DA1 answers in a 256-color terminal', async () => {
     const {stdin, detection} = setup({TERM: 'xterm-256color', TERM_PROGRAM: 'Apple_Terminal'});
     stdin.reply(DA1);
     expect(await detection.result).toMatchObject({protocol: 'blocks', colorDepth: 2, terminal: 'Apple_Terminal', cellPxSource: 'default', cellPx: {w: 10, h: 20}});
@@ -402,8 +406,8 @@ describe('startGraphicsDetection', () => {
 
   it('chooses Kitty under tmux when the wrapped query gets an OK from Ghostty', async () => {
     // tmux sets TERM_PROGRAM to itself; the outer terminal is named by the
-    // variables its shell passed down.
-    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'});
+    // client tmux says is attached.
+    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'}, undefined, {tmuxClient: ghosttyClient});
     expect(writes[0]!.startsWith(`${ESC}Ptmux;${ESC}${ESC}_Gi=31,`)).toBe(true);
     stdin.reply(`${OK}${xtversion('tmux 3.4')}${CELL}${DA1}`);
     expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true, cellPx: {w: 10, h: 20}});
@@ -412,7 +416,7 @@ describe('startGraphicsDetection', () => {
   it('chooses Kitty under tmux when the OK comes after tmux\'s own DA1, keeping stdin raw until the outer DA1', async () => {
     // tmux answers XTVERSION and DA1 as it reads the query; the outer
     // terminal's OK and DA1 come back through tmux later.
-    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'});
+    const {stdin, writes, detection} = setup({...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'}, undefined, {tmuxClient: ghosttyClient});
     expect(writes).toEqual([TMUX_QUERY]);
     let settled = false;
     void detection.result.then(() => {
@@ -444,6 +448,99 @@ describe('startGraphicsDetection', () => {
     detection.cancel();
   });
 
+  describe('under tmux, naming the terminal by the attached client', () => {
+    // The server started in Ghostty, so its environment still says Ghostty,
+    // and the outer terminal answered OK. The client attached now decides.
+    const STALE_ENV = {...TMUX_ENV, TMUX_PANE: '%3', GHOSTTY_RESOURCES_DIR: '/Applications/Ghostty.app/Contents/Resources/ghostty'};
+    const answer = `${xtversion('tmux 3.4')}${TMUX_DA1}${OK}${DA1}`;
+    const answered = (extra = '') => parseReplies(`${extra}${DA1}`);
+
+    it('gives blocks for a WezTerm client, whatever the environment says', async () => {
+      const {stdin, detection} = setup(STALE_ENV, undefined, {tmuxClient: () => Promise.resolve({termtype: 'WezTerm 20240203', termname: 'xterm-256color'})});
+      stdin.reply(answer);
+      expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+    });
+
+    it('gives Kitty for a Ghostty 1.3.2 client, with animation off', async () => {
+      const {stdin, detection} = setup(STALE_ENV, undefined, {tmuxClient: () => Promise.resolve({termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'})});
+      stdin.reply(answer);
+      expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true, animation: false, terminal: 'ghostty 1.3.2'});
+    });
+
+    it('gives Kitty for a kitty client', async () => {
+      const {stdin, detection} = setup(STALE_ENV, undefined, {tmuxClient: () => Promise.resolve({termtype: 'kitty(0.36.4)', termname: 'xterm-kitty'})});
+      stdin.reply(answer);
+      expect(await detection.result).toMatchObject({protocol: 'kitty', tmux: true, terminal: 'kitty'});
+    });
+
+    it('gives blocks when tmux cannot say, or names no terminal on the allow list', async () => {
+      for (const tmuxClient of [() => Promise.reject(new Error('no server')), () => Promise.resolve(null), () => Promise.resolve({termtype: 'iTerm2 3.5.0', termname: 'xterm-256color'})]) {
+        const {stdin, detection} = setup(STALE_ENV, undefined, {tmuxClient});
+        stdin.reply(answer);
+        expect(await detection.result).toMatchObject({protocol: 'blocks', tmux: true});
+      }
+    });
+
+    it('reads neither the environment nor tmux\'s XTVERSION as the terminal under tmux', () => {
+      for (const env of [
+        {...TMUX_ENV, KITTY_WINDOW_ID: '1'},
+        {...TMUX_ENV, TERM: 'xterm-kitty'},
+        {...TMUX_ENV, TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.4.0'},
+        {...TMUX_ENV, GHOSTTY_RESOURCES_DIR: '/x'},
+      ]) {
+        expect(decideCaps(answered(`${OK}${xtversion('kitty(0.36.4)')}`), env, {}).protocol, JSON.stringify(env)).toBe('blocks');
+      }
+      // The deny list applies to the client's TERM too.
+      expect(decideCaps(answered(OK), TMUX_ENV, {}, {termtype: 'ghostty 1.3.2', termname: 'wezterm'}).protocol).toBe('blocks');
+      expect(decideCaps(answered(OK), TMUX_ENV, {}, {termtype: '', termname: 'xterm-ghostty'}).protocol).toBe('kitty');
+    });
+
+    it('still names the terminal from the environment outside tmux', () => {
+      expect(decideCaps(answered(OK), {GHOSTTY_RESOURCES_DIR: '/x', TERM: 'xterm-256color'}, {}, {termtype: 'WezTerm 20240203', termname: 'x'}).protocol).toBe('kitty');
+    });
+
+    it('asks tmux for the client of this pane with an argument array, a timeout and a size cap', async () => {
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-tmux-bin-'));
+      const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-tmux-repo-'));
+      try {
+        fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\nexit 9\n', {mode: 0o755});
+        const calls: Array<{file: string; args: string[]; options: {timeout: number; maxBuffer: number}}> = [];
+        const run = (file: string, args: string[], options: {timeout: number; maxBuffer: number}, callback: (error: Error | null, stdout: string) => void) => {
+          calls.push({file, args, options});
+          callback(null, 'ghostty 1.3.2\txterm-ghostty\n');
+        };
+        const env = {PATH: bin, TMUX: '/tmp/tmux-501/default,1,0', TMUX_PANE: '%7'};
+        expect(await queryTmuxClient(env, repo, run)).toEqual({termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'});
+        expect(calls).toEqual([{file: path.join(fs.realpathSync(bin), 'tmux'), args: ['display-message', '-p', '-t', '%7', '#{client_termtype}\t#{client_termname}'], options: expect.objectContaining({timeout: 300, maxBuffer: 1024})}]);
+        // A failure, or no pane to name, gives nothing.
+        expect(await queryTmuxClient(env, repo, (_file, _args, _options, callback) => callback(new Error('timed out'), ''))).toBeNull();
+        expect(await queryTmuxClient({...env, TMUX_PANE: '-x'}, repo, run)).toBeNull();
+        expect(calls).toHaveLength(1);
+      } finally {
+        fs.rmSync(bin, {recursive: true, force: true});
+        fs.rmSync(repo, {recursive: true, force: true});
+      }
+    });
+  });
+
+  it('says the window timed out under tmux when only tmux\'s own DA1 came, and hands off the partial reply', async () => {
+    vi.useFakeTimers({toFake: ['setTimeout', 'clearTimeout']});
+    const {stdin, detection} = setup(TMUX_ENV, undefined, {tmuxClient: ghosttyClient});
+    stdin.reply(`${xtversion('tmux 3.4')}${TMUX_DA1}${OK}${ESC}[?62;22`);
+    vi.advanceTimersByTime(1000);
+    await turn();
+    const caps = await detection.result;
+    expect(caps.detectionTimedOut).toBe(true);
+    expect(detection.handOff()).toEqual({keys: '', replyHead: `${ESC}[?62;22`});
+    detection.cancel();
+  });
+
+  it('says the window was answered under tmux once both DA1 replies came', async () => {
+    const {stdin, detection} = setup(TMUX_ENV, undefined, {tmuxClient: ghosttyClient});
+    stdin.reply(`${xtversion('tmux 3.4')}${TMUX_DA1}${OK}${DA1}`);
+    expect((await detection.result).detectionTimedOut).toBe(false);
+  });
+
   it('tells tmux users the passthrough setting that also reaches a hidden pane', () => {
     // With `on`, tmux drops graphics sent while the pane is not visible, so
     // a redrawn picture or an exit delete written then never arrives.
@@ -460,7 +557,7 @@ describe('startGraphicsDetection', () => {
     }
   });
 
-  it('honours BRANCH_REVIEW_IMAGES=kitty and =blocks, still reading the cell size', async () => {
+  it('honors BRANCH_REVIEW_IMAGES=kitty and =blocks, still reading the cell size', async () => {
     const forcedKitty = setup({TERM: 'xterm-256color', TERM_PROGRAM: 'iTerm.app', BRANCH_REVIEW_IMAGES: 'kitty'});
     forcedKitty.stdin.reply(`${CELL}${DA1}`);
     expect(await forcedKitty.detection.result).toMatchObject({protocol: 'kitty', cellPxSource: 'csi16'});
@@ -524,7 +621,7 @@ describe('startGraphicsDetection', () => {
 });
 
 describe('parseReplies', () => {
-  it('recognises each reply and keeps everything else as stray input', () => {
+  it('recognizes each reply and keeps everything else as stray input', () => {
     const parsed = parseReplies(`a${OK}${xtversion('kitty(0.35.2)')}b${CELL}${AREA}${DA1}c`);
     expect(parsed).toMatchObject({
       graphics: 'OK',
@@ -555,10 +652,10 @@ describe('parseReplies', () => {
 describe('decideCaps', () => {
   const answered = (extra = '') => parseReplies(`${extra}${DA1}`);
 
-  it('needs a colour depth of at least 256 for blocks', () => {
+  it('needs a color depth of at least 256 for blocks', () => {
     expect(decideCaps(answered(), {TERM: 'xterm'}, {}).protocol).toBe('none');
     expect(decideCaps(answered(), {TERM: 'xterm', COLORTERM: 'truecolor'}, {})).toMatchObject({protocol: 'blocks', colorDepth: 3});
-    // Apple Terminal draws 256 colours even when TERM says otherwise.
+    // Apple Terminal draws 256 colors even when TERM says otherwise.
     expect(decideCaps(answered(), {TERM: 'xterm', TERM_PROGRAM: 'Apple_Terminal'}, {})).toMatchObject({protocol: 'blocks', colorDepth: 2});
   });
 
@@ -586,7 +683,7 @@ describe('decideCaps', () => {
     const tmux = '/tmp/tmux-501/default,1,0';
     expect(decideCaps(answered(), {TERM: 'screen', TMUX: tmux}, {})).toMatchObject({protocol: 'blocks', tmux: true});
     expect(decideCaps(parseReplies(''), {TERM: 'tmux-256color', TMUX: tmux}, {})).toMatchObject({protocol: 'blocks', tmux: true, detectionTimedOut: true});
-    expect(decideCaps(answered(OK), {...GHOSTTY, TMUX: tmux}, {})).toMatchObject({protocol: 'kitty', tmux: true});
+    expect(decideCaps(answered(OK), {...GHOSTTY, TMUX: tmux}, {}, GHOSTTY_CLIENT)).toMatchObject({protocol: 'kitty', tmux: true});
     expect(decideCaps(answered(OK), {TERM: 'tmux-256color', TMUX: tmux, TERM_PROGRAM: 'tmux'}, {}).protocol).toBe('blocks');
     expect(decideCaps(answered(), {TERM: 'tmux-256color', TMUX: tmux, TERM_PROGRAM: 'tmux', GHOSTTY_RESOURCES_DIR: '/x'}, {})).toMatchObject({protocol: 'blocks', tmux: true});
   });
@@ -617,7 +714,7 @@ describe('decideCaps', () => {
     ['Alacritty', {TERM: 'alacritty', COLORTERM: 'truecolor'}, DA1, {protocol: 'blocks', colorDepth: 3}],
     ['tmux', {TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0'}, DA1, {protocol: 'blocks', tmux: true}],
     ['a forced block preview in Ghostty', {TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', BRANCH_REVIEW_IMAGES: 'blocks'}, `${OK}${DA1}`, {protocol: 'blocks', colorDepth: 3}],
-    ['a 16-colour xterm', {TERM: 'xterm'}, DA1, {protocol: 'none'}],
+    ['a 16-color xterm', {TERM: 'xterm'}, DA1, {protocol: 'none'}],
     ['a terminal that never answers', {TERM: 'xterm-256color'}, '', {protocol: 'none', detectionTimedOut: true}],
   ] as const) {
     it(`gives ${name} ${expected.protocol === 'none' ? 'no graphics' : expected.protocol}`, () => {
@@ -628,5 +725,12 @@ describe('decideCaps', () => {
   it('ignores a cell size that is zero or absurd', () => {
     const caps = decideCaps(answered(`${OK}${ESC}[6;0;0t`), GHOSTTY, {columns: 0, rows: 0});
     expect(caps).toMatchObject({cellPx: {w: 10, h: 20}, cellPxSource: 'default'});
+    // Past 512 px a cell is a confused reply, whichever query gave it.
+    expect(decideCaps(answered(`${OK}${ESC}[6;4000;4000t`), GHOSTTY, {})).toMatchObject({cellPx: {w: 10, h: 20}, cellPxSource: 'default'});
+    expect(decideCaps(answered(`${OK}${ESC}[6;513;10t`), GHOSTTY, {})).toMatchObject({cellPxSource: 'default'});
+    expect(decideCaps(answered(`${OK}${ESC}[4;60000;60000t`), GHOSTTY, {columns: 80, rows: 30})).toMatchObject({cellPx: {w: 10, h: 20}, cellPxSource: 'default'});
+    // 512 itself is a cell.
+    expect(decideCaps(answered(`${OK}${ESC}[6;512;512t`), GHOSTTY, {})).toMatchObject({cellPx: {w: 512, h: 512}, cellPxSource: 'csi16'});
+    expect(decideCaps(answered(`${OK}${ESC}[4;15360;40960t`), GHOSTTY, {columns: 80, rows: 30})).toMatchObject({cellPx: {w: 512, h: 512}, cellPxSource: 'csi14'});
   });
 });

@@ -36,7 +36,7 @@ export type Box = {
   // The fraction of the source size drawn, before any upscale.
   scale: number;
   upscale: number;
-  // Cells before the box that centre it in the columns it was fitted to.
+  // Cells before the box that center it in the columns it was fitted to.
   leftPad: number;
 };
 
@@ -215,8 +215,11 @@ function reasonFor(state: SideState, watching?: boolean) {
   return '';
 }
 
-function imageKey(ref: MediaRef, role: BoxRole, cols: number, rows: number, caps: GraphicsCaps, suffix = '') {
-  return `${ref.contentKey}|${role}|${cols}x${rows}|${caps.cellPx.w}x${caps.cellPx.h}${suffix}`;
+// The picture's own size and kernel are part of the key: a box planned from
+// provisional sizes has another key than the real one, so it is never drawn
+// under the real one's name.
+function imageKey(ref: MediaRef, role: BoxRole, cols: number, rows: number, caps: GraphicsCaps, drawPx: {w: number; h: number}, nearest: boolean, suffix = '') {
+  return `${ref.contentKey}|${role}|${cols}x${rows}|${caps.cellPx.w}x${caps.cellPx.h}|${drawPx.w}x${drawPx.h}${nearest ? '|nearest' : ''}${suffix}`;
 }
 
 function boxSpec(ref: MediaRef, role: 'before' | 'after' | 'diff', box: Box, offset: number, layout: Layout, geometry?: {cols: number; rows: number; leftPad: number}): BoxSpec {
@@ -224,7 +227,7 @@ function boxSpec(ref: MediaRef, role: 'before' | 'after' | 'diff', box: Box, off
   const rows = geometry?.rows ?? box.rows;
   const blocks = layout.caps.protocol === 'blocks';
   return {
-    imageKey: imageKey(ref, role, cols, rows, layout.caps),
+    imageKey: imageKey(ref, role, cols, rows, layout.caps, box.drawPx, box.nearest),
     role,
     ...(role === 'diff' ? {} : {side: role}),
     cols,
@@ -495,14 +498,15 @@ function stripGeometry(inner: number, caps: GraphicsCaps, oneStrip: boolean): St
 
 function stripBox(ref: MediaRef, side: SideName, geometry: StripGeometry, caps: GraphicsCaps): BoxSpec {
   const role = side === 'before' ? 'strip-before' : 'strip-after';
+  const drawPx = {w: geometry.cols * caps.cellPx.w, h: geometry.rows * caps.cellPx.h};
   return {
-    imageKey: imageKey(ref, role, geometry.cols, geometry.rows, caps, `|f${geometry.frames}`),
+    imageKey: imageKey(ref, role, geometry.cols, geometry.rows, caps, drawPx, false, `|f${geometry.frames}`),
     role,
     side,
     cols: geometry.cols,
     rows: geometry.rows,
     leftPad: 0,
-    drawPx: {w: geometry.cols * caps.cellPx.w, h: geometry.rows * caps.cellPx.h},
+    drawPx,
     nearest: false,
     op: 'video',
     frames: geometry.frames,

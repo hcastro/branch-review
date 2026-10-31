@@ -1,10 +1,10 @@
 import {KITTY_DIACRITICS} from './kittyDiacritics.js';
 
-// Kitty graphics protocol sequences, Unicode placeholder flavour. An image is
+// Kitty graphics protocol sequences, Unicode placeholder flavor. An image is
 // transmitted once out of band and given a virtual placement of c × r cells;
 // the app then draws it as ordinary text: one U+10EEEE per cell, its row and
 // column carried by two combining marks and the image id by the cell's
-// 256-colour foreground. Ink lays those cells out, clips and scrolls them
+// 256-color foreground. Ink lays those cells out, clips and scrolls them
 // like any other text, and a full-screen repaint redraws them without
 // re-sending pixels.
 //
@@ -16,7 +16,7 @@ const ESC = '\x1B';
 const ST = `${ESC}\\`;
 // The protocol's recommended chunk size for base64 payloads.
 const CHUNK = 4096;
-// The 256-colour foreground carries the id, so 0 (no id) and 256+ are out.
+// The 256-color foreground carries the id, so 0 (no id) and 256+ are out.
 const MAX_ID = 255;
 const MAX_CELLS = KITTY_DIACRITICS.length;
 const MIN_FRAME_DELAY_MS = 20;

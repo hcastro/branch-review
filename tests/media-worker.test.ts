@@ -70,6 +70,18 @@ async function encoded(format: MediaFormat, width: number, height: number) {
   return sharp([red, green], {join: {animated: true}}).gif({delay: [100, 100]}).toBuffer();
 }
 
+// 200 × 100 stored pixels, left half red and right half blue, saved with an
+// EXIF orientation.
+async function halvesWithOrientation(format: 'jpeg' | 'png' | 'webp', orientation: number) {
+  const width = 200;
+  const height = 100;
+  const raw = Buffer.alloc(width * height * 3);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) raw[(y * width + x) * 3 + (x < width / 2 ? 0 : 2)] = 255;
+  }
+  return sharp(raw, {raw: {width, height, channels: 3}})[format]().withMetadata({orientation}).toBuffer();
+}
+
 describe('sniffing image headers', () => {
   it('reads the size, frames and alpha of each format without decoding', async () => {
     expect(sniffImage(await encoded('png', 120, 80), 'png')).toEqual({ok: true, format: 'png', width: 120, height: 80, frames: 1, hasAlpha: true});
@@ -83,6 +95,37 @@ describe('sniffing image headers', () => {
   it('refuses bytes whose magic does not match the extension', async () => {
     expect(sniffImage(await encoded('jpeg', 8, 8), 'png')).toEqual({ok: false, reason: 'not a PNG image'});
     expect(sniffImage(Buffer.from('version https://git-lfs.github.com/spec/v1\n'), 'gif')).toEqual({ok: false, reason: 'not a GIF image'});
+  });
+
+  it('reports the displayed size of a picture its orientation turns a quarter', async () => {
+    for (const format of ['jpeg', 'png', 'webp'] as const) {
+      expect(sniffImage(await halvesWithOrientation(format, 6), format), format).toMatchObject({ok: true, width: 100, height: 200});
+      expect(sniffImage(await halvesWithOrientation(format, 8), format), format).toMatchObject({ok: true, width: 100, height: 200});
+      // A half turn or a mirror keeps the stored shape.
+      expect(sniffImage(await halvesWithOrientation(format, 3), format), format).toMatchObject({ok: true, width: 200, height: 100});
+      expect(sniffImage(await halvesWithOrientation(format, 2), format), format).toMatchObject({ok: true, width: 200, height: 100});
+    }
+    // An AVIF's quarter turn is an `irot` box.
+    const avif = await encoded('avif', 48, 30);
+    const irot = (angle: number) => Buffer.concat([avif, Buffer.from([0, 0, 0, 9]), Buffer.from('irot'), Buffer.from([angle])]);
+    expect(sniffImage(irot(1), 'avif')).toMatchObject({ok: true, width: 30, height: 48});
+    expect(sniffImage(irot(3), 'avif')).toMatchObject({ok: true, width: 30, height: 48});
+    expect(sniffImage(irot(2), 'avif')).toMatchObject({ok: true, width: 48, height: 30});
+  });
+
+  it('keeps the stored size when the EXIF data is cut short or malformed', async () => {
+    const jpeg = await halvesWithOrientation('jpeg', 6);
+    const app1 = jpeg.indexOf(Buffer.from('Exif\0\0'));
+    expect(app1).toBeGreaterThan(0);
+    // The IFD offset pointing far past the segment.
+    const broken = Buffer.from(jpeg);
+    broken.writeUInt32BE(0xfffffff0, app1 + 6 + 4);
+    broken.writeUInt32LE(0xfffffff0, app1 + 6 + 4);
+    expect(sniffImage(broken, 'jpeg')).toMatchObject({ok: true, width: 200, height: 100});
+    // A byte order mark that is neither II nor MM.
+    const unknown = Buffer.from(jpeg);
+    unknown.write('XX', app1 + 6, 'latin1');
+    expect(sniffImage(unknown, 'jpeg')).toMatchObject({ok: true, width: 200, height: 100});
   });
 
   it('refuses a giant size from the header before any decode', () => {
@@ -120,10 +163,10 @@ describe('the real media worker', {timeout: 60_000}, () => {
       expect(meta.format, file).toBe('png');
       expect([meta.width, meta.height], file).toEqual([request.target.cols * CELL.w, request.target.rows * CELL.h]);
       if (format === 'gif') {
-        // Red is the first frame; the picture sits centred in the padding.
+        // Red is the first frame; the picture sits centered in the padding.
         const {data, info: raw} = await sharp(result.png).raw().toBuffer({resolveWithObject: true});
-        const centre = ((raw.height >> 1) * raw.width + (raw.width >> 1)) * raw.channels;
-        expect([...data.subarray(centre, centre + 4)]).toEqual([255, 0, 0, 255]);
+        const center = ((raw.height >> 1) * raw.width + (raw.width >> 1)) * raw.channels;
+        expect([...data.subarray(center, center + 4)]).toEqual([255, 0, 0, 255]);
         // Near the bottom of the drawn picture: still red. Both frames
         // stacked and squashed into the box would put the green one here.
         const top = Math.floor((raw.height - request.target.drawPx.h) / 2);
@@ -133,7 +176,36 @@ describe('the real media worker', {timeout: 60_000}, () => {
     }
   });
 
-  it('upscales a tiny icon with nearest neighbour, keeping hard edges', async () => {
+  it('lays out and draws a photo its EXIF orientation turns, the way a viewer shows it', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'turned.jpg'), await halvesWithOrientation('jpeg', 6));
+    fs.writeFileSync(path.join(cwd, 'turned.png'), await halvesWithOrientation('png', 6));
+    commitAll(cwd, 'add turned photos');
+    const {backend} = backendFor();
+    for (const [file, format] of [['turned.jpg', 'jpeg'], ['turned.png', 'png']] as const) {
+      const side = blobSide(cwd, file);
+      const inspected = await backend.inspect({cwd, side, kind: 'raster', format}, never);
+      expect(inspected, file).toMatchObject({ok: true, info: {width: 100, height: 200}});
+      if (!inspected.ok) throw new Error(file);
+      const request = fitRequest(cwd, side, {w: inspected.info.width, h: inspected.info.height});
+      // Portrait, as displayed.
+      expect(request.target.drawPx.h, file).toBeGreaterThan(request.target.drawPx.w);
+      const result = await backend.render({...request, format}, never);
+      if (!result.ok || !('png' in result)) throw new Error(`${file}: no png`);
+      const {data, info} = await sharp(result.png).raw().toBuffer({resolveWithObject: true});
+      const left = Math.floor((info.width - request.target.drawPx.w) / 2);
+      const top = Math.floor((info.height - request.target.drawPx.h) / 2);
+      const pixel = (y: number) => {
+        const at = ((top + y) * info.width + left + (request.target.drawPx.w >> 1)) * info.channels;
+        return [...data.subarray(at, at + 3)].map((value) => (value > 128 ? 1 : 0));
+      };
+      // Turned a quarter clockwise: the left half is on top.
+      expect(pixel(2), file).toEqual([1, 0, 0]);
+      expect(pixel(request.target.drawPx.h - 3), file).toEqual([0, 0, 1]);
+    }
+  });
+
+  it('upscales a tiny icon with nearest neighbor, keeping hard edges', async () => {
     const cwd = initRepo();
     // 4 × 4 checks of black and white.
     fs.writeFileSync(path.join(cwd, 'tiny.png'), pngFixture(4, 4, (x, y) => ((x + y) % 2 ? [255, 255, 255, 255] : [0, 0, 0, 255])));
@@ -210,7 +282,7 @@ describe('the real media worker', {timeout: 60_000}, () => {
     expect(result.path.startsWith(`${tempDir}${path.sep}`)).toBe(true);
     expect(path.basename(result.path)).toBe('after.png');
     expect(Buffer.compare(fs.readFileSync(result.path), png)).toBe(0);
-    expect(fs.statSync(result.path).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(result.path).mode & 0o777).toBe(0o400);
   });
 
   it('hands a viewer nothing when the bytes are not the format the name says', async () => {
@@ -258,7 +330,7 @@ describe('which worker failures describe the file on disk', {timeout: 60_000}, (
     expect(await changing.handle({type: 'render', ...fitRequest(cwd, live, {w: 4, h: 4})})).toEqual({ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true});
   });
 
-  it('leaves a git filter, the size cap, a bad header and a missing blob untagged', async () => {
+  it('tags a git filter, which describes the file on disk, and leaves the size cap, a bad header and a missing blob untagged', async () => {
     const cwd = initRepo({'.gitattributes': '*.png text eol=crlf\n'});
     // Lone line feeds, which a CRLF checkout rewrites.
     const png = Buffer.concat([pngFixture(4, 4), Buffer.from('\n\n')]);
@@ -272,9 +344,19 @@ describe('which worker failures describe the file on disk', {timeout: 60_000}, (
     const handler = createWorkerHandler({reader: createSideReader({sleep: async () => undefined})});
 
     const filtered = worktreeSide('crlf.png', git(cwd, 'hash-object', 'crlf.png').trim().slice(0, 7));
-    const filterReason = {ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)'};
+    const filterReason = {ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)', disk: true, filter: true};
     expect(await handler.handle(inspectJob(cwd, filtered))).toEqual(filterReason);
     expect(await handler.handle({type: 'render', ...fitRequest(cwd, filtered, {w: 4, h: 4})})).toEqual(filterReason);
+    // A file that reads the same twice but not as its id gets the same
+    // verdict; written back as the bytes the id names, the same worker
+    // reads it. (Outside the CRLF rule, so the id is of these bytes.)
+    const original = pngFixture(6, 3);
+    fs.writeFileSync(path.join(cwd, 'back.image'), original);
+    const back = worktreeSide('back.image', git(cwd, 'hash-object', 'back.image').trim().slice(0, 7));
+    fs.writeFileSync(path.join(cwd, 'back.image'), pngFixture(6, 3, [1, 2, 3, 255]));
+    expect(await handler.handle(inspectJob(cwd, back))).toEqual(filterReason);
+    fs.writeFileSync(path.join(cwd, 'back.image'), original);
+    expect(await handler.handle(inspectJob(cwd, back))).toMatchObject({ok: true, info: {width: 6, height: 3}});
     expect(await handler.handle(inspectJob(cwd, worktreeSide('huge.png', 'abcdef1')))).toEqual({ok: false, state: 'error', reason: 'huge.png is larger than 16 MB'});
     const fake = worktreeSide('fake.png', git(cwd, 'hash-object', 'fake.png').trim().slice(0, 7));
     expect(await handler.handle(inspectJob(cwd, fake))).toEqual({ok: false, state: 'error', reason: 'not a PNG image'});
@@ -285,7 +367,7 @@ describe('which worker failures describe the file on disk', {timeout: 60_000}, (
   });
 });
 
-describe('without the image library', () => {
+describe('without the image library', {timeout: 30_000}, () => {
   const failing = () => Promise.reject(new Error('dlopen failed: libvips-cpp.dylib\nmore detail'));
 
   it('reports unavailable for formats the terminal cannot decode, and passes a small PNG through as it is', async () => {
@@ -301,6 +383,18 @@ describe('without the image library', () => {
     const passed = await handler.handle({type: 'render', ...fitRequest(cwd, blobSide(cwd, 'a.png'), {w: 30, h: 20})});
     expect(passed).toMatchObject({ok: true, passthrough: true});
     if (passed.ok && 'png' in passed) expect(Buffer.compare(Buffer.from(passed.png), png)).toBe(0);
+  });
+
+  it('passes no PNG through that its orientation turns, since the terminal would draw it unturned', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'turned.png'), await halvesWithOrientation('png', 6));
+    fs.writeFileSync(path.join(cwd, 'upright.png'), await halvesWithOrientation('png', 1));
+    commitAll(cwd, 'add');
+    const handler = createWorkerHandler({loadSharp: failing});
+    const turned = await handler.handle({type: 'render', ...fitRequest(cwd, blobSide(cwd, 'turned.png'), {w: 100, h: 200})});
+    expect(turned).toEqual({ok: false, state: 'unavailable', reason: 'image library failed to load (dlopen failed: libvips-cpp.dylib)'});
+    const upright = await handler.handle({type: 'render', ...fitRequest(cwd, blobSide(cwd, 'upright.png'), {w: 200, h: 100})});
+    expect(upright).toMatchObject({ok: true, passthrough: true});
   });
 
   it('still transmits the PNG to the terminal through the service', async () => {
@@ -539,6 +633,57 @@ describe('the media worker client', {timeout: 30_000}, () => {
     expect(jobsIn(pids[1]!)).toEqual(['hang-b.png', 'hang-c.png']);
   });
 
+  it('never lets the deadline of a job aborted before a crash kill the next worker', async () => {
+    const cwd = initRepo();
+    const pids: number[] = [];
+    const {backend, tempDir} = backendFor({
+      modulePath: SCRIPTED_WORKER,
+      deadlinesMs: {inspect: 20_000, render: 800},
+      backoffMs: [50, 50, 50],
+      onSpawn: (pid) => pids.push(pid),
+    });
+    const renderOf = (file: string) => ({...fitRequest(cwd, sideFor(file), {w: 20, h: 20}), format: 'png' as const});
+    const startedAt = Date.now();
+    const first = new AbortController();
+    const second = new AbortController();
+    const hung = backend.render(renderOf('hang-r1.png'), first.signal);
+    const exiting = backend.render(renderOf('exit-r2.png'), second.signal);
+    await waitFor(() => jobPaths(tempDir).length >= 2);
+    first.abort();
+    second.abort();
+    await expect(hung).rejects.toThrow('aborted');
+    await expect(exiting).rejects.toThrow('aborted');
+
+    // The fixture exits on its own: one crash. The next job forks again.
+    await waitFor(() => !alive(pids[0]!), 5_000);
+    expect(await backend.inspect(inspectOf(cwd, 'answer-after.png'), never)).toMatchObject({reason: 'answered answer-after.png'});
+    expect(pids).toHaveLength(2);
+
+    // Past both aborted renders' deadlines.
+    await pause(Math.max(0, startedAt + 1_500 - Date.now()));
+    expect(alive(pids[1]!)).toBe(true);
+    expect(pids).toHaveLength(2);
+    expect(backend.disabledReason()).toBeNull();
+
+    // One real timeout makes two failures in the window: still on.
+    expect(await backend.render(renderOf('hang-real.png'), never)).toEqual({ok: false, state: 'error', reason: 'timed out'});
+    expect(backend.disabledReason()).toBeNull();
+    await waitFor(() => !alive(pids[1]!), 5_000);
+  });
+
+  it('still kills a hung worker at the deadline of a job the UI aborted', async () => {
+    const cwd = initRepo();
+    const pids: number[] = [];
+    const {backend, tempDir} = backendFor({modulePath: SCRIPTED_WORKER, deadlinesMs: {render: 400}, onSpawn: (pid) => pids.push(pid)});
+    const controller = new AbortController();
+    const pending = backend.render({...fitRequest(cwd, sideFor('hang-aborted.png'), {w: 20, h: 20}), format: 'png'}, controller.signal);
+    await waitFor(() => jobPaths(tempDir).length >= 1);
+    controller.abort();
+    await expect(pending).rejects.toThrow('aborted');
+    expect(alive(pids[0]!)).toBe(true);
+    await waitFor(() => !alive(pids[0]!), 5_000);
+  });
+
   it('stops a worker left idle', async () => {
     const cwd = initRepo();
     const pids: number[] = [];
@@ -554,6 +699,49 @@ describe('the media worker client', {timeout: 30_000}, () => {
     await backend.inspect(inspectOf(cwd, 'answer.png'), never);
     expect(scriptedLog(tempDir).find((entry) => entry.event === 'start')?.tmpdir).toBe(path.join(tempDir, 'worker'));
   });
+
+  it('kills its own process group, git included, when the UI process dies', async () => {
+    const cwd = initRepo();
+    const tempDir = makeTempDir('branch-review-media-test-');
+    // A git that records its pid and hangs, first on the worker's PATH.
+    const bin = makeTempDir('branch-review-hanging-git-');
+    const gitLog = path.join(bin, 'git.pids');
+    fs.writeFileSync(path.join(bin, 'git'), `#!/bin/sh\necho $$ >> '${gitLog}'\nexec sleep 60\n`, {mode: 0o755});
+    const probe = fileURLToPath(new URL('./fixtures/orphaned-worker-probe.ts', import.meta.url));
+    const tsx = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
+    const parent = spawn(process.execPath, ['--import', tsx, probe, tempDir, cwd], {
+      cwd,
+      env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`},
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const recorded: number[] = [parent.pid!];
+    try {
+      let output = '';
+      parent.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      await waitFor(() => /worker \d+/.test(output), 20_000);
+      const workerPid = Number(/worker (\d+)/.exec(output)![1]);
+      recorded.push(workerPid);
+      await waitFor(() => fs.existsSync(gitLog) && fs.readFileSync(gitLog, 'utf8').trim() !== '', 20_000);
+      const gitPid = Number(fs.readFileSync(gitLog, 'utf8').trim().split('\n')[0]);
+      recorded.push(gitPid);
+      expect(alive(workerPid)).toBe(true);
+      expect(alive(gitPid)).toBe(true);
+
+      process.kill(parent.pid!, 'SIGKILL');
+      await waitFor(() => !alive(workerPid) && !alive(gitPid), 5_000);
+    } finally {
+      // Only the pids this test recorded.
+      for (const pid of recorded) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  }, 60_000);
 
   it('never keeps the process alive once its jobs are answered', async () => {
     const tempDir = makeTempDir('branch-review-media-test-');
@@ -691,14 +879,48 @@ describe('the difference view in the real media worker', {timeout: 60_000}, () =
     expect((await differenceOf(pngFixture(20, 10, BLUE), faded)).result).toMatchObject({ok: true, changedRatio: 1});
   });
 
-  it('ignores the colour of pixels transparent on both sides', async () => {
-    // An optimizer rewrote the colour under the transparent right half.
+  it('ignores the color of pixels transparent on both sides', async () => {
+    // An optimizer rewrote the color under the transparent right half.
     const hidden = (rgb: number) => pngFixture(40, 20, (x) => (x < 20 ? BLUE : [rgb, rgb, rgb, 0]));
     expect((await differenceOf(hidden(255), hidden(0))).result).toMatchObject({ok: true, changedRatio: 0});
     // The same holds where only the larger side covers the canvas.
     expect((await differenceOf(pngFixture(20, 20, BLUE), hidden(255))).result).toMatchObject({ok: true, changedRatio: 0});
     // A transparent pixel turning visible still counts.
     expect((await differenceOf(hidden(255), pngFixture(40, 20, BLUE))).result).toMatchObject({ok: true, changedRatio: 0.5});
+  });
+
+  it('compares two photos their EXIF orientation turns as they are displayed, into the portrait box', async () => {
+    // Both stored 200 × 100 and turned a quarter clockwise by orientation 6.
+    // The before side is red left and blue right, so it shows red on top;
+    // the after side is all blue.
+    const cwd = initRepo();
+    const allBlue = await sharp({create: {width: 200, height: 100, channels: 3, background: {r: 0, g: 0, b: 255}}}).jpeg().withMetadata({orientation: 6}).toBuffer();
+    fs.writeFileSync(path.join(cwd, 'before.jpg'), await halvesWithOrientation('jpeg', 6));
+    fs.writeFileSync(path.join(cwd, 'after.jpg'), allBlue);
+    commitAll(cwd, 'add both turned sides');
+    const before: SideRef = {...blobSide(cwd, 'before.jpg'), side: 'before'};
+    const after = blobSide(cwd, 'after.jpg');
+    const {backend} = backendFor();
+    for (const side of [before, after]) {
+      expect(await backend.inspect({cwd, side, kind: 'raster', format: 'jpeg'}, never)).toMatchObject({ok: true, info: {width: 100, height: 200}});
+    }
+    const box = fitBox({w: 100, h: 200}, 40, 20, KITTY_CAPS);
+    expect(box.drawPx.h).toBeGreaterThan(box.drawPx.w);
+    const request: RenderRequest = {
+      cwd, op: 'difference', sides: [before, after], kind: 'raster', format: 'jpeg', checker: false,
+      target: {cols: box.cols, rows: box.rows, cellPx: CELL, drawPx: box.drawPx, nearest: box.nearest},
+    };
+    const result = await backend.render(request, never);
+    if (!result.ok || !('png' in result)) throw new Error(`no png: ${JSON.stringify(result)}`);
+    // The top half changed, as displayed.
+    expect(result.changedRatio).toBeCloseTo(0.5, 1);
+    const {w, h} = request.target.drawPx;
+    // The mark is #d2a8ff at 60% over the darkened pixel.
+    const tinted = (pixel: number[]) => pixel[0]! > 110 && pixel[1]! > 85 && pixel[2]! > 180;
+    const darkBlue = (pixel: number[]) => pixel[0]! < 40 && pixel[1]! < 40 && pixel[2]! > 90 && pixel[2]! < 140;
+    for (const [x, y] of [[w >> 1, 3], [3, 3], [w - 4, 3]]) expect(tinted(await pixelAt(result.png, request, x!, y!)), `${x},${y}`).toBe(true);
+    // The bottom half is the after side darkened, edge to edge.
+    for (const [x, y] of [[w >> 1, h - 4], [3, h - 4], [w - 4, h - 4]]) expect(darkBlue(await pixelAt(result.png, request, x!, y!)), `${x},${y}`).toBe(true);
   });
 
   it('refuses a combined canvas over the pixel cap before drawing the difference', async () => {
@@ -1001,7 +1223,7 @@ describe('SVG pictures in the media worker', {timeout: 60_000}, () => {
     const oid = git(cwd, 'rev-parse', 'HEAD:icon.svg').trim();
     expect(path.basename(result.path)).toBe(`${oid}.png`);
     expect(result.path.startsWith(`${dir}${path.sep}`)).toBe(true);
-    expect(fs.statSync(result.path).mode & 0o777).toBe(0o600);
+    expect(fs.statSync(result.path).mode & 0o777).toBe(0o400);
     expect(await sharp(fs.readFileSync(result.path)).metadata()).toMatchObject({format: 'png', width: 4, height: 4});
 
     const fake = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'fake.svg'), format: 'svg', dir: makeTempDir('branch-review-media-export-')});

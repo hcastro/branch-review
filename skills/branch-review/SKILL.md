@@ -74,8 +74,8 @@ The script resolves the git root, reports repo state on stderr, prints the
 command on stdout, and copies it to the clipboard (`pbcopy`, `wl-copy`, `xclip`,
 or `clip.exe`). It warns when the range is empty or when `branch-review` or
 `git-delta` is missing from `PATH`. The command is for POSIX shells and zsh.
-A hint that `ffprobe` is missing is no problem: videos then show their size
-without frames.
+A hint that `ffmpeg`/`ffprobe` is missing is no problem: videos then show their
+size without frames.
 
 The script refuses (exit 1) a repo path or ref name that holds control or
 invisible characters: newlines, tabs, escapes, bidi controls, zero-width
@@ -133,6 +133,10 @@ Rarely needed, but available when the default misbehaves:
 - `--watch-poll` — poll instead of using filesystem events, for network mounts
   and container bind mounts where those events never arrive.
 - `--no-animations` — drop transitions on slow or remote terminals.
+- `--no-images`: show image, SVG and video files as plain diffs, for previews
+  that misbehave in a terminal.
+- `BRANCH_REVIEW_IMAGES=blocks`: draw block previews instead of pictures, for a
+  terminal that claims image support but draws them wrong.
 
 Watch mode is on by default in an interactive terminal, which is what makes a
 review update live while an agent keeps working.

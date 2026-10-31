@@ -1,6 +1,8 @@
 import os from 'node:os';
 import React from 'react';
 import {describe, expect, it} from 'vitest';
+import {EventEmitter} from 'node:events';
+import {startGraphicsDetection} from '../src/media/detect.js';
 import {createLoneEscapeGuard, isTerminalReply} from '../src/media/replyGuard.js';
 import {NO_GRAPHICS, type GraphicsCaps} from '../src/media/types.js';
 import {ReviewController} from '../src/ui/ReviewController.js';
@@ -168,7 +170,7 @@ describe('createLoneEscapeGuard with no reply handed off', () => {
     expect(feed('', true)).toBe('handled');
     expect(feed('j')).toBe('handled');
     expect(quits).toHaveLength(1);
-    // The deferred quit was cancelled, so it does not run again.
+    // The deferred quit was canceled, so it does not run again.
     await wait(120);
     expect(quits).toHaveLength(1);
   });
@@ -235,6 +237,55 @@ describe('late terminal replies', () => {
     await flush(3);
     await wait(50);
     expect(copies).toHaveLength(1);
+    instance.unmount();
+  });
+
+  // Under tmux, tmux answers DA1 itself at once; the outer terminal's DA1
+  // was cut off when the window closed.
+  async function timedOutUnderTmux() {
+    const stdin = Object.assign(new EventEmitter(), {isTTY: true, setRawMode: () => undefined, pause: () => undefined, resume: () => undefined, unshift: () => undefined});
+    const detection = startGraphicsDetection({
+      stdin,
+      stdout: {isTTY: true, columns: 120, rows: 30, write: () => true},
+      env: {TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', TMUX_PANE: '%1'},
+      options: {images: 'auto'},
+      timeoutMs: 10,
+      onInterrupt: () => undefined,
+      queryTmuxClient: () => Promise.resolve({termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'}),
+    });
+    stdin.emit('data', Buffer.from(`${ESC}P>|tmux 3.4${ESC}\\${ESC}[?1;2c${ESC}_Gi=31;OK${ESC}\\${ESC}[?62;22`, 'latin1'));
+    const caps = await detection.result;
+    const {keys, replyHead} = detection.handOff();
+    detection.cancel();
+    return {...caps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})};
+  }
+
+  it('do not run the key their tail spells after a window under tmux that only tmux answered in full', async () => {
+    const graphics = await timedOutUnderTmux();
+    expect(graphics).toMatchObject({detectionTimedOut: true, replyHead: `${ESC}[?62;22`});
+    const copies: string[] = [];
+    const {instance, state} = start(fixture(graphics), copies);
+    await flush();
+    const before = instance.lastFrame();
+    instance.stdin.write('c');
+    await flush(3);
+    await wait(50);
+    expect(copies).toEqual([]);
+    expect(state.exited).toBe(false);
+    expect(instance.lastFrame()).toBe(before);
+    instance.unmount();
+  });
+
+  it('do not quit on a split lone Esc after a window under tmux that only tmux answered in full', async () => {
+    const graphics = await timedOutUnderTmux();
+    const {instance, state} = start(fixture({...graphics, replyHead: ''}));
+    await flush();
+    instance.stdin.write(ESC);
+    await flush();
+    instance.stdin.write('[?62;22c');
+    await flush(2);
+    await wait(120);
+    expect(state.exited).toBe(false);
     instance.unmount();
   });
 

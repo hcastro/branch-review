@@ -11,6 +11,8 @@ import {INK_RENDER_OPTIONS, TERMINAL_RESTORE_SEQUENCE, createTerminalSession, ru
 import {cleanupTempDirs, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
 import {tmuxWrap} from '../src/media/kitty.js';
+import {claimKittyTmux, createMediaTempDir} from '../src/media/tempDir.js';
+import type {TmuxClient} from '../src/media/detect.js';
 
 // Each test builds real repos or spawns the CLI.
 vi.setConfig({testTimeout: 30_000});
@@ -430,6 +432,7 @@ function lateTerminal(ms: number) {
 const SSH_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: '10.0.0.1 22 10.0.0.2 50000', BRANCH_REVIEW_IMAGES: undefined};
 
 const GRAPHICS_QUERY = '\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\\x1B[>0q\x1B[16t\x1B[14t\x1B[c';
+const GHOSTTY_CLIENT = {termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'};
 const GHOSTTY_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: undefined, BRANCH_REVIEW_IMAGES: undefined};
 
 describe('runCli graphics detection', () => {
@@ -1022,7 +1025,8 @@ describe('runCli media previews', () => {
   // A runCli session on a fake terminal answering `reply`, up to the first
   // render: its controller's props and the terminal's writes. `files` are
   // written to the worktree as they are, untracked.
-  async function startedSession(argv: readonly string[], reply: string, env: NodeJS.ProcessEnv, files: Record<string, Buffer> = {}) {
+  // Tests never ask a real tmux which terminal is attached.
+  async function startedSession(argv: readonly string[], reply: string, env: NodeJS.ProcessEnv, files: Record<string, Buffer> = {}, tmuxClient: TmuxClient | null = null) {
     const cwd = initRepo({'a.txt': 'one\n'});
     writeFiles(cwd, {'a.txt': 'one\ntwo\n'});
     for (const [name, bytes] of Object.entries(files)) fs.writeFileSync(path.join(cwd, name), bytes);
@@ -1046,15 +1050,16 @@ describe('runCli media previews', () => {
         markRendered();
         return {waitUntilExit: () => new Promise(() => {}), unmount: () => {}};
       },
+      queryTmuxClient: () => Promise.resolve(tmuxClient),
     });
     await withTimeout(rendered, 20_000);
-    const props = controllerOf(tree).props as {media?: import('../src/media/service.js').MediaService; initialReview: import('../src/review/model.js').ReviewModel; range: import('../src/git.js').DiffRange};
+    const props = controllerOf(tree).props as {media?: import('../src/media/service.js').MediaService; initialReview: import('../src/review/model.js').ReviewModel; range: import('../src/git.js').DiffRange; graphics?: import('../src/media/types.js').GraphicsCaps};
     return {props, proc, terminal, cwd};
   }
 
-  it('starts block previews for a colour terminal without Kitty placeholders, sending no image at any point', async () => {
+  it('starts block previews for a color terminal without Kitty placeholders, sending no image at any point', async () => {
     const appleTerminal = {...GHOSTTY_ENV, TERM_PROGRAM: 'Apple_Terminal', TERM_PROGRAM_VERSION: '455'};
-    // A terminal that answers only DA1, in 256 colours or more, whoever it is.
+    // A terminal that answers only DA1, in 256 colors or more, whoever it is.
     const {planMedia} = await import('../src/media/layout.js');
     for (const env of [GHOSTTY_ENV, appleTerminal]) {
       const tmpParent = makeTempDir('branch-review-media-parent-');
@@ -1091,7 +1096,7 @@ describe('runCli media previews', () => {
     const tmuxEnv = {...GHOSTTY_ENV, TERM: 'tmux-256color', TMUX: '/tmp/tmux-501/default,1,0', BRANCH_REVIEW_TMPDIR: tmpParent};
     // tmux answers DA1 itself before the outer terminal's OK and DA1 come
     // back through it.
-    const {props, proc, terminal, cwd} = await startedSession(['HEAD', '--no-watch'], `\x1B[?1;2c${KITTY_REPLY}`, tmuxEnv, {'logo.png': pngFixture(4, 2)});
+    const {props, proc, terminal, cwd} = await startedSession(['HEAD', '--no-watch'], `\x1B[?1;2c${KITTY_REPLY}`, tmuxEnv, {'logo.png': pngFixture(4, 2)}, GHOSTTY_CLIENT);
     const media = props.media!;
     expect(media.caps).toMatchObject({protocol: 'kitty', tmux: true, detectionTimedOut: false});
     // The query went out wrapped with a DA1 for the outer terminal, every
@@ -1126,6 +1131,73 @@ describe('runCli media previews', () => {
     expect(fs.readdirSync(tmpParent)).toEqual([]);
   }, 40_000);
 
+  describe('one Kitty-drawing session per tmux server', () => {
+    const TMUX = '/tmp/tmux-501/default,1,0';
+    const NOTICE = 'another branch-review draws images in this tmux server · block previews here';
+    const children: Array<ReturnType<typeof spawn>> = [];
+    afterEach(() => {
+      // Only the children these tests started.
+      for (const child of children.splice(0)) child.kill('SIGKILL');
+    });
+
+    // A sibling session dir owned by `pid`, claiming `tmux`'s server.
+    const sibling = (tmpParent: string, pid: number, tmux: string) => {
+      const env = {BRANCH_REVIEW_TMPDIR: tmpParent};
+      const dir = createMediaTempDir({env, pid}).get();
+      expect(claimKittyTmux(dir, tmux, {env, pid})).toBe(true);
+      return dir;
+    };
+    const livePid = () => {
+      const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], {stdio: 'ignore'});
+      children.push(child);
+      return child.pid!;
+    };
+    const deadPid = () => spawnSync(process.execPath, ['-e', '0']).pid!;
+    const markers = (tmpParent: string) => fs.readdirSync(tmpParent).filter((name) => fs.existsSync(path.join(tmpParent, name, 'kitty-tmux')));
+
+    it('gives way to a live session that already draws in the same tmux server, and says so', async () => {
+      const tmpParent = makeTempDir('branch-review-media-parent-');
+      const other = sibling(tmpParent, livePid(), TMUX);
+      const env = {...GHOSTTY_ENV, TERM: 'tmux-256color', TMUX, BRANCH_REVIEW_TMPDIR: tmpParent};
+      const {props, proc} = await startedSession(['HEAD', '--no-watch'], `\x1B[?1;2c${KITTY_REPLY}`, env, {}, GHOSTTY_CLIENT);
+      expect(props.media!.caps).toMatchObject({protocol: 'blocks', tmux: true});
+      expect(props.graphics).toMatchObject({protocol: 'blocks'});
+      expect(props.media!.takeNotices()).toEqual([NOTICE]);
+      // Only the other session's claim is left.
+      expect(markers(tmpParent)).toEqual([path.basename(other)]);
+      proc.emit('exit', 0);
+    }, 40_000);
+
+    it('draws Kitty images when the claim is a dead session\'s or another server\'s', async () => {
+      const tmpParent = makeTempDir('branch-review-media-parent-');
+      sibling(tmpParent, deadPid(), TMUX);
+      const otherServer = sibling(tmpParent, livePid(), '/tmp/tmux-501/other,9,0');
+      const env = {...GHOSTTY_ENV, TERM: 'tmux-256color', TMUX, BRANCH_REVIEW_TMPDIR: tmpParent};
+      const {props, proc} = await startedSession(['HEAD', '--no-watch'], `\x1B[?1;2c${KITTY_REPLY}`, env, {}, GHOSTTY_CLIENT);
+      expect(props.media!.caps).toMatchObject({protocol: 'kitty', tmux: true});
+      expect(props.media!.takeNotices()).toEqual([]);
+      // The dead session's dir was swept; this session's claim joins the
+      // other server's.
+      expect(markers(tmpParent)).toHaveLength(2);
+      expect(markers(tmpParent)).toContain(path.basename(otherServer));
+      proc.emit('exit', 0);
+      expect(markers(tmpParent)).toEqual([path.basename(otherServer)]);
+    }, 40_000);
+
+    it('writes no claim outside tmux, and draws whatever a claim says', async () => {
+      const tmpParent = makeTempDir('branch-review-media-parent-');
+      const other = sibling(tmpParent, livePid(), TMUX);
+      const {props, proc, cwd} = await startedSession(['HEAD', '--no-watch'], KITTY_REPLY, {...GHOSTTY_ENV, BRANCH_REVIEW_TMPDIR: tmpParent}, {'logo.png': pngFixture(4, 2)});
+      const media = props.media!;
+      expect(media.caps).toMatchObject({protocol: 'kitty', tmux: false});
+      // Inspecting starts the worker, which makes the session dir.
+      media.setReview(props.initialReview, {cwd, range: props.range});
+      await waitFor(() => fs.readdirSync(tmpParent).length === 2, 20_000);
+      expect(markers(tmpParent)).toEqual([path.basename(other)]);
+      proc.emit('exit', 0);
+    }, 40_000);
+  });
+
   it('runs animations in a terminal that animates, unless --no-animations turns them off', async () => {
     // Ghostty from 1.4.0 runs Kitty animations.
     const animating = {...GHOSTTY_ENV, TERM_PROGRAM_VERSION: '1.4.0'};
@@ -1142,13 +1214,13 @@ describe('runCli media previews', () => {
     }
   }, 60_000);
 
-  it('starts no media with --no-images, with colour off, or in a terminal of fewer than 256 colours', async () => {
-    const sixteenColours = {...GHOSTTY_ENV, TERM: 'xterm', TERM_PROGRAM: undefined, TERM_PROGRAM_VERSION: undefined, COLORTERM: undefined};
+  it('starts no media with --no-images, with color off, or in a terminal of fewer than 256 colors', async () => {
+    const sixteenColors = {...GHOSTTY_ENV, TERM: 'xterm', TERM_PROGRAM: undefined, TERM_PROGRAM_VERSION: undefined, COLORTERM: undefined};
     for (const [argv, reply, env] of [
       [['HEAD', 'main', '--no-watch', '--no-images'], KITTY_REPLY, GHOSTTY_ENV],
       [['HEAD', 'main', '--no-watch'], KITTY_REPLY, {...GHOSTTY_ENV, NO_COLOR: '1'}],
       [['HEAD', 'main', '--no-watch'], KITTY_REPLY, {...GHOSTTY_ENV, NO_COLOR: '1', BRANCH_REVIEW_IMAGES: 'blocks'}],
-      [['HEAD', 'main', '--no-watch'], '\x1B[?62c', sixteenColours],
+      [['HEAD', 'main', '--no-watch'], '\x1B[?62c', sixteenColors],
     ] as const) {
       const {props, proc, terminal} = await startedSession(argv, reply, env);
       expect(props.media, `${argv.join(' ')} ${JSON.stringify({NO_COLOR: env.NO_COLOR, TERM: env.TERM})}`).toBeUndefined();

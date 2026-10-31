@@ -119,8 +119,8 @@ describe('NO_COLOR', () => {
 
 describe('the Kitty image placeholder character in file contents', () => {
   // A terminal with Kitty graphics draws a transmitted image wherever
-  // U+10EEEE appears under a 256-colour foreground, which delta's syntax
-  // colours supply. Repo text must never produce such a cell.
+  // U+10EEEE appears under a 256-color foreground, which delta's syntax
+  // colors supply. Repo text must never produce such a cell.
   it('is drawn as a marker and copied by drag-select as the raw character', async () => {
     const cwd = initRepo({'icons.txt': 'start\n'});
     writeFiles(cwd, {'icons.txt': 'start\nimg \u{10EEEE}̅̅ end\n'});

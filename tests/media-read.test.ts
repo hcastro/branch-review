@@ -25,7 +25,7 @@ function writeBytes(cwd: string, file: string, bytes: Uint8Array) {
   fs.writeFileSync(path.join(cwd, file), bytes);
 }
 
-describe('media side reads', () => {
+describe('media side reads', {timeout: 30_000}, () => {
   it('reads a blob side by its abbreviated id and verifies it', async () => {
     const cwd = initRepo();
     const png = pngFixture(4, 3);
@@ -50,6 +50,28 @@ describe('media side reads', () => {
     const result = await createSideReader().read(cwd, side('worktree', 'shot.png', id), 'raster');
     expect(result).toMatchObject({ok: true});
     if (result.ok) expect(Buffer.compare(result.bytes, png)).toBe(0);
+  });
+
+  it('reads a work tree file rewritten under one reader as its new content', async () => {
+    const cwd = initRepo();
+    const reader = createSideReader();
+    const a = pngFixture(4, 4, [255, 0, 0, 255]);
+    const b = pngFixture(4, 4, [0, 0, 255, 255]);
+    writeBytes(cwd, 'live.png', a);
+    const sideA = side('worktree', 'live.png', hashObject(cwd, 'live.png').slice(0, 7));
+    const first = await reader.read(cwd, sideA, 'raster');
+    expect(first.ok && Buffer.compare(first.bytes, a)).toBe(0);
+
+    writeBytes(cwd, 'live.png', b);
+    const sideB = side('worktree', 'live.png', hashObject(cwd, 'live.png').slice(0, 7));
+    const second = await reader.read(cwd, sideB, 'raster');
+    expect(second.ok && Buffer.compare(second.bytes, b)).toBe(0);
+    // A cache entry under a key that now names other content is never
+    // returned for it, whatever the key spells.
+    const reused = await reader.read(cwd, {...sideB, key: sideA.key}, 'raster');
+    expect(reused).toMatchObject({ok: true});
+    expect(reused.ok && Buffer.compare(reused.bytes, b)).toBe(0);
+    expect(reused.ok && reused.oid.startsWith(sideB.abbrevId)).toBe(true);
   });
 
   it('fails a blob id that names no object with git\'s reason', async () => {
@@ -102,7 +124,8 @@ describe('media side reads', () => {
     const id = hashObject(cwd, 'icon.svg').slice(0, 7);
 
     const result = await createSideReader({sleep: async () => undefined}).read(cwd, side('worktree', 'icon.svg', id), 'svg');
-    expect(result).toEqual({ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)'});
+    // A verdict on the file as it is on disk: asked again on the next review.
+    expect(result).toEqual({ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)', disk: true, filter: true});
   });
 
   it('refuses a symlink in the work tree', async () => {

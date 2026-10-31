@@ -11,7 +11,7 @@ import {visibleWidth} from '../src/sections.js';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir} from './core-helpers.js';
 import {BLOCKS_CAPS, pngFixture, sgrCodes} from './media-helpers.js';
 
-// The block preview: a picture drawn as coloured half blocks for terminals
+// The block preview: a picture drawn as colored half blocks for terminals
 // without Kitty placeholders. The worker samples the image down to one pixel
 // per cell column and two per row; the UI turns those pixels into `▀` cells.
 
@@ -31,18 +31,18 @@ function cellsOf(pairs: Array<[number, number]>) {
 }
 
 describe('block rows', () => {
-  it('draws 24-bit half blocks, top pixel as foreground and bottom as background, sharing an SGR between equal colours', () => {
+  it('draws 24-bit half blocks, top pixel as foreground and bottom as background, sharing an SGR between equal colors', () => {
     const [row] = blockRows(cellsOf([[RED, BLUE], [RED, BLUE], [GREEN, BLUE]]), 3, 1, 3);
     expect(row).toBe(`${ESC}[38;2;255;0;0;48;2;0;0;255m▀▀${ESC}[38;2;0;255;0m▀${ESC}[39;49m`);
   });
 
-  it('maps every colour to the xterm 256-colour cube or grey ramp at depth 2', () => {
+  it('maps every color to the xterm 256-color cube or gray ramp at depth 2', () => {
     const [row] = blockRows(cellsOf([[RED, BLUE], [RED, BLUE], [GREEN, BLUE]]), 3, 1, 2);
     expect(row).toBe(`${ESC}[38;5;196;48;5;21m▀▀${ESC}[38;5;46m▀${ESC}[39;49m`);
     expect(xterm256(0x000000)).toBe(16);
     expect(xterm256(0xffffff)).toBe(231);
     expect(xterm256(0x5f87af)).toBe(67);
-    // Greys go to the grey ramp when it is nearer than the cube.
+    // Grays go to the gray ramp when it is nearer than the cube.
     expect(xterm256(0x808080)).toBe(244);
     expect(xterm256(0x0d1117)).toBe(233);
   });
@@ -118,7 +118,7 @@ describe('the blocks render op in the media worker', {timeout: 60_000}, () => {
     expect(cellAt(result.cells, 40, 35, 3)).toEqual([BLUE, BLUE]);
   });
 
-  it('flattens transparency onto the dark pane colour, and leaves the padding outside the picture clear', async () => {
+  it('flattens transparency onto the dark pane color, and leaves the padding outside the picture clear', async () => {
     const cwd = initRepo();
     fs.writeFileSync(path.join(cwd, 'clear.png'), pngFixture(40, 20, [255, 255, 255, 0]));
     commitAll(cwd, 'add');
@@ -204,7 +204,7 @@ describe('the blocks render op in the media worker', {timeout: 60_000}, () => {
     expect(cellAt(result.cells, 40, 5, 3)).toEqual([RED, RED]);
   });
 
-  it('keeps hard nearest-neighbour edges for a tiny icon scaled up to 8 columns', async () => {
+  it('keeps hard nearest-neighbor edges for a tiny icon scaled up to 8 columns', async () => {
     const cwd = initRepo();
     // 2 × 2 px: red, blue on top; blue, red below.
     fs.writeFileSync(path.join(cwd, 'icon.png'), pngFixture(2, 2, (x, y) => ((x + y) % 2 === 0 ? [255, 0, 0, 255] : [0, 0, 255, 255])));
@@ -216,9 +216,9 @@ describe('the blocks render op in the media worker', {timeout: 60_000}, () => {
     expect(cellAt(result.cells, 8, 0, 0)).toEqual([RED, RED]);
     expect(cellAt(result.cells, 8, 7, 0)).toEqual([BLUE, BLUE]);
     expect(cellAt(result.cells, 8, 0, 3)).toEqual([BLUE, BLUE]);
-    // Every source pixel becomes a 4 × 4 square of pure colour. The corners
+    // Every source pixel becomes a 4 × 4 square of pure color. The corners
     // above stay pure under any filter; the cells along the middle edges
-    // turn purple unless the scale is nearest-neighbour.
+    // turn purple unless the scale is nearest-neighbor.
     const source = (x: number, py: number) => ((Math.floor(x / 4) + Math.floor(py / 4)) % 2 === 0 ? RED : BLUE);
     for (let y = 0; y < 4; y += 1) {
       for (let x = 0; x < 8; x += 1) expect(cellAt(result.cells, 8, x, y), `cell ${x},${y}`).toEqual([source(x, y * 2), source(x, y * 2 + 1)]);

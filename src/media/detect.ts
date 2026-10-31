@@ -1,7 +1,9 @@
+import {execFile} from 'node:child_process';
 import {escapeHiddenCharacters} from '../controlChars.js';
 import {isColorDisabled} from '../git.js';
 import {KITTY_QUERY, tmuxWrap} from './kitty.js';
 import {NO_GRAPHICS, type GraphicsCaps, type GraphicsProtocol} from './types.js';
+import {findTool} from './worker/tools.js';
 
 // Finds out what the terminal can draw, once, before Ink owns stdin. One
 // write asks four questions and ends with DA1, which every terminal answers
@@ -24,6 +26,9 @@ const DEFAULT_TIMEOUT_MS = 300;
 // Replies cross the network over SSH, and tmux answers some itself.
 const SLOW_LINK_TIMEOUT_MS = 1000;
 const DEFAULT_CELL_PX = {w: 10, h: 20};
+// Asking tmux which terminal is attached: a local socket round trip.
+const TMUX_CLIENT_TIMEOUT_MS = 300;
+const TMUX_CLIENT_MAX_BYTES = 1024;
 // Anything outside this is a confused reply, not a font.
 const MAX_CELL_PX = 512;
 const MAX_TERMINAL_LABEL = 40;
@@ -78,6 +83,11 @@ export type HandOff = {
 
 const NOTHING_HANDED: HandOff = Object.freeze({keys: '', replyHead: ''});
 
+// The terminal attached to the tmux client showing this pane, as tmux names
+// it: `client_termtype` is the terminal's own XTVERSION answer to tmux, and
+// `client_termname` its TERM.
+export type TmuxClient = {termtype: string; termname: string};
+
 type DetectionIo = {
   stdin?: TtyInput;
   stdout: {isTTY?: boolean; columns?: number; rows?: number; write(text: string): unknown};
@@ -88,7 +98,54 @@ type DetectionIo = {
   onInterrupt: () => void;
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
+  // Under tmux, asks tmux which terminal its client runs in. Without it,
+  // nothing names the terminal under tmux, and Kitty mode is never chosen.
+  queryTmuxClient?: () => Promise<TmuxClient | null>;
 };
+
+type ExecFile = (
+  file: string,
+  args: string[],
+  options: {timeout: number; maxBuffer: number; encoding: 'utf8'; windowsHide: boolean; env: NodeJS.ProcessEnv},
+  callback: (error: Error | null, stdout: string) => void,
+) => unknown;
+
+/**
+ * Asks the tmux server which terminal the client attached to this pane runs
+ * in. The tmux binary comes from PATH, outside the repo, and runs with an
+ * argument array and no shell; null when it fails, takes longer than 300 ms,
+ * says more than 1 KiB, or there is no pane to ask about.
+ */
+export function queryTmuxClient(env: NodeJS.ProcessEnv, repoRoot: string, run: ExecFile = execFile as unknown as ExecFile): Promise<TmuxClient | null> {
+  const pane = env.TMUX_PANE ?? '';
+  if (!/^%\d+$/.test(pane)) return Promise.resolve(null);
+  const tmux = findTool('tmux', env, repoRoot);
+  if (!tmux) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      run(
+        tmux,
+        ['display-message', '-p', '-t', pane, '#{client_termtype}\t#{client_termname}'],
+        {timeout: TMUX_CLIENT_TIMEOUT_MS, maxBuffer: TMUX_CLIENT_MAX_BYTES, encoding: 'utf8', windowsHide: true, env},
+        (error, stdout) => {
+          if (error) {
+            resolve(null);
+            return;
+          }
+          const [termtype = '', termname = ''] = String(stdout).replace(/\n$/, '').split('\t');
+          resolve(termtype || termname ? {termtype, termname} : null);
+        },
+      );
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/** How many DA1 replies close the window: under tmux, tmux's own and the outer terminal's. */
+export function da1ExpectedFor(env: NodeJS.ProcessEnv) {
+  return env.TMUX ? 2 : 1;
+}
 
 /** Pure: the replies found in everything stdin delivered during the window. */
 export function parseReplies(buffer: string): ParsedReplies {
@@ -129,15 +186,45 @@ function mayPrintApc(env: NodeJS.ProcessEnv) {
 
 type Identity = {name: 'kitty' | 'ghostty' | null; version?: string; denied: boolean; label: string};
 
+const DENIED_NAME = /wezterm|konsole/i;
+const XT_GHOSTTY = /^ghostty\s*v?([\d.]+\S*)?/i;
+const XT_KITTY = /^kitty\(/;
+
+function labelOf(name: Identity['name'], version: string | undefined, fallback: string) {
+  const raw = name ? `${name}${version ? ` ${version}` : ''}` : fallback;
+  // From the environment or the terminal, and shown in messages.
+  return escapeHiddenCharacters(raw).slice(0, MAX_TERMINAL_LABEL);
+}
+
+// Under tmux the environment describes the terminal the server started in,
+// and XTVERSION is answered by tmux itself, so neither names the terminal
+// drawing now. Only the attached client does.
+function identifyTmuxClient(client: TmuxClient | undefined): Identity {
+  const termtype = client?.termtype ?? '';
+  const termname = client?.termname ?? '';
+  const denied = DENIED_NAME.test(termtype) || DENIED_NAME.test(termname);
+  const ghostty = XT_GHOSTTY.exec(termtype);
+  let name: Identity['name'] = null;
+  let version: string | undefined;
+  if (XT_KITTY.test(termtype) || termname === 'xterm-kitty') {
+    name = 'kitty';
+  } else if (ghostty || termname === 'xterm-ghostty') {
+    name = 'ghostty';
+    version = ghostty?.[1];
+  }
+  return {name, version, denied, label: labelOf(name, version, termtype || termname || 'tmux')};
+}
+
 // Who is answering: the environment first, then XTVERSION. Terminals on the
 // deny list answer the graphics query but cannot draw Unicode placeholders.
-function identify(env: NodeJS.ProcessEnv, xtversion: string | undefined): Identity {
+function identify(env: NodeJS.ProcessEnv, xtversion: string | undefined, tmuxClient: TmuxClient | undefined): Identity {
+  if (env.TMUX) return identifyTmuxClient(tmuxClient);
   const program = env.TERM_PROGRAM ?? '';
   const denied = ['WarpTerminal', 'WezTerm', 'vscode'].includes(program)
     || Boolean(env.WEZTERM_EXECUTABLE)
     || Boolean(env.KONSOLE_VERSION)
-    || /wezterm|konsole/i.test(xtversion ?? '');
-  const xtGhostty = /^ghostty\s*v?([\d.]+\S*)?/i.exec(xtversion ?? '');
+    || DENIED_NAME.test(xtversion ?? '');
+  const xtGhostty = XT_GHOSTTY.exec(xtversion ?? '');
 
   let name: Identity['name'] = null;
   let version: string | undefined;
@@ -146,17 +233,14 @@ function identify(env: NodeJS.ProcessEnv, xtversion: string | undefined): Identi
   } else if (program === 'ghostty' || env.GHOSTTY_RESOURCES_DIR) {
     name = 'ghostty';
     version = (program === 'ghostty' ? env.TERM_PROGRAM_VERSION : undefined) || xtGhostty?.[1];
-  } else if (/^kitty\(/.test(xtversion ?? '')) {
+  } else if (XT_KITTY.test(xtversion ?? '')) {
     name = 'kitty';
   } else if (xtGhostty) {
     name = 'ghostty';
     version = xtGhostty[1];
   }
 
-  const raw = name ? `${name}${version ? ` ${version}` : ''}` : program || xtversion || env.TERM || '';
-  // From the environment or the terminal, and shown in messages.
-  const label = escapeHiddenCharacters(raw).slice(0, MAX_TERMINAL_LABEL);
-  return {name, version, denied, label};
+  return {name, version, denied, label: labelOf(name, version, program || xtversion || env.TERM || '')};
 }
 
 function atLeast(version: string | undefined, major: number, minor: number) {
@@ -172,9 +256,12 @@ function validCell(px: {w: number; h: number} | undefined) {
     : undefined;
 }
 
-/** Pure: what to draw with, from the replies, the environment and the grid size. */
-export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size: {columns?: number; rows?: number}): GraphicsCaps {
-  const identity = identify(env, replies.xtversion);
+/**
+ * Pure: what to draw with, from the replies, the environment, the grid size
+ * and, under tmux, the terminal tmux says its client runs in.
+ */
+export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size: {columns?: number; rows?: number}, tmuxClient?: TmuxClient): GraphicsCaps {
+  const identity = identify(env, replies.xtversion, tmuxClient);
   const truecolor = ['truecolor', '24bit'].includes((env.COLORTERM ?? '').toLowerCase());
   const colors256 = truecolor || (env.TERM ?? '').includes('256color') || env.TERM_PROGRAM === 'Apple_Terminal';
   const tmux = Boolean(env.TMUX);
@@ -205,7 +292,9 @@ export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size:
     : undefined;
   const cellPx = fromCell ?? fromArea ?? DEFAULT_CELL_PX;
 
-  const detectionTimedOut = !replies.da1;
+  // Under tmux, tmux's own DA1 comes first; the window is only answered
+  // once the outer terminal's DA1 came back too.
+  const detectionTimedOut = replies.da1Count < da1ExpectedFor(env);
   if (protocol === 'none') return {...NO_GRAPHICS, terminal: identity.label, detectionTimedOut};
 
   return {
@@ -230,7 +319,7 @@ function latin1(chunk: Buffer | string) {
  * Ctrl-C or cancel(), raw mode is off and the listener is gone by then. After
  * a timeout the terminal may still be answering, so stdin stays raw and ours,
  * swallowing late replies, until handOff() gives it to the app or cancel()
- * ends it. When images are off, stdin or stdout is not a terminal, colour is
+ * ends it. When images are off, stdin or stdout is not a terminal, color is
  * off, or the terminal may print APC payloads, it settles at once with no
  * graphics and writes nothing.
  */
@@ -265,7 +354,12 @@ export function startGraphicsDetection(io: DetectionIo): {
   // 'closed' once raw mode is off and the listener gone.
   let state: 'open' | 'holding' | 'handedOff' | 'closed' = 'open';
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const da1Expected = env.TMUX ? 2 : 1;
+  const da1Expected = da1ExpectedFor(env);
+  // Asked at the same time as the terminal, and awaited before deciding.
+  let tmuxClient: Promise<TmuxClient | undefined> = Promise.resolve(undefined);
+  const decide = (replies: ParsedReplies) => {
+    void tmuxClient.then((client) => resolve(decideCaps(replies, env, {columns: stdout.columns, rows: stdout.rows}, client)));
+  };
 
   const rawModeOff = () => {
     try {
@@ -298,13 +392,13 @@ export function startGraphicsDetection(io: DetectionIo): {
     // our listener, so the app reads these bytes first.
     const keys = replies.stray + replies.partial;
     if (keys) stdin.unshift?.(Buffer.from(keys, 'latin1'));
-    resolve(decideCaps(replies, env, {columns: stdout.columns, rows: stdout.rows}));
+    decide(replies);
   };
 
   const timeOut = () => {
     if (state !== 'open') return;
     state = 'holding';
-    resolve(decideCaps(parseReplies(buffer), env, {columns: stdout.columns, rows: stdout.rows}));
+    decide(parseReplies(buffer));
   };
 
   function onData(chunk: Buffer | string) {
@@ -352,6 +446,9 @@ export function startGraphicsDetection(io: DetectionIo): {
   // that second DA1 closes the window. With passthrough off it never comes,
   // and the window ends at the timeout with stdin still held.
   const graphicsQuery = env.TMUX ? tmuxWrap(`${KITTY_QUERY}${DA1_QUERY}`) : KITTY_QUERY;
+  if (env.TMUX && io.queryTmuxClient) {
+    tmuxClient = io.queryTmuxClient().then((client) => client ?? undefined, () => undefined);
+  }
   try {
     stdout.write(`${graphicsQuery}${XTVERSION_QUERY}${CELL_SIZE_QUERY}${TEXT_AREA_QUERY}${DA1_QUERY}`);
   } catch {

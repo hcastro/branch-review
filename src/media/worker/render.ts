@@ -4,7 +4,7 @@ import type {Sniffed} from './sniff.js';
 import {MAX_PIXELS, svgSize} from './sniff.js';
 
 // Decodes and scales an image into the PNG the terminal is sent. The PNG is
-// exactly cols × cell width by rows × cell height, the picture centred on
+// exactly cols × cell width by rows × cell height, the picture centered on
 // transparent padding, so the terminal draws it at its aspect ratio whatever
 // rule it uses to fit an image into its cells.
 
@@ -35,8 +35,8 @@ const MAX_ANIMATION_PIXELS = 16_000_000;
 const SHORT_FRAME_MS = 10;
 const SHORT_FRAME_SHOWN_MS = 100;
 export const ANIMATION_TOO_LARGE = 'animation too large';
-// Block previews show transparency over the dark pane colour of the
-// mockups; a terminal cell has one colour per half, with no alpha.
+// Block previews show transparency over the dark pane color of the
+// mockups; a terminal cell has one color per half, with no alpha.
 const BLOCK_BACKGROUND = [0x0d, 0x11, 0x17] as const;
 
 // An SVG is drawn at a density (dots per inch, where 72 is its own size) that
@@ -83,8 +83,8 @@ type RawImage = {data: Buffer; width: number; height: number};
 // The difference of two decoded RGBA images aligned top-left on a canvas of
 // the larger width and height. A pixel only one side covers counts against
 // transparency, so sizes that differ show as change. Two pixels that are both
-// transparent, or within the threshold of it, look the same whatever colour
-// they hold, and PNG optimizers rewrite that colour freely, so only their
+// transparent, or within the threshold of it, look the same whatever color
+// they hold, and PNG optimizers rewrite that color freely, so only their
 // alpha is compared.
 export function differenceImage(before: RawImage, after: RawImage): RawImage & {changedRatio: number; hasAlpha: boolean} {
   const width = Math.max(before.width, after.width);
@@ -149,7 +149,7 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     // The input is always a buffer, never a path; one page, so an animation
     // shows its first frame.
     const input = 'bytes' in source
-      ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1, ...svgDensity(info, drawW)})
+      ? sharp(source.bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1, autoOrient: true, ...svgDensity(info, drawW)})
       : sharp(source.raw.data, {limitInputPixels: MAX_PIXELS, raw: {width: source.raw.width, height: source.raw.height, channels: 4}});
     // An SVG whose stated size the sniff could not read (em, say) draws at
     // another shape than its box: it keeps its own, letterboxed on clear
@@ -190,8 +190,8 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
 
   /**
    * The source as block preview cells: one pixel per column and two per row
-   * of `target`'s cols × rows, the picture centred at `drawPx` and the rest
-   * clear, transparency flattened onto the pane colour.
+   * of `target`'s cols × rows, the picture centered at `drawPx` and the rest
+   * clear, transparency flattened onto the pane color.
    */
   async function blockCells(sharp: SharpFactory, source: Source, info: SourceInfo, target: RenderTarget) {
     const cols = Math.max(1, target.cols);
@@ -258,14 +258,16 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
     };
 
     try {
-      const meta = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: -1}).metadata();
+      const meta = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: -1, autoOrient: true}).metadata();
       const pages = meta.pages ?? 1;
       const width = meta.width ?? 0;
       const pageHeight = meta.pageHeight ?? meta.height ?? 0;
-      if (pages < 2) return await fit(bytes, info, target, checker);
+      // A turned animation cannot be turned frame by frame in one decode, so
+      // it shows its first frame, turned.
+      if (pages < 2 || (meta.orientation ?? 1) > 1) return await fit(bytes, info, target, checker);
       if (pages > limits.max || pages * width * pageHeight > MAX_ANIMATION_PIXELS) return await still();
 
-      const {data} = await sharp(bytes, {limitInputPixels: MAX_ANIMATION_PIXELS, failOn: 'error', pages: -1})
+      const {data} = await sharp(bytes, {limitInputPixels: MAX_ANIMATION_PIXELS, failOn: 'error', pages: -1, autoOrient: true})
         .timeout({seconds: DECODE_TIMEOUT_S})
         .ensureAlpha()
         .raw()
@@ -318,7 +320,7 @@ export function createRenderer({loadSharp = defaultLoader}: {loadSharp?: SharpLo
   // Both sides decoded and compared, or why they could not be.
   async function decodedDifference(sharp: SharpFactory, before: Buffer, after: Buffer): Promise<ReturnType<typeof differenceImage> | JobFailure> {
     const decode = async (bytes: Buffer): Promise<RawImage> => {
-      const {data, info} = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1})
+      const {data, info} = await sharp(bytes, {limitInputPixels: MAX_PIXELS, failOn: 'error', pages: 1, autoOrient: true})
         .timeout({seconds: DECODE_TIMEOUT_S})
         .ensureAlpha()
         .raw()

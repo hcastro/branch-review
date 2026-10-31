@@ -16,7 +16,7 @@ function chunk(type: string, data: Buffer) {
   return Buffer.concat([length, body, crc]);
 }
 
-/** A valid RGBA PNG of `width` × `height`, one colour or a colour per pixel. */
+/** A valid RGBA PNG of `width` × `height`, one color or a color per pixel. */
 export function pngFixture(width: number, height: number, rgba: Rgba | ((x: number, y: number) => Rgba) = [200, 40, 40, 255]) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
@@ -58,8 +58,8 @@ export const KITTY_CAPS: GraphicsCaps = {
   terminal: 'ghostty 1.3.2',
 };
 
-// A colour terminal without Kitty placeholders (Apple Terminal, say):
-// pictures draw as coloured half blocks.
+// A color terminal without Kitty placeholders (Apple Terminal, say):
+// pictures draw as colored half blocks.
 export const BLOCKS_CAPS: GraphicsCaps = {
   ...NO_GRAPHICS,
   protocol: 'blocks',
@@ -75,7 +75,7 @@ export function sideInfo(overrides: Partial<SideInfo> = {}): SideInfo {
 
 /**
  * The codes of one SGR's parameter string, in order, each as its parameter
- * list: an extended colour (`38`, `48` or `58` with `5;N` or `2;r;g;b`) is one
+ * list: an extended color (`38`, `48` or `58` with `5;N` or `2;r;g;b`) is one
  * code that carries its arguments, so `38;5;39` is a foreground of 39, never
  * a `39` reset. A colon form such as `48:2::r:g:b` is one code too, named by
  * its leading number.
@@ -101,7 +101,7 @@ export function sgrCodes(params: string): string[][] {
   return codes;
 }
 
-/** The leading code of every SGR sequence in `text`, extended-colour arguments left out. */
+/** The leading code of every SGR sequence in `text`, extended-color arguments left out. */
 export function sgrCodeNames(text: string): string[] {
   return [...text.matchAll(/\u001B\[([0-9;:]*)m/g)].flatMap((match) => sgrCodes(match[1]!).map((code) => code[0]!));
 }

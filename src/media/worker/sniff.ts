@@ -28,6 +28,45 @@ const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
 type Header = {width: number; height: number; frames: number; hasAlpha: boolean; durationMs?: number} | null;
 
+// The EXIF Orientation tag (0x0112) of a TIFF structure at `start`, read
+// only within [start, end); 1 when it is absent or unreadable.
+const ORIENTATION_TAG = 0x0112;
+function tiffOrientation(bytes: Uint8Array, start: number, end: number) {
+  const limit = Math.min(end, bytes.length);
+  if (start < 0 || start + 8 > limit) return 1;
+  const order = ascii(bytes, start, 2);
+  if (order !== 'II' && order !== 'MM') return 1;
+  const u16 = order === 'II' ? u16le : u16be;
+  const u32 = order === 'II' ? u32le : u32be;
+  if (u16(bytes, start + 2) !== 42) return 1;
+  const ifd = start + u32(bytes, start + 4);
+  if (ifd + 2 > limit) return 1;
+  const count = u16(bytes, ifd);
+  for (let index = 0; index < count; index += 1) {
+    const entry = ifd + 2 + index * 12;
+    if (entry + 12 > limit) return 1;
+    if (u16(bytes, entry) !== ORIENTATION_TAG) continue;
+    // A SHORT, stored in the first two bytes of the value field.
+    if (u16(bytes, entry + 2) !== 3) return 1;
+    const value = u16(bytes, entry + 8);
+    return value >= 1 && value <= 8 ? value : 1;
+  }
+  return 1;
+}
+
+// An EXIF payload: a TIFF structure, after an `Exif\0\0` prefix when the
+// writer added one.
+function exifOrientation(bytes: Uint8Array, start: number, end: number) {
+  const prefixed = start + 6 <= end && ascii(bytes, start, 6) === 'Exif\0\0';
+  return tiffOrientation(bytes, prefixed ? start + 6 : start, end);
+}
+
+// Orientations 5 to 8 turn the picture a quarter, so it displays with its
+// stored width and height swapped.
+function oriented(header: Header, orientation: number): Header {
+  return header && orientation >= 5 ? {...header, width: header.height, height: header.width} : header;
+}
+
 // Browsers show a GIF frame of 10 ms or less for 100 ms, and so do we.
 const MIN_GIF_DELAY_MS = 20;
 const SHORT_GIF_DELAY_MS = 100;
@@ -73,7 +112,20 @@ function png(bytes: Uint8Array): Header {
     if (type === 'tRNS') hasAlpha = true;
     at += 12 + length;
   }
-  return {width: u32be(bytes, 16), height: u32be(bytes, 20), frames, hasAlpha};
+  return oriented({width: u32be(bytes, 16), height: u32be(bytes, 20), frames, hasAlpha}, pngOrientation(bytes));
+}
+
+/** The EXIF orientation of a PNG, from an `eXIf` chunk before the image data; 1 without one. */
+export function pngOrientation(bytes: Uint8Array) {
+  let at = 8;
+  while (at + 8 <= Math.min(bytes.length, HEADER_SCAN_BYTES)) {
+    const length = u32be(bytes, at);
+    const type = ascii(bytes, at + 4, 4);
+    if (type === 'IDAT' || type === 'IEND') break;
+    if (type === 'eXIf') return exifOrientation(bytes, at + 8, at + 8 + length);
+    at += 12 + length;
+  }
+  return 1;
 }
 
 // Skips GIF data sub-blocks from `at`; returns the offset after the terminator.
@@ -126,6 +178,7 @@ const SOF_MARKERS = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xc
 
 function jpeg(bytes: Uint8Array): Header {
   let at = 2;
+  let orientation = 1;
   for (let segments = 0; segments < 4096 && at + 4 <= bytes.length; segments += 1) {
     if (bytes[at] !== 0xff) return null;
     const marker = bytes[at + 1]!;
@@ -142,7 +195,12 @@ function jpeg(bytes: Uint8Array): Header {
     const length = u16be(bytes, at + 2);
     if (SOF_MARKERS.has(marker)) {
       if (at + 9 > bytes.length) return null;
-      return {width: u16be(bytes, at + 7), height: u16be(bytes, at + 5), frames: 1, hasAlpha: false};
+      return oriented({width: u16be(bytes, at + 7), height: u16be(bytes, at + 5), frames: 1, hasAlpha: false}, orientation);
+    }
+    // APP1 holds EXIF, before the frame header; read within the segment.
+    if (marker === 0xe1 && orientation === 1) {
+      const end = at + 2 + length;
+      if (at + 10 <= end && ascii(bytes, at + 4, 6) === 'Exif\0\0') orientation = tiffOrientation(bytes, at + 10, end);
     }
     at += 2 + length;
   }
@@ -179,7 +237,21 @@ function webp(bytes: Uint8Array): Header {
       }
       frames = Math.max(1, frames);
     }
-    return withDuration({width: u24le(bytes, 24) + 1, height: u24le(bytes, 27) + 1, frames, hasAlpha: Boolean(flags & 0x10)}, delays);
+    let orientation = 1;
+    // The EXIF chunk may come after the image data, so the walk covers the
+    // whole buffer, chunk headers only.
+    if (flags & 0x08) {
+      let at = 12;
+      for (let chunks = 0; at + 8 <= bytes.length && chunks < 4096; chunks += 1) {
+        const size = u32le(bytes, at + 4);
+        if (ascii(bytes, at, 4) === 'EXIF') {
+          orientation = exifOrientation(bytes, at + 8, at + 8 + size);
+          break;
+        }
+        at += 8 + size + (size & 1);
+      }
+    }
+    return oriented(withDuration({width: u24le(bytes, 24) + 1, height: u24le(bytes, 27) + 1, frames, hasAlpha: Boolean(flags & 0x10)}, delays), orientation);
   }
   return null;
 }
@@ -212,7 +284,13 @@ function avif(bytes: Uint8Array): Header {
   }
   if (!width || !height) return null;
   const hasAlpha = indexOfAscii(bytes, 'urn:mpeg:mpegB:cicp:systems:auxiliary:alpha', 0, end) >= 0;
-  return {width, height, frames: 1, hasAlpha};
+  // libheif applies an `irot` rotation when it decodes: a quarter turn (angle
+  // 1 or 3, counterclockwise) displays with width and height swapped. A
+  // mirror (`imir`) keeps the size.
+  const irot = indexOfAscii(bytes, 'irot', 4, end);
+  // The box is 9 bytes: its size, its type and one byte holding the angle.
+  const angle = irot >= 0 && irot + 5 <= end && u32be(bytes, irot - 4) === 9 ? bytes[irot + 4]! & 3 : 0;
+  return angle === 1 || angle === 3 ? {width: height, height: width, frames: 1, hasAlpha} : {width, height, frames: 1, hasAlpha};
 }
 
 // The size a browser gives an SVG that states none.

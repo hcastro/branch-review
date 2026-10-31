@@ -4,7 +4,7 @@ import type {ExportResult, InspectResult, RenderResult, VideoResult, WorkerReque
 import type {MediaFormat, SideRef} from '../types.js';
 import {createSideReader, type SideReader} from './read.js';
 import {createRenderer, type SharpLoader} from './render.js';
-import {isFormat, magicFormat, notFormatReason, sniffImage} from './sniff.js';
+import {isFormat, magicFormat, notFormatReason, pngOrientation, sniffImage} from './sniff.js';
 import {createVideoRunner, type VideoOptions} from './video.js';
 
 // The media worker's jobs, without the process around them, so tests can run
@@ -81,7 +81,8 @@ export function createWorkerHandler({loadSharp, reader = createSideReader(), vid
     const result = animate
       ? await renderer.fitAnimated(bytes, sniffed, request.target, request.checker, request.frames!)
       : await renderer.fit(bytes, sniffed, request.target, request.checker);
-    if (!result.ok && result.state === 'unavailable' && format === 'png' && bytes.byteLength <= MAX_PASSTHROUGH_BYTES) {
+    // A PNG the terminal would draw unturned is not passed through.
+    if (!result.ok && result.state === 'unavailable' && format === 'png' && bytes.byteLength <= MAX_PASSTHROUGH_BYTES && pngOrientation(bytes) === 1) {
       return {ok: true, png: bytes, passthrough: true};
     }
     return result;
@@ -102,7 +103,8 @@ export function createWorkerHandler({loadSharp, reader = createSideReader(), vid
   };
 
   async function exportCopy(request: Extract<WorkerRequest, {type: 'exportCopy'}>): Promise<ExportResult> {
-    if (!path.isAbsolute(request.dir)) return {ok: false, state: 'error', reason: 'cannot open this file type'};
+    // The UI resolves the dir before it asks; this never fires.
+    if (!path.isAbsolute(request.dir)) return {ok: false, state: 'error', reason: 'the session temp dir is not an absolute path'};
     if (['mp4', 'mov', 'webm'].includes(request.format)) return videos.exportCopy(request, () => openDir(request.dir));
     const extension = EXTENSIONS[request.format];
     if (!extension) return {ok: false, state: 'error', reason: 'cannot open this file type'};
@@ -129,7 +131,9 @@ export function createWorkerHandler({loadSharp, reader = createSideReader(), vid
 
     try {
       const target = path.join(openDir(request.dir), name);
-      fs.writeFileSync(target, bytes, {flag: 'wx', mode: 0o600});
+      // Read-only, so a viewer that saves in place cannot change what a
+      // later open shows as this side.
+      fs.writeFileSync(target, bytes, {flag: 'wx', mode: 0o400});
       return {ok: true, path: target};
     } catch (error) {
       return {ok: false, state: 'error', reason: (error instanceof Error ? error.message : String(error)).split('\n')[0]!};

@@ -181,7 +181,8 @@ describe('media service', () => {
         '1111111': (call) => (call === 1
           ? {ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true}
           : {ok: true, info: sideInfo({width: 40, height: 20})}),
-        '2222222': {ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)'},
+        // What the worker answers for a file a git filter changes.
+        '2222222': {ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)', disk: true, filter: true},
       },
     });
     const {service, notified} = serviceOver(backend);
@@ -533,5 +534,147 @@ describe('media service compare modes', () => {
     service.want([{fileKey: ref.fileKey, box}], keys);
     await flush(4);
     expect(renders).toEqual([]);
+  });
+
+  it('never renders a box planned from provisional sizes under the real box\'s key', async () => {
+    const gate: {open?: () => void} = {};
+    const sizes: Record<string, {width: number; height: number}> = {'1111111': {width: 200, height: 100}, '2222222': {width: 195, height: 95}};
+    const renders: RenderRequest[] = [];
+    const backend: MediaBackend = {
+      async inspect(request) {
+        if (request.side.abbrevId === '2222222') await new Promise<void>((resolve) => { gate.open = resolve; });
+        return {ok: true, info: sideInfo(sizes[request.side.abbrevId]!)};
+      },
+      async render(request) {
+        renders.push(request);
+        const {cols, rows, cellPx} = request.target;
+        return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h)};
+      },
+      async exportCopy() {
+        return {ok: false, state: 'error', reason: 'not used'};
+      },
+      dispose() {},
+    };
+    const {service, writes} = serviceOver(backend);
+    service.setReview(review('1111111'), range);
+    await flush(4);
+    // Rewritten: the new content's size is not known yet, so its box is
+    // planned from the old one's.
+    const rewritten = review('2222222');
+    service.setReview(rewritten, range);
+    await flush(4);
+    const [stale] = boxesOf(service, rewritten);
+    expect(stale!.box.drawPx).toEqual({w: 200, h: 100});
+
+    gate.open!();
+    await flush(4);
+    const [real] = boxesOf(service, rewritten);
+    expect(real!.box.drawPx).toEqual({w: 195, h: 95});
+    expect([real!.box.cols, real!.box.rows]).toEqual([stale!.box.cols, stale!.box.rows]);
+    expect(real!.box.imageKey).not.toBe(stale!.box.imageKey);
+
+    // An effect still holding the rows planned before, then the next one.
+    service.want([stale!], new Set([stale!.box.imageKey]));
+    const live = new Set([real!.box.imageKey]);
+    service.want([real!], live);
+    service.sweep(live, live);
+    await flush(6);
+
+    const realRenders = renders.filter((request) => request.target.drawPx.w === 195);
+    expect(realRenders).toHaveLength(1);
+    expect(realRenders[0]!.target.drawPx).toEqual({w: 195, h: 95});
+    const state = service.boxState(real!.box);
+    expect(state.status).toBe('kitty');
+    const transmits = parseApc(writes).filter((command) => command.a === 't');
+    expect(transmits.map((command) => command.i)).toEqual([(state as {id: number}).id]);
+  });
+
+});
+
+describe('a work tree side a git filter changes, beside a drawn committed side', () => {
+  const FILTER = {ok: false as const, state: 'error' as const, reason: 'preview unavailable: a git filter changes this file (shown as text)', disk: true as const, filter: true as const};
+
+  // A modified PNG: the committed before side reads, the work tree after
+  // side answers as `after` says. Each inspect waits for `release`.
+  function filteredFile(after: (call: number) => InspectResult) {
+    const inspects: string[] = [];
+    const pending: Array<() => void> = [];
+    const backend: MediaBackend = {
+      async inspect(request) {
+        inspects.push(request.side.abbrevId);
+        const count = inspects.filter((id) => id === request.side.abbrevId).length;
+        await new Promise<void>((resolve) => pending.push(resolve));
+        return request.side.abbrevId === '97fa3ee' ? after(count) : {ok: true, info: sideInfo({width: 200, height: 100})};
+      },
+      async render(request) {
+        const {cols, rows, cellPx} = request.target;
+        return {ok: true, png: pngFixture(cols * cellPx.w, rows * cellPx.h)};
+      },
+      async exportCopy() {
+        return {ok: false, state: 'error', reason: 'not used'};
+      },
+      dispose() {},
+    };
+    const {service} = serviceOver(backend);
+    const model = () => buildFixture([binaryMediaFile('img/a.png', 'modified', ['029ace0', '97fa3ee'])]).review;
+    const first = model();
+    service.setReview(first, range);
+    const ref = service.refFor(first.files[0]!) as MediaRef;
+    expect(ref.after!.source).toBe('worktree');
+    const plan = () => planMedia(ref, {before: service.sideState(ref, 'before'), after: service.sideState(ref, 'after')}, service.viewState(ref.fileKey), {innerWidth: 100, viewportRows: 20, caps: KITTY_CAPS})
+      .rows.map((row) => (row.type === 'text' ? row.pieces.flatMap((piece) => piece.parts.map((part) => part.text)).join('') : row.type));
+    const release = async () => {
+      for (const resolve of pending.splice(0)) resolve();
+      await flush(4);
+    };
+    return {service, inspects, plan, release, model, pending};
+  }
+
+  it('asks nothing again on refreshes that keep the review, and the drawn side stays', async () => {
+    const {service, inspects, plan, release, pending} = filteredFile(() => FILTER);
+    await release();
+    const settled = plan();
+    expect(settled.filter((row) => row === 'box').length).toBeGreaterThan(0);
+    expect(settled.join('\n')).toContain('git filter');
+    for (let refresh = 0; refresh < 3; refresh += 1) {
+      service.retryDisk();
+      expect(plan()).toEqual(settled);
+      expect(pending).toHaveLength(0);
+      await release();
+      expect(plan()).toEqual(settled);
+    }
+    expect(inspects).toEqual(['029ace0', '97fa3ee']);
+  });
+
+  it('asks again when a new review arrives, showing the last verdict until the answer lands', async () => {
+    let readable = false;
+    const {service, inspects, plan, release, model, pending} = filteredFile(() => (readable ? {ok: true, info: sideInfo({width: 200, height: 100})} : FILTER));
+    await release();
+    const settled = plan();
+    // The file was written back as git stores it: a new fingerprint.
+    readable = true;
+    service.setReview(model(), range);
+    expect(pending).toHaveLength(1);
+    expect(plan()).toEqual(settled);
+    expect(plan()).not.toContain('loading preview…');
+    await release();
+    expect(inspects).toEqual(['029ace0', '97fa3ee', '97fa3ee']);
+    expect(plan()).not.toEqual(settled);
+    expect(plan().join('\n')).not.toContain('git filter');
+  });
+
+  it('shows a side that was gone as it was while a refresh asks again, then its new answer', async () => {
+    const {service, inspects, plan, release, pending} = filteredFile((call) => (call === 1
+      ? {ok: false, state: 'error', reason: 'img/a.png no longer exists', disk: true}
+      : {ok: true, info: sideInfo({width: 200, height: 100})}));
+    await release();
+    const settled = plan();
+    expect(settled.join('\n')).toContain('no longer exists');
+    service.retryDisk();
+    expect(pending).toHaveLength(1);
+    expect(plan()).toEqual(settled);
+    await release();
+    expect(inspects).toEqual(['029ace0', '97fa3ee', '97fa3ee']);
+    expect(plan().join('\n')).not.toContain('no longer exists');
   });
 });

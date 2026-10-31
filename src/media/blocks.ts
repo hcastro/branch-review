@@ -1,11 +1,11 @@
-// The block preview: a picture as coloured half blocks, for terminals that
+// The block preview: a picture as colored half blocks, for terminals that
 // cannot draw images. Each cell is `▀` with the top pixel as its foreground
 // and the bottom pixel as its background, so one cell shows two pixels
 // stacked. U+2580 is one cell wide everywhere and one slot in Ink's grid, so
 // these rows survive anything drawn over or beside them.
 
 // A pixel outside the picture (the padding of a box shared with a larger
-// side): the terminal's own background shows there. Above any 24-bit colour.
+// side): the terminal's own background shows there. Above any 24-bit color.
 export const CLEAR_PIXEL = 0x1000000;
 
 const UPPER = '▀';
@@ -26,21 +26,21 @@ function distance(left: readonly number[], right: readonly number[]) {
   return left.reduce((sum, value, index) => sum + (value - right[index]!) ** 2, 0);
 }
 
-/** The nearest xterm 256-colour index: the 6 × 6 × 6 cube or the 24 greys. */
+/** The nearest xterm 256-color index: the 6 × 6 × 6 cube or the 24 grays. */
 export function xterm256(rgb: number): number {
-  const colour = channels(rgb);
-  const [r, g, b] = colour.map(nearestLevel) as [number, number, number];
+  const color = channels(rgb);
+  const [r, g, b] = color.map(nearestLevel) as [number, number, number];
   const cube = 16 + 36 * r + 6 * g + b;
-  const cubeDistance = distance(colour, [CUBE_LEVELS[r]!, CUBE_LEVELS[g]!, CUBE_LEVELS[b]!]);
-  const average = (colour[0] + colour[1] + colour[2]) / 3;
-  const grey = Math.max(0, Math.min(23, Math.round((average - 8) / 10)));
-  const level = 8 + 10 * grey;
-  return distance(colour, [level, level, level]) < cubeDistance ? 232 + grey : cube;
+  const cubeDistance = distance(color, [CUBE_LEVELS[r]!, CUBE_LEVELS[g]!, CUBE_LEVELS[b]!]);
+  const average = (color[0] + color[1] + color[2]) / 3;
+  const gray = Math.max(0, Math.min(23, Math.round((average - 8) / 10)));
+  const level = 8 + 10 * gray;
+  return distance(color, [level, level, level]) < cubeDistance ? 232 + gray : cube;
 }
 
-// One colour's SGR parameters, foreground (38) or background (48); the
-// default colour when the pixel is clear.
-function colourCode(base: 38 | 48, rgb: number, depth: 2 | 3) {
+// One color's SGR parameters, foreground (38) or background (48); the
+// default color when the pixel is clear.
+function colorCode(base: 38 | 48, rgb: number, depth: 2 | 3) {
   if (rgb === CLEAR_PIXEL) return base === 38 ? '39' : '49';
   if (depth === 2) return `${base};5;${xterm256(rgb)}`;
   const [r, g, b] = channels(rgb);
@@ -50,8 +50,8 @@ function colourCode(base: 38 | 48, rgb: number, depth: 2 | 3) {
 /**
  * One ANSI string per cell row from the worker's cells (for each cell its
  * top pixel then its bottom pixel, `0xRRGGBB` or CLEAR_PIXEL), each exactly
- * `cols` cells wide. Colours that stay the same from one cell to the next
- * are not repeated, and a row that set any colour ends with the defaults.
+ * `cols` cells wide. Colors that stay the same from one cell to the next
+ * are not repeated, and a row that set any color ends with the defaults.
  */
 export function blockRows(cells: Uint32Array, cols: number, rows: number, depth: 2 | 3): string[] {
   const lines: string[] = [];
@@ -73,11 +73,11 @@ export function blockRows(cells: Uint32Array, cols: number, rows: number, depth:
         nextBg = '49';
       } else if (top === CLEAR_PIXEL) {
         char = LOWER;
-        nextFg = colourCode(38, bottom, depth);
+        nextFg = colorCode(38, bottom, depth);
         nextBg = '49';
       } else {
-        nextFg = colourCode(38, top, depth);
-        nextBg = colourCode(48, bottom, depth);
+        nextFg = colorCode(38, top, depth);
+        nextBg = colorCode(48, bottom, depth);
       }
       const changes = [nextFg !== fg ? nextFg : '', nextBg !== bg ? nextBg : ''].filter(Boolean);
       if (changes.length > 0) line += `\u001B[${changes.join(';')}m`;

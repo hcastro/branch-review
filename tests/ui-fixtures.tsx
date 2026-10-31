@@ -3,7 +3,7 @@ import {EventEmitter} from 'node:events';
 import stripAnsi from 'strip-ansi';
 import stringWidth from 'string-width';
 import {render as inkRender} from 'ink';
-import {expect} from 'vitest';
+import {expect, onTestFinished} from 'vitest';
 import {App} from '../src/ui/App.js';
 import {buildDiffSections, type DiffSection} from '../src/sections.js';
 import type {GraphicsCaps} from '../src/media/types.js';
@@ -15,7 +15,7 @@ import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
 import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult, VideoRequest, VideoResult} from '../src/media/backend.js';
 import type {SideInfo, VideoMeta} from '../src/media/types.js';
-import {KITTY_CAPS, pngFixture} from './media-helpers.js';
+import {KITTY_CAPS, decodePlaceholders, parseApc, pngFixture} from './media-helpers.js';
 
 export {BLOCKS_CAPS, decodePlaceholders, KITTY_CAPS, parseApc, pngFixture, sgrCodeNames, sideInfo} from './media-helpers.js';
 
@@ -146,17 +146,65 @@ export function renderFixture(
   writes: string[] = [],
   copyWriter: ClipboardWriter = recordingWriter(writes),
 ) {
-  return renderSized(appElement(fixture, dimensions, copyWriter), dimensions);
+  return renderSized(appElement(fixture, dimensions, copyWriter), dimensions, fixture.media ? timelines.get(fixture.media) : undefined);
+}
+
+// Graphics escapes and frames in the order the terminal got them.
+export type TimelineEntry = {kind: 'apc'; seq: string} | {kind: 'frame'; frame: string};
+
+// Each fake media service's timeline, which frames rendered with it join.
+const timelines = new WeakMap<object, TimelineEntry[]>();
+
+/** The timeline a fake media service's graphics escapes go to. */
+export function timelineOf(service: MediaService) {
+  return timelines.get(service)!;
+}
+
+/**
+ * Adds the frames `stdout` writes to `timeline` from now on, after the ones
+ * it already wrote; for a stdout this module did not make.
+ */
+export function recordFramesInto(timeline: TimelineEntry[], stdout: {frames: string[]; write: (frame: string) => unknown}) {
+  for (const frame of stdout.frames) timeline.push({kind: 'frame', frame});
+  const write = stdout.write.bind(stdout);
+  stdout.write = (frame: string) => {
+    timeline.push({kind: 'frame', frame});
+    return write(frame);
+  };
+}
+
+/**
+ * Every image id a frame names was transmitted earlier on the timeline, and
+ * not deleted since.
+ */
+export function expectTransmitBeforeUse(timeline: readonly TimelineEntry[]) {
+  const live = new Set<number>();
+  let frames = 0;
+  for (const [index, entry] of timeline.entries()) {
+    if (entry.kind === 'apc') {
+      for (const command of parseApc([entry.seq])) {
+        if (command.i === undefined) continue;
+        if (command.a === 't') live.add(command.i);
+        else if (command.a === 'd') live.delete(command.i);
+      }
+      continue;
+    }
+    frames += 1;
+    for (const id of new Set(decodePlaceholders(entry.frame).map((cell) => cell.id))) {
+      expect(live.has(id), `frame ${frames} (timeline entry ${index}) names image ${id} with no live transmit before it`).toBe(true);
+    }
+  }
 }
 
 class FrameStream extends EventEmitter {
   frames: string[] = [];
-  constructor(public columns: number, public rows: number) {
+  constructor(public columns: number, public rows: number, private timeline?: TimelineEntry[]) {
     super();
   }
 
   write = (frame: string) => {
     this.frames.push(frame);
+    this.timeline?.push({kind: 'frame', frame});
     return true;
   };
 
@@ -194,8 +242,9 @@ class KeyStdin extends EventEmitter {
 export function renderSized(
   tree: React.ReactElement<{dimensions?: {columns: number; rows: number}}>,
   size = tree.props.dimensions ?? {columns: 100, rows: 40},
+  timeline?: TimelineEntry[],
 ) {
-  const stdout = new FrameStream(size.columns, size.rows);
+  const stdout = new FrameStream(size.columns, size.rows, timeline);
   const stderr = new FrameStream(size.columns, size.rows);
   const stdin = new KeyStdin();
   const instance = inkRender(tree, {
@@ -402,20 +451,49 @@ type FakeSide = SideInfo | {error: string; state?: 'stale' | 'error'};
  * answers the export job instead of the canned path (the worker's own job, say).
  * A video job answers with `videoMeta` for the side's id (no metadata when it
  * has none) and a strip PNG of the strip's size, or `video` answers it.
+ * Inspects and renders answer on a later turn of the event loop, as the
+ * worker does, never in the same microtask; `inspectDelayMs` holds an
+ * inspect of those ids back for that long. A test fails when one box is
+ * rendered more than `maxRendersPerKey` times: a retry loop.
  */
-export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, video, videoMeta = {}}: {
+export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, video, videoMeta = {}, inspectDelayMs = {}, maxRendersPerKey = 3}: {
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
   exportDir?: string;
   exportCopy?: (request: ExportRequest) => Promise<ExportResult>;
   video?: (request: VideoRequest) => VideoResult | Promise<VideoResult>;
   videoMeta?: Record<string, VideoMeta>;
+  inspectDelayMs?: Record<string, number>;
+  maxRendersPerKey?: number;
 } = {}) {
   const calls: FakeBackendCall[] = [];
   let disposed = 0;
+  // A box's identity, as its image key names it: the content, the op and
+  // the geometry.
+  const renderKey = ({op, sides: refs, target}: RenderRequest) =>
+    `${refs.map((ref) => ref.key).join('+')}|${op}|${target.cols}x${target.rows}|${target.cellPx.w}x${target.cellPx.h}|${target.drawPx.w}x${target.drawPx.h}${target.nearest ? '|nearest' : ''}`;
+  // A video strip's identity: the side's content and the strip's geometry.
+  const videoKey = (request: VideoRequest) =>
+    `video|${request.side.key}|${request.frameCount}|${request.framePx.w}x${request.framePx.h}|${request.stripCols}x${request.stripRows}|${request.stripCellPx.w}x${request.stripCellPx.h}${request.blocks ? '|blocks' : ''}`;
+  // Renders and video jobs per box, so a retry loop fails the test by name.
+  const renders = new Map<string, number>();
+  const count = (key: string) => renders.set(key, (renders.get(key) ?? 0) + 1);
+  const later = () => new Promise<void>((resolve) => setImmediate(resolve));
+  try {
+    onTestFinished(() => {
+      for (const [key, count] of renders) {
+        if (count > maxRendersPerKey) throw new Error(`render retried for ${key} (${count} times)`);
+      }
+    });
+  } catch {
+    // Made outside a test: nothing to check at its end.
+  }
   const backend: MediaBackend = {
     async inspect(request) {
       calls.push({type: 'inspect', request});
+      const delay = inspectDelayMs[request.side.abbrevId];
+      if (delay !== undefined) await new Promise((resolve) => setTimeout(resolve, delay));
+      await later();
       const side = sides[request.side.abbrevId];
       if (!side) return {ok: false, state: 'error', reason: `no fake side ${request.side.abbrevId}`};
       if ('error' in side) return {ok: false, state: side.state ?? 'error', reason: side.error} as InspectResult;
@@ -423,6 +501,8 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, vid
     },
     async render(request) {
       calls.push({type: 'render', request});
+      count(renderKey(request));
+      await later();
       if (render) return render(request);
       const {cols, rows, cellPx} = request.target;
       if (request.op === 'blocks' || request.op === 'blocksDifference') {
@@ -435,6 +515,10 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, vid
     },
     async video(request) {
       calls.push({type: 'video', request});
+      count(videoKey(request));
+      // Never in the same microtask, so a loop of video jobs still lets the
+      // test's timeout fire.
+      await later();
       if (video) return video(request);
       const {stripCols, stripRows, stripCellPx, frameCount} = request;
       const meta = videoMeta[request.side.abbrevId] ?? null;
@@ -463,7 +547,7 @@ export function fakeMediaBackend({sides = {}, render, exportDir, exportCopy, vid
  * (kept apart from the frames, so a frame is never an escape) and a
  * recording opener.
  */
-export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, videoMeta, exportCopy, tempDir = '/tmp/branch-review-media-test', env = {}, platform = 'darwin', review, includeWorktree = false, watching, animations, registry}: {
+export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, videoMeta, exportCopy, tempDir = '/tmp/branch-review-media-test', env = {}, platform = 'darwin', review, includeWorktree = false, watching, animations, registry, inspectDelayMs, maxRendersPerKey}: {
   caps?: GraphicsCaps;
   sides?: Record<string, FakeSide>;
   render?: (request: RenderRequest) => RenderResult | Promise<RenderResult>;
@@ -478,14 +562,22 @@ export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, video
   watching?: boolean;
   animations?: boolean;
   registry?: Parameters<typeof createMediaService>[0]['registry'];
+  inspectDelayMs?: Record<string, number>;
+  maxRendersPerKey?: number;
 } = {}) {
-  const fake = fakeMediaBackend({sides, render, ...(video ? {video} : {}), ...(videoMeta ? {videoMeta} : {}), ...(exportCopy ? {exportCopy} : {})});
+  const fake = fakeMediaBackend({sides, render, ...(video ? {video} : {}), ...(videoMeta ? {videoMeta} : {}), ...(exportCopy ? {exportCopy} : {}), ...(inspectDelayMs ? {inspectDelayMs} : {}), ...(maxRendersPerKey === undefined ? {} : {maxRendersPerKey})});
   const graphicsWrites: string[] = [];
+  const timeline: TimelineEntry[] = [];
   const opened: Array<{command: string; args: string[]}> = [];
   const service = createMediaService({
     caps,
     backend: fake.backend,
-    sink: {write: (sequence) => graphicsWrites.push(sequence)},
+    sink: {
+      write: (sequence) => {
+        graphicsWrites.push(sequence);
+        timeline.push({kind: 'apc', seq: sequence});
+      },
+    },
     tempDir: () => tempDir,
     opener: (command, args) => opened.push({command, args}),
     env,
@@ -494,6 +586,7 @@ export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, video
     ...(animations === undefined ? {} : {animations}),
     ...(registry ? {registry} : {}),
   });
+  timelines.set(service, timeline);
   if (review) service.setReview(review, {cwd: '/repo', range: {includeWorktree}});
-  return {service, graphicsWrites, opened, calls: fake.calls, disposedCount: fake.disposedCount};
+  return {service, graphicsWrites, timeline, opened, calls: fake.calls, disposedCount: fake.disposedCount};
 }

@@ -36,10 +36,13 @@ export const FILTER_REASON = 'preview unavailable: a git filter changes this fil
 
 // `disk`: the failure describes the work tree file as it was when read, not
 // the content the side's id names, so the same id is worth reading again
-// later. A filter or the size cap follows from the content and is not tagged.
+// later. A filter verdict depends on the disk too: the file read the same
+// twice but not as the id, and writing it back makes it readable. It is
+// also tagged `filter`, since only a write, which brings a new review, can
+// change it. The size cap follows from the content and is not tagged.
 export type ReadResult =
   | {ok: true; bytes: Buffer; oid: string}
-  | {ok: false; state: 'stale' | 'error'; reason: string; disk?: true};
+  | {ok: false; state: 'stale' | 'error'; reason: string; disk?: true; filter?: true};
 
 type ReaderOptions = {
   sleep?: (ms: number) => Promise<void>;
@@ -83,7 +86,10 @@ export function createSideReader({sleep = (ms) => new Promise((resolve) => setTi
 
   async function read(cwd: string, side: SideRef, kind: MediaKind): Promise<ReadResult> {
     const cached = verified.get(side.key);
-    if (cached) return {ok: true, ...cached};
+    // Only bytes that hashed to this side's id: a key that ever named other
+    // content reads again.
+    if (cached?.oid.startsWith(side.abbrevId)) return {ok: true, ...cached};
+    if (cached) verified.delete(side.key);
 
     try {
       const format = await formatFor(cwd);
@@ -103,7 +109,7 @@ export function createSideReader({sleep = (ms) => new Promise((resolve) => setTi
           // brings in with a new id. The same bytes twice: a clean filter
           // (eol conversion, LFS) turns them into what git stores.
           return again.equals(bytes)
-            ? {ok: false, state: 'error', reason: FILTER_REASON}
+            ? {ok: false, state: 'error', reason: FILTER_REASON, disk: true, filter: true}
             : {ok: false, state: 'stale', reason: STALE_REASON, disk: true};
         }
         good = again;

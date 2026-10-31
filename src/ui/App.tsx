@@ -148,7 +148,7 @@ const COMPARE_SPANS: Record<string, CompareMode | undefined> = {
 };
 // The screen row of the diff pane's first line: the top bar's three rows,
 // then the pane's top border and its two header rows.
-const DIFF_FIRST_SCREEN_ROW = 6;
+export const DIFF_FIRST_SCREEN_ROW = 6;
 const ABSOLUTE_PATH_ACTION = {id: 'copy.absolutePath', label: 'Copy absolute path'} as const;
 // Keyboard copy: file commands act on the file in view, block commands on the
 // focused block.
@@ -2166,7 +2166,7 @@ function DiffPaneBody({
     const marksFocus = index === 0 && focusedBlockLineIndex !== null && focusedBlockLineIndex < diffOffset;
     if (row?.kind === 'media') {
       // Media rows hold no code: no selection highlight and no arrival wash,
-      // which would put colour codes between placeholder cells.
+      // which would put color codes between placeholder cells.
       const mediaRow = frameLine(row.media?.boxes && media ? renderBoxRow(row.media, media, inner) : visibleLine, inner, borderAnsi);
       rows.push(marksFocus ? mediaRow.replace('│', FOCUS_BAR) : mediaRow);
       continue;

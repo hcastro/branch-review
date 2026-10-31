@@ -74,7 +74,7 @@ export type GraphicsCaps = {
   protocol: GraphicsProtocol;
   cellPx: {w: number; h: number};
   cellPxSource: 'csi16' | 'csi14' | 'default';
-  // 2 = 256 colours, 3 = 24-bit.
+  // 2 = 256 colors, 3 = 24-bit.
   colorDepth: 2 | 3;
   animation: boolean;
   tmux: boolean;

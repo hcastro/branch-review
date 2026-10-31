@@ -8,7 +8,12 @@ export type InspectRequest = {cwd: string; side: SideRef; kind: MediaKind; forma
 // A failure. `disk`: it describes the work tree file as it was when read (it
 // was gone, not a regular file, could not be opened), not the content the
 // side's id names, so the same id in a later review is worth asking again.
-export type JobFailure = {ok: false; state: 'stale' | 'error' | 'unavailable'; reason: string; disk?: true};
+// `filter`: a git filter changes the work tree file, which read the same
+// twice but not as its id. That depends on the disk too, but the file reads
+// differently only once it is written again, and writing it changes the
+// review's fingerprint: a new review asks again, a refresh that kept the
+// review does not.
+export type JobFailure = {ok: false; state: 'stale' | 'error' | 'unavailable'; reason: string; disk?: true; filter?: true};
 
 export type InspectResult =
   | {ok: true; info: SideInfo}
@@ -80,8 +85,12 @@ export type VideoResult =
   | {ok: true; meta: VideoMeta | null; strip: Uint8Array | null; cells?: Uint32Array; times: number[]; note?: string}
   | JobFailure;
 
-export type ExportRequest = {cwd: string; side: SideRef; format: MediaFormat; dir: string};
-export type ExportResult = {ok: true; path: string} | JobFailure;
+// `copy`: a work tree video is copied out too, from the verified bytes, rather
+// than handed over at its real path.
+export type ExportRequest = {cwd: string; side: SideRef; format: MediaFormat; dir: string; copy?: true};
+// `dev` and `ino`: the path is a work tree file itself, the one checked, so
+// the opener checks it is still that file right before it starts a player.
+export type ExportResult = {ok: true; path: string; dev?: number; ino?: number} | JobFailure;
 
 export interface MediaBackend {
   // `priority`: lower runs first; boxes on screen ask with 0.

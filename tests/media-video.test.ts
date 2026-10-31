@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import {randomBytes} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {execFileSync, spawnSync} from 'node:child_process';
@@ -106,7 +106,7 @@ function handlerWith(tools: {dir: string} | null, options: {probeTimeoutMs?: num
 
 const videoJob = async (handler: ReturnType<typeof createWorkerHandler>, request: VideoRequest) => await handler.handle({type: 'video', ...request}) as VideoResult;
 
-describe('finding ffprobe and ffmpeg', () => {
+describe('finding ffprobe and ffmpeg', {timeout: 30_000}, () => {
   it('takes the first executable on PATH, skipping relative entries and anything inside the repo', () => {
     const cwd = initRepo();
     const planted = path.join(cwd, 'bin');
@@ -128,6 +128,43 @@ describe('finding ffprobe and ffmpeg', () => {
     const link = path.join(makeTempDir('branch-review-link-'), 'bin');
     fs.symlinkSync(planted, link);
     expect(findTool('ffprobe', {PATH: link}, cwd)).toBeNull();
+  });
+});
+
+// Whether the temp dir's file system ignores case, as APFS and NTFS do by default.
+const caseInsensitiveTmp = (() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'branch-review-Case-'));
+  try {
+    return fs.existsSync(dir.replace(/Case-/, 'cASE-'));
+  } finally {
+    fs.rmSync(dir, {recursive: true, force: true});
+  }
+})();
+
+describe('finding tools whatever the spelling of the repo dir', {timeout: 30_000}, () => {
+  it.runIf(caseInsensitiveTmp)('skips a PATH entry that spells a dir inside the repo in another case', () => {
+    const cwd = initRepo();
+    const planted = path.join(cwd, 'bin');
+    fs.mkdirSync(planted);
+    writeExecutable(path.join(planted, 'ffmpeg'), '#!/bin/sh\nexit 0\n');
+    const respelled = path.join(path.dirname(cwd), path.basename(cwd).toUpperCase(), 'BIN');
+    expect(fs.existsSync(path.join(respelled, 'ffmpeg'))).toBe(true);
+    expect(findTool('ffmpeg', {PATH: respelled}, cwd)).toBeNull();
+    // The repo root spelled in another case is still the repo.
+    expect(findTool('ffmpeg', {PATH: planted}, path.join(path.dirname(cwd), path.basename(cwd).toUpperCase()))).toBeNull();
+  });
+
+  it('skips a PATH entry that reaches the repo\'s bin through a symlinked ancestor', () => {
+    const cwd = initRepo();
+    fs.mkdirSync(path.join(cwd, 'tools', 'bin'), {recursive: true});
+    writeExecutable(path.join(cwd, 'tools', 'bin', 'ffmpeg'), '#!/bin/sh\nexit 0\n');
+    const link = path.join(makeTempDir('branch-review-link-'), 'checkout');
+    fs.symlinkSync(cwd, link);
+    expect(findTool('ffmpeg', {PATH: path.join(link, 'tools', 'bin')}, cwd)).toBeNull();
+    // The same tool outside the repo is found.
+    const real = makeTempDir('branch-review-tools-');
+    writeExecutable(path.join(real, 'ffmpeg'), '#!/bin/sh\nexit 0\n');
+    expect(findTool('ffmpeg', {PATH: [path.join(link, 'tools', 'bin'), real].join(path.delimiter)}, cwd)).toBe(path.join(fs.realpathSync.native(real), 'ffmpeg'));
   });
 });
 
@@ -156,6 +193,12 @@ describe('the video job with fake ffprobe and ffmpeg', {timeout: 60_000}, () => 
         expect(arg).not.toContain('clip.mp4');
       }
     }
+    // What ffprobe is asked for: no tags, the display rotation as side data.
+    const probeArgv = calls[0]!.argv;
+    expect(probeArgv.slice(probeArgv.indexOf('-show_entries'), probeArgv.indexOf('-show_entries') + 2)).toEqual([
+      '-show_entries',
+      'format=duration,size,bit_rate:stream=codec_type,codec_name,width,height,avg_frame_rate,channels:stream_side_data=rotation',
+    ]);
     // ffprobe has no -nostdin (it never reads stdin, which is closed); every
     // ffmpeg call has it.
     for (const call of calls.filter((each) => each.tool === 'ffmpeg')) {
@@ -255,7 +298,7 @@ describe('the video job with fake ffprobe and ffmpeg', {timeout: 60_000}, () => 
     expect(await videoJob(rewriting, videoRequest(cwd, side))).toMatchObject({ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true});
     // The same bytes on both reads: a filter turns them into what git stores.
     const steady = createWorkerHandler({video: {env: {PATH: tools.dir}, tempDir: () => tempDir, sleep: async () => undefined}});
-    expect(await videoJob(steady, videoRequest(cwd, side))).toEqual({ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)'});
+    expect(await videoJob(steady, videoRequest(cwd, side))).toEqual({ok: false, state: 'error', reason: 'preview unavailable: a git filter changes this file (shown as text)', disk: true, filter: true});
     expect(tools.calls()).toEqual([]);
   });
 
@@ -351,10 +394,12 @@ describe('the video job with fake ffprobe and ffmpeg', {timeout: 60_000}, () => 
     fs.writeFileSync(path.join(cwd, 'new.mp4'), mp4Bytes(5));
     const {handler, tempDir} = handlerWith(null);
     const worktree = await handler.handle({type: 'exportCopy', cwd, side: worktreeSide(cwd, 'new.mp4'), format: 'mp4', dir: tempDir}) as ExportResult;
-    expect(worktree).toEqual({ok: true, path: path.join(cwd, 'new.mp4')});
+    const checked = fs.statSync(path.join(cwd, 'new.mp4'));
+    expect(worktree).toEqual({ok: true, path: path.join(cwd, 'new.mp4'), dev: checked.dev, ino: checked.ino});
     const blob = await handler.handle({type: 'exportCopy', cwd, side: blobSide(cwd, 'old.mp4', 'before'), format: 'mp4', dir: tempDir}) as ExportResult;
     expect(blob).toEqual({ok: true, path: path.join(tempDir, 'open-1', 'before.mp4')});
     expect(fs.readFileSync(path.join(tempDir, 'open-1', 'before.mp4'))).toEqual(mp4Bytes(4));
+    expect(fs.statSync(path.join(tempDir, 'open-1', 'before.mp4')).mode & 0o777).toBe(0o400);
     // A symlink in the work tree is never handed to a player.
     fs.symlinkSync('/etc/hosts', path.join(cwd, 'link.mp4'));
     const linked = await handler.handle({type: 'exportCopy', cwd, side: {...worktreeSide(cwd, 'new.mp4'), path: 'link.mp4'}, format: 'mp4', dir: tempDir}) as ExportResult;
@@ -362,7 +407,62 @@ describe('the video job with fake ffprobe and ffmpeg', {timeout: 60_000}, () => 
   });
 });
 
+describe('opening a work tree video', {timeout: 30_000}, () => {
+  const hashOf = (bytes: Buffer) => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+
+  it('copies the verified bytes out when asked, named from the id, and refuses a file past 512 MB', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.webm'), webmBytes());
+    const {handler, tempDir} = handlerWith(null);
+    const side = worktreeSide(cwd, 'clip.webm');
+    const copied = await handler.handle({type: 'exportCopy', cwd, side, format: 'webm', dir: tempDir, copy: true}) as ExportResult;
+    if (!copied.ok) throw new Error(copied.reason);
+    const oid = git(cwd, 'hash-object', 'clip.webm').trim();
+    expect(copied).toEqual({ok: true, path: path.join(tempDir, 'open-1', `${oid.slice(0, 12)}-after.webm`)});
+    expect(hashOf(fs.readFileSync(copied.path))).toBe(oid);
+    expect(fs.statSync(copied.path).mode & 0o777).toBe(0o400);
+
+    // Past the cap: nothing is copied.
+    const big = path.join(cwd, 'big.webm');
+    fs.writeFileSync(big, webmBytes());
+    fs.truncateSync(big, 512 * 1024 * 1024 + 1);
+    const tooBig = await handler.handle({type: 'exportCopy', cwd, side: {...side, path: 'big.webm', key: 'worktree|big.webm|x'}, format: 'webm', dir: tempDir, copy: true});
+    expect(tooBig).toEqual({ok: false, state: 'error', reason: 'too large to open safely (over 512 MB)'});
+  });
+
+  it('copies nothing when the file changes between the hash and the copy', async () => {
+    const cwd = initRepo();
+    const file = path.join(cwd, 'clip.webm');
+    fs.writeFileSync(file, webmBytes());
+    const side = worktreeSide(cwd, 'clip.webm');
+    const {handler, tempDir} = handlerWith(null);
+    // Touched after the hash: the descriptor for the copy is refused.
+    const lstat = fs.promises.lstat.bind(fs.promises);
+    let looks = 0;
+    vi.spyOn(fs.promises, 'lstat').mockImplementation(async (...args: Parameters<typeof fs.promises.lstat>) => {
+      if (args[0] === file) {
+        looks += 1;
+        if (looks === 3) fs.utimesSync(file, new Date(), new Date(Date.now() + 5_000));
+      }
+      return lstat(...args) as ReturnType<typeof fs.promises.lstat>;
+    });
+    const result = await handler.handle({type: 'exportCopy', cwd, side, format: 'webm', dir: tempDir, copy: true});
+    expect(result).toEqual({ok: false, state: 'stale', reason: 'the file changed on disk', disk: true});
+    const copies = path.join(tempDir, 'open-1');
+    expect(fs.existsSync(copies) ? fs.readdirSync(copies) : []).toEqual([]);
+  });
+});
+
 describe('reading ffprobe\'s answer', () => {
+  it('swaps width and height for a display rotation of a quarter turn, and only then', () => {
+    const probeWith = (rotation?: unknown) => JSON.stringify({
+      streams: [{codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080, avg_frame_rate: '30/1', ...(rotation === undefined ? {} : {side_data_list: [{rotation}]})}],
+      format: {duration: '1.0'},
+    });
+    for (const rotation of [-90, 90, 270, -270, 89.6]) expect(parseProbe(probeWith(rotation)), String(rotation)).toMatchObject({width: 1080, height: 1920});
+    for (const rotation of [undefined, 0, 180, -180, 45, 'x', null]) expect(parseProbe(probeWith(rotation)), String(rotation)).toMatchObject({width: 1920, height: 1080});
+  });
+
   it('escapes the codec names the file gives and keeps them short', () => {
     const codec = `h264\x1B[31m\u{10EEEE}${'x'.repeat(40)}`;
     const meta = parseProbe(JSON.stringify({
@@ -401,6 +501,126 @@ describe('drawing the strip', {timeout: 60_000}, () => {
     const meta = await sharp(result.png).metadata();
     expect(meta.width).toBeLessThan(strip.cols * strip.cellPx.w);
     expect(meta.width! / meta.height!).toBeCloseTo((strip.cols * strip.cellPx.w) / (strip.rows * strip.cellPx.h), 1);
+  });
+});
+
+describe('probe results that describe the file on disk', {timeout: 30_000}, () => {
+  it('asks ffprobe again when the file changed between hashing and the probe, caching nothing', async () => {
+    const cwd = initRepo();
+    const file = path.join(cwd, 'clip.mp4');
+    fs.writeFileSync(file, mp4Bytes());
+    const side = worktreeSide(cwd, 'clip.mp4');
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
+    const {handler} = handlerWith(tools);
+    // The second look at the file, the probe's open, finds it touched since
+    // it was hashed: same bytes, a new modification time.
+    const lstat = fs.promises.lstat.bind(fs.promises);
+    let looks = 0;
+    vi.spyOn(fs.promises, 'lstat').mockImplementation(async (...args: Parameters<typeof fs.promises.lstat>) => {
+      if (args[0] === file) {
+        looks += 1;
+        if (looks === 2) fs.utimesSync(file, new Date(), new Date(Date.now() + 5_000));
+      }
+      return lstat(...args) as ReturnType<typeof fs.promises.lstat>;
+    });
+    expect(await videoJob(handler, videoRequest(cwd, side))).toEqual({ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true});
+    expect(tools.calls()).toEqual([]);
+    // The next job for the same key runs ffprobe.
+    expect(await videoJob(handler, videoRequest(cwd, side))).toMatchObject({ok: true, meta: {width: 1920}});
+    expect(tools.calls().filter((call) => call.tool === 'ffprobe')).toHaveLength(1);
+  });
+
+  it('caches no verdict when ffprobe read the file, failed, and the file changed under it', async () => {
+    const cwd = initRepo();
+    const file = path.join(cwd, 'clip.mp4');
+    const bytes = mp4Bytes();
+    fs.writeFileSync(file, bytes);
+    const side = worktreeSide(cwd, 'clip.mp4');
+    // ffprobe opens fd 3, then the file is written again under it (the same
+    // bytes, a new modification time) and ffprobe fails.
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, exitCode: 1, rewrite: {when: '-show_entries', file, bytes}});
+    const {handler} = handlerWith(tools, {});
+    const probes = () => tools.calls().filter((call) => call.tool === 'ffprobe');
+    expect(await videoJob(handler, videoRequest(cwd, side))).toEqual({ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true});
+    expect(probes()).toHaveLength(1);
+    expect(probes()[0]!.fd3Bytes).toBe(bytes.length);
+    // The next job for the same key asks ffprobe again.
+    expect(await videoJob(handler, videoRequest(cwd, side))).toEqual({ok: false, state: 'stale', reason: 'changed on disk · refreshing', disk: true});
+    expect(probes()).toHaveLength(2);
+  });
+
+  for (const [label, failure] of [
+    ['the Linux loader', {stderr: 'ffprobe: error while loading shared libraries: libavdevice.so.61: cannot open shared object file: No such file or directory\n', exitCode: 127}],
+    ['dyld', {stderr: 'dyld[4242]: Library not loaded: /opt/ffmpeg/lib/libavdevice.61.dylib\n', signal: 'SIGABRT' as const}],
+  ] as const) {
+    it(`remembers nothing when ffprobe could not load its libraries (${label})`, async () => {
+      const cwd = initRepo();
+      fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+      const side = worktreeSide(cwd, 'clip.mp4');
+      const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, ...failure});
+      const {handler} = handlerWith(tools);
+      for (let job = 0; job < 2; job += 1) {
+        expect(await videoJob(handler, videoRequest(cwd, side))).toMatchObject({ok: true, meta: null, strip: null});
+      }
+      // A fact about this machine's setup: asked again on each job.
+      expect(tools.calls().filter((call) => call.tool === 'ffprobe')).toHaveLength(2);
+    });
+  }
+
+  it('hands ffprobe and ffmpeg the loader paths an install may need', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
+    const libs = makeTempDir('branch-review-ffmpeg-lib-');
+    const tempDir = makeTempDir('branch-review-media-session-');
+    const env = {...process.env, PATH: `${tools.dir}${path.delimiter}/usr/bin${path.delimiter}/bin`, LD_LIBRARY_PATH: libs, DYLD_FALLBACK_LIBRARY_PATH: libs, FFREPORT: '1'};
+    const handler = createWorkerHandler({video: {env, tempDir: () => tempDir, platform: 'darwin'}});
+    expect(await videoJob(handler, videoRequest(cwd, worktreeSide(cwd, 'clip.mp4')))).toMatchObject({ok: true, meta: {width: 1920}});
+    const calls = tools.calls();
+    expect(calls.map((call) => call.tool)).toEqual(['ffprobe', 'ffmpeg', 'ffmpeg', 'ffmpeg', 'ffmpeg']);
+    for (const call of calls) {
+      expect(call.env).toMatchObject({LD_LIBRARY_PATH: libs, DYLD_FALLBACK_LIBRARY_PATH: libs});
+      expect(call.env.FFREPORT).toBeUndefined();
+    }
+  });
+
+  it('drops loader path entries that are empty, relative or in the repo before the tools see them', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+    fs.mkdirSync(path.join(cwd, 'lib'));
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
+    const libs = makeTempDir('branch-review-ffmpeg-lib-');
+    // Outside the repo by its spelling, inside it once resolved.
+    const link = path.join(makeTempDir('branch-review-lib-link-'), 'lib');
+    fs.symlinkSync(path.join(cwd, 'lib'), link);
+    const tempDir = makeTempDir('branch-review-media-session-');
+    const env = {
+      ...process.env,
+      PATH: `${tools.dir}${path.delimiter}/usr/bin${path.delimiter}/bin`,
+      LD_LIBRARY_PATH: [path.join(cwd, 'lib'), '', 'lib', link, libs].join(path.delimiter),
+      DYLD_FALLBACK_LIBRARY_PATH: [path.join(cwd, 'lib'), '', 'lib'].join(path.delimiter),
+    };
+    const handler = createWorkerHandler({video: {env, tempDir: () => tempDir, platform: 'darwin'}});
+    expect(await videoJob(handler, videoRequest(cwd, worktreeSide(cwd, 'clip.mp4')))).toMatchObject({ok: true, meta: {width: 1920}});
+    const calls = tools.calls();
+    expect(calls.map((call) => call.tool)).toEqual(['ffprobe', 'ffmpeg', 'ffmpeg', 'ffmpeg', 'ffmpeg']);
+    for (const call of calls) {
+      expect(call.env.LD_LIBRARY_PATH).toBe(libs);
+      // Nothing left: the variable is not set at all.
+      expect(call.env).not.toHaveProperty('DYLD_FALLBACK_LIBRARY_PATH');
+    }
+  });
+
+  it('remembers an ffprobe failure on a file that stayed the same', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+    const side = worktreeSide(cwd, 'clip.mp4');
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, exitCode: 1});
+    const {handler} = handlerWith(tools);
+    for (let job = 0; job < 2; job += 1) {
+      expect(await videoJob(handler, videoRequest(cwd, side))).toMatchObject({ok: true, meta: null, strip: null});
+    }
+    expect(tools.calls().filter((call) => call.tool === 'ffprobe')).toHaveLength(1);
   });
 });
 
@@ -490,6 +710,60 @@ describe('the video job in the real media worker', {timeout: 60_000}, () => {
     } finally {
       backend.dispose();
     }
+  });
+});
+
+describe('the tools\' cwd and environment in the real media worker', {timeout: 60_000}, () => {
+  it('runs ffprobe and ffmpeg in the session temp dir with only an allow-listed environment', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+    commitAll(cwd, 'add clip');
+    const before = [...snapshotTree(cwd)].filter(([name]) => !name.startsWith('.git'));
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
+    const tempDir = makeTempDir('branch-review-media-session-');
+    const env = {
+      ...process.env,
+      PATH: `${tools.dir}${path.delimiter}${process.env.PATH ?? ''}`,
+      FFREPORT: '1',
+      AV_LOG_FORCE_COLOR: '1',
+      FFMPEG_DATADIR: '/nowhere',
+      BRANCH_REVIEW_CANARY: 'repo-secret',
+      LANG: 'en_US.UTF-8',
+    };
+    // The worker runs in the repo, as it does under the CLI.
+    const backend = createWorkerBackend({tempDir: () => tempDir, env, cwd});
+    try {
+      const result = await backend.video!(videoRequest(cwd, blobSide(cwd, 'clip.mp4')), new AbortController().signal);
+      if (!result.ok) throw new Error(result.reason);
+      const calls = tools.calls();
+      expect(calls.map((call) => call.tool)).toEqual(['ffprobe', 'ffmpeg', 'ffmpeg', 'ffmpeg', 'ffmpeg']);
+      const sessionWorker = fs.realpathSync(path.join(tempDir, 'worker'));
+      for (const call of calls) {
+        expect(call.cwd).toBe(sessionWorker);
+        // macOS adds __CF_USER_TEXT_ENCODING to every process it starts.
+        expect(Object.keys(call.env).filter((key) => !['PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', '__CF_USER_TEXT_ENCODING'].includes(key))).toEqual([]);
+        for (const key of ['FFREPORT', 'AV_LOG_FORCE_COLOR', 'FFMPEG_DATADIR', 'BRANCH_REVIEW_CANARY', 'HOME']) expect(call.env[key], key).toBeUndefined();
+        expect(call.env).toMatchObject({PATH: env.PATH, TMPDIR: path.join(tempDir, 'worker'), LANG: 'en_US.UTF-8'});
+      }
+    } finally {
+      backend.dispose();
+    }
+    expect([...snapshotTree(cwd)].filter(([name]) => !name.startsWith('.git'))).toEqual(before);
+  });
+
+  it('falls back to the OS temp dir, never the repo, when the worker runs outside a session', async () => {
+    const cwd = initRepo();
+    fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
+    const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
+    const start = process.cwd();
+    try {
+      process.chdir(cwd);
+      const {handler} = handlerWith(tools);
+      expect(await videoJob(handler, videoRequest(cwd, worktreeSide(cwd, 'clip.mp4')))).toMatchObject({ok: true});
+    } finally {
+      process.chdir(start);
+    }
+    for (const call of tools.calls()) expect(call.cwd).toBe(fs.realpathSync(os.tmpdir()));
   });
 });
 

@@ -82,6 +82,21 @@ function isPlaceholderRow(row: SectionRow | undefined) {
   return row?.kind === 'body' && row.block === -1;
 }
 
+// The end of the placeholder line at the top of a section: its first row and
+// every wrapped row after it. 0 when the section does not start with one.
+function placeholderEnd(rows: readonly SectionRow[]) {
+  if (!isPlaceholderRow(rows[0])) return 0;
+  let end = 1;
+  while (rows[end]?.continuation === true && rows[end]!.block === -1) end += 1;
+  return end;
+}
+
+// Whether the placeholder names the kind of change and nothing else; a rename
+// source or a mode change is text the picture does not show.
+function placeholderIsKindOnly(file: ReviewFile | undefined) {
+  return file?.renderedLines.length === 1 && file.renderedLines[0] === 'binary file changed';
+}
+
 /**
  * The sections with media rows added, and start lines renumbered after
  * them. The same array when no section is media, or nothing can be drawn.
@@ -101,9 +116,13 @@ export function addMediaRows<S extends WrappedSection & {file?: ReviewFile}>(sec
         // it. An SVG's picture goes before its first source block, whose
         // frame opens with a blank row under the picture; any line delta
         // prints above that block is source text and stays.
+        // The placeholder is one unit, however many rows it wraps to: it is
+        // replaced whole when it says only `binary file changed`, and kept
+        // whole, with the media rows under it, when it says more.
         const firstBlock = ref.hasSourceBlocks ? section.rows.findIndex((row) => row.block >= 0) : -1;
-        const replace = firstBlock < 0 && !added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
-        const at = firstBlock >= 0 ? firstBlock : added.textView && isPlaceholderRow(section.rows[0]) ? 1 : 0;
+        const end = placeholderEnd(section.rows);
+        const replace = firstBlock < 0 && !added.textView && placeholderIsKindOnly(section.file) ? end : 0;
+        const at = firstBlock >= 0 ? firstBlock : replace > 0 ? 0 : end;
         const lines = [...section.lines];
         const rows = [...section.rows];
         lines.splice(at, replace, ...added.lines);

@@ -6,7 +6,7 @@ import {resolveRefs, type FileStatus} from '../src/git.js';
 import type {ReviewFile} from '../src/review/model.js';
 import {git, initRepo, writeFiles} from './core-helpers.js';
 
-// Media is recognised from the patch git already printed: the `index` line's
+// Media is recognized from the patch git already printed: the `index` line's
 // object ids, the mode lines and the `Binary files` line. Anything that does
 // not fit keeps today's view.
 

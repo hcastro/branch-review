@@ -16,7 +16,7 @@ const HIDDEN_RANGES = [
   '\\u2066-\\u2069', // bidi isolates
   '\\uFEFF', // zero-width no-break space (BOM)
   '\\u{E0000}-\\u{E007F}', // tag characters
-  // Kitty image placeholder: under a foreground colour, a terminal with
+  // Kitty image placeholder: under a foreground color, a terminal with
   // Kitty graphics draws a transmitted image in this cell, so only the
   // media layer may produce it.
   '\\u{10EEEE}',

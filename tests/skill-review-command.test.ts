@@ -968,3 +968,19 @@ describe('SKILL.md', () => {
     }
   });
 });
+
+describe.each(scriptShells)('the video tools hint under %s', (shell) => {
+  it('hints at ffmpeg unless both ffprobe and ffmpeg are on PATH', {timeout: 60_000}, () => {
+    const sandbox = createSandbox();
+    const repo = createRepo(sandbox);
+    const hint = 'hint: ffmpeg/ffprobe not on PATH, so videos show their size only, without frames: brew install ffmpeg';
+    expect(runScript(sandbox, shell, [repo]).stderr).toContain(hint);
+    // ffprobe alone draws no frames.
+    writeExecutable(path.join(sandbox.bin, 'ffprobe'), '#!/bin/sh\nexit 0\n');
+    expect(runScript(sandbox, shell, [repo]).stderr).toContain(hint);
+    writeExecutable(path.join(sandbox.bin, 'ffmpeg'), '#!/bin/sh\nexit 0\n');
+    const both = runScript(sandbox, shell, [repo]);
+    expect(both.status, both.stderr).toBe(0);
+    expect(both.stderr).not.toContain('ffmpeg/ffprobe');
+  });
+});

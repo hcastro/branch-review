@@ -139,7 +139,7 @@ describe('the row and column diacritics', () => {
 });
 
 describe('placeholder runs', () => {
-  it('writes the id as a 256-colour foreground and addresses every cell by row and column', () => {
+  it('writes the id as a 256-color foreground and addresses every cell by row and column', () => {
     const run = placeholderRun(42, 3, 5, 2);
     const d = KITTY_DIACRITICS;
     expect(run).toBe(`${ESC}[38;5;42m${PLACEHOLDER}${d[3]}${d[5]}${PLACEHOLDER}${d[3]}${d[6]}${ESC}[39m`);

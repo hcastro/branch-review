@@ -1,4 +1,4 @@
-import {randomBytes} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
@@ -10,6 +10,7 @@ import {
   buildFixture,
   cellPosition,
   decodePlaceholders,
+  expectTransmitBeforeUse,
   emitMouseDragAt,
   emitMouseMoveAt,
   emitMousePressAt,
@@ -28,14 +29,17 @@ import {
   svgMediaFile,
   type FixtureFile,
 } from './ui-fixtures.js';
-import {tooltipCoversKittyRows} from '../src/ui/App.js';
+import {DIFF_FIRST_SCREEN_ROW, tooltipCoversKittyRows} from '../src/ui/App.js';
 import type {ExportRequest, ExportResult, MediaBackend, RenderRequest, RenderResult} from '../src/media/backend.js';
 import {createMediaService} from '../src/media/service.js';
 import {createWorkerHandler} from '../src/media/worker/handler.js';
-import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
+import {parseProbe} from '../src/media/worker/video.js';
+import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir} from './core-helpers.js';
+import {resolveRefs} from '../src/git.js';
+import {buildReviewModel, buildReviewSections} from '../src/review/build.js';
 import {addMediaRows} from '../src/ui/mediaRows.js';
 import {sgrCodes} from './media-helpers.js';
-import type {SectionRow} from '../src/sections.js';
+import {wrapSections, type SectionRow} from '../src/sections.js';
 
 // Kitty still images in the diff pane: placeholder rows in place of the
 // `binary file changed` line, drawn from a media service over a fake
@@ -85,7 +89,7 @@ function boxRectangle(frame: string | undefined) {
 
 describe('Kitty still images', () => {
   it('draws an added PNG as a contiguous rectangle of placeholder cells inside the pane', async () => {
-    const {instance, graphicsWrites} = mediaApp([textFile('src/a.ts', 3), LOGO]);
+    const {instance, graphicsWrites, timeline} = mediaApp([textFile('src/a.ts', 3), LOGO]);
     await settle();
     // Jump to the picture.
     instance.stdin.write('\u001B[B');
@@ -116,6 +120,7 @@ describe('Kitty still images', () => {
     expect(commands.find((command) => command.a === 'p')).toMatchObject({i: id, U: 1, c: 20, r: 5, q: 2});
     const firstWithId = instance.frames.findIndex((each) => decodePlaceholders(each).length > 0);
     expect(firstWithId).toBeGreaterThan(0);
+    expectTransmitBeforeUse(timeline);
 
     const text = frameLines(frame).join('\n');
     expect(text).toContain('after');
@@ -204,7 +209,7 @@ describe('Kitty still images', () => {
     expect(decodePlaceholders(frame).length).toBeGreaterThan(0);
     for (const cell of decodePlaceholders(frame)) {
       const line = lines[cell.line]!;
-      // No background colour and no inverse, read as codes: the image's own
+      // No background color and no inverse, read as codes: the image's own
       // `38;5;N` is a foreground whatever N is.
       const codes = sgrCodeNames(line);
       expect(codes).not.toContain('48');
@@ -218,11 +223,11 @@ describe('Kitty still images', () => {
     instance.unmount();
   };
 
-  it('puts no arrival wash or selection colour inside a media row', async () => {
+  it('puts no arrival wash or selection color inside a media row', async () => {
     await noWashOrSelection();
   });
 
-  it.each([7, 48])('puts no arrival wash or selection colour inside a media row whose image id is %i', async (firstId) => {
+  it.each([7, 48])('puts no arrival wash or selection color inside a media row whose image id is %i', async (firstId) => {
     await noWashOrSelection(firstId);
   });
 
@@ -254,7 +259,7 @@ describe('Kitty still images', () => {
 
   it('keeps a selection across a picture while the picture loads, and copies the same text', async () => {
     const files = [textFile('src/a.ts', 3), LOGO, textFile('src/b.ts', 3)];
-    const selectionColour = '\u001B[48;2;28;68;76m';
+    const selectionColor = '\u001B[48;2;28;68;76m';
     // Inspect answers only when the test opens the gate, so the picture is
     // one `loading preview…` row while the drag starts and its full height
     // when it ends.
@@ -291,7 +296,7 @@ describe('Kitty still images', () => {
       const footer = frameLines(frame).at(-2) ?? '';
       expect(footer).not.toContain('Selection cancelled');
       for (const text of ['src/a.ts line 2', 'src/b.ts line 0']) {
-        expect(frame.split('\n').find((line) => line.includes(text)), `${text} selected`).toContain(selectionColour);
+        expect(frame.split('\n').find((line) => line.includes(text)), `${text} selected`).toContain(selectionColor);
       }
       if (!releaseBeforeLoad) {
         // The text the drag ends on moved down under the grown picture.
@@ -404,6 +409,59 @@ describe('Kitty still images', () => {
     instance.unmount();
   });
 
+  describe('the tooltip guard at its boundary', () => {
+    const longName = `src/${'deeply-nested-folder-name/'.repeat(3)}a-source-file-with-a-long-name.ts`;
+    const tipLine = (lines: string[]) => lines.findIndex((line) => line.includes('│ a-source-file-with-a-long-name.ts │'));
+
+    it('maps the diff pane\'s first body row to the screen row the guard assumes', async () => {
+      // A section whose first row is plain text, outside any block.
+      const {instance} = mediaApp([{path: 'notes.txt', rawDiff: '', rendered: ['the first body row', 'the second']}], {}, {columns: 120, rows: 30});
+      await settle();
+      const lines = frameLines(instance.lastFrame());
+      expect(lines.findIndex((line) => line.includes('the first body row'))).toBe(DIFF_FIRST_SCREEN_ROW);
+      expect(lines.findIndex((line) => line.includes('the second'))).toBe(DIFF_FIRST_SCREEN_ROW + 1);
+      instance.unmount();
+    });
+
+    // Scrolls until the picture's first row is `offset` rows below the
+    // hovered tree entry, then hovers it.
+    async function hoverWithPictureAt(offset: number) {
+      const {instance} = mediaApp([textFile(longName, 12), LOGO], {}, {columns: 120, rows: 40});
+      await settle();
+      const label = cellPosition(instance.lastFrame(), ['• a-source-fil'], 'a-source-fil');
+      const firstBoxLine = () => Math.min(...decodePlaceholders(instance.lastFrame()).map((cell) => cell.line));
+      for (let presses = 0; presses < 40 && firstBoxLine() > label.row + offset; presses += 1) {
+        instance.stdin.write('j');
+        await settle();
+      }
+      expect(firstBoxLine()).toBe(label.row + offset);
+      const cells = decodePlaceholders(instance.lastFrame());
+      await emitMouseMoveAt(label.column, label.row);
+      // The tooltip shows after its hover delay.
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      await settle();
+      return {instance, label, cells};
+    }
+
+    it('draws no overlay when the picture starts on the last row the tooltip covers', async () => {
+      const {instance, cells} = await hoverWithPictureAt(3);
+      const lines = frameLines(instance.lastFrame());
+      expect(tipLine(lines)).toBe(-1);
+      expect(lines[1]).toContain('a-source-file-with-a-long-name.ts');
+      expect(decodePlaceholders(instance.lastFrame())).toEqual(cells);
+      instance.unmount();
+    });
+
+    it('draws the overlay when the picture starts one row below it', async () => {
+      const {instance, label, cells} = await hoverWithPictureAt(4);
+      const lines = frameLines(instance.lastFrame());
+      expect(tipLine(lines)).toBe(label.row + 2);
+      expect(lines[1]).not.toContain('a-source-file-with-a-long-name.ts');
+      expect(decodePlaceholders(instance.lastFrame())).toEqual(cells);
+      instance.unmount();
+    });
+  });
+
   it('decides tooltip cover from the rows it spans', () => {
     const tooltip = {left: 30, top: 8, width: 40};
     expect(tooltipCoversKittyRows(tooltip, 40, (row) => row === 10)).toBe(true);
@@ -502,6 +560,105 @@ describe('Kitty still images', () => {
     await settle();
     expect(decodePlaceholders(instance.lastFrame()).length).toBe(100);
     instance.unmount();
+  });
+
+  describe('a placeholder that says more than the kind', {timeout: 30_000}, () => {
+    const NEW_PATH = 'assets/images/marketing/landing-page/hero-section/new-hero-banner-dark.png';
+    const OLD_PATH = 'assets/images/marketing/landing-page/hero-section/old-hero-banner-dark.png';
+    const size = {columns: 100, rows: 24};
+
+    // A PNG renamed, changed a little and made executable, built by real git.
+    function renamedReview() {
+      const noise = randomBytes(4096);
+      const cwd = initRepo({});
+      fs.mkdirSync(path.join(cwd, path.dirname(OLD_PATH)), {recursive: true});
+      fs.writeFileSync(path.join(cwd, OLD_PATH), Buffer.concat([pngFixture(8, 4), noise]));
+      commitAll(cwd, 'add banner');
+      git(cwd, 'checkout', '-q', '-b', 'feature');
+      git(cwd, 'mv', OLD_PATH, NEW_PATH);
+      fs.writeFileSync(path.join(cwd, NEW_PATH), Buffer.concat([pngFixture(8, 4), noise, Buffer.from('tail')]));
+      fs.chmodSync(path.join(cwd, NEW_PATH), 0o755);
+      commitAll(cwd, 'rename banner');
+      const review = buildReviewModel({cwd, range: resolveRefs(cwd, 'HEAD', 'main'), width: 100});
+      const file = review.files[0]!;
+      const [, before, after] = /^index (\w+)\.\.(\w+)/m.exec(file.rawDiff)!;
+      return {review, file, before: before!, after: after!};
+    }
+
+    function renamedApp() {
+      const {review, file, before, after} = renamedReview();
+      const sides = {[before]: sideInfo({width: 200, height: 100, bytes: 4_000}), [after]: sideInfo({width: 200, height: 100, bytes: 4_004})};
+      const fake = fakeMediaService({sides, review});
+      const instance = renderFixture({sections: buildReviewSections(review), review, media: fake.service}, size);
+      return {...fake, instance, file};
+    }
+
+    // The diff pane's text, one entry per screen line: everything right of
+    // the tree pane, whose top border is the first of two on one line.
+    const paneText = (frame: string | undefined) => {
+      const lines = frameLines(frame);
+      const top = lines.find((line) => (line.match(/╭/g) ?? []).length >= 2)!;
+      const start = top.indexOf('╭', top.indexOf('╮'));
+      return lines.map((line) => line.slice(start + 1));
+    };
+
+    it('keeps the whole wrapped rename and mode line above the picture', async () => {
+      const {instance, file} = renamedApp();
+      const placeholder = `renamed from ${OLD_PATH}, binary file changed, mode 100644 → 100755`;
+      expect(file.renderedLines).toEqual([placeholder]);
+      await settle();
+      const frame = instance.lastFrame();
+      const lines = paneText(frame);
+      const boxLines = [...new Set(decodePlaceholders(frame).map((cell) => cell.line))];
+      expect(boxLines.length).toBeGreaterThan(0);
+      const squash = (text: string) => text.replace(/[\s│]+/g, '');
+      const above = squash(lines.slice(0, boxLines[0]).join(''));
+      expect(above).toContain(squash(placeholder));
+      const below = squash(lines.slice(boxLines.at(-1)! + 1).join(''));
+      for (const fragment of ['renamedfrom', 'binaryfilechanged', 'mode100644', '→100755', 'hero-banner']) expect(below).not.toContain(fragment);
+      instance.unmount();
+    });
+
+    it('lists the details after the last wrapped row of that line in the text view', async () => {
+      const {instance} = renamedApp();
+      await settle();
+      instance.stdin.write('v');
+      await settle();
+      const lines = paneText(instance.lastFrame());
+      const tail = lines.findIndex((line) => line.includes('100755'));
+      const table = lines.findIndex((line) => /format\s+PNG/.test(line));
+      expect(tail).toBeGreaterThanOrEqual(0);
+      expect(table).toBeGreaterThan(tail);
+      expect(lines.findIndex((line) => line.includes('renamed from'))).toBeLessThan(tail);
+      instance.unmount();
+    });
+
+    it('still replaces a plain added PNG\'s one placeholder row, keeping its row count', () => {
+      const fixture = buildFixture([LOGO]);
+      const fake = fakeMediaService({sides: SIDES, review: fixture.review});
+      const wrapped = wrapSections(fixture.sections, 80)[0]!;
+      const section = {...wrapped, rows: wrapped.rows!, file: fixture.review.files[0]!};
+      const [withMedia] = addMediaRows([section], fake.service, {innerWidth: 80, viewportRows: 30});
+      expect(section.rows[0]).toMatchObject({kind: 'body', block: -1});
+      const mediaRows = withMedia!.rows.filter((row) => row.kind === 'media').length;
+      expect(mediaRows).toBeGreaterThan(0);
+      // The media rows stand where the one placeholder row was.
+      expect(withMedia!.rows.length).toBe(section.rows.length - 1 + mediaRows);
+      expect(withMedia!.rows[0]!.kind).toBe('media');
+      expect(withMedia!.lines.join('\n')).not.toContain('binary file changed');
+    });
+
+    it('leaves the frame unchanged with previews off', async () => {
+      const {review} = renamedReview();
+      const sections = buildReviewSections(review);
+      const plain = renderFixture({sections, review}, size);
+      const off = fakeMediaService({caps: {...KITTY_CAPS, protocol: 'none'}, review});
+      const withOff = renderFixture({sections, review, media: off.service}, size);
+      await settle();
+      expect(withOff.lastFrame()).toBe(plain.lastFrame());
+      plain.unmount();
+      withOff.unmount();
+    });
   });
 
   it('shows a modified image\'s two sides side by side under the tab row', async () => {
@@ -697,7 +854,7 @@ describe('compare modes', () => {
   });
 
   it('flips with 2, sending the hidden side ahead, and swaps with 2 again or a click without sending anything', async () => {
-    const {instance, graphicsWrites} = mediaApp([MODIFIED], {sides: BOTH});
+    const {instance, graphicsWrites, timeline} = mediaApp([MODIFIED], {sides: BOTH});
     await settle();
     instance.stdin.write('2');
     await settle();
@@ -734,6 +891,7 @@ describe('compare modes', () => {
     expect(new Set(decodePlaceholders(frame).map((each) => each.id))).toEqual(new Set([afterId]));
     expect(transmits(graphicsWrites)).toHaveLength(sent);
     expect(graphicsWrites).toHaveLength(writesBefore);
+    expectTransmitBeforeUse(timeline);
     instance.unmount();
   });
 
@@ -1073,7 +1231,7 @@ describe('compare modes', () => {
     added.instance.unmount();
   });
 
-  it('shows both sides\' size and bytes in the metrics row, the byte change coloured', async () => {
+  it('shows both sides\' size and bytes in the metrics row, the byte change colored', async () => {
     const {instance} = mediaApp([MODIFIED], {sides: BOTH});
     await settle();
     const frame = instance.lastFrame() ?? '';
@@ -1503,7 +1661,7 @@ describe('block preview', () => {
     const count = [...stripAnsi(line)].filter((char) => char === '▀' || char === '▄').length;
     return count > 0 ? [{index, count}] : [];
   });
-  // The run of a line from the colours before its first half block to the
+  // The run of a line from the colors before its first half block to the
   // reset after its last: the box's own escapes, without the pane's.
   const boxRun = (line: string) => /(?:\u001B\[[0-9;]*m)*[▀▄][\s\S]*[▀▄](?:\u001B\[[0-9;]*m)*/.exec(line)?.[0] ?? '';
   const blocksApp = (files: FixtureFile[], options: Parameters<typeof fakeMediaService>[0] = {}, size = SIZE) => mediaApp(files, {caps: BLOCKS_CAPS, ...options}, size);
@@ -1524,7 +1682,7 @@ describe('block preview', () => {
       const plain = stripAnsi(frameLines(frame)[index]!);
       expect(stringWidth(plain)).toBe(SIZE.columns);
       expect(plain.trimEnd().endsWith('│')).toBe(true);
-      // Every cell is blue over red, as the fake drew it, in 24-bit colour.
+      // Every cell is blue over red, as the fake drew it, in 24-bit color.
       expect(boxRun(rawLines(frame)[index]!)).toContain('38;2;30;120;200');
       expect(boxRun(rawLines(frame)[index]!)).toContain('48;2;200;40;40');
     }
@@ -1560,7 +1718,7 @@ describe('block preview', () => {
     kitty.instance.unmount();
   });
 
-  it('uses only 256-colour codes at colour depth 2', async () => {
+  it('uses only 256-color codes at color depth 2', async () => {
     const {instance} = blocksApp([LOGO], {caps: {...BLOCKS_CAPS, colorDepth: 2}});
     await settle();
     const frame = instance.lastFrame();
@@ -1574,7 +1732,7 @@ describe('block preview', () => {
         if (code[0] === '38' || code[0] === '48') expect(code[1]).toBe('5');
         else expect(['0', '39', '49']).toContain(code[0]);
       }
-      // Blue #1e78c8 and red #c82828 in the 256-colour cube.
+      // Blue #1e78c8 and red #c82828 in the 256-color cube.
       expect(run).toMatch(/38;5;32[m;]/);
       expect(run).toMatch(/48;5;160[m;]/);
     }
@@ -1621,11 +1779,11 @@ describe('block preview', () => {
   });
 
   it('compares a modified image side by side, by flipping and as a difference, in blocks', async () => {
-    // Each side in its own colour, so the frame says which one shows.
+    // Each side in its own color, so the frame says which one shows.
     const render = (request: RenderRequest): RenderResult => {
       const {cols, rows} = request.target;
-      const colour = request.op === 'blocksDifference' ? 0xd2a8ff : request.sides[0]!.side === 'before' ? 0xc82828 : 0x1e78c8;
-      return {ok: true, cells: new Uint32Array(cols * rows * 2).fill(colour), cols, rows, ...(request.op === 'blocksDifference' ? {changedRatio: 0.31} : {})};
+      const color = request.op === 'blocksDifference' ? 0xd2a8ff : request.sides[0]!.side === 'before' ? 0xc82828 : 0x1e78c8;
+      return {ok: true, cells: new Uint32Array(cols * rows * 2).fill(color), cols, rows, ...(request.op === 'blocksDifference' ? {changedRatio: 0.31} : {})};
     };
     const {instance, calls, graphicsWrites} = blocksApp([MODIFIED], {sides: BOTH, render}, {columns: 160, rows: 34});
     await settle();
@@ -1902,6 +2060,245 @@ describe('video', () => {
     await emitMousePressAt(quickLook.column, quickLook.row);
     await settle();
     expect(opened.slice(2).map((entry) => entry.command)).toEqual(['/usr/bin/open', '/usr/bin/qlmanage']);
+    instance.unmount();
+  });
+
+  describe('opening a work tree video', {timeout: 30_000}, () => {
+    // A changed video whose after side is the work tree file in `repo`.
+    function worktreeVideoApp(name: string, bytes: Buffer, options: {platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; exportCopy?: (request: ExportRequest, repo: string) => Promise<ExportResult>} = {}) {
+      const repo = initRepo();
+      fs.mkdirSync(path.join(repo, 'media'));
+      const abs = path.join(repo, 'media', name);
+      fs.writeFileSync(abs, bytes);
+      const afterId = git(repo, 'hash-object', `media/${name}`).trim().slice(0, 7);
+      const file = binaryMediaFile(`media/${name}`, 'modified', ['1a2b3c4', afterId]);
+      const fixture = buildFixture([file]);
+      const tempDir = makeTempDir('branch-review-media-session-');
+      const handler = createWorkerHandler();
+      const exportCopy = options.exportCopy
+        ? (request: ExportRequest) => options.exportCopy!(request, repo)
+        : (request: ExportRequest) => handler.handle({type: 'exportCopy', ...request}) as Promise<ExportResult>;
+      const format = name.endsWith('.webm') ? 'webm' : 'mp4';
+      const sides = {
+        '1a2b3c4': sideInfo({oid: '1a2b3c4'.padEnd(40, '0'), format, width: 0, height: 0, bytes: 4_100_000}),
+        [afterId]: sideInfo({oid: afterId.padEnd(40, '0'), format, width: 0, height: 0, bytes: bytes.length}),
+      };
+      const fake = fakeMediaService({sides, videoMeta: {'1a2b3c4': VIDEO_META['1a2b3c4'], [afterId]: VIDEO_META['5d6e7f8']}, exportCopy, tempDir, platform: options.platform ?? 'darwin', env: options.env ?? {}});
+      fake.service.setReview(fixture.review, {cwd: repo, range: {includeWorktree: true}});
+      const instance = renderFixture({...fixture, media: fake.service}, TALL);
+      return {...fake, instance, repo, abs, afterId, tempDir};
+    }
+    const mp4 = () => Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom', 'latin1'), Buffer.from([0, 0, 2, 0]), Buffer.from('isommp42', 'latin1'), Buffer.alloc(200, 7)]);
+    const webm = () => Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x84]), Buffer.from('webm', 'latin1'), Buffer.alloc(200, 3)]);
+    const blobHash = (bytes: Buffer) => createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+
+    it('plays a work tree MP4 in QuickTime by bundle id, and Quick Looks it, at its real path', async () => {
+      const {instance, opened, abs, calls} = worktreeVideoApp('demo.mp4', mp4());
+      await settle(10);
+      instance.stdin.write('o');
+      await settle(10);
+      instance.stdin.write('O');
+      await settle(10);
+      expect(opened).toEqual([
+        {command: '/usr/bin/open', args: ['-b', 'com.apple.QuickTimePlayerX', abs]},
+        {command: '/usr/bin/qlmanage', args: ['-p', abs]},
+      ]);
+      for (const call of calls.filter((each) => each.type === 'exportCopy')) expect(call.request).not.toHaveProperty('copy');
+      instance.unmount();
+    });
+
+    it('Quick Looks a work tree WebM on macOS at its real path, as the README says', async () => {
+      const {instance, opened, abs, calls} = worktreeVideoApp('demo.webm', webm());
+      await settle(10);
+      instance.stdin.write('O');
+      await vi.waitFor(() => expect(opened).toHaveLength(1));
+      expect(opened).toEqual([{command: '/usr/bin/qlmanage', args: ['-p', abs]}]);
+      for (const call of calls.filter((each) => each.type === 'exportCopy')) expect(call.request).not.toHaveProperty('copy');
+      const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+      const video = readme.split('\n').find((line) => line.startsWith("A video's header is"))!;
+      expect(video).toContain('`O` previews any work tree video in Quick Look as the file itself');
+      expect(video).toContain('Every other `o` on a work tree video, and every open of a committed version, uses a verified read-only temp copy.');
+      instance.unmount();
+    });
+
+    it('Quick Looks a work tree WebM at its real path after o opened a copy of it, and o opens that copy again', async () => {
+      const {instance, opened, abs, calls, tempDir} = worktreeVideoApp('demo.webm', webm());
+      await settle(10);
+      instance.stdin.write('o');
+      await vi.waitFor(() => expect(opened).toHaveLength(1));
+      const copy = opened[0]!.args.at(-1)!;
+      expect(opened[0]).toEqual({command: '/usr/bin/open', args: [copy]});
+      expect(copy.startsWith(`${tempDir}${path.sep}open-`)).toBe(true);
+      instance.stdin.write('O');
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      expect(opened[1]).toEqual({command: '/usr/bin/qlmanage', args: ['-p', abs]});
+      // The copy is still kept for o: no second copy is exported.
+      instance.stdin.write('o');
+      await vi.waitFor(() => expect(opened).toHaveLength(3));
+      expect(opened[2]).toEqual({command: '/usr/bin/open', args: [copy]});
+      const exports = calls.filter((each) => each.type === 'exportCopy').map((each) => (each.request as ExportRequest).copy === true);
+      expect(exports).toEqual([true, false]);
+      instance.unmount();
+    });
+
+    it('opens nothing when the file was swapped for a symlink after the check', async () => {
+      const {instance, opened} = worktreeVideoApp('demo.mp4', mp4(), {
+        exportCopy: async (request, repo) => {
+          const abs = path.join(repo, request.side.path);
+          const checked = fs.statSync(abs);
+          // Swapped in after the worker checked it.
+          fs.mkdirSync(path.join(repo, 'Evil.app'));
+          fs.rmSync(abs);
+          fs.symlinkSync(path.join(repo, 'Evil.app'), abs);
+          return {ok: true, path: abs, dev: checked.dev, ino: checked.ino};
+        },
+      });
+      await settle(10);
+      instance.stdin.write('o');
+      await settle(10);
+      expect(frameLines(instance.lastFrame()).join('\n')).toContain("can't open: the file changed on disk");
+      expect(opened).toEqual([]);
+      instance.unmount();
+    });
+
+    for (const [label, name, bytes, platform, command] of [
+      ['a work tree WebM on macOS', 'demo.webm', webm(), 'darwin', '/usr/bin/open'],
+      ['a work tree MP4 on Linux', 'demo.mp4', mp4(), 'linux', 'xdg-open'],
+    ] as const) {
+      it(`opens ${label} from a verified copy`, async () => {
+        const bin = makeTempDir('branch-review-xdg-');
+        fs.writeFileSync(path.join(bin, 'xdg-open'), '#!/bin/sh\nexit 0\n', {mode: 0o755});
+        const {instance, opened, calls, tempDir, afterId} = worktreeVideoApp(name, bytes, {platform, env: {PATH: bin}});
+        await settle(10);
+        instance.stdin.write('o');
+        await vi.waitFor(() => expect(opened, frameLines(instance.lastFrame()).slice(-4).join('\n')).toHaveLength(1), {timeout: 10_000});
+        const request = calls.filter((each) => each.type === 'exportCopy').at(-1)!.request as ExportRequest;
+        expect(request.copy).toBe(true);
+        expect(opened[0]!.command).toBe(platform === 'linux' ? path.join(fs.realpathSync.native(bin), command) : command);
+        const copy = opened[0]!.args.at(-1)!;
+        expect(opened[0]!.args).toEqual([copy]);
+        expect(copy.startsWith(`${tempDir}${path.sep}open-`)).toBe(true);
+        expect(path.basename(copy)).toMatch(new RegExp(`^${afterId}[0-9a-f]{5}-after\\.${name.split('.').at(-1)}$`));
+        expect(blobHash(fs.readFileSync(copy)).startsWith(afterId)).toBe(true);
+        instance.unmount();
+      });
+    }
+  });
+
+  it('opens a committed video once however fast o is pressed, and opens the same copy again', async () => {
+    const tempDir = makeTempDir('branch-review-media-session-');
+    let exports = 0;
+    let release!: () => void;
+    const {instance, opened} = videoApp({
+      tempDir,
+      exportCopy: async (request) => {
+        exports += 1;
+        await new Promise<void>((resolve) => { release = resolve; });
+        const dir = path.join(request.dir, 'open-1');
+        fs.mkdirSync(dir, {recursive: true});
+        const copy = path.join(dir, 'after.mp4');
+        // Read-only, as the worker writes every copy.
+        fs.writeFileSync(copy, 'video bytes', {mode: 0o400});
+        return {ok: true, path: copy};
+      },
+    });
+    await settle(10);
+    for (let press = 0; press < 3; press += 1) {
+      instance.stdin.write('o');
+      await settle(2);
+    }
+    expect(frameLines(instance.lastFrame()).join('\n')).toContain('still opening demo.mp4');
+    release();
+    await settle(6);
+    expect(exports).toBe(1);
+    const copy = path.join(tempDir, 'open-1', 'after.mp4');
+    expect(opened).toEqual([{command: '/usr/bin/open', args: [copy]}]);
+
+    instance.stdin.write('o');
+    await settle(6);
+    expect(exports).toBe(1);
+    expect(opened).toEqual([{command: '/usr/bin/open', args: [copy]}, {command: '/usr/bin/open', args: [copy]}]);
+    // A copy that is gone is exported again.
+    fs.rmSync(copy);
+    instance.stdin.write('O');
+    await settle(2);
+    expect(exports).toBe(2);
+    release();
+    await settle(6);
+    instance.unmount();
+  });
+
+  it('exports a side again when a viewer saved over the copy it opened', async () => {
+    const SAVED_AT = 1_700_000_000;
+    const tempDir = makeTempDir('branch-review-media-session-');
+    let exports = 0;
+    const {instance, opened} = videoApp({
+      tempDir,
+      exportCopy: async (request) => {
+        exports += 1;
+        const dir = path.join(request.dir, `open-${exports}`);
+        fs.mkdirSync(dir, {recursive: true});
+        const copy = path.join(dir, 'after.mp4');
+        fs.writeFileSync(copy, 'video bytes', {mode: 0o400});
+        // A whole-second time, so a replacement can be given the same one.
+        fs.utimesSync(copy, SAVED_AT, SAVED_AT);
+        return {ok: true, path: copy};
+      },
+    });
+    const press = async (key: string) => {
+      instance.stdin.write(key);
+      await vi.waitFor(() => expect(opened.length).toBeGreaterThan(pressed));
+      pressed = opened.length;
+    };
+    let pressed = 0;
+    await settle(10);
+    await press('o');
+    await press('o');
+    expect(exports).toBe(1);
+    const first = path.join(tempDir, 'open-1', 'after.mp4');
+    expect(opened.map((entry) => entry.args.at(-1))).toEqual([first, first]);
+
+    // Saved in place, as a viewer with write access does: edited bytes.
+    fs.chmodSync(first, 0o600);
+    fs.writeFileSync(first, 'edited video bytes');
+    fs.chmodSync(first, 0o400);
+    await press('o');
+    expect(exports).toBe(2);
+    const second = path.join(tempDir, 'open-2', 'after.mp4');
+    expect(opened.at(-1)!.args.at(-1)).toBe(second);
+
+    // Saved by writing a new file and renaming it over the copy: the same
+    // size, mode and modification time, another inode.
+    const replacement = path.join(tempDir, 'open-2', 'saved.mp4');
+    fs.writeFileSync(replacement, 'VIDEO BYTES', {mode: 0o400});
+    fs.utimesSync(replacement, SAVED_AT, SAVED_AT);
+    expect(fs.statSync(replacement).mtimeMs).toBe(fs.statSync(second).mtimeMs);
+    fs.renameSync(replacement, second);
+    await press('O');
+    expect(exports).toBe(3);
+
+    // Made writable, so the next save could land unseen.
+    const third = path.join(tempDir, 'open-3', 'after.mp4');
+    fs.chmodSync(third, 0o600);
+    await press('o');
+    expect(exports).toBe(4);
+    // Left alone, the copy opens again with no export.
+    await press('o');
+    expect(exports).toBe(4);
+    expect(opened.at(-1)!.args.at(-1)).toBe(path.join(tempDir, 'open-4', 'after.mp4'));
+    instance.unmount();
+  });
+
+  it('shows a video turned a quarter by its display matrix at its displayed size, as a change', async () => {
+    const probe = (rotation?: number) => parseProbe(JSON.stringify({
+      streams: [{codec_type: 'video', codec_name: 'h264', width: 1920, height: 1080, avg_frame_rate: '30/1', ...(rotation === undefined ? {} : {side_data_list: [{rotation}]})}],
+      format: {duration: '42.0'},
+    }))!;
+    const {instance} = videoApp({videoMeta: {'1a2b3c4': probe(), '5d6e7f8': probe(-90)}});
+    await settle(10);
+    const text = frameLines(instance.lastFrame()).join('\n');
+    expect(text).toMatch(/before\s+0:42\s+4\.1 MB\s+1920 × 1080\s+H\.264\s+30 fps\s*│/);
+    expect(text).toMatch(/after\s+0:42\s+3\.6 MB −0\.5 MB\s+1080 × 1920\s+H\.264\s+30 fps changed/);
     instance.unmount();
   });
 
