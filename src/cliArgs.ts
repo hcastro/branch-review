@@ -7,8 +7,19 @@ export type CliOptions = {
   // Image previews: 'off' from --no-images, 'auto' from --images; unset
   // means auto. Set only when a flag was given.
   images?: 'auto' | 'off';
+  // --render-out <dir>: write the rendered pages there and exit, with no
+  // UI. Set only when given, as is --json, which prints the report as JSON.
+  renderOut?: string;
+  json?: boolean;
 };
 
+const RENDER_OUT = '--render-out';
+const NEEDS_DIRECTORY = '--render-out needs a directory, for example --render-out ./rendered';
+
+/**
+ * The options in `argv`. Throws with a one-line usage message for a
+ * `--render-out` with no directory, or a `--json` without one.
+ */
 export function parseCliArgs(argv: string[], {interactive}: {interactive: boolean}): CliOptions {
   const positional: string[] = [];
   let watchFlag = false;
@@ -16,8 +27,23 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
   let watchPoll = false;
   let animations = true;
   let images: CliOptions['images'];
+  let renderOut: string | undefined;
+  let json = false;
 
-  for (const arg of argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]!;
+    if (arg === RENDER_OUT || arg.startsWith(`${RENDER_OUT}=`)) {
+      const value = arg === RENDER_OUT ? argv[++index] : arg.slice(RENDER_OUT.length + 1);
+      if (!value || value.startsWith('--')) throw new Error(NEEDS_DIRECTORY);
+      renderOut = value;
+      continue;
+    }
+
+    if (arg === '--json') {
+      json = true;
+      continue;
+    }
+
     if (arg === '--watch') {
       watchFlag = true;
       continue;
@@ -57,12 +83,17 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
     positional.push(arg);
   }
 
+  if (json && renderOut === undefined) throw new Error('--json works only with --render-out');
+
   return {
     requestedBranch: positional[0] ?? 'HEAD',
     requestedBase: positional[1],
-    watch: noWatch ? false : watchFlag || interactive,
+    // Headless output is one snapshot.
+    watch: noWatch || renderOut !== undefined ? false : watchFlag || interactive,
     watchPoll,
     animations,
     ...(images ? {images} : {}),
+    ...(renderOut === undefined ? {} : {renderOut}),
+    ...(json ? {json} : {}),
   };
 }

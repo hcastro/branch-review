@@ -54,4 +54,25 @@ describe('parseCliArgs', () => {
       requestedBase: 'main',
     });
   });
+
+  it('reads --render-out with its directory, as a separate argument or after =, and --json with it', () => {
+    expect(parseCliArgs(['--render-out', 'out'], {interactive: true})).toMatchObject({renderOut: 'out', requestedBranch: 'HEAD'});
+    expect(parseCliArgs(['feature', '--render-out=./pages', '--json', 'main'], {interactive: false})).toMatchObject({
+      renderOut: './pages',
+      json: true,
+      requestedBranch: 'feature',
+      requestedBase: 'main',
+    });
+    // Headless output never watches, even in a terminal.
+    expect(parseCliArgs(['--render-out', 'out', '--watch'], {interactive: true}).watch).toBe(false);
+    expect(parseCliArgs([], {interactive: true})).not.toHaveProperty('renderOut');
+    expect(parseCliArgs([], {interactive: true})).not.toHaveProperty('json');
+  });
+
+  it('refuses --render-out with no directory, and --json without --render-out', () => {
+    expect(() => parseCliArgs(['--render-out'], {interactive: true})).toThrow('--render-out needs a directory, for example --render-out ./rendered');
+    expect(() => parseCliArgs(['--render-out', '--json'], {interactive: true})).toThrow('--render-out needs a directory');
+    expect(() => parseCliArgs(['--render-out='], {interactive: true})).toThrow('--render-out needs a directory');
+    expect(() => parseCliArgs(['--json'], {interactive: true})).toThrow('--json works only with --render-out');
+  });
 });

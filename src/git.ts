@@ -1236,6 +1236,11 @@ export async function openVerifiedVideoFd(cwd: string, filePath: string, verifie
 }
 
 /** A blob's full id and size, by its (abbreviated) id. */
+/** The id of the object `ref` holds at `filePath`, such as a pure rename's blob, which its patch doesn't name. */
+export function* objectAtRefOperation(cwd: string, ref: string, filePath: string): GitOperation<string> {
+  return yield* gitLineOperation(cwd, ['rev-parse', '--verify', `${ref}:${filePath}`]);
+}
+
 export function* blobFactsOperation(cwd: string, abbrevId: string): GitOperation<{oid: string; size: number}> {
   if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
   const oid = yield* gitLineOperation(cwd, ['-c', 'core.disambiguate=blob', 'rev-parse', '--verify', `${abbrevId}^{blob}`]);

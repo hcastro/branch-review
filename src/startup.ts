@@ -1,3 +1,4 @@
+import path from 'node:path';
 import React from 'react';
 import {parseCliArgs, type CliOptions} from './cliArgs.js';
 import {AbortedError, InterruptedError, getRepoRoot, inferBaseRefAsync, removePrivateIndexDirs, resolveRefs} from './git.js';
@@ -77,7 +78,7 @@ export type CliIo = {
   // The terminal's input, read once before the UI mounts to ask what it can
   // draw. Without it the app draws no media.
   stdin?: TtyInput;
-  stdout: {isTTY?: boolean; columns?: number; rows?: number; write(text: string): unknown};
+  stdout: {isTTY?: boolean; columns?: number; rows?: number; write(text: string, done?: () => void): unknown};
   stderr: {write(text: string): unknown};
   render: (tree: React.ReactElement, options: typeof INK_RENDER_OPTIONS) => InkInstance;
   env?: NodeJS.ProcessEnv;
@@ -139,6 +140,38 @@ function startMedia({caps: detected, cwd, env, proc, session, watching, animatio
   return {media, caps};
 }
 
+async function writeRenderedPages({cwd, startDir, range, review, outLabel, json, stdout, stderr, proc}: {
+  cwd: string;
+  startDir: string;
+  range: Awaited<ReturnType<typeof prepareStartup>>['range'];
+  review: Awaited<ReturnType<typeof prepareStartup>>['review'];
+  outLabel: string;
+  json: boolean;
+  stdout: CliIo['stdout'];
+  stderr: CliIo['stderr'];
+  proc: CliProcess;
+}) {
+  // Relative to where the command was typed, as any path argument is.
+  const outDir = path.resolve(startDir, outLabel);
+  try {
+    // Loaded only here: the renderer and its parsers stay out of the UI's
+    // startup.
+    const {formatRenderOutJson, formatRenderOutSummary, renderToDirectory} = await import('./rendered/renderOut.js');
+    const report = await renderToDirectory({cwd, range, review, outDir, outLabel, now: Date.now});
+    const text = json ? formatRenderOutJson(report) : formatRenderOutSummary(report, outLabel);
+    // A pipe on macOS takes a large write in pieces, after the call returns;
+    // exiting before the last piece is out would cut the report short.
+    await new Promise<void>((resolve) => {
+      stdout.write(text, () => resolve());
+    });
+    proc.exit(0);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    stderr.write(`branch-review: ${escapeHiddenCharacters(message.split('\n')[0] || 'unknown error')}\n`);
+    proc.exit(1);
+  }
+}
+
 /**
  * The whole CLI run: parse arguments, build the first review and run the UI.
  * The restore and cleanup handlers go in before the startup build, and the
@@ -148,7 +181,14 @@ function startMedia({caps: detected, cwd, env, proc, session, watching, animatio
  */
 export async function runCli(io: CliIo) {
   const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env} = io;
-  const options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
+  let options: CliOptions;
+  try {
+    options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
+  } catch (error) {
+    stderr.write(`branch-review: ${error instanceof Error ? error.message : String(error)}\n`);
+    proc.exit(1);
+    return;
+  }
   const terminalWidth = stdout.columns ?? 160;
 
   const session = createTerminalSession({stdout, stderr, proc});
@@ -178,6 +218,13 @@ export async function runCli(io: CliIo) {
   }
 
   const {cwd, range, resolveRange, review, initialFingerprint, requestedBranch, requestedBase} = startup;
+
+  // Headless: the pages and the report, then exit. The terminal is never
+  // asked anything and never drawn on, so stdout carries only the report.
+  if (options.renderOut !== undefined) {
+    await writeRenderedPages({cwd, startDir, range, review, outLabel: options.renderOut, json: options.json ?? false, stdout, stderr, proc});
+    return;
+  }
 
   if (!options.watch && review.files.length === 0) {
     // Ref names come from the repo.

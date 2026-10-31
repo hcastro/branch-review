@@ -43,15 +43,38 @@ function sideRef(side: SideName, source: SideRef['source'], filePath: string, ab
   return {side, source, path: filePath, abbrevId, key: `${source}|${filePath}|${abbrevId}`};
 }
 
+/**
+ * Whether a file's patch is one regular file's: a type change (file to
+ * symlink, say) is two patches in one diff, and a symlink or gitlink's
+ * content is a link target or a commit id, never the file's bytes.
+ */
+export function isRegularFilePatch(rawDiff: string) {
+  if (rawDiff.split('\n').filter((line) => line.startsWith('diff --git ')).length !== 1) return false;
+  return !LINK_MODE_LINE.test(rawDiff);
+}
+
+/** The object ids on the patch's `index` line, with an all-zero (absent) side left out. */
+export function patchObjectIds(rawDiff: string): {before?: string; after?: string} | null {
+  const index = INDEX_LINE.exec(rawDiff);
+  if (!index) return null;
+  return {
+    ...(ABSENT_ID.test(index[1]!) ? {} : {before: index[1]!}),
+    ...(ABSENT_ID.test(index[2]!) ? {} : {after: index[2]!}),
+  };
+}
+
+/** Whether git printed the patch as binary rather than as text hunks. */
+export function isBinaryPatch(rawDiff: string) {
+  return BINARY_LINE.test(rawDiff);
+}
+
 function classify(file: ReviewFile, includeWorktree: boolean): MediaRef | null {
   if (file.pathError || file.error) return null;
 
   const type = formatFor(file.path);
   if (!type) return null;
 
-  // A type change (file to symlink, say) is two patches in one diff.
-  if (file.rawDiff.split('\n').filter((line) => line.startsWith('diff --git ')).length !== 1) return null;
-  if (LINK_MODE_LINE.test(file.rawDiff)) return null;
+  if (!isRegularFilePatch(file.rawDiff)) return null;
 
   // A pure rename or a mode-only change has no index line, so there is no
   // content id to verify bytes against; today's line already describes it.

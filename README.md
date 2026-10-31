@@ -108,9 +108,21 @@ A modified image opens with its old and new versions side by side. To flip betwe
 
 For more information about terminal support, tmux setup, compare modes, and opening a file in a viewer, see [Image and video previews](docs/media-previews.md).
 
+## Read the markdown as GitHub will show it
+
+`--render-out` writes each changed markdown file as the page GitHub would show, rendered on your machine. Each page marks the blocks the branch added or changed with a bar in the margin, and marks removed content where it was:
+
+```sh
+branch-review --render-out ../rendered
+```
+
+Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
+
+Each page is a single HTML file with no script, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
+
 ## Review untrusted changes safely
 
-`branch-review` is built for reading changes that an agent or a teammate wrote, before you trust them. It doesn't write to the repo it reviews. The index, the working tree, refs, the stash, config, and hooks stay as they were, and Git runs on a private copy of the index.
+`branch-review` is built for reading changes that an agent or a teammate wrote, before you trust them. It doesn't write to the repo it reviews, except for pages you ask `--render-out` to write into a directory there. The index, the working tree, refs, the stash, config, and hooks stay as they were, and Git runs on a private copy of the index.
 
 `branch-review` ignores repo settings that could change the diff or run a program, such as `diff.external`, textconv drivers, `core.fsmonitor`, and `diff.noprefix`. The patch that you read and copy is Git's own output.
 
@@ -199,6 +211,8 @@ branch-review my-feature release/2026.04
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
+| `--render-out DIR` | Write a page for each changed markdown file to `DIR`, print a summary, and exit without opening the UI. |
+| `--json` | With `--render-out`, print the report as JSON. |
 
 For `--animations` and `--images`, the last flag of each pair wins.
 
@@ -310,3 +324,5 @@ pnpm build
 MIT © hcastro
 
 Image decoding uses [sharp](https://sharp.pixelplumbing.com/), which ships prebuilt binaries of libvips. libvips is licensed under LGPL-3.0.
+
+Rendered pages carry a copy of [github-markdown-css](https://github.com/sindresorhus/github-markdown-css) and icons from [Octicons](https://github.com/primer/octicons), both licensed under MIT. Their license files are in `src/rendered/assets/`.

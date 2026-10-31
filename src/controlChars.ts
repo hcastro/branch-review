@@ -48,3 +48,19 @@ export function escapeHiddenCharacters(text: string) {
 export function escapeHiddenCharactersInLines(text: string) {
   return text.replace(HIDDEN_CHARACTERS, (char) => (char === '\t' || char === '\n' ? char : visibleMarker(char)));
 }
+
+/**
+ * JSON.stringify output with every hidden character in it written as a
+ * `\uXXXX` escape (two for a character past U+FFFF), so it decodes to the
+ * same values and none of them reaches a terminal as itself. JSON.stringify
+ * already escapes C0 inside strings, so a C0 character left here is the
+ * layout's own newline.
+ */
+export function escapeHiddenCharactersInJson(json: string) {
+  return json.replace(HIDDEN_CHARACTERS, (char) => {
+    if (char < ' ') return char;
+    let escaped = '';
+    for (let index = 0; index < char.length; index += 1) escaped += `\\u${char.charCodeAt(index).toString(16).padStart(4, '0')}`;
+    return escaped;
+  });
+}
