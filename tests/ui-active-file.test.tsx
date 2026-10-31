@@ -23,8 +23,14 @@ function headerRow(frame: string | undefined) {
   return frameLines(frame)[4] ?? '';
 }
 
-async function press(instance: {stdin: {write: (data: string) => void}}, key: string) {
+// Presses a key and, given `expected`, waits for the frame that shows it. A
+// loaded CI runner can take longer than a couple of event-loop turns to redraw.
+async function press(instance: {stdin: {write: (data: string) => void}; lastFrame: () => string | undefined}, key: string, expected?: string) {
   instance.stdin.write(key);
+  const deadline = Date.now() + 5_000;
+  while (expected && Date.now() < deadline && !frameLines(instance.lastFrame()).join('\n').includes(expected)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   await flush(2);
 }
 
@@ -34,18 +40,18 @@ describe('a file whose only line is blank', () => {
     await flush();
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('file 1/3');
 
-    await press(instance, '\u001B[B');
+    await press(instance, '\u001B[B', 'file 2/3');
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('file 2/3');
     expect(headerRow(instance.lastFrame())).toContain('empty.txt');
 
-    await press(instance, '\u001B[B');
+    await press(instance, '\u001B[B', 'file 3/3');
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('file 3/3');
 
-    await press(instance, '\u001B[A');
+    await press(instance, '\u001B[A', 'file 2/3');
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('file 2/3');
     expect(headerRow(instance.lastFrame())).toContain('empty.txt');
 
-    await press(instance, '\u001B[A');
+    await press(instance, '\u001B[A', 'file 1/3');
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('file 1/3');
 
     instance.unmount();
