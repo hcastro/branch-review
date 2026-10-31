@@ -260,6 +260,15 @@ describe('one Kitty-drawing session per tmux server', () => {
     });
   });
 
+  it('records the real start time of this process by default', () => {
+    const env = {BRANCH_REVIEW_TMPDIR: makeTempDir('branch-review-tmp-parent-')};
+    const started = processStartTime(process.pid);
+    expect(started).not.toBeNull();
+    const mine = createMediaTempDir({env}).get();
+    expect(claimKittyTmux(mine, TMUX, {env})).toBe(true);
+    expect(fs.readFileSync(path.join(mine, 'kitty-tmux'), 'utf8')).toBe(`${tmuxServerHash(TMUX)}\n${started}\n`);
+  }, 30_000);
+
   it('still gives way to a live claim whose owner started when it recorded, or whose start cannot be read now', async () => {
     const parent = makeTempDir('branch-review-tmp-parent-');
     const env = {BRANCH_REVIEW_TMPDIR: parent};
