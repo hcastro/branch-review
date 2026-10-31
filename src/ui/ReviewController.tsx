@@ -11,6 +11,7 @@ import {debounce} from '../watch/debounce.js';
 import {App} from './App.js';
 import type {GraphicsCaps} from '../media/types.js';
 import type {MediaService} from '../media/service.js';
+import type {RenderedService} from '../rendered/service.js';
 
 type WatchState =
   | {state: 'off'}
@@ -38,6 +39,8 @@ export type ReviewControllerProps = {
   graphics?: GraphicsCaps;
   // Draws media files as pictures; absent when the terminal cannot.
   media?: MediaService;
+  // Renders the review's markdown pages in the background.
+  rendered?: RenderedService;
   copyWriter?: ClipboardWriter;
   dimensions?: {columns: number; rows: number};
   initialFingerprint?: string;
@@ -117,6 +120,7 @@ export function ReviewController({
   animations = true,
   graphics,
   media,
+  rendered,
   copyWriter,
   dimensions,
   initialFingerprint,
@@ -307,6 +311,7 @@ export function ReviewController({
   // already knows which files are media. setReview only starts work and
   // notifies nobody, so calling it while rendering is safe.
   useMemo(() => media?.setReview(review, {cwd, range: activeRange}), [activeRange, cwd, media, review]);
+  useMemo(() => rendered?.setReview(review, {cwd, range: activeRange}), [activeRange, cwd, rendered, review]);
   const footerStatus = watcherError && watchStatus.state === 'watching'
     ? `watch error: ${watcherError}`
     : formatWatchFooterStatus(watchStatus);
@@ -329,6 +334,7 @@ export function ReviewController({
       animations={animations}
       graphics={graphics}
       media={media}
+      rendered={rendered}
     />
   );
 }

@@ -100,9 +100,7 @@ const TMUX_SHARED_NOTICE = 'another branch-review draws images in this tmux serv
  * hooks kill the media worker and remove the session's temp dir. Nothing is
  * sent before the UI enters the alt screen.
  */
-function startMedia({caps: detected, cwd, env, proc, session, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; watching: boolean; animations: boolean}): {media: MediaService; caps: GraphicsCaps} {
-  sweepStaleMediaDirs({env});
-  const tempDir = createMediaTempDir({env});
+function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; tempDir: SessionDir; watching: boolean; animations: boolean}): {media: MediaService; caps: GraphicsCaps} {
   // Every pane of a tmux server draws on the one outer terminal and its one
   // table of image ids, so only the first session there draws Kitty images.
   let caps = detected;
@@ -136,9 +134,10 @@ function startMedia({caps: detected, cwd, env, proc, session, watching, animatio
   });
   session.setRestorePrefix(() => forTerminal(media.restoreSequence()));
   proc.on('exit', () => media.dispose());
-  proc.on('exit', tempDir.remove);
   return {media, caps};
 }
+
+type SessionDir = ReturnType<typeof createMediaTempDir>;
 
 async function writeRenderedPages({cwd, startDir, range, review, outLabel, json, stdout, stderr, proc}: {
   cwd: string;
@@ -233,6 +232,11 @@ export async function runCli(io: CliIo) {
     return;
   }
 
+  // Loaded while the terminal answers, so it adds nothing to startup: the
+  // service is small, and its renderer loads only in its own worker. A
+  // module that fails to load leaves the app as it is without the view.
+  const loadingRendered = import('./rendered/service.js').catch(() => null);
+
   // Asks the terminal what it can draw once the UI is sure to mount. Raw
   // mode moves keys typed ahead out of the terminal into this process, so
   // asking during the build would swallow them on the exits above, which
@@ -257,9 +261,28 @@ export async function runCli(io: CliIo) {
   // Ctrl-C during the window, or a signal, has already exited.
   if (startupBuild.signal.aborted) return;
   const {keys, replyHead} = detection.handOff();
+  // One session dir for media and the rendered view, made when either first
+  // needs it and removed at exit. Dirs that dead sessions left behind are
+  // swept first: at once when media starts, else when the dir is first made.
+  const tempDir = createMediaTempDir({env});
+  let swept = false;
+  const sweepOnce = () => {
+    if (swept) return;
+    swept = true;
+    sweepStaleMediaDirs({env});
+  };
   // Kitty terminals draw pictures and other color terminals block previews;
   // with no graphics the app is exactly as it is without media.
-  const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, watching: options.watch, animations: options.animations}) : undefined;
+  if (caps.protocol !== 'none') sweepOnce();
+  const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, tempDir, watching: options.watch, animations: options.animations}) : undefined;
+  // The rendered view needs no graphics: its pages open in a browser.
+  const renderedModule = await loadingRendered;
+  const rendered = renderedModule?.startRenderedService({tempDir: () => {
+    sweepOnce();
+    return tempDir.get();
+  }, env, cwd});
+  proc.on('exit', () => rendered?.dispose());
+  proc.on('exit', tempDir.remove);
   const media = started?.media;
   const drawCaps = started?.caps ?? caps;
   const graphics = replyHead ? {...drawCaps, replyHead, ...(keys ? {keysBeforeReply: keys} : {})} : drawCaps;
@@ -276,6 +299,7 @@ export async function runCli(io: CliIo) {
       animations: options.animations,
       graphics,
       ...(media ? {media} : {}),
+      ...(rendered ? {rendered} : {}),
       requestedBranch,
       requestedBase,
     }),
@@ -284,4 +308,5 @@ export async function runCli(io: CliIo) {
   // process ends once its event loop drains, so the worker is stopped here
   // rather than left to its idle timer.
   media?.dispose();
+  rendered?.dispose();
 }

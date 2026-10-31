@@ -118,7 +118,7 @@ branch-review --render-out ../rendered
 
 Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
 
-Each page is a single HTML file with no script, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
+Each page is a single HTML file with no script. Images from the repo travel inside it, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
 
 ## Review untrusted changes safely
 

@@ -89,8 +89,9 @@ html, body {
   background: var(--br-surface);
   font-size: 13px;
 }
-/* On a narrow screen the refs shrink to an ellipsis; the brand and the
-   chip keep one line. */
+/* On a narrow screen the refs shrink to an ellipsis, the base first, so
+   the branch under review stays readable; the brand and the chip keep one
+   line, and below 480 px the brand keeps only its mark. */
 .br-brand {
   flex: none;
   white-space: nowrap;
@@ -102,16 +103,20 @@ html, body {
 }
 .br-brand-mark { color: var(--br-accent); font-size: 18px; line-height: 1; }
 .br-refs {
+  display: flex;
   min-width: 0;
   overflow: hidden;
   font-family: var(--br-mono);
   font-size: 12px;
   color: var(--br-muted);
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.br-refs .br-arrow { padding: 0 6px; color: var(--br-faint); }
-.br-refs .br-branch { color: var(--br-fg); }
+.br-refs .br-base,
+.br-refs .br-branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* The base gives up its room long before the branch gives up any. */
+.br-refs .br-base { flex: 0 1000 auto; }
+.br-refs .br-branch { flex: 0 1 auto; color: var(--br-fg); }
+.br-refs .br-arrow { flex: none; padding: 0 6px; color: var(--br-faint); }
 .br-strip-end { flex: none; margin-left: auto; display: flex; align-items: center; gap: 12px; white-space: nowrap; }
 
 /* The fidelity chip and its popover, a plain <details>: no script needed. */
@@ -333,6 +338,17 @@ html, body {
 /* A quote's or alert's left border moves its padding box in by 0.25em. */
 .markdown-body :is(blockquote, .markdown-alert)[data-mark]::before { left: calc(var(--br-bar-x) - 0.25em); }
 .markdown-body li[data-mark]::before { left: calc(-2em + var(--br-bar-x)); }
+/* A rule is a quarter em high and clips what it holds, and GitHub makes its
+   ::before a table, which no top and bottom stretch: its bar is a block that
+   stands out above and below it. */
+.markdown-body hr[data-mark] { overflow: visible; }
+.markdown-body hr[data-mark]::before { display: block; top: -6px; bottom: -6px; }
+/* The box around a lone image or other inline HTML block, so its bar is as
+   tall as the block, in the block's place in the line. */
+.markdown-body .br-marked { display: inline-block; max-width: 100%; }
+/* One that follows another inline block may share its line: its bar sits in
+   the gap just before it, never over its neighbor. */
+.markdown-body > :is(a, b, code, em, i, img, kbd, picture, small, span, strong, sub, sup) + .br-marked::before { left: -5px; }
 .markdown-body tr[data-mark] { position: static; }
 .markdown-body tr[data-mark]::before { content: none; }
 .markdown-body tr[data-mark] > :first-child { box-shadow: inset 3px 0 0 var(--br-added); }
@@ -387,26 +403,33 @@ html, body {
 .markdown-body tr.br-removed-row details.br-removed > summary { background: none; }
 .markdown-body tr.br-removed-row details.br-removed::before { content: none; }
 
-/* The before chip sits at the right end of its block's last line and takes
-   no room: closed, it's out of the flow, at the static position the block's
-   16 px bottom margin puts it (every GitHub block has that margin), lifted
-   back by it. Opened, it joins the flow so its view takes room, and its
-   summary stays where the chip was. In a list item there's no margin to
-   lift past unless the item ends in a paragraph. In a table cell the chip
-   follows the cell's text. */
+/* The before chip sits at the right end of its block, under the block's
+   last line, and takes none of its width, so the block wraps where GitHub
+   wraps it. Closed, it's out of the flow, at the static position the
+   block's 16 px bottom margin puts it (every GitHub block has that
+   margin), lifted back by it into room the block keeps at its foot, so it
+   never sits on the block's last line of text, card or image. Opened, it
+   joins the flow so its view takes room, and its summary stays where the
+   chip was. In a list item the chip follows the item's last word, as it
+   does a table cell's text, unless the item ends in a paragraph. */
+:root { --br-chip-room: 26px; }
+.markdown-body [data-mark="modified"]:has(+ details.br-before),
+.markdown-body li > p:has(+ details.br-before) { padding-block-end: var(--br-chip-room); }
 .markdown-body details.br-before { margin: 0; }
 .markdown-body details.br-before:not([open]) {
   position: absolute;
   right: var(--br-article-pad);
   transform: translateY(calc(-100% - 16px));
 }
-.markdown-body li > details.br-before:not([open]) { right: 0; transform: translateY(-100%); }
-.markdown-body li > p + details.br-before:not([open]) { transform: translateY(calc(-100% - 16px)); }
 .markdown-body details.br-before[open] { position: relative; margin-bottom: 16px; }
 .markdown-body details.br-before[open] > summary { position: absolute; top: -16px; right: 0; transform: translateY(-100%); }
-.markdown-body li > details.br-before[open] { margin: 0 0 8px; }
-.markdown-body li > details.br-before[open] > summary { top: 0; }
-.markdown-body li > p + details.br-before[open] > summary { top: -16px; }
+.markdown-body li > details.br-before { display: inline-block; margin-left: 8px; vertical-align: middle; }
+.markdown-body li > details.br-before:not([open]) { position: static; right: auto; transform: none; }
+.markdown-body li > details.br-before[open] { display: block; margin: 4px 0 8px; }
+.markdown-body li > details.br-before[open] > summary { position: static; transform: none; }
+.markdown-body li > p + details.br-before:not([open]) { position: absolute; right: 0; transform: translateY(calc(-100% - 16px)); }
+.markdown-body li > p + details.br-before[open] { margin: 0 0 8px; }
+.markdown-body li > p + details.br-before[open] > summary { position: absolute; top: -16px; right: 0; transform: translateY(-100%); }
 .markdown-body :is(td, th) > details.br-before { display: inline-block; margin-left: 8px; vertical-align: middle; }
 /* As specific as the closed chip's rule above, so it wins in a cell. */
 .markdown-body :is(td, th) > details.br-before:not([open]) { position: static; right: auto; transform: none; }
@@ -430,9 +453,11 @@ html, body {
   display: inline-flex;
   align-items: center;
   max-width: 100%;
-  padding: 2px 10px;
+  padding: 3px 10px;
   border: 1px dashed var(--br-border);
-  border-radius: 999px;
+  /* A card that wraps to more lines stays a card, never a stadium whose
+     ends cut into its text. */
+  border-radius: 8px;
   color: var(--br-muted);
   background: var(--br-surface);
   font-family: var(--br-mono);
@@ -443,6 +468,19 @@ html, body {
 }
 .markdown-body .br-card.br-refused { border-style: solid; border-color: var(--br-removed); color: var(--br-removed); background: var(--br-removed-soft); }
 .markdown-body .br-card.br-soft { border-color: var(--br-modified); color: var(--br-modified-text); }
+/* A note under an image the page shows, such as one not part of a push yet. */
+.markdown-body .br-image-note {
+  display: block;
+  width: fit-content;
+  margin-top: 4px;
+  padding: 1px 8px;
+  border: 1px solid var(--br-modified);
+  border-radius: 999px;
+  color: var(--br-modified-text);
+  background: var(--br-modified-soft);
+  font-family: var(--br-sans);
+  font-size: 11px;
+}
 .markdown-body a.br-inert {
   color: inherit;
   text-decoration: underline dotted var(--br-faint);
@@ -470,15 +508,18 @@ html, body {
    `#gh-light-mode-only`, and the cards that stand in for them. */
 @media (prefers-color-scheme: dark) {
   .markdown-body :is(img, .br-card)[data-gh-theme="light"] { display: none; }
+  .markdown-body .br-image-note[data-gh-theme="light"] { display: none; }
 }
 @media (prefers-color-scheme: light) {
   .markdown-body :is(img, .br-card)[data-gh-theme="dark"] { display: none; }
+  .markdown-body .br-image-note[data-gh-theme="dark"] { display: none; }
 }
 
-/* A file that couldn't render as a page. */
+/* A file that couldn't render as a page, in the article's box and inset,
+   so it lines up with the file head. */
+.br-body { max-width: 980px; margin: 0 auto; padding: 0 var(--br-article-pad); }
 .br-state {
-  max-width: 980px;
-  margin: 32px auto 16px;
+  margin: 32px 0 16px;
   padding: 16px 20px;
   border: 1px dashed var(--br-border);
   border-radius: 8px;
@@ -489,8 +530,7 @@ html, body {
 }
 .br-state-error { border-style: solid; border-color: var(--br-removed); color: var(--br-removed); background: var(--br-removed-soft); }
 .br-raw {
-  max-width: 980px;
-  margin: 0 auto;
+  margin: 0;
   padding: 16px;
   overflow: auto;
   border-radius: 6px;
@@ -537,6 +577,11 @@ html, body {
   .br-filehead { padding-left: 15px; padding-right: 15px; }
   .br-banners, .br-switcher { padding: 0 15px; }
   .markdown-body .markdown-heading .anchor { display: none; }
+}
+
+/* Out of sight, still read aloud. */
+@media (max-width: 479px) {
+  .br-brand-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
 }
 
 @media print {

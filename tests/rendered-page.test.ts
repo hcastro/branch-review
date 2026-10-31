@@ -150,6 +150,62 @@ describe('assembleFilePage', () => {
     expect(failed).toContain('<pre class="br-raw">raw &#x3C;script></pre>');
   });
 
+  it('sets a file with no rendered page in the article\'s box, and says its state in the head', () => {
+    const page = (body: PageFile['body']) => assembleFilePage(input({path: 'a.md', status: 'modified', body}));
+    const failed = page({kind: 'failed', reason: 'took too long to render', source: '# Raw'});
+    expect(failed).toContain('<div class="br-body">\n<p class="br-state br-state-error">couldn\'t render this file · took too long to render</p>\n<pre class="br-raw"># Raw</pre>\n</div>');
+    expect(failed).toContain('<p class="br-summary"><span class="br-status br-status-modified">M</span> · couldn\'t render</p>');
+    expect(page({kind: 'empty'})).toContain('M</span> · empty</p>');
+    expect(page({kind: 'tooLarge', bytes: 3 * 1024 * 1024, head: ''})).toContain('M</span> · too large to render</p>');
+    expect(page({kind: 'notUtf8'})).toContain('M</span> · not UTF-8 text</p>');
+    // The article's measure and inset, at every width; the card and raw
+    // text set no width of their own.
+    expect(rule('.br-body')).toBe('.br-body { max-width: 980px; margin: 0 auto; padding: 0 var(--br-article-pad); }');
+    expect(rule('.br-state')).not.toContain('max-width');
+    expect(rule('.br-raw')).not.toContain('max-width');
+  });
+
+  it('keeps a modified block at GitHub\'s measure, with room for its before chip under its last line', () => {
+    // Room at the block's foot, never at the end of its lines, so it wraps where GitHub wraps it.
+    expect(CHROME_CSS).toMatch(/\.markdown-body \[data-mark="modified"\]:has\(\+ details\.br-before\),\n\.markdown-body li > p:has\(\+ details\.br-before\) \{ padding-block-end: var\(--br-chip-room\); \}/);
+    expect(CHROME_CSS).not.toContain('padding-inline-end');
+    // As tall as the closed chip: its line, padding and border.
+    expect(CHROME_CSS).toContain(':root { --br-chip-room: 26px; }');
+    // In a list item the chip follows the item's last word, where it can only move to a line of its own.
+    expect(rule('.markdown-body li > details.br-before')).toContain('display: inline-block;');
+    expect(rule('.markdown-body li > details.br-before:not([open])')).toMatch(/position: static;[\s\S]*transform: none;/);
+  });
+
+  it('draws the bar of an added rule outside its clipped quarter em, and of a lone image on the box around it', () => {
+    expect(rule('.markdown-body hr[data-mark]')).toContain('overflow: visible;');
+    expect(rule('.markdown-body hr[data-mark]::before')).toMatch(/display: block; top: -6px; bottom: -6px;/);
+    expect(rule('.markdown-body .br-marked')).toContain('display: inline-block;');
+    // Beside another inline block in its line, its bar sits in the gap before it.
+    expect(CHROME_CSS).toMatch(/\.markdown-body > :is\([^)]*\bimg\b[^)]*\bspan\b[^)]*\) \+ \.br-marked::before \{ left: -5px; \}/);
+  });
+
+  it('keeps an asset card\'s corners clear of its text when it wraps', () => {
+    expect(rule('.markdown-body .br-card')).toContain('border-radius: 8px;');
+    expect(rule('.markdown-body .br-card')).not.toContain('999px');
+  });
+
+  it('keeps the branch readable in a narrow strip, giving up the base first', async () => {
+    const html = await page();
+    expect(html).toMatch(/<span class="br-refs" title="[^"]*"><span class="br-base">[^<]*<\/span><span class="br-arrow">←<\/span><span class="br-branch">/);
+    expect(rule('.br-refs .br-base')).toContain('flex: 0 1000 auto;');
+    expect(CHROME_CSS).toContain('.br-refs .br-branch { flex: 0 1 auto; color: var(--br-fg); }');
+    expect(rule('.br-refs .br-base,\n.br-refs .br-branch')).toContain('text-overflow: ellipsis;');
+    // Below 480 px the brand keeps its mark; its word is still read aloud.
+    expect(html).toContain('<span class="br-brand-word">branch-review</span>');
+    expect(CHROME_CSS).toMatch(/@media \(max-width: 479px\) \{\s*\.br-brand-word \{ position: absolute;[^}]*clip: rect\(0, 0, 0, 0\);/);
+  });
+
+  it('says a file the background render hasn\'t reached is not rendered yet', () => {
+    const html = assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'pending'}}));
+    expect(html).toContain('<p class="br-state">not rendered yet · opening this file in branch-review renders it</p>');
+    expect(html).toContain('M</span> · not rendered yet</p>');
+  });
+
   it('escapes every repo-supplied string it prints', async () => {
     const fragment = await rendered('Text.\n');
     const html = assembleFilePage(input(

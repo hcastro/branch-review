@@ -1,7 +1,7 @@
 import {defineConfig} from "tsup";
 
 export default defineConfig({
-  entry: ["src/cli.tsx", "src/refreshWorker.ts", "src/mediaWorker.ts"],
+  entry: ["src/cli.tsx", "src/refreshWorker.ts", "src/mediaWorker.ts", "src/renderedWorker.ts"],
   format: ["esm"],
   target: "node22",
   outDir: "dist",

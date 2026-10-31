@@ -240,6 +240,33 @@ describe('change marks on the page', () => {
     expect(beforeViews(html)).toEqual(['const widget = createWidget();']);
   });
 
+  it('leaves a heading and paragraph that stayed unmarked when git lines them up against a removed section', async () => {
+    const before = '# Assets\n\nIntro.\n\n![Hero](docs/img/hero.png)\n\n## Retired\n\n![Old diagram](docs/img/old.png)\n\nThe old diagram above is removed on the branch.\n\n## Kept\n\nPlain paragraph that stays.\n';
+    const after = '# Assets\n\nIntro.\n\n![Hero](docs/img/hero.png)\n\n## Kept\n\nPlain paragraph that stays.\n\n## New assets\n\n![Flow SVG](docs/img/flow.svg)\n\n![LFS pointer](docs/img/big-lfs.png)\n';
+    // Git pairs each old line with a new one around the blank lines.
+    expect(diffFile(before, after).rawDiff).toContain('-## Retired\n+## Kept\n');
+    const {marked, removed, html} = await marksFor(before, after);
+    expect(marked).toEqual([
+      {tag: 'div', mark: 'added', text: 'New assets'},
+      {tag: 'p', mark: 'added', text: 'Flow SVG · docs/img/flow.svg · not embed'},
+      {tag: 'p', mark: 'added', text: 'LFS pointer · docs/img/big-lfs.png · not'},
+    ]);
+    expect(removed).toEqual(['− 3 blocks removed · show']);
+    const removedText = stripTags(/<div class="br-removed-body">([\s\S]*?)<\/div><\/details>/.exec(html)![1]!);
+    expect(removedText).toContain('The old diagram above is removed on the branch.');
+    expect(removedText).not.toContain('Kept');
+    expect(beforeViews(html)).toEqual([]);
+  });
+
+  it('never shows a new image-only paragraph as an edit of removed text', async () => {
+    const before = '# Widgets\n\n## Old section\n\nThis section is going away on the branch.\n\n## License\n\nMIT.\n';
+    const after = '# Widgets\n\n![Flow](docs/img/flow.png)\n\nImages that won\'t render on GitHub:\n\n![Logo](docs/img/logo.png)\n![Draft](docs/img/draft.png)\n\n## License\n\nMIT.\n';
+    const {marked, removed, html} = await marksFor(before, after);
+    expect(marked.map((block) => block.mark)).toEqual(['added', 'added', 'added']);
+    expect(removed).toEqual(['− 2 blocks removed · show']);
+    expect(beforeViews(html)).toEqual([]);
+  });
+
   it('marks a block added in the same hunk as an edit as added, with no before chip', async () => {
     const {marked, html} = await marksFor('Alpha.\n', 'Alpha edited.\n\nBrand new para.\n');
     expect(marked).toEqual([
@@ -460,5 +487,18 @@ describe('change marks on the page', () => {
     const [before] = beforeBodies(edited.html);
     expect(before).toMatch(/^<table>[\s\S]*<th>a<\/th>[\s\S]*<td>4<\/td>[\s\S]*<\/table>$/);
     expect(before).not.toContain('<pre>');
+  });
+
+  it('marks an added rule, a lone image and a picture on a box that can draw their bars', async () => {
+    const before = '# Doc\n\nIntro.\n';
+    const after = '# Doc\n\nIntro.\n\n---\n\n<img src="d.png" width="90">\n\n<picture>\n<source srcset="d.png">\n<img src="d.png">\n</picture>\n';
+    const embed = {kind: 'embed', mime: 'image/png', dataUrl: 'data:image/png;base64,AA==', oid: 'abc'} as const;
+    const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(diffFile(before, after)), asset: async () => embed, link: () => ({kind: 'outside'})});
+    expect(fragment.changes).toEqual({changed: 3, removed: 0});
+    // A rule draws its own bar; an image draws none, and a picture sits in the line.
+    expect(fragment.html).toMatch(/<hr data-block="[^"]+" data-lines="5-5" data-mark="added">/);
+    expect(fragment.html).toMatch(/<span class="br-marked" data-block="[^"]+" data-lines="7-7" data-mark="added"><img src="data:image\/png;base64,AA==" width="90"><\/span>/);
+    expect(fragment.html).toMatch(/<span class="br-marked" data-block="[^"]+" data-lines="9-12" data-mark="added"><picture>/);
+    expect(fragment.html).not.toMatch(/<(img|picture)[^>]*data-mark/);
   });
 });

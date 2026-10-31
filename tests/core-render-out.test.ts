@@ -4,6 +4,7 @@ import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, snapshotTree, writeExecutable, writeFiles} from './core-helpers.js';
+import {pngFixture} from './media-helpers.js';
 
 // Each test builds a real repo and runs the CLI in a child, git and delta
 // included.
@@ -404,6 +405,22 @@ describe('--render-out', () => {
     expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toContain('too large to render (2.1 MB)');
   });
 
+  it('marks only the edited block of a doc moved with its images', () => {
+    const repo = initRepo({'docs/guide.md': '# Guide\n\nIntro.\n\n![Logo](logo.png)\n'});
+    fs.writeFileSync(path.join(repo, 'docs/logo.png'), pngFixture(3, 2));
+    commitAll(repo, 'logo');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    git(repo, 'mv', 'docs', 'guide');
+    writeFiles(repo, {'guide/guide.md': '# Guide\n\nIntro, edited.\n\n![Logo](logo.png)\n'});
+    commitAll(repo, 'move the guide');
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as Report;
+    expect(report.pages.map((page) => [page.path, page.status, page.changes])).toEqual([['guide/guide.md', 'renamed', {changed: 1, removed: 0}]]);
+    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).not.toContain('file not found');
+  });
+
   it('renders a markdown file whose terminal diff failed, and lists it', () => {
     const repo = initRepo({'a.md': '# A\n\nBREAKDELTA here.\n', 'b.md': '# B\n\nFine.\n'});
     writeFiles(repo, {'a.md': '# A\n\nBREAKDELTA here, edited.\n', 'b.md': '# B\n\nFine, edited.\n'});
@@ -453,6 +470,32 @@ describe('--render-out', () => {
     const page = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
     expect(page).not.toMatch(/<[a-z]+ [^>]*data-mark=/);
     expect(page).toContain('<pre class="br-raw"># A\n\nNew first.');
+  });
+
+  it('inlines the images git tracks on each side, and shows a card for one GitHub won\'t show', () => {
+    const red = pngFixture(2, 2, [200, 40, 40, 255]);
+    const blue = pngFixture(3, 3, [40, 40, 200, 255]);
+    const repo = initRepo({'README.md': '# Readme\n\n![Logo](img/logo.png) Old caption.\n'});
+    fs.mkdirSync(path.join(repo, 'img'));
+    fs.writeFileSync(path.join(repo, 'img/logo.png'), red);
+    commitAll(repo, 'logo');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, 'img/logo.png'), blue);
+    writeFiles(repo, {'README.md': '# Readme\n\n![Logo](img/logo.png) New caption.\n\n![Draft](notes/draft.png)\n'});
+    commitAll(repo, 'new logo');
+    writeFiles(repo, {'notes/draft.png': 'not committed'});
+    const out = makeTempDir('branch-review-out-');
+
+    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    expect(result.stderr).toBe('');
+    const report = JSON.parse(result.stdout) as Report;
+    const html = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    const inlined = (bytes: Buffer) => `data:image/png;base64,${bytes.toString('base64')}`;
+    // The page shows the branch's logo; its before view, the base's.
+    expect(html).toContain(inlined(blue));
+    expect(html).toMatch(new RegExp(`class="br-before-body">[\\s\\S]*${inlined(red).replace(/[+/]/g, '\\$&')}`));
+    expect(html).toContain("won't render on GitHub: file is untracked · notes/draft.png");
+    expect(report.pages[0]!.differences).toEqual([]);
   });
 
   it('renders from the published bundle, render thread included', () => {

@@ -25,10 +25,20 @@ import {octicon, type OcticonName} from './octicons.js';
 
 /** How one image path resolved. The lookup owns every file and git read. */
 export type AssetAnswer =
-  | {kind: 'embed'; mime: string; dataUrl: string; oid: string; width?: number; height?: number}
-  | {kind: 'refused'; reason: 'remote' | 'untracked' | 'ignored' | 'caseMismatch' | 'missing' | 'symlink' | 'outside' | 'lfs' | 'submodule' | 'tooLarge' | 'pageLimit'; hint?: string}
+  // `untracked`: a file the review shows that isn't part of a push yet.
+  | {kind: 'embed'; mime: string; dataUrl: string; oid: string; width?: number; height?: number; untracked?: true}
+  | {kind: 'refused'; reason: RefusedReason; hint?: string}
   // The lookup doesn't read local images, so the page says so in place.
   | {kind: 'skipped'};
+
+export type RefusedReason =
+  | 'remote' | 'untracked' | 'ignored' | 'caseMismatch' | 'missing' | 'symlink' | 'outside' | 'lfs' | 'submodule' | 'notImage'
+  // Not a finding about GitHub: the page has no room left, or the bytes
+  // couldn't be read as the review named them (`hint` says why).
+  | 'tooLarge' | 'pageLimit' | 'unreadable';
+
+/** The most image bytes one page inlines; images past it show a card. */
+export const PAGE_INLINE_LIMIT = 32 * 1024 * 1024;
 
 /** How one relative link resolved: to another rendered page, or not. */
 export type LinkAnswer = {kind: 'inReview'; href: string} | {kind: 'outside'} | {kind: 'missing'} | {kind: 'badAnchor'};
@@ -36,9 +46,22 @@ export type LinkAnswer = {kind: 'inReview'; href: string} | {kind: 'outside'} | 
 export type RenderInput = {
   /** The file's repo-relative POSIX path; relative links resolve from its folder. */
   path: string;
+  /**
+   * Where the file was on the base side, when the review moved it. Images
+   * the base side shows resolve from its folder, as they did there; links
+   * open the review's pages, so they always resolve from `path`.
+   */
+  basePath?: string;
   source: string;
   groups: ChangeGroup[];
   asset: (repoPath: string) => Promise<AssetAnswer>;
+  // Images in the base side's text, which `before` views and removed
+  // markers show. Without it they resolve as the page's own images do.
+  baseAsset?: (repoPath: string) => Promise<AssetAnswer>;
+  // Whether an image shows other content than it did on the base side,
+  // where the base side's text finds it at `basePath`. A block that shows
+  // one is marked even when its text didn't change.
+  assetChanged?: (repoPath: string, basePath: string) => Promise<boolean>;
   link: (repoPath: string, hash?: string) => LinkAnswer;
 };
 
@@ -65,10 +88,14 @@ export type RenderedFragment = {
   changes: {changed: number; removed: number};
 };
 
-type Lookups = Pick<RenderInput, 'asset' | 'link'>;
+type Lookups = Pick<RenderInput, 'asset' | 'baseAsset' | 'assetChanged' | 'link'>;
 
 type TreeOptions = Lookups & {
   path: string;
+  basePath?: string;
+  // Where this text's images resolve from, when not `path`: the base
+  // side's text of a file the review moved.
+  imagesFrom?: string;
   // Change runs to mark; null renders without marks (removed and base text).
   groups: ChangeGroup[] | null;
   // Heading anchors carry ids, so only the page's own text gets them.
@@ -78,6 +105,9 @@ type TreeOptions = Lookups & {
 type Tally = {
   differences: Map<DifferenceKind, number>;
   assetOids: Set<string>;
+  // Image bytes inlined so far, before views and removed markers included:
+  // the whole page shares one budget.
+  inlined: {bytes: number};
 };
 
 type RenderedTree = {
@@ -89,7 +119,7 @@ type RenderedTree = {
 };
 
 export async function renderMarkdown(input: RenderInput): Promise<RenderedFragment> {
-  const tally: Tally = {differences: new Map(), assetOids: new Set()};
+  const tally: Tally = {differences: new Map(), assetOids: new Set(), inlined: {bytes: 0}};
   const rendered = await renderTree(input.source, {...input, groups: input.groups, anchors: true}, tally);
   return {
     html: unified().use(rehypeStringify).stringify(rendered.tree),
@@ -120,7 +150,7 @@ async function renderTree(source: string, options: TreeOptions, tally: Tally): P
   finishGithubMarkup(tree, tally);
   await highlightCode(tree, tally);
   const links = resolveLinks(tree, options, tally);
-  await resolveImages(tree, options, tally);
+  const images = await resolveImages(tree, options, tally);
 
   const blocks: RenderedBlock[] = [];
   const changes = {changed: 0, removed: 0};
@@ -130,38 +160,50 @@ async function renderTree(source: string, options: TreeOptions, tally: Tally): P
     // shows except through the nested renders below, which sanitize.
     const base = groups.length > 0 ? await baseSide(processor, source, groups) : emptySide();
     const page: Side = {blocks: candidates, lines: sourceLines, ...(context ?? emptySide())};
+    const imageLines = groups.length > 0 ? await changedImageLines(images, options) : new Set<number>();
     const {marks, removals} = groups.length > 0
-      ? markBlocks({blocks: candidates, lines: sourceLines}, {blocks: base.blocks, lines: base.lines}, groups)
+      ? markBlocks({blocks: candidates, lines: sourceLines}, {blocks: base.blocks, lines: base.lines}, groups, imageLines)
       : {marks: [], removals: []};
     // Nested renders count their own differences: the page's chip counts
-    // only what the page itself shows.
+    // only what the page itself shows. Images in what reaches the page share
+    // its budget; renders made only to compare get budgets of their own, so
+    // both sides of a comparison inline the same images.
     const nested: TreeOptions = {...options, groups: null, anchors: false};
-    const nestedTally = (): Tally => ({differences: new Map(), assetOids: tally.assetOids});
+    const nestedBase: TreeOptions = {...nested, asset: options.baseAsset ?? options.asset, imagesFrom: options.basePath ?? options.path};
+    const nestedTally = (): Tally => ({differences: new Map(), assetOids: tally.assetOids, inlined: tally.inlined});
+    const trialTally = (): Tally => ({differences: new Map(), assetOids: new Set(), inlined: {bytes: 0}});
 
     for (const [index, candidate] of candidates.entries()) {
       let mark = marks[index] ?? null;
       let before: BaseRender | null = null;
       if (mark?.kind === 'modified' && mark.was.length > 0) {
-        before = await renderBase(base, mark.was, nested, nestedTally());
+        const trial = trialTally();
+        before = await renderBase(base, mark.was, nestedBase, trial);
         // Text that changed without changing what the page shows, such as a
         // renumbered list item or a trailing space, is no change to mark.
-        if (before && sameRendering(before, await renderBase(page, [index], nested, nestedTally()))) mark = null;
+        if (before && sameRendering(before, await renderBase(page, [index], nested, trialTally()))) mark = null;
+        // The view the page keeps, within what the page has left.
+        else if (before && trial.inlined.bytes > 0) before = await renderBase(base, mark.was, nestedBase, nestedTally());
       }
       const placed = blockNodes.get(index);
-      blocks.push({id: candidate.id, kind: candidate.tag, lines: candidate.lines, ...(mark ? {group: mark.groups[0], mark: mark.kind} : {})});
+      const group = mark?.groups[0];
+      blocks.push({id: candidate.id, kind: candidate.tag, lines: candidate.lines, ...(mark ? {...(group ? {group} : {}), mark: mark.kind} : {})});
       if (!placed) continue;
       // Every block carries its id and source lines, so the page can find
       // the block a diff line belongs to.
       placed.node.properties.dataBlock = candidate.id;
       placed.node.properties.dataLines = `${candidate.lines[0]}-${candidate.lines[1]}`;
       if (!mark) continue;
-      placed.node.properties.dataMark = mark.kind;
+      const marked = INLINE_TAGS.has(placed.node.tagName) ? markBox(placed) : placed;
+      // A removed marker placed before this block goes before its box.
+      blockNodes.set(index, marked);
+      marked.node.properties.dataMark = mark.kind;
       changes.changed += 1;
-      if (before) placeChip(placed, candidate.tag, details('br-before', 'before', 'br-before-body', before.nodes));
+      if (before) placeChip(marked, candidate.tag, details('br-before', 'before', 'br-before-body', before.nodes));
     }
 
     for (const removal of removals) {
-      const removed = await renderBase(base, removal.blocks, nested, nestedTally());
+      const removed = await renderBase(base, removal.blocks, nestedBase, nestedTally());
       // Text that renders as nothing, such as a link definition or an HTML
       // comment, left nothing on the page to mark.
       if (!removed) continue;
@@ -501,7 +543,9 @@ function isRemote(url: string) {
 /**
  * The repo path a relative URL in `fromFile` names, POSIX-normalized, or null
  * when it climbs out of the repo or names its root. A leading `/` is the repo
- * root, as on GitHub.
+ * root, as on GitHub. A URL that decodes to an absolute path (`/%2F/etc`) or
+ * to a control character such as NUL names no file in the repo either, so
+ * no lookup ever hands one to git.
  */
 export function repoPathFor(fromFile: string, url: string): string | null {
   let target = url.split('#')[0]!.split('?')[0]!;
@@ -512,7 +556,8 @@ export function repoPathFor(fromFile: string, url: string): string | null {
   }
   const joined = target.startsWith('/') ? target.slice(1) : path.posix.join(path.posix.dirname(fromFile), target);
   const normal = path.posix.normalize(joined).replace(/\/+$/, '');
-  if (normal === '' || normal === '.' || normal === '..' || normal.startsWith('../')) return null;
+  if (normal === '' || normal === '.' || normal === '..' || normal.startsWith('../') || normal.startsWith('/')) return null;
+  if (/[\u0000-\u001f\u007f]/.test(normal)) return null;
   return normal;
 }
 
@@ -590,8 +635,10 @@ const REFUSED_TEXT: Record<Extract<AssetAnswer, {kind: 'refused'}>['reason'], st
   outside: "won't render on GitHub: outside the repo",
   lfs: "won't render on GitHub: LFS object · not fetched",
   submodule: "won't render on GitHub: submodule · not rendered",
+  notImage: "won't render on GitHub: not an image",
   tooLarge: 'image not inlined · page limit',
   pageLimit: 'image not inlined · page limit',
+  unreadable: 'image not inlined',
 };
 
 // The first URL of a `srcset`, which is all a markdown `<picture>` uses.
@@ -600,26 +647,36 @@ function srcsetUrl(srcset: unknown) {
   return value.split(',')[0]?.trim().split(/\s+/)[0] ?? '';
 }
 
+/** A repo image the page shows, as written, and the source line it sits on. */
+type PageImage = {repoPath: string; url: string; line: number};
+
 // Every image becomes bytes inside the page or a card in its place, so the
 // page never asks for anything: a remote image is a dashed pill, never a
 // request, and a `<source>` that can't be inlined is dropped so the
-// `<img>` fallback shows.
-async function resolveImages(tree: Root, options: TreeOptions, tally: Tally) {
+// `<img>` fallback shows. Returns the repo images it looked up.
+async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Promise<PageImage[]> {
   const images: Array<{node: Element; parent: Parents; url: string}> = [];
   walk(tree, (node, parent) => {
     if (node.tagName === 'img' && typeof node.properties.src === 'string') images.push({node, parent, url: node.properties.src});
     else if (node.tagName === 'source') images.push({node, parent, url: srcsetUrl(node.properties.srcSet)});
   });
 
+  // Every distinct image is asked for at once, so a page's lookups take the
+  // time of the slowest rather than of all of them in turn. They are used
+  // in page order, which is the order the page budget counts them in.
   const answers = new Map<string, Promise<AssetAnswer>>();
-  const answerFor = (repoPath: string) => {
-    let answer = answers.get(repoPath);
-    if (!answer) {
-      answer = options.asset(repoPath);
-      answers.set(repoPath, answer);
-    }
-    return answer;
-  };
+  const looked: PageImage[] = [];
+  const repoPathOf = (url: string) => (url === '' || isRemote(url) ? null : repoPathFor(options.imagesFrom ?? options.path, url));
+  for (const {node, url} of images) {
+    const repoPath = repoPathOf(url);
+    if (repoPath === null) continue;
+    looked.push({repoPath, url, line: node.position?.start.line ?? 0});
+    if (answers.has(repoPath)) continue;
+    const answer = options.asset(repoPath);
+    // Awaited in turn below; a failure is seen there, not before.
+    answer.catch(() => undefined);
+    answers.set(repoPath, answer);
+  }
 
   // GitHub shows one image of a `#gh-dark-mode-only` and
   // `#gh-light-mode-only` pair per theme, so a pair of cards is one
@@ -636,16 +693,23 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally) {
     const theme = /#gh-(dark|light)-mode-only$/.exec(url)?.[1] as 'dark' | 'light' | undefined;
     const alt = typeof node.properties.alt === 'string' ? node.properties.alt : '';
     const remote = url === '' || isRemote(url);
-    const repoPath = remote ? null : repoPathFor(options.path, url);
-    const answer: AssetAnswer = remote
+    const repoPath = remote ? null : repoPathOf(url);
+    let answer: AssetAnswer = remote
       ? {kind: 'refused', reason: 'remote'}
-      : repoPath === null ? {kind: 'refused', reason: 'outside'} : await answerFor(repoPath);
+      : repoPath === null ? {kind: 'refused', reason: 'outside'} : await answers.get(repoPath)!;
+    if (answer.kind === 'embed') {
+      if (tally.inlined.bytes + answer.dataUrl.length > PAGE_INLINE_LIMIT) answer = {kind: 'refused', reason: 'pageLimit'};
+      else tally.inlined.bytes += answer.dataUrl.length;
+    }
 
     if (answer.kind === 'embed') {
       tally.assetOids.add(answer.oid);
       if (isSource) node.properties.srcSet = answer.dataUrl;
       else node.properties.src = answer.dataUrl;
       if (theme && !isSource) node.properties.dataGhTheme = theme;
+      // Shown, as the work tree has it, with the same word the page's own
+      // banner gives an untracked file.
+      if (answer.untracked && !isSource) insertAfter({node, parent}, imageNote('untracked · not part of a push yet', theme));
       continue;
     }
     if (isSource) {
@@ -662,8 +726,10 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally) {
       countCard('localImage', theme);
       next = card(['br-card', 'br-skipped'], [alt, repoPath ?? url, 'not embedded']);
     } else {
-      const soft = answer.reason === 'tooLarge' || answer.reason === 'pageLimit';
-      const reason = answer.reason === 'caseMismatch' && answer.hint ? `${REFUSED_TEXT.caseMismatch}: ${answer.hint}` : REFUSED_TEXT[answer.reason];
+      const soft = answer.reason === 'tooLarge' || answer.reason === 'pageLimit' || answer.reason === 'unreadable';
+      const reason = !answer.hint ? REFUSED_TEXT[answer.reason]
+        : answer.reason === 'caseMismatch' ? `${REFUSED_TEXT.caseMismatch}: ${answer.hint}`
+          : answer.reason === 'unreadable' ? `${REFUSED_TEXT.unreadable} · ${answer.hint}` : REFUSED_TEXT[answer.reason];
       next = card(['br-card', soft ? 'br-soft' : 'br-refused'], [reason, repoPath ?? url]);
     }
     // The card shows in the theme the image would, as the image does.
@@ -673,6 +739,37 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally) {
   for (const [kind, {plain, dark, light}] of cards) {
     tally.differences.set(kind, (tally.differences.get(kind) ?? 0) + plain + Math.max(dark, light));
   }
+  return looked;
+}
+
+// The source lines that show an image whose content changed on the branch.
+// The base side's text of a moved file found the image from its old folder;
+// one it found outside the repo there is no change to mark.
+async function changedImageLines(images: PageImage[], options: TreeOptions) {
+  const {assetChanged} = options;
+  const lines = new Set<number>();
+  if (!assetChanged) return lines;
+  const changed = new Map<string, Promise<boolean>>();
+  const keyOf = ({repoPath, url}: PageImage) => {
+    const basePath = repoPathFor(options.basePath ?? options.path, url);
+    return basePath === null ? null : {key: `${repoPath}\0${basePath}`, repoPath, basePath};
+  };
+  for (const image of images) {
+    const found = keyOf(image);
+    if (!found || changed.has(found.key)) continue;
+    const answer = assetChanged(found.repoPath, found.basePath);
+    answer.catch(() => undefined);
+    changed.set(found.key, answer);
+  }
+  for (const image of images) {
+    const found = keyOf(image);
+    if (found && await changed.get(found.key)!) lines.add(image.line);
+  }
+  return lines;
+}
+
+function imageNote(text: string, theme: 'dark' | 'light' | undefined): Element {
+  return {type: 'element', tagName: 'span', properties: {className: ['br-image-note'], ...(theme ? {dataGhTheme: theme} : {})}, children: [{type: 'text', value: text}]};
 }
 
 function hostOf(url: string) {
@@ -705,6 +802,26 @@ function details(className: string, summary: string, bodyClass: string, body: Ar
       {type: 'element', tagName: 'div', properties: {className: [bodyClass]}, children: body.filter((child) => child.type !== 'doctype') as ElementContent[]},
     ],
   };
+}
+
+// Raw HTML a block can be that sits in the line rather than making a box
+// of its own, such as a lone `<img>` or `<picture>`. A change bar is the
+// marked element's ::before, which an image never draws and an inline
+// element draws only a line high.
+const INLINE_TAGS = new Set([
+  'a', 'abbr', 'b', 'bdi', 'bdo', 'cite', 'code', 'del', 'dfn', 'em', 'i', 'img', 'ins', 'kbd', 'mark', 'picture',
+  'q', 's', 'samp', 'small', 'span', 'strike', 'strong', 'sub', 'sup', 'time', 'tt', 'u', 'var',
+]);
+
+// Wraps such a block in a box of ours that keeps its place in the line and
+// carries its id, source lines and mark, so the bar spans the whole block.
+function markBox(placed: Placed): Placed {
+  const {node, parent} = placed;
+  const {dataBlock, dataLines, ...rest} = node.properties;
+  node.properties = rest;
+  const box: Element = {type: 'element', tagName: 'span', properties: {className: ['br-marked'], dataBlock, dataLines}, children: [node]};
+  parent.children.splice(parent.children.indexOf(node), 1, box);
+  return {node: box, parent};
 }
 
 function insertBefore(target: Placed, node: Element) {

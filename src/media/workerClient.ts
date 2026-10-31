@@ -14,62 +14,84 @@ import type {
   RenderResult,
   VideoRequest,
   VideoResult,
-  WorkerRequest,
 } from './backend.js';
 
-// The UI side of the media worker. One long-lived child process does every
-// read and decode, two jobs at a time, nearest-the-viewport first. Every job
-// has a deadline; a worker that misses one, or dies, is killed with its whole
+// The UI side of a forked worker. One long-lived child process does the
+// work, a few jobs at a time, nearest-the-viewport first. Every job has a
+// deadline; a worker that misses one, or dies, is killed with its whole
 // process group and started again after a backoff. Three such failures in a
-// minute turn previews off for the session, so a file that hangs or crashes
-// the decoder can never make the app spin.
+// minute turn that worker off for the session, so a file that hangs or
+// crashes it can never make the app spin. Each worker (media previews, the
+// rendered view) has its own instance, so one turning off leaves the other
+// serving.
 
-type JobType = WorkerRequest['type'];
-type JobResult = InspectResult | RenderResult | VideoResult | ExportResult;
-
-const DEFAULT_DEADLINES_MS: Record<JobType, number> = {
-  // Covers a partial clone fetching a blob it never had.
-  inspect: 10_000,
-  render: 8_000,
-  // A probe and up to four frames, each with its own shorter deadline.
-  video: 30_000,
-  exportCopy: 30_000,
-};
 const DEFAULT_BACKOFF_MS = [1_000, 5_000, 30_000];
 const FAILURE_WINDOW_MS = 60_000;
 const MAX_FAILURES = 3;
 const IDLE_EXIT_MS = 60_000;
-const MAX_IN_FLIGHT = 2;
 const STDERR_TAIL_LIMIT = 4096;
 
 const killsProcessGroup = process.platform !== 'win32';
 
-export type WorkerBackendOptions = {
-  // The session's media temp dir, made on first use; the worker's own temp
-  // files go in its `worker` dir.
+/** A job that got no answer from the worker: it timed out, the worker died, or the worker is off. */
+export type WorkerFailure = {ok: false; state: 'stale' | 'error' | 'unavailable'; reason: string};
+
+/** Each job type's request and answer. */
+export type JobMap = Record<string, {request: object; result: object}>;
+
+/** What tells one worker from another. */
+export type ForkedWorkerSpec<Type extends string> = {
+  // The worker's entry: `<entry>.js` beside the bundled CLI, or
+  // `src/<entry>.ts` running from source.
+  entry: 'mediaWorker' | 'renderedWorker';
+  // Names the worker in failures: `media worker exited (code 3)`.
+  label: string;
+  // What every job is told once the worker is off: `previews turned off`.
+  offLabel: string;
+  // The worker's own temp dir, inside the session dir.
+  tempSubdir: string;
+  deadlinesMs: Record<Type, number>;
+  maxInFlight: number;
+  // Job types that may run only this many at a time.
+  perTypeLimit?: Partial<Record<Type, number>>;
+};
+
+export type ForkedWorkerOptions<Type extends string> = {
+  // The session's temp dir, made on first use; the worker's own temp files
+  // go in its `tempSubdir`.
   tempDir: () => string;
   env?: NodeJS.ProcessEnv;
   // Where the worker runs: the repo root.
   cwd?: string;
   modulePath?: string;
-  deadlinesMs?: Partial<Record<JobType, number>>;
+  deadlinesMs?: Partial<Record<Type, number>>;
   backoffMs?: readonly number[];
   idleMs?: number;
-  // Called once, when failures turn previews off.
+  // Called once, when failures turn the worker off.
   onDisabled?: (reason: string) => void;
   // Called right after each fork with the new worker's pid.
   onSpawn?: (pid: number) => void;
 };
 
-export type WorkerBackend = MediaBackend & {disabledReason(): string | null};
+export type ForkedWorker<Jobs extends JobMap> = {
+  // `priority`: lower runs first.
+  submit<T extends keyof Jobs & string>(type: T, request: Jobs[T]['request'], signal: AbortSignal, priority?: number): Promise<Jobs[T]['result'] | WorkerFailure>;
+  // Gives the queued job submitted with `signal` a new priority. A job
+  // already sent to the worker keeps running as it is.
+  prioritize(signal: AbortSignal, priority: number): void;
+  // Ends the worker at once (exit hook): synchronous.
+  dispose(): void;
+  // Why the worker is off for the session, or null.
+  disabledReason(): string | null;
+};
 
 type Job = {
   id: number;
-  type: JobType;
-  request: InspectRequest | RenderRequest | VideoRequest | ExportRequest;
+  type: string;
+  request: object;
   priority: number;
   signal: AbortSignal;
-  resolve: (result: JobResult) => void;
+  resolve: (result: object) => void;
   reject: (error: Error) => void;
   requeued: boolean;
   settled: boolean;
@@ -80,15 +102,15 @@ type Job = {
   onAbort?: () => void;
 };
 
-// The bundle puts cli.js and mediaWorker.js side by side in dist/; running
-// from source (tsx, vitest) the worker is src/mediaWorker.ts.
-function resolveWorkerModule() {
+// The bundle puts cli.js and the workers side by side in dist/; running
+// from source (tsx, vitest) a worker is src/<entry>.ts.
+function resolveWorkerModule(entry: string, label: string) {
   const candidates = [
-    new URL('./mediaWorker.js', import.meta.url),
-    new URL('../mediaWorker.ts', import.meta.url),
+    new URL(`./${entry}.js`, import.meta.url),
+    new URL(`../${entry}.ts`, import.meta.url),
   ];
   const found = candidates.find((url) => fs.existsSync(fileURLToPath(url)));
-  if (!found) throw new Error('media worker module not found next to the CLI');
+  if (!found) throw new Error(`${label} module not found next to the CLI`);
   return fileURLToPath(found);
 }
 
@@ -115,7 +137,7 @@ function abortError() {
   return new Error('aborted');
 }
 
-export function createWorkerBackend({
+export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<keyof Jobs & string>, {
   tempDir,
   env = process.env,
   cwd,
@@ -125,8 +147,9 @@ export function createWorkerBackend({
   idleMs = IDLE_EXIT_MS,
   onDisabled,
   onSpawn,
-}: WorkerBackendOptions): WorkerBackend {
-  const deadlines = {...DEFAULT_DEADLINES_MS, ...deadlinesMs};
+}: ForkedWorkerOptions<keyof Jobs & string>): ForkedWorker<Jobs> {
+  const deadlines: Record<string, number> = {...spec.deadlinesMs, ...deadlinesMs};
+  const limits: Partial<Record<string, number>> = spec.perTypeLimit ?? {};
   const queue: Job[] = [];
   const inFlight = new Map<number, Job>();
   let child: ChildProcess | null = null;
@@ -142,7 +165,7 @@ export function createWorkerBackend({
   let disabled: string | null = null;
   let disposed = false;
 
-  const settle = (job: Job, result: JobResult) => {
+  const settle = (job: Job, result: object) => {
     // An aborted job is settled with its timer still armed; clearing it here
     // first means no path that finishes a job leaves its deadline running.
     clearTimeout(job.timer);
@@ -152,8 +175,10 @@ export function createWorkerBackend({
     job.resolve(result);
   };
 
+  const failure = (state: WorkerFailure['state'], reason: string): WorkerFailure => ({ok: false, state, reason});
+
   const failQueued = (reason: string) => {
-    for (const job of queue.splice(0)) settle(job, {ok: false, state: 'unavailable', reason});
+    for (const job of queue.splice(0)) settle(job, failure('unavailable', reason));
   };
 
   const stopChild = () => {
@@ -176,7 +201,7 @@ export function createWorkerBackend({
     failures = [...failures.filter((at) => now - at < FAILURE_WINDOW_MS), now];
     consecutiveFailures += 1;
     if (failures.length >= MAX_FAILURES && !disabled) {
-      disabled = `previews turned off: ${reason}`;
+      disabled = `${spec.offLabel}: ${reason}`;
       failQueued(disabled);
       onDisabled?.(reason);
       return;
@@ -191,7 +216,7 @@ export function createWorkerBackend({
       inFlight.delete(job.id);
       clearTimeout(job.timer);
       if (job.settled) continue;
-      if (job.requeued) settle(job, {ok: false, state: 'error', reason});
+      if (job.requeued) settle(job, failure('error', reason));
       else {
         job.requeued = true;
         queue.push(job);
@@ -204,11 +229,11 @@ export function createWorkerBackend({
     if (child === exited) child = null;
     if (expectedExits.has(exited) || disposed) return;
     const detail = stderrTail.split('\n').map((line) => line.trim()).find((line) => /^[A-Za-z]*Error\b/.test(line));
-    const reason = `media worker exited (${signal ? `signal ${signal}` : `code ${code}`})${detail ? `: ${detail}` : ''}`;
+    const reason = `${spec.label} exited (${signal ? `signal ${signal}` : `code ${code}`})${detail ? `: ${detail}` : ''}`;
     for (const job of [...inFlight.values()]) {
       inFlight.delete(job.id);
       clearTimeout(job.timer);
-      settle(job, {ok: false, state: 'error', reason});
+      settle(job, failure('error', reason));
     }
     recordFailure(reason);
     pump();
@@ -216,9 +241,9 @@ export function createWorkerBackend({
 
   const spawnChild = () => {
     const dir = tempDir();
-    const workerTemp = path.join(dir, 'worker');
+    const workerTemp = path.join(dir, spec.tempSubdir);
     fs.mkdirSync(workerTemp, {recursive: true, mode: 0o700});
-    const resolved = modulePath ?? resolveWorkerModule();
+    const resolved = modulePath ?? resolveWorkerModule(spec.entry, spec.label);
     const spawned = fork(resolved, [], {
       execArgv: workerExecArgv(resolved),
       // TMPDIR sends anything the worker's process tree writes to temp into
@@ -234,7 +259,7 @@ export function createWorkerBackend({
     spawned.stderr?.on('data', (chunk: string) => {
       stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_LIMIT);
     });
-    spawned.on('message', (message: {id?: number} & JobResult) => {
+    spawned.on('message', (message: {id?: number}) => {
       if (typeof message?.id !== 'number') return;
       const job = inFlight.get(message.id);
       if (!job) return;
@@ -242,7 +267,7 @@ export function createWorkerBackend({
       clearTimeout(job.timer);
       consecutiveFailures = 0;
       const {id: _id, ...result} = message;
-      settle(job, result as JobResult);
+      settle(job, result);
       pump();
     });
     spawned.on('error', () => undefined);
@@ -265,7 +290,7 @@ export function createWorkerBackend({
     // stale: it must not kill a later worker or count as a failure.
     if (!inFlight.has(job.id) || job.child !== child) return;
     inFlight.delete(job.id);
-    settle(job, {ok: false, state: 'error', reason: 'timed out'});
+    settle(job, failure('error', 'timed out'));
     stopChild();
     requeueOthers('timed out');
     recordFailure('timed out');
@@ -279,7 +304,7 @@ export function createWorkerBackend({
       return;
     }
     clearTimeout(idleTimer);
-    while (inFlight.size < MAX_IN_FLIGHT && queue.length > 0) {
+    while (inFlight.size < spec.maxInFlight && queue.length > 0) {
       if (!child) {
         const wait = nextForkAt - Date.now();
         if (wait > 0) {
@@ -291,18 +316,19 @@ export function createWorkerBackend({
         try {
           child = spawnChild();
         } catch (error) {
-          const reason = `media worker failed to start (${error instanceof Error ? error.message.split('\n')[0] : String(error)})`;
-          for (const job of queue.splice(0)) settle(job, {ok: false, state: 'error', reason});
+          const reason = `${spec.label} failed to start (${error instanceof Error ? error.message.split('\n')[0] : String(error)})`;
+          for (const job of queue.splice(0)) settle(job, failure('error', reason));
           recordFailure(reason);
           return;
         }
       }
 
       queue.sort((left, right) => left.priority - right.priority || left.id - right.id);
-      // One video job at a time: the worker runs one ffmpeg at a time, and a
-      // second video job sent now would wait there with its deadline running.
-      const videoBusy = [...inFlight.values()].some((each) => each.type === 'video');
-      const next = queue.findIndex((each) => !(videoBusy && each.type === 'video'));
+      // A job type with a limit waits while that many of it are in flight:
+      // the media worker runs one ffmpeg at a time, and a second video job
+      // sent now would wait there with its deadline running.
+      const running = (type: string) => [...inFlight.values()].filter((each) => each.type === type).length;
+      const next = queue.findIndex((each) => running(each.type) < (limits[each.type] ?? Infinity));
       if (next < 0) break;
       const [job] = queue.splice(next, 1) as [Job];
       if (job.settled) continue;
@@ -319,28 +345,18 @@ export function createWorkerBackend({
     scheduleIdle();
   }
 
-  function submit<T extends JobResult>(type: JobType, request: Job['request'], signal: AbortSignal, priority = 1): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
+  function submit(type: string, request: object, signal: AbortSignal, priority = 1): Promise<object> {
+    return new Promise<object>((resolve, reject) => {
       if (signal.aborted) {
         reject(abortError());
         return;
       }
       if (disposed || disabled) {
-        resolve({ok: false, state: 'unavailable', reason: disabled ?? 'previews turned off'} as T);
+        resolve(failure('unavailable', disabled ?? spec.offLabel));
         return;
       }
       nextId += 1;
-      const job: Job = {
-        id: nextId,
-        type,
-        request,
-        priority,
-        signal,
-        resolve: resolve as (result: JobResult) => void,
-        reject,
-        requeued: false,
-        settled: false,
-      };
+      const job: Job = {id: nextId, type, request, priority, signal, resolve, reject, requeued: false, settled: false};
       // A job dropped by the UI: queued, it never runs; in flight, its answer
       // is ignored, and the worker is left to finish it within its deadline.
       job.onAbort = () => {
@@ -357,10 +373,13 @@ export function createWorkerBackend({
   }
 
   return {
-    inspect: (request, signal, priority) => submit<InspectResult>('inspect', request, signal, priority),
-    render: (request, signal, priority) => submit<RenderResult>('render', request, signal, priority),
-    video: (request, signal, priority) => submit<VideoResult>('video', request, signal, priority),
-    exportCopy: (request, signal) => submit<ExportResult>('exportCopy', request, signal, -1),
+    submit: submit as ForkedWorker<Jobs>['submit'],
+    prioritize(signal, priority) {
+      const job = queue.find((each) => each.signal === signal && !each.settled);
+      if (!job) return;
+      job.priority = priority;
+      pump();
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -369,10 +388,51 @@ export function createWorkerBackend({
       stopChild();
       for (const job of [...queue.splice(0), ...inFlight.values()]) {
         clearTimeout(job.timer);
-        settle(job, {ok: false, state: 'unavailable', reason: 'previews turned off'});
+        settle(job, failure('unavailable', spec.offLabel));
       }
       inFlight.clear();
     },
     disabledReason: () => disabled,
+  };
+}
+
+type MediaJobs = {
+  inspect: {request: InspectRequest; result: InspectResult};
+  render: {request: RenderRequest; result: RenderResult};
+  video: {request: VideoRequest; result: VideoResult};
+  exportCopy: {request: ExportRequest; result: ExportResult};
+};
+
+const MEDIA_WORKER: ForkedWorkerSpec<keyof MediaJobs> = {
+  entry: 'mediaWorker',
+  label: 'media worker',
+  offLabel: 'previews turned off',
+  tempSubdir: 'worker',
+  deadlinesMs: {
+    // Covers a partial clone fetching a blob it never had.
+    inspect: 10_000,
+    render: 8_000,
+    // A probe and up to four frames, each with its own shorter deadline.
+    video: 30_000,
+    exportCopy: 30_000,
+  },
+  maxInFlight: 2,
+  perTypeLimit: {video: 1},
+};
+
+export type WorkerBackendOptions = ForkedWorkerOptions<keyof MediaJobs>;
+
+export type WorkerBackend = MediaBackend & {disabledReason(): string | null};
+
+/** The media worker: reads, verifies and decodes image and video bytes. */
+export function createWorkerBackend(options: WorkerBackendOptions): WorkerBackend {
+  const worker = createForkedWorker<MediaJobs>(MEDIA_WORKER, options);
+  return {
+    inspect: (request, signal, priority) => worker.submit('inspect', request, signal, priority),
+    render: (request, signal, priority) => worker.submit('render', request, signal, priority),
+    video: (request, signal, priority) => worker.submit('video', request, signal, priority),
+    exportCopy: (request, signal) => worker.submit('exportCopy', request, signal, -1),
+    dispose: worker.dispose,
+    disabledReason: worker.disabledReason,
   };
 }

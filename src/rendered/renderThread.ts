@@ -1,6 +1,8 @@
 import {createRequire} from 'node:module';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {Worker, isMainThread, parentPort, workerData} from 'node:worker_threads';
+import type {FileStatus} from '../git.js';
+import {createAssetResolver, LOOKUP_BUDGET_MS, pageLookups, type AssetResolver, type AssetSides} from './assets.js';
 import type {ChangeGroup} from './changes.js';
 import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown.js';
 
@@ -10,8 +12,11 @@ import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown
 // thread can be stopped in the middle of that. One thread serves every file
 // in turn and is replaced after it's stopped.
 
-/** One file to render. Links resolve from `links` by repo path; any other path is outside the review. */
-export type RenderJob = {path: string; source: string; groups: ChangeGroup[]; links: Record<string, LinkAnswer>};
+/**
+ * One file to render. Links resolve from `links` by repo path; any other
+ * path is outside the review. Images follow the asset rule on `assets`.
+ */
+export type RenderJob = {cwd: string; path: string; oldPath?: string; status: FileStatus; source: string; groups: ChangeGroup[]; links: Record<string, LinkAnswer>; assets: AssetSides};
 
 type Reply = {fragment: RenderedFragment} | {error: string};
 
@@ -92,16 +97,24 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
   };
 }
 
-// The thread's side. Images are left as cards: this path reads only the
-// pages' own text.
+// The thread's side. One resolver per repo, so each tree is listed once for
+// the whole run.
 if (!isMainThread && workerData === THREAD_TAG) {
   const port = parentPort!;
+  const resolvers = new Map<string, AssetResolver>();
   port.on('message', (job: RenderJob) => {
+    let resolver = resolvers.get(job.cwd);
+    if (!resolver) {
+      resolver = createAssetResolver({cwd: job.cwd});
+      resolvers.set(job.cwd, resolver);
+    }
     renderMarkdown({
       path: job.path,
+      ...(job.oldPath ? {basePath: job.oldPath} : {}),
       source: job.source,
       groups: job.groups,
-      asset: async () => ({kind: 'skipped'}),
+      // Within the render deadline, so a slow git costs cards, not the page.
+      ...pageLookups(resolver, job.assets, job.status === 'deleted', [], {budgetMs: LOOKUP_BUDGET_MS}),
       // Own keys only: a link to `constructor` names no file in the review.
       link: (repoPath) => (Object.hasOwn(job.links, repoPath) ? job.links[repoPath]! : {kind: 'outside'}),
     }).then(

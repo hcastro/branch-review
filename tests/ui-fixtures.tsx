@@ -13,6 +13,7 @@ import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
+import type {RenderedService} from '../src/rendered/service.js';
 import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult, VideoRequest, VideoResult} from '../src/media/backend.js';
 import type {SideInfo, VideoMeta} from '../src/media/types.js';
 import {KITTY_CAPS, decodePlaceholders, parseApc, pngFixture} from './media-helpers.js';
@@ -111,6 +112,7 @@ export type AppFixtureProps = {
   graphics?: GraphicsCaps;
   addMediaRows?: MediaRowsHook;
   media?: MediaService;
+  rendered?: Pick<RenderedService, 'focus'>;
 };
 
 export function appElement(
@@ -133,6 +135,7 @@ export function appElement(
       {...(fixture.graphics ? {graphics: fixture.graphics} : {})}
       {...(fixture.addMediaRows ? {addMediaRows: fixture.addMediaRows} : {})}
       {...(fixture.media ? {media: fixture.media} : {})}
+      {...(fixture.rendered ? {rendered: fixture.rendered} : {})}
     />
   );
 }

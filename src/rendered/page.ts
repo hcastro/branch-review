@@ -20,12 +20,22 @@ export type RailEntry = {
   current: boolean;
 };
 
+/** A rail entry's count: `+` for a new file, `−` for a deleted one, else its changed and removed blocks, `·` for none. */
+export function railLabel(status: FileStatus, changes: RenderedFragment['changes'] | null) {
+  if (status === 'added' || status === 'untracked') return '+';
+  if (status === 'deleted') return '−';
+  const total = changes ? changes.changed + changes.removed : 0;
+  return total > 0 ? String(total) : '·';
+}
+
 export type PageBody =
   | {kind: 'rendered'; fragment: RenderedFragment}
   | {kind: 'empty'}
   | {kind: 'tooLarge'; bytes: number; head: string}
   | {kind: 'notUtf8'}
-  | {kind: 'failed'; reason: string; source: string};
+  | {kind: 'failed'; reason: string; source: string}
+  // A file the background render hasn't reached: opening it renders it.
+  | {kind: 'pending'};
 
 export type PageFile = {path: string; status: FileStatus; oldPath?: string; body: PageBody};
 
@@ -95,8 +105,8 @@ export function assembleFilePage(input: PageInput): string {
 function strip(title: PageInput['title'], differences: RenderedFragment['differences']) {
   return [
     '<header class="br-strip">',
-    '<span class="br-brand"><span class="br-brand-mark" aria-hidden="true">▍</span>branch-review</span>',
-    `<span class="br-refs" title="${escapeHtml(title.repo)}">${escapeHtml(title.base)}<span class="br-arrow">←</span><span class="br-branch">${escapeHtml(title.branch)}</span></span>`,
+    '<span class="br-brand"><span class="br-brand-mark" aria-hidden="true">▍</span><span class="br-brand-word">branch-review</span></span>',
+    `<span class="br-refs" title="${escapeHtml(title.repo)}"><span class="br-base">${escapeHtml(title.base)}</span><span class="br-arrow">←</span><span class="br-branch">${escapeHtml(title.branch)}</span></span>`,
     '<div class="br-strip-end">',
     fidelity(differences),
     '</div>',
@@ -195,6 +205,8 @@ function fileHead(file: PageFile) {
     const {changed, removed} = file.body.fragment.changes;
     if (changed > 0) parts.push(`${changed} changed`);
     if (removed > 0) parts.push(`${removed} removed`);
+  } else {
+    parts.push(BODY_STATE[file.body.kind]);
   }
   return [
     '<div class="br-filehead">',
@@ -218,19 +230,34 @@ function megabytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// What the head says of a file with no rendered page.
+const BODY_STATE: Record<Exclude<PageBody['kind'], 'rendered'>, string> = {
+  empty: 'empty',
+  tooLarge: 'too large to render',
+  notUtf8: 'not UTF-8 text',
+  failed: "couldn't render",
+  pending: 'not rendered yet',
+};
+
 function body(file: PageFile) {
+  return file.body.kind === 'rendered'
+    ? `<article class="markdown-body${file.status === 'deleted' ? ' br-dimmed' : ''}">\n${file.body.fragment.html}\n</article>`
+    : `<div class="br-body">\n${cardBody(file.body)}\n</div>`;
+}
+
+function cardBody(fileBody: Exclude<PageBody, {kind: 'rendered'}>) {
   const state = (text: string, error = false) => `<p class="br-state${error ? ' br-state-error' : ''}">${escapeHtml(text)}</p>`;
   const raw = (text: string) => `<pre class="br-raw">${escapeHtml(text)}</pre>`;
-  switch (file.body.kind) {
-    case 'rendered':
-      return `<article class="markdown-body${file.status === 'deleted' ? ' br-dimmed' : ''}">\n${file.body.fragment.html}\n</article>`;
+  switch (fileBody.kind) {
     case 'empty':
       return state('this file is empty');
     case 'tooLarge':
-      return `${state(`too large to render (${megabytes(file.body.bytes)})`)}\n${raw(file.body.head)}`;
+      return `${state(`too large to render (${megabytes(fileBody.bytes)})`)}\n${raw(fileBody.head)}`;
     case 'notUtf8':
       return state('not UTF-8 text');
     case 'failed':
-      return `${state(`couldn't render this file · ${file.body.reason}`, true)}\n${raw(file.body.source)}`;
+      return `${state(`couldn't render this file · ${fileBody.reason}`, true)}\n${raw(fileBody.source)}`;
+    case 'pending':
+      return state('not rendered yet · opening this file in branch-review renders it');
   }
 }

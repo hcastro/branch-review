@@ -122,7 +122,10 @@ export type MarkableBlock = {
 /** One side of the diff: its blocks and its source lines. */
 export type MarkSide = {blocks: readonly MarkableBlock[]; lines: readonly string[]};
 
-/** `was` lists the base blocks a modified block replaced, for its `before` view. */
+/**
+ * `was` lists the base blocks a modified block replaced, for its `before`
+ * view. `groups` is empty for a block whose text didn't change.
+ */
 export type BlockMark = {kind: 'added' | 'modified'; groups: string[]; was: number[]};
 
 /**
@@ -145,13 +148,19 @@ export type Removal = {group: ChangeGroup; before: number | null; blocks: number
  * also took text away, the run's new blocks and its removed blocks are
  * paired in order by kind and wording, the way a reader would match them: a
  * pair is one `modified` block, a new block left over is `added`, and a
- * removed block left over becomes a marker where it was. A run that only
- * added lines makes `added` blocks.
+ * removed block left over becomes a marker where it was. Blocks pair only
+ * when their wording mostly matches, so a new block is never shown as an
+ * edit of unrelated old text. A run that only added lines makes `added`
+ * blocks.
+ *
+ * An after block whose text didn't change is `modified` when one of its
+ * lines shows an image whose content changed (`imageLines`), with its base
+ * block as the `before` view.
  *
  * A table's delimiter row counts as part of its header row, so a table is
  * marked by its rows, the way a list is by its items.
  */
-export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly ChangeGroup[]): {marks: Array<BlockMark | null>; removals: Removal[]} {
+export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly ChangeGroup[], imageLines: ReadonlySet<number> = new Set()): {marks: Array<BlockMark | null>; removals: Removal[]} {
   after = {...after, blocks: withDelimiterRows(after.blocks)};
   base = {...base, blocks: withDelimiterRows(base.blocks)};
   const afterOwner = owners(after.blocks);
@@ -184,6 +193,7 @@ export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly Cha
         }
       }
       if (touching.size > 0) marks[index] = {kind: 'modified', groups: [...touching], was};
+      else if (owned.some((line) => imageLines.has(line))) marks[index] = {kind: 'modified', groups: [], was};
       return;
     }
 
@@ -203,20 +213,43 @@ export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly Cha
     push(gone, baseGroup.get(changed[0]!)!.id, index);
   });
 
-  const removals: Removal[] = [];
+  // Runs the diff split only at blank lines are one change: git lines up a
+  // rewritten section by its blank lines, so a heading that stayed can land
+  // in one run while its old copy sits in the next. Their blocks pair as one.
+  const blankBetween = (left: ChangeGroup, right: ChangeGroup) => {
+    const from = left.after ? left.after[1] + 1 : left.anchorLine;
+    const to = right.after ? right.after[0] - 1 : right.anchorLine - 1;
+    for (let line = from; line <= to; line += 1) if ((after.lines[line - 1] ?? '').trim() !== '') return false;
+    return true;
+  };
+  const regions: ChangeGroup[][] = [];
   for (const group of groups) {
     if (group.kind === 'added') continue;
-    const ops = align(gone.get(group.id) ?? [], fresh.get(group.id) ?? [], (baseIndex, afterIndex) => pairScore(base.blocks[baseIndex]!, after.blocks[afterIndex]!));
+    const region = regions.at(-1);
+    if (region && blankBetween(region.at(-1)!, group)) region.push(group);
+    else regions.push([group]);
+  }
+  const freshGroup = new Map([...fresh].flatMap(([id, indexes]) => indexes.map((index) => [index, id] as const)));
+  const goneGroup = new Map(groups.flatMap((group) => (gone.get(group.id) ?? []).map((index) => [index, group] as const)));
+
+  const removals: Removal[] = [];
+  for (const region of regions) {
+    const last = region.at(-1)!;
+    const ops = align(
+      region.flatMap((group) => gone.get(group.id) ?? []),
+      region.flatMap((group) => fresh.get(group.id) ?? []),
+      (baseIndex, afterIndex) => pairScore(base.blocks[baseIndex]!, after.blocks[afterIndex]!),
+    );
     // Removed blocks go before the next block of the run, the way the diff
     // prints `-` lines before `+` lines; with none left, after the run.
     let run: number[] = [];
     const flush = (next: number | undefined) => {
       if (run.length === 0) return;
       const footnote = base.blocks[run[0]!]!.footnote;
-      const anchor = next === undefined ? (group.after ? group.after[1] + 1 : group.anchorLine) : after.blocks[next]!.lines[0];
+      const anchor = next === undefined ? (last.after ? last.after[1] + 1 : last.anchorLine) : after.blocks[next]!.lines[0];
       const target = next === undefined ? afterOwner.get(anchor) : next;
       const point = insertionPoint(after.blocks, target, anchor, footnote);
-      removals.push({group, blocks: run, before: point === null ? null : keepOutOfContainer(after.blocks, point, base.blocks, run)});
+      removals.push({group: goneGroup.get(run[0]!)!, blocks: run, before: point === null ? null : keepOutOfContainer(after.blocks, point, base.blocks, run)});
       run = [];
     };
     for (const op of ops) {
@@ -225,8 +258,9 @@ export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly Cha
         continue;
       }
       flush(op.after);
-      if (op.base === undefined) marks[op.after!] = {kind: 'added', groups: [group.id], was: []};
-      else marks[op.after!] = {kind: 'modified', groups: [group.id], was: [op.base]};
+      const group = freshGroup.get(op.after!)!;
+      if (op.base === undefined) marks[op.after!] = {kind: 'added', groups: [group], was: []};
+      else marks[op.after!] = {kind: 'modified', groups: [...new Set([group, goneGroup.get(op.base)!.id])], was: [op.base]};
     }
     flush(undefined);
   }
@@ -302,18 +336,45 @@ function family(block: MarkableBlock) {
   return block.footnote ? `footnote ${tag}` : tag;
 }
 
-function words(text: string) {
-  return new Set(text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+// An image, and a link's destination: neither is part of a block's wording.
+const IMAGE = /!\[[^\]]*\]\([^)]*\)/g;
+const IMAGE_SOURCE = /!\[[^\]]*\]\(\s*<?([^)>\s]*)/g;
+const LINK_DESTINATION = /\]\([^)]*\)/g;
+
+// What a block shows, for telling an edit from new text: the letter pairs
+// of its words, so `Theme` and `Theming` are close and unrelated sentences
+// are far apart. A block that is only images shows its images, so it
+// compares by their sources.
+function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>} {
+  const prose = text.replace(IMAGE, ' ').replace(LINK_DESTINATION, ']').toLowerCase();
+  const words = prose.match(/[\p{L}\p{N}]+/gu) ?? [];
+  if (words.length === 0) return {kind: 'images', parts: new Set([...text.matchAll(IMAGE_SOURCE)].map((match) => match[1]!))};
+  const parts = new Set<string>();
+  for (const word of words) {
+    const letters = [...word];
+    if (letters.length === 1) parts.add(word);
+    for (let at = 0; at + 1 < letters.length; at += 1) parts.add(letters[at]! + letters[at + 1]!);
+  }
+  return {kind: 'words', parts};
 }
 
-// Blocks of one kind pair, the closer their wording the better; others never.
+// Below this share of parts in common, two blocks are different text, not
+// an edit of one another.
+const MIN_LIKENESS = 0.3;
+
+// Blocks of one kind pair when they look alike, the closer the better, and a
+// block whose text is the same on both sides pairs ahead of any other;
+// blocks of different kinds never pair.
 function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
   if (family(baseBlock) !== family(afterBlock)) return null;
-  const left = words(baseBlock.text);
-  const right = words(afterBlock.text);
-  const shared = [...left].filter((word) => right.has(word)).length;
-  const union = left.size + right.size - shared;
-  return 1 + (union === 0 ? 1 : shared / union);
+  if (baseBlock.text.trim() === afterBlock.text.trim()) return 3;
+  const left = likeness(baseBlock.text);
+  const right = likeness(afterBlock.text);
+  if (left.kind !== right.kind) return null;
+  const shared = [...left.parts].filter((part) => right.parts.has(part)).length;
+  const total = left.parts.size + right.parts.size;
+  const similarity = total === 0 ? 1 : (2 * shared) / total;
+  return similarity < MIN_LIKENESS ? null : 1 + similarity;
 }
 
 type AlignOp = {base?: number; after?: number};

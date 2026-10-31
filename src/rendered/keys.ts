@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import type {FileStatus} from '../git.js';
 import {PAGE_CSS_HASH} from './assets.generated.js';
 import type {ChangeGroup} from './changes.js';
+import type {RailEntry} from './page.js';
 
 /** Bumped whenever the renderer's output changes for the same input. */
 export const RENDERER_VERSION = 1;
@@ -10,10 +11,12 @@ export const RENDERER_VERSION = 1;
  * A page's file name: the first 20 hex of a sha256 over everything that
  * decides its content, so a page's name never carries repo text and an
  * unchanged file keeps its name. `rail` is the signature of the rendered
- * file list the page links to.
+ * file list the page links to. `oldPath` is where a moved file was, which
+ * decides the images its base side shows.
  */
 export function pageKey(parts: {
   path: string;
+  oldPath?: string;
   status: FileStatus;
   before?: string;
   after?: string;
@@ -21,10 +24,34 @@ export function pageKey(parts: {
   rail: string;
 }): string {
   const groups = parts.groups.map((group) => [group.kind, group.after, group.base]);
+  // Named only when there is one, so a file that didn't move keeps its key.
+  const moved = parts.oldPath === undefined ? [] : [parts.oldPath];
   return createHash('sha256')
-    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail]))
+    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail, ...moved]))
     .digest('hex')
     .slice(0, 20);
+}
+
+/**
+ * A TUI page's file name: its fragment's key, what its body is (rendered,
+ * or a card and why), the images that fragment embeds, the files its rail
+ * lists and the refs in its title. The rail's change counts are left out:
+ * they come from other files' fragments, and a key that held them would
+ * rewrite every page when one file's count moved. A page shows the counts
+ * of the moment it was written.
+ */
+export function renderedPageKey(parts: {fragment: string; body: string; assets: string; rail: readonly RailEntry[]; title: {repo: string; base: string; branch: string; worktree: boolean}}): string {
+  const rail = parts.rail.map((entry) => [entry.path, entry.status, entry.href, entry.current]);
+  const {repo, base, branch, worktree} = parts.title;
+  return createHash('sha256')
+    .update(JSON.stringify([RENDERER_VERSION, parts.fragment, parts.body, parts.assets, rail, [repo, base, branch, worktree]]))
+    .digest('hex')
+    .slice(0, 20);
+}
+
+/** A file's stable page name for the session, which always shows its newest page. */
+export function fileAlias(fileKey: string) {
+  return `f-${createHash('sha256').update(fileKey).digest('hex').slice(0, 20)}`;
 }
 
 /** The signature of a rail: which files it lists, in order, and their status. */

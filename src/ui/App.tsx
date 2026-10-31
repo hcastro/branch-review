@@ -39,6 +39,7 @@ import {createLoneEscapeGuard} from '../media/replyGuard.js';
 import {placeholderRun} from '../media/kitty.js';
 import {formatBytes, formatLabel} from '../media/layout.js';
 import type {MediaService, WantedBox} from '../media/service.js';
+import type {RenderedService} from '../rendered/service.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 
 /**
@@ -69,6 +70,8 @@ type AppProps = {
   addMediaRows?: MediaRowsHook;
   // Draws media files as pictures, when the terminal can.
   media?: MediaService;
+  // Renders the review's markdown in the background, the active file first.
+  rendered?: Pick<RenderedService, 'focus'>;
 };
 
 const SCROLL_STEP = 3;
@@ -2223,6 +2226,7 @@ function AppContent({
   graphics,
   addMediaRows,
   media,
+  rendered,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -2424,6 +2428,9 @@ function AppContent({
   const activeTreeId = useMemo(() => findTreeSelectionId(rows, activeFileKey), [activeFileKey, rows]);
   const activeRowIndex = rows.findIndex((row) => row.id === activeTreeId);
   const activeFile = activeSection?.file;
+  useEffect(() => {
+    if (activeFileKey) rendered?.focus(activeFileKey);
+  }, [activeFileKey, rendered]);
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
     [allDiffRows],

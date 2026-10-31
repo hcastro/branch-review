@@ -300,6 +300,8 @@ type ToolStep = {
   cwd: string;
   /** Unset for git: the driver supplies the git environment for `cwd`. */
   env?: NodeJS.ProcessEnv;
+  /** Added to the environment the step runs with. */
+  extraEnv?: Record<string, string>;
   input?: string;
   maxBuffer?: number;
   decode?: false;
@@ -332,7 +334,7 @@ export function runOperation<T>(operation: GitOperation<T>, onProgress?: () => v
 
     let result: ToolResult;
     try {
-      result = runTool(step.command, step.args, {...step, env: step.env ?? gitEnv(step.cwd)});
+      result = runTool(step.command, step.args, {...step, env: {...(step.env ?? gitEnv(step.cwd)), ...step.extraEnv}});
     } catch (error) {
       next = operation.throw(error);
       continue;
@@ -377,7 +379,7 @@ export async function runOperationAsync<T>(operation: GitOperation<T>, scope: Op
       continue;
     }
 
-    const env = step.env ?? gitEnvFor(step.cwd, privateIndex);
+    const env = {...(step.env ?? gitEnvFor(step.cwd, privateIndex)), ...step.extraEnv};
     let result: ToolResult;
     try {
       result = await runToolAsync(step.command, step.args, {...step, env}, {onProgress, signal});
@@ -507,15 +509,51 @@ type RunGitOptions = {
   allowDiffExit?: boolean;
   maxBuffer?: number;
   decode?: false;
+  /**
+   * In a partial clone, an object the clone lacks fails the call instead of
+   * being fetched; on a git too old to promise that, the call is refused.
+   */
+  local?: true;
 };
 
+// Turns off lazy fetching in a partial clone (git 2.44 and later; older git
+// ignores it).
+const LOCAL_ONLY_ENV = {GIT_NO_LAZY_FETCH: '1'};
+const LAZY_FETCH_OFF_SINCE = [2, 44] as const;
+
+// By repo: whether a `local` read can be kept from fetching. It can unless
+// the repo is a partial clone and git is too old to honor LOCAL_ONLY_ENV;
+// there, git would fetch any object the clone lacks the moment it is read,
+// so `local` reads are refused instead. Asked once per repo.
+const localReadsSafe = new Map<string, boolean>();
+
+function* localReadsSafeOperation(cwd: string): GitOperation<boolean> {
+  const known = localReadsSafe.get(cwd);
+  if (known !== undefined) return known;
+  const version = /git version (\d+)\.(\d+)/.exec(yield* gitOperation(cwd, ['version']));
+  const [major, minor] = version ? [Number(version[1]), Number(version[2])] : [0, 0];
+  const [wantMajor, wantMinor] = LAZY_FETCH_OFF_SINCE;
+  let safe = major > wantMajor || (major === wantMajor && minor >= wantMinor);
+  if (!safe) {
+    // A partial clone names its promisor remote; a value of false names none.
+    const promisors = yield* tryGitOperation(cwd, ['config', '--get-regexp', '^(extensions\\.partialclone|remote\\..*\\.promisor)$']);
+    safe = !(promisors ?? '').split('\n').some((line) => /^extensions\.partialclone \S/.test(line) || /^remote\..*\.promisor true$/.test(line));
+  }
+  localReadsSafe.set(cwd, safe);
+  return safe;
+}
+
 function* gitResultOperation(cwd: string, args: string[], options: RunGitOptions = {}): GitOperation<ToolResult> {
+  if (options.local && !(yield* localReadsSafeOperation(cwd))) {
+    throw new Error("git refused: in a partial clone, git before 2.44 would fetch what the clone lacks");
+  }
   const result = yield* runToolStep({
     command: 'git',
     args: [...GIT_SAFETY_ARGS, ...args],
     cwd,
     maxBuffer: options.maxBuffer,
     ...(options.decode === false ? {decode: false as const} : {}),
+    ...(options.local ? {extraEnv: LOCAL_ONLY_ENV} : {}),
   });
   if (result.status === 0) return result;
 
@@ -544,8 +582,8 @@ function* gitOperation(cwd: string, args: string[], options: RunGitOptions = {})
   return (yield* gitResultOperation(cwd, args, options)).stdout;
 }
 
-function* gitBytesOperation(cwd: string, args: string[]): GitOperation<Buffer> {
-  return (yield* gitResultOperation(cwd, args)).stdoutBytes;
+function* gitBytesOperation(cwd: string, args: string[], options: RunGitOptions = {}): GitOperation<Buffer> {
+  return (yield* gitResultOperation(cwd, args, options)).stdoutBytes;
 }
 
 // Failures that affect every file, so per-file isolation must not swallow them.
@@ -1104,6 +1142,35 @@ export function* catFileBlobOperation(cwd: string, abbrevId: string, limit: numb
 }
 
 /**
+ * A blob's bytes, as catFileBlobOperation reads them, or null when it holds
+ * more than `limit` bytes. A partial clone never fetches it: a blob the
+ * clone lacks fails instead, so reading one costs no network.
+ */
+export function* localBlobOperation(cwd: string, abbrevId: string, limit: number): GitOperation<Buffer | null> {
+  if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
+  try {
+    const result = yield* gitResultOperation(cwd, ['-c', 'core.disambiguate=blob', 'cat-file', 'blob', abbrevId], {maxBuffer: limit, decode: false, local: true});
+    return result.stdoutBytes;
+  } catch (error) {
+    if (error instanceof OutputTooLargeError) return null;
+    throw error;
+  }
+}
+
+/**
+ * The full id of the blob `id` names, when bytes read from the work tree
+ * are that blob, or null. Bytes that differ only in CRLF line ends match
+ * too: git turns them into LF as it reads the file (`core.autocrlf`,
+ * `eol=crlf`), so the blob holds LF.
+ */
+export function matchingBlobId(bytes: Buffer, id: string, format: ObjectFormat): string | null {
+  const exact = gitBlobId(bytes, format);
+  if (exact.startsWith(id)) return exact;
+  const normalized = gitBlobId(Buffer.from(bytes.toString('latin1').replace(/\r\n/g, '\n'), 'latin1'), format);
+  return normalized.startsWith(id) ? normalized : null;
+}
+
+/**
  * A work tree file over the read limit. Unlike the other ways a work tree
  * read fails, this one follows from the content itself: the same content is
  * always too large.
@@ -1235,12 +1302,60 @@ export async function openVerifiedVideoFd(cwd: string, filePath: string, verifie
   return opened.handle;
 }
 
-/** A blob's full id and size, by its (abbreviated) id. */
 /** The id of the object `ref` holds at `filePath`, such as a pure rename's blob, which its patch doesn't name. */
 export function* objectAtRefOperation(cwd: string, ref: string, filePath: string): GitOperation<string> {
   return yield* gitLineOperation(cwd, ['rev-parse', '--verify', `${ref}:${filePath}`]);
 }
 
+/** The id of the tree `ref` names: a commit's tree, or a tree id itself. */
+export function* treeOidOperation(cwd: string, ref: string): GitOperation<string> {
+  return yield* gitLineOperation(cwd, ['rev-parse', '--verify', `${ref}^{tree}`]);
+}
+
+/** The commit two refs' history meets at: the base side of `base...branch`. */
+export function* mergeBaseOidOperation(cwd: string, base: string, branch: string): GitOperation<string> {
+  return yield* mergeBaseOperation(cwd, base, branch);
+}
+
+/** A file in a tree: a blob (`100644`, `100755`), a symlink (`120000`) or a submodule (`160000`). */
+export type TreeEntry = {mode: string; oid: string};
+
+const TREE_LINE = /^([0-7]{6}) [a-z]+ ([0-9a-f]{40,64})$/;
+
+/**
+ * Every file a tree holds, recursively, by repo path. Folders aren't listed,
+ * and a submodule is one entry. A name that isn't UTF-8 names no file a
+ * markdown link can reach, so it is left out. Sizes aren't asked for: in a
+ * partial clone, git would fetch every blob of the tree to learn them.
+ */
+export function* treeEntriesOperation(cwd: string, treeOid: string): GitOperation<Map<string, TreeEntry>> {
+  if (!OBJECT_ID.test(treeOid)) throw new Error(`not an object id: ${treeOid}`);
+  const output = yield* gitBytesOperation(cwd, ['ls-tree', '-r', '-z', '--full-tree', treeOid], {local: true});
+  const entries = new Map<string, TreeEntry>();
+  for (const field of splitNul(output)) {
+    const tab = field.indexOf(0x09);
+    if (tab < 0) continue;
+    const header = TREE_LINE.exec(field.subarray(0, tab).toString('latin1'));
+    const name = field.subarray(tab + 1);
+    if (!header || !isUtf8(name)) continue;
+    entries.set(name.toString('utf8'), {mode: header[1]!, oid: header[2]!});
+  }
+  return entries;
+}
+
+/**
+ * Whether a path git doesn't track is in the work tree as an untracked
+ * file, or as one the ignore rules hide. Only git's listing is read, never
+ * the file.
+ */
+export function* untrackedStateOperation(cwd: string, filePath: string): GitOperation<'untracked' | 'ignored' | null> {
+  const listed = (output: Buffer) => splitNul(output).some((name) => name.length > 0);
+  if (listed(yield* gitBytesOperation(cwd, ['ls-files', '-z', '--others', '--exclude-standard', '--', filePath], {local: true}))) return 'untracked';
+  if (listed(yield* gitBytesOperation(cwd, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', filePath], {local: true}))) return 'ignored';
+  return null;
+}
+
+/** A blob's full id and size, by its (abbreviated) id. */
 export function* blobFactsOperation(cwd: string, abbrevId: string): GitOperation<{oid: string; size: number}> {
   if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
   const oid = yield* gitLineOperation(cwd, ['-c', 'core.disambiguate=blob', 'rev-parse', '--verify', `${abbrevId}^{blob}`]);
