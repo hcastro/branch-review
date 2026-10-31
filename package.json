@@ -1,7 +1,7 @@
 {
   "name": "branch-review",
   "version": "0.1.0",
-  "description": "A local, PR-style review UI for your terminal. Review branch, worktree, and AI-generated changes before they leave your machine.",
+  "description": "A PR-style review UI in your terminal for checking what you or a coding agent changed before it reaches GitHub.",
   "keywords": [
     "cli",
     "git",
@@ -34,6 +34,7 @@
   "files": [
     "dist",
     "skills",
+    "docs",
     "README.md",
     "LICENSE"
   ],

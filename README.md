@@ -1,12 +1,12 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/banner-dark.png">
     <img alt="branch-review" src="assets/banner-light.png" width="640">
   </picture>
-</p>
+</h1>
 
 <p align="center">
-  A PR-style review UI for your terminal, built for checking what you or your coding agent changed before any of it reaches GitHub.
+  A PR-style review UI in your terminal for checking what you or a coding agent changed before it reaches GitHub.
 </p>
 
 <p align="center">
@@ -16,139 +16,49 @@
   <img alt="Powered by git-delta" src="https://img.shields.io/badge/diffs-git--delta-7ee787?style=flat-square">
 </p>
 
+`branch-review` shows what your branch's pull request will contain, in the terminal, before you push. Use it to read your own changes the way a reviewer will, or keep it open beside a coding agent and watch each edit land while the agent works.
+
+When an edit needs another pass, copy the block or its path into the agent's prompt. Changed images and videos show as pictures in the diff. `branch-review` never writes to the repo or runs its diff settings, so you can read a change from an agent or a teammate before you trust it.
+
+In the following screenshot, a rate-limiting change is under review, with the changed-file tree beside the diff of `src/middleware/rateLimit.ts`:
+
 <p align="center">
   <img alt="branch-review showing a changed-file tree next to a syntax-highlighted diff of src/middleware/rateLimit.ts" src="assets/review-ui.png" width="100%">
 </p>
 
-Run `branch-review` in any Git repo, from the root or any folder inside it. You get a changed-file tree, syntax-highlighted diffs from [`git-delta`](https://github.com/dandavison/delta), and per-file and branch-wide stats. The view updates live while files change on disk.
+In the preceding screenshot, the tree lists eight changed files, each with a colored status letter such as `A` for added, `M` for modified, or `U` for untracked. Each diff comes from delta, with syntax highlighting and line numbers, and the top bar shows the totals for the whole branch.
 
-Every file and diff block has copy buttons. They hand a path, a diff, or an agent-ready block of context to Claude Code, Codex, Cursor, or a Slack thread in one click.
+## Review what the pull request will contain
+
+Run `branch-review` from the root of a Git repo or from any folder inside it. By default, it reviews the commits on your branch since it left the base branch, plus everything that you haven't committed. That includes staged and unstaged edits and untracked files that nobody has staged yet. The top bar labels this range `HEAD + worktree`, and it matches the pull request that you'll open after you commit those edits.
+
+You don't have to name the base, because `branch-review` detects it. For more information about how it picks the base and about other comparisons, see the [Usage](#usage) section.
+
+A renamed file shows its edits against its old path. A change with no text to diff still shows up in the review. A pure rename, a mode change, a new empty file, or a binary file gets a one-line summary, such as `renamed from a.txt` or `mode 100644 → 100755`.
+
+A file that can't be diffed shows `✗ Could not load diff` and the reason under its header, and the rest of the review keeps working.
 
 ## Watch an agent work
 
-Leave `branch-review` open next to a coding agent. New files land in the tree as they're written. Edits wash in over the diff you're reading, and you never reload.
+Leave `branch-review` open next to a coding agent. The review refreshes as files change on disk, so new files appear in the tree as the agent writes them and edits appear in the diff you're reading, with no reload.
+
+The following recording shows an agent writing a new file and then editing it while `branch-review` is open:
 
 <p align="center">
   <img alt="An agent writes a new file and edits it while branch-review shows each change arriving live" src="assets/live-review.gif" width="100%">
 </p>
 
-By default the review covers `HEAD` plus your worktree against the base branch. Commits the agent made and edits it hasn't committed yet show up together, scoped the way the eventual PR will be.
+Each change is highlighted as it arrives. In a truecolor terminal, a new file or block is tinted green and an edited one teal, and the tint fades within about a second and a half. The file's tree row stays lit in a matching color for about 2.6 seconds.
 
-## Install
+The review keeps your place through every refresh: the text at the top of the pane stays in place when lines or files appear above it. Blocks that you collapsed stay collapsed, and a block that you focused with `[` or `]` keeps its focus as long as its header doesn't move. If the lines you're selecting change mid-drag, `branch-review` drops the selection and says why, so the copy never holds text that you didn't pick.
 
-You need Node.js 22+, Git, and `git-delta` on your `PATH`. CI runs on Node 22 and 24.
+Commits, checkouts, fetches, and pushes refresh the review as well, and `branch-review` recalculates the range each time. The footer shows `refreshing...` and then `updated now`. If a refresh fails, the last good review stays on screen with Git's reason in the footer, and the next change tries again.
 
-```sh
-brew install git-delta          # macOS. See the delta docs for other platforms.
-```
+## Copy context back to the agent
 
-Install the CLI straight from GitHub. The package builds itself on install, so pnpm needs permission to run that build:
+Every file and diff block has copy buttons, and most buttons have a key. They put a diff or a block of agent-ready context on your clipboard, ready to paste into Claude Code, Codex, Cursor, or a Slack thread.
 
-```sh
-pnpm add -g --allow-build=branch-review github:hcastro/branch-review
-```
-
-Or work from a clone:
-
-```sh
-git clone https://github.com/hcastro/branch-review.git
-cd branch-review
-pnpm install
-pnpm link --global
-```
-
-## Usage
-
-```sh
-branch-review                      # HEAD + worktree vs the detected base
-branch-review my-feature           # my-feature vs the detected base
-branch-review my-feature main      # my-feature vs main
-branch-review HEAD HEAD            # uncommitted changes only
-```
-
-From a subdirectory, the review still covers the whole repo, with paths relative to the repo root.
-
-The base comes from `origin/HEAD` when the remote has one. Otherwise it falls back to the first of `development`, `main`, `master`, and `trunk` that exists.
-
-Refs resolve locally first and then as `origin/<ref>`. That lets you review against a remote base you never checked out:
-
-```sh
-branch-review my-feature release/2026.04
-```
-
-### Options
-
-| Flag | Effect |
-| --- | --- |
-| `--watch` | Refresh live as files change. On by default in an interactive terminal. |
-| `--no-watch` | Open a frozen snapshot. Handy while an agent is mid-write and the view would churn. |
-| `--watch-poll` | Poll instead of using filesystem events. Use it on network mounts and container bind mounts. |
-| `--no-animations` | Skip the arrival highlights. Useful on slow or remote terminals. |
-| `--no-images` | Show image, SVG and video files as plain diffs, as before media previews. `--images` cancels an earlier `--no-images`; `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn previews off. |
-
-Color is off when `NO_COLOR` is set to any non-empty value, when `FORCE_COLOR` is `0` or `false`, or when `TERM=dumb`. The same rule covers delta's diffs and the app's own chrome. Diffs keep their `+` and `-` markers.
-
-## Reviewing
-
-### Keys
-
-| Key | Action |
-| --- | --- |
-| `↑` / `↓` | Previous / next file |
-| `j` / `k` | Scroll the diff down / up |
-| `g` / `G` | Jump to the top / bottom |
-| `[` / `]` | Previous / next diff block |
-| `Enter` / `Space` | Collapse or expand the focused block |
-| `t` | Show or hide the file tree |
-| `o` | Open the image on screen in the default viewer |
-| `O` | Quick Look the image on macOS. Elsewhere it works like `o`. |
-| `v` | Switch an image or video to a details table and back. On an SVG, show its source only, and back. |
-| `1` / `2` / `3` | Compare a modified image side by side, by flipping between its versions, or as a difference. `2` again flips to the other version. |
-| `q` / `Esc` / `Ctrl-C` | Quit |
-
-The focused block is the one at the top of the diff pane, and it's marked. The footer keeps a short hint of these keys.
-
-Every copy action works from the keyboard too. File keys copy from the current file, and block keys copy from the focused block.
-
-| Key | Copies |
-| --- | --- |
-| `y` | Path relative to the repo root |
-| `Y` | Absolute path |
-| `d` | The file's diff |
-| `f` | The file's current contents |
-| `c` | The block's code |
-| `p` | The block's diff |
-| `b` | The block as agent-ready context |
-| `T` | The changed-file tree |
-
-### Mouse
-
-| Gesture | Action |
-| --- | --- |
-| Click a file | Jump the diff to that file |
-| Click a folder | Collapse or expand it |
-| Click a block header | Collapse or expand that diff block |
-| Drag across code | Select lines and copy them |
-| Drag the tree's edge | Resize the file tree. `‹` collapses it. |
-| Scroll | Scroll whichever pane is under the pointer |
-
-### Copy actions
-
-Hover a file header, a diff block, or a tree row to reveal its copy buttons.
-
-| Where | Button | Copies |
-| --- | --- | --- |
-| File header | `Copy path` | Path relative to the repo root |
-| | `Copy absolute path` | Full path on disk. It shows up when you hover `Copy path`. |
-| | `Copy diff` | The file's diff |
-| | `Copy file` | The file's current contents |
-| Diff block | `Copy code` | The block's added lines, without diff markers |
-| | `Copy diff` | The block's diff |
-| | `Copy block` | Agent-ready context for the block |
-| Tree row | `Copy` | That file's path |
-| Tree header | `Copy tree` | The changed files as a fenced ASCII tree |
-
-`Copy block` produces a snippet you can paste straight into a prompt:
+**Copy block**, or `b`, copies the focused block as a snippet that you can paste into a prompt. The following example shows a block copied from `src/server.ts`:
 
 ````md
 File: src/server.ts
@@ -168,108 +78,228 @@ Lines: 1-8
 ```
 ````
 
-When Git can name the enclosing function, the snippet adds a `Function:` line too.
+When Git can name the enclosing function, the snippet adds a `Function:` line too. The fence is longer than any run of backticks in the patch, so no line of code can close it early, and the patch keeps its trailing context lines so it still applies.
 
-Copies keep the file's exact bytes, from the buttons, the keys, and a drag-select alike. Tabs stay tabs and control characters stay as they are, even though the screen shows them as visible markers.
+Dragging across code copies the code alone, without delta's line numbers or the `+` and `-` markers. Every copy keeps the file's exact bytes, including a drag-select. A wrapped line copies as one line with its tabs intact, and a control character that the screen shows as a marker copies as the real character.
 
-Some copies fail on purpose, and the toast names the reason:
+File keys copy from the file at the top of the diff, and block keys copy from the focused block. The following table lists every copy:
 
-- A file that isn't valid UTF-8 text can't be copied as text. The copy reports "not UTF-8 text".
-- Copying contents (`Copy file` or `f`) fails for a file over 16 MB.
-- When a file's diff failed to load, its diff and block copies report that failure as the reason. `Copy file` and `f` still work, since they read the file itself.
-- A file whose name isn't valid UTF-8 can't be copied at all, its path included. Every copy of it reports "file name is not UTF-8".
-- `Copy tree` and `T` copy nothing when any one file name in the review isn't valid UTF-8. The tree is refused whole, and the toast names that file.
+| Where | Button | Key | Copies |
+| --- | --- | --- | --- |
+| File header | **Copy path** | `y` | The path relative to the repo root |
+| File header | **Copy absolute path** | `Y` | The full path on disk. The button appears when you hold the pointer over **Copy path**. |
+| File header | **Copy diff** | `d` | The file's diff |
+| File header | **Copy file** | `f` | The file's contents in the reviewed version: the file on disk by default, or the branch's version when you review a named branch |
+| Diff block | **Copy code** | `c` | The block's added lines, without diff markers |
+| Diff block | **Copy diff** | `p` | The block's diff |
+| Diff block | **Copy block** | `b` | The block as agent-ready context |
+| Tree row | **Copy** | None | That file's path |
+| Tree header | **Copy tree** | `T` | The changed files as a fenced ASCII tree |
 
-### Images
+A file header always shows its buttons. A diff block shows its buttons when it's focused or when you hold the pointer over it, and a tree row shows **Copy** while the pointer is over the row. After a copy, the button reads **✓ Copied** for a moment, and the footer names what you copied, such as `✓ Copied block · src/a.ts:12`.
 
-In a terminal that draws images, added, deleted and modified PNG, JPEG, GIF, WebP and AVIF files show as pictures in the diff pane. Each one keeps its aspect ratio and is sized to fit the pane. Tiny icons are scaled up by a whole factor so their pixels stay sharp. In Kitty and in Ghostty 1.4 or later, an animated GIF or WebP plays in a loop, run by the terminal itself. Everywhere else, and with `--no-animations`, it shows its first frame and says how many it has.
+Some copies refuse on purpose, and the footer names the reason. A file that isn't UTF-8 text, for example, reports `not UTF-8 text`. For more information about refusals and payload formats, see [Clipboard copies in branch-review](docs/copying.md).
 
-A modified image opens with its old and new versions side by side. `2` (or the tab row above the picture) switches to flip mode, which shows one version at a time: press `2` again or click the picture to swap. `3` shows the difference, with changed pixels marked over a darkened copy of the new version and the share of the image that changed. The mode you pick stays for the rest of the session. The metrics row shows both versions' sizes and the change in bytes.
+## See images and video in the diff
 
-An SVG shows its rendered picture first, with its source blocks folded under it. `Enter` or `Space` unfolds a block like any other, and a block you unfolded stays unfolded through refreshes. `v` shows the source only. The header keeps `Copy path · Copy diff · Copy file`. `o` and `O` open a PNG rendered from the SVG, never the SVG itself, so no script in it ever runs.
+Added, deleted, and modified PNG, JPEG, GIF, WebP, and AVIF files show as pictures in Ghostty, cmux, and Kitty. Other terminals with 256 colors or more draw a block preview in colored half-block characters. Kitty and Ghostty 1.4 or later play an animated GIF or WebP in a loop. Inside tmux, pictures need `set -g allow-passthrough all` in your tmux config.
 
-| Terminal | Images |
+A modified image opens with its old and new versions side by side. To flip between the versions, press `2`. The difference view, on `3`, marks changed pixels over a darkened copy and shows what percent of the image changed. An SVG shows its rendered picture with its source collapsed under it. A video shows a table of its length, size, resolution, codec, and frame rate, with frames taken from each version.
+
+For more information about terminal support, tmux setup, compare modes, and opening a file in a viewer, see [Image and video previews](docs/media-previews.md).
+
+## Review untrusted changes safely
+
+`branch-review` is built for reading changes that an agent or a teammate wrote, before you trust them. It doesn't write to the repo it reviews. The index, the working tree, refs, the stash, config, and hooks stay as they were, and Git runs on a private copy of the index.
+
+`branch-review` ignores repo settings that could change the diff or run a program, such as `diff.external`, textconv drivers, `core.fsmonitor`, and `diff.noprefix`. The patch that you read and copy is Git's own output.
+
+Hidden characters, such as control characters and bidirectional (bidi) overrides, show on screen as markers, for example `^M` or `<U+202E>`, in diffs, paths, ref names, and tooltips. A line that uses bidi characters to disguise its code, the attack known as Trojan Source, stands out on screen, and so does a look-alike file name. Copies keep the original bytes.
+
+For more information about watch mode and what `branch-review` touches on disk, see [How branch-review works](docs/how-it-works.md).
+
+## Install
+
+You need the following tools:
+
+- Node.js 22 or later. CI runs on Node 22 and 24.
+- Git.
+- A clipboard tool for copies: `pbcopy` on macOS, `clip.exe` on Windows and WSL, or `wl-copy`, `xclip`, or `xsel` on Linux.
+- Optional: `ffprobe` and `ffmpeg` on your `PATH`, for video metadata and frames.
+
+To install `branch-review`, follow these steps:
+
+1. Install delta (the `git-delta` package), with its `delta` command on your `PATH`. On macOS, install it with Homebrew:
+
+   ```sh
+   brew install git-delta
+   ```
+
+   For other platforms, see the [delta installation instructions](https://dandavison.github.io/delta/installation.html).
+
+2. Install `branch-review` from GitHub:
+
+   ```sh
+   pnpm add -g --allow-build=branch-review github:hcastro/branch-review
+   ```
+
+   The package builds when it installs, so the `--allow-build` flag lets pnpm run that build.
+
+To install from a clone instead, link the package globally:
+
+```sh
+git clone https://github.com/hcastro/branch-review.git
+cd branch-review
+pnpm install
+pnpm link --global
+```
+
+## Usage
+
+The command takes up to two refs:
+
+```
+branch-review [BRANCH [BASE]] [OPTIONS]
+```
+
+Replace the following:
+
+- `BRANCH`: the branch to review. The default is `HEAD`, which also includes uncommitted and untracked files. Any other branch is reviewed by its commits only.
+- `BASE`: the branch to compare against. The default is the detected base.
+
+The following examples show common comparisons:
+
+```sh
+branch-review                      # HEAD plus the working tree vs. the detected base
+branch-review my-feature           # my-feature's commits vs. the detected base
+branch-review my-feature main      # my-feature vs. main
+branch-review HEAD HEAD            # uncommitted changes only
+```
+
+From a subdirectory, the review still covers the whole repo, with paths relative to the repo root. Outside a repo, `branch-review` exits with a one-line `not a git repository` error.
+
+The detected base is `origin/HEAD` when the remote has one. Otherwise, `branch-review` uses the first of `development`, `main`, `master`, and `trunk` that exists, locally or on `origin`. If none of those exists, it uses the current branch, which leaves only uncommitted changes in the review. A repo where nothing resolves makes it exit and ask for a base, such as `branch-review HEAD main`.
+
+Refs resolve locally first and then on `origin`, so you can review against a remote base that you never checked out:
+
+```sh
+branch-review my-feature release/2026.04
+```
+
+### Options
+
+`branch-review` accepts the following options:
+
+| Flag | Effect |
 | --- | --- |
-| Ghostty, cmux, Kitty | Drawn as pictures |
-| Apple Terminal, Alacritty, iTerm2, WezTerm, VS Code, Warp, Konsole, and any other terminal with 256 colors or more | A block preview |
-| Inside tmux | Drawn as pictures when tmux passes graphics through to Ghostty or Kitty (`set -g allow-passthrough all`), a block preview otherwise |
-| Terminals with fewer than 256 colors, or that don't answer the startup query | The usual `binary file changed` line |
+| `--watch` | Refresh live as files change. On by default in an interactive terminal. |
+| `--no-watch` | Open a snapshot that doesn't refresh, for when an agent is mid-write and the view keeps changing. It overrides `--watch` and `--watch-poll`. |
+| `--watch-poll` | Turn on watch mode, and poll for changes in place of filesystem events. Use it on network mounts and container bind mounts. |
+| `--no-animations` | Skip the arrival highlights, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
+| `--animations` | Turn animations back on after an earlier `--no-animations`. |
+| `--no-images` | Show image, SVG, and video files as plain diffs. |
+| `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
 
-A block preview draws the picture in colored half-block characters, two pixels to a cell and at most 60 × 20 cells. That's enough to tell which image you're looking at and roughly what changed, in every compare mode. `o` opens the real image, and the footer says `no image support detected` while one is on screen.
+For `--animations` and `--images`, the last flag of each pair wins.
 
-Inside tmux, every graphics command goes out wrapped for tmux's passthrough, the startup query and the deletes at exit included. Pictures are used only when the wrapped query gets an answer back, so a tmux that blocks passthrough gets the block preview and never shows stray text.
+### Environment variables
 
-Use `allow-passthrough all`, not `on`. With `on`, tmux drops graphics sent while the pane is hidden behind another window, so a picture redrawn by a refresh then comes back as empty cells, and a quit from a hidden pane leaves its images in the terminal. With passthrough off, startup waits up to a second for an answer that never comes.
+`branch-review` reads the following environment variables:
 
-tmux answers the question of which terminal it runs in by itself, and its environment describes the terminal the server started in. So inside tmux, branch-review asks tmux which terminal the attached client runs in, and draws pictures only when that is Ghostty or Kitty. When tmux can't say, you get the block preview.
+| Variable | Effect |
+| --- | --- |
+| `NO_COLOR` | Any non-empty value turns off color and image previews. |
+| `FORCE_COLOR` | `0` or `false` turns off color and image previews. |
+| `TERM` | `dumb` turns off color and image previews. `linux`, and `screen*` outside tmux, turn off image previews. |
+| `BRANCH_REVIEW_IMAGES` | `auto`, the default, detects what the terminal can draw. `kitty` forces pictures in a terminal that supports them but isn't recognized. `blocks` forces the block preview. `off`, `none`, `0`, or `false` turns previews off. |
+| `BRANCH_REVIEW_TMPDIR` | The directory for temp files, such as the private index copy and media files. The default is the system temp directory. |
 
-Only the first branch-review session in a tmux server draws images, since every pane draws on the same outer terminal; later ones show block previews.
+The same settings turn off color in delta's diffs and in the rest of `branch-review`. With color off, diffs keep their `+` and `-` markers, and a selection shows in inverse video.
 
-For a raster image, the file header gains an `Open` button in place of `Copy file`, since an image's contents aren't text. `f` still reports "not UTF-8 text". `o` and `Open` hand the viewer a private temp copy of the exact bytes on screen, never the file in your repo. Over SSH, `o` says it isn't available instead of opening anything on the remote machine.
+## Keys and mouse
 
-#### Video
+The following table lists the keys for moving through a review:
 
-An added, deleted or changed MP4, MOV or WebM shows a table of its length, size, resolution, codec and frame rate. For a changed video, the new version's row marks what changed: shorter or smaller in green, longer or larger in red. Under the table, each version gets a strip of four frames taken evenly through it, with their times underneath. `2` shows one version's strip at a time, larger, and `2` again swaps it. `1` shows both again.
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` | Jump to the previous or next file |
+| `j` / `k` | Scroll the diff down or up one line |
+| `g` / `G` | Jump to the top or bottom |
+| `[` / `]` | Focus the previous or next diff block |
+| `Enter` / `Space` | Collapse or expand the focused block |
+| `t` | Show or hide the file tree |
+| `q` / `Esc` / `Control+C` | Quit |
 
-The metadata and frames come from `ffprobe` and `ffmpeg` on your `PATH` (`brew install ffmpeg`). They're optional: without them a video shows its size, and the strip says what to install. Only a program outside the repo is ever run. It reads the video through a checked file descriptor, or a checked temp copy for a committed version, with the container forced and every input but plain files refused.
+The tree highlights the file at the top of the diff and keeps that row in view as you scroll. That file's header shows its added, deleted, and changed line counts and its place in the review, such as `file 6/8`. Each block header names the file and the block's first line, such as `src/middleware/rateLimit.ts:1:`.
 
-A video's header is `Copy path · Play · Quick Look` on macOS and `Copy path · Open` elsewhere, with no `Copy diff`. `o` plays the video. On macOS, `o` plays a work tree MP4 or MOV in QuickTime as the file itself, and `O` previews any work tree video in Quick Look as the file itself. The path is checked again right before either one starts. Every other `o` on a work tree video, and every open of a committed version, uses a verified read-only temp copy.
+The focused block is the one at the top of the diff pane until you move the focus with `[` or `]`. Heavy `┃` bars mark its header, so the mark reads without color. The footer keeps a short hint of the keys that apply to the file in view. For more information about the copy keys, see the [Copy context back to the agent](#copy-context-back-to-the-agent) section.
 
-Images stay off when color is off (`NO_COLOR` and the rest of the color rule), when the output isn't a terminal, with `--no-images`, or with `BRANCH_REVIEW_IMAGES=off`. The app then looks exactly as it does without image support. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognized, `BRANCH_REVIEW_IMAGES=blocks` forces the block preview, and `BRANCH_REVIEW_IMAGES=auto` (the default) detects what the terminal can draw.
+While an image or video preview is on screen, the following keys work:
 
-Every image is read in a separate background process. Bytes are checked against the object id in Git's diff before anything is drawn, so a file that changed on disk or that a Git filter rewrites never shows as a stale or wrong picture. A file that can't be previewed shows the reason in its place. If that process keeps failing or hanging, previews turn off for the session and the review carries on.
+| Key | Action |
+| --- | --- |
+| `1` / `2` / `3` | Compare a modified image side by side, by flipping between its versions, or as a difference. `2` again flips to the other version. On a video, `1` shows both frame strips and `2` shows one. |
+| `v` | Switch an image or video to a details table and back. On an SVG, show its source only, and back. |
+| `o` | Open the image or video in the default viewer |
+| `O` | Preview the image or video in Quick Look on macOS. On Linux and BSD, `O` works like `o`. |
 
-Images are decoded with [sharp](https://sharp.pixelplumbing.com/), which ships prebuilt binaries of libvips. libvips is licensed under LGPL-3.0. Temp files go in one private directory under the system temp directory, and it is removed when the app exits.
+You can also do most of this with the mouse:
+
+| Gesture | Action |
+| --- | --- |
+| Click a file | Jump the diff to that file |
+| Click a folder | Collapse or expand it |
+| Click a block header | Collapse or expand that diff block |
+| Drag across code | Select lines and copy them |
+| Drag the tree's right border | Resize the file tree. Dragging it to its minimum width collapses it to a rail. |
+| Click `‹` or `›` in the tree header | Collapse or expand the file tree |
+| Scroll | Scroll whichever pane is under the pointer, three lines per notch |
+
+To see what a button, badge, or label does, hold the pointer over it. A short hint appears in the top bar, such as `copies block with file and line context`.
 
 ### Small terminals
 
-When the terminal is too narrow for both panes, the file tree collapses to a narrow rail beside the diff. Below a minimum size, the app shows "Terminal too small" until you make the window bigger. While it does, only `q`, `Esc` and `Ctrl-C` do anything.
+When the terminal is narrower than 74 columns, the file tree collapses to a rail beside the diff, and it opens again after the window is wide enough. Below 58 columns by 14 rows, `branch-review` shows `Terminal too small` with the current and required size. Until you make the window bigger, only `q`, `Esc`, and `Control+C` work.
 
 ## Agent skill
 
-The repo ships an agent skill in [`skills/branch-review`](skills/branch-review). It teaches Claude Code, or any tool that reads `SKILL.md`, to hand you a ready-to-run `branch-review` command.
+The repo ships an agent skill in [`skills/branch-review`](skills/branch-review). It teaches Claude Code, or any tool that reads `SKILL.md` files, to hand you a ready-to-run `branch-review` command.
 
-An agent can't drive a full-screen TUI, so the skill never runs the CLI itself. It works out which repo or worktree holds the changes, picks the refs, and copies one line to your clipboard:
+An agent can't drive a full-screen terminal UI, so the skill never runs `branch-review` itself. It finds the repo or worktree that holds the changes and picks the refs. Then it copies one line to your clipboard, such as the following:
 
 ```sh
 cd '/Users/me/code/app' && branch-review
 ```
 
-Ask for it with "let me review this", "/branch-review", or "show me the diff before you continue". Paste, review, and quit with `q`.
+To get the command, ask the agent with a phrase such as `let me review this`, `/branch-review`, or `let me check the diff before you continue`. Paste the command into your terminal. When you finish the review, press `q`. To get a frozen snapshot or another option, say so, and the skill puts the flag, such as `--no-watch`, in the copied command.
 
-The command is written for POSIX shells and zsh. The script refuses a repo path or ref name that holds control or invisible characters, such as a newline, an escape, or a bidi control, because a pasted command can't carry those safely. Its own report shows them escaped, like `\x1b` or `\u202e`.
+The command is written for POSIX shells and zsh. The script refuses a repo path or ref name that holds control or invisible characters, because a pasted command can't carry them safely. Examples include a newline, an escape, and a bidi control, and the script's report shows them escaped, such as `\x1b` or `\u202e`.
 
-Link the skill into your user skills directory so it tracks the repo:
+### Install the skill
+
+From the root of a clone, link the skill so it tracks your install:
 
 ```sh
+mkdir -p ~/.claude/skills
 ln -s "$PWD/skills/branch-review" ~/.claude/skills/branch-review
 ```
 
-To pin a version, copy it with `cp -R` instead. For one project only, put it in that repo's `.claude/skills/`.
+If you installed with `pnpm add -g`, link the copy inside the global package:
 
-## How it works
+```sh
+mkdir -p ~/.claude/skills
+ln -s "$(pnpm root -g)/branch-review/skills/branch-review" ~/.claude/skills/branch-review
+```
 
-`branch-review` asks Git for the changed files in the range, pipes each file's diff through `delta` with a fixed theme, and lays out the result with [Ink](https://github.com/vadimdemedes/ink). Untracked files are diffed against `/dev/null`, so new files show up before anyone stages them.
-
-Watch mode follows the work tree plus the Git state that moves on a commit, push, or fetch: `HEAD`, the index, the current branch ref, and remote refs. On macOS and Windows it uses one native recursive watch on the repo root. On Linux it watches directories only, so the number of handles grows with directories and never with files. Either way it skips what Git ignores, never follows symlinks, and doesn't descend into submodules or nested repos. `--watch-poll` is the fallback when filesystem events don't arrive.
-
-A cheap fingerprint decides whether anything changed. When it did, a background process rebuilds the review so the UI stays responsive while delta runs. Each file it finishes counts as progress, and so does each chunk of output from `git` or `delta`. The process is stopped only when `git` or `delta` produces nothing for 30 seconds. A slow refresh of a large repo finishes, and a hung `git` or `delta` still gets killed.
-
-### What branch-review touches
-
-`branch-review` never writes to the repo it reviews. It leaves the index, the work tree, refs, the stash, config, and hooks alone. Worktree diffs read a private copy of the index with Git's optional locks off, so a stat-dirty file never makes Git rewrite `.git/index` or a submodule's index.
-
-A few things happen the same way they do for `git status` or `git diff`:
-
-- Configured clean filters such as git-lfs run on worktree files, and git-lfs may store objects under `.git/lfs`.
-- In a split-index repo, Git refreshes the shared index file's mtime on every read. Its content stays the same.
-- A partial clone may fetch missing objects on demand, and Git writes what it fetches into `.git/objects` as new pack files. Git is never allowed to prompt, so a fetch that needs credentials shows up as an error on that file.
+To pin a version, copy the folder with `cp -R` in place of the link. For one project only, put it in that repo's `.claude/skills/` folder.
 
 ## Development
 
+The package scripts build and test a clone:
+
 ```sh
 pnpm install      # also builds dist/
-pnpm dev          # run from source with tsx, watch mode included
+pnpm dev          # run from source with tsx, with no build step
 pnpm test
 pnpm typecheck
 pnpm build
@@ -278,3 +308,5 @@ pnpm build
 ## License
 
 MIT © hcastro
+
+Image decoding uses [sharp](https://sharp.pixelplumbing.com/), which ships prebuilt binaries of libvips. libvips is licensed under LGPL-3.0.

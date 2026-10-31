@@ -2107,17 +2107,17 @@ describe('video', () => {
       instance.unmount();
     });
 
-    it('Quick Looks a work tree WebM on macOS at its real path, as the README says', async () => {
+    it('Quick Looks a work tree WebM on macOS at its real path, as the media docs say', async () => {
       const {instance, opened, abs, calls} = worktreeVideoApp('demo.webm', webm());
       await settle(10);
       instance.stdin.write('O');
       await vi.waitFor(() => expect(opened).toHaveLength(1));
       expect(opened).toEqual([{command: '/usr/bin/qlmanage', args: ['-p', abs]}]);
       for (const call of calls.filter((each) => each.type === 'exportCopy')) expect(call.request).not.toHaveProperty('copy');
-      const readme = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
-      const video = readme.split('\n').find((line) => line.startsWith("A video's header is"))!;
-      expect(video).toContain('`O` previews any work tree video in Quick Look as the file itself');
-      expect(video).toContain('Every other `o` on a work tree video, and every open of a committed version, uses a verified read-only temp copy.');
+      const doc = fs.readFileSync(new URL('../docs/media-previews.md', import.meta.url), 'utf8');
+      const video = doc.split('\n').find((line) => line.startsWith('`o` plays the video.'))!;
+      expect(video).toContain('`O` previews any working-tree video in Quick Look as the file itself');
+      expect(video).toContain('Every other `o` on a working-tree video, and every open of a committed version, uses a verified read-only temp copy.');
       instance.unmount();
     });
 
