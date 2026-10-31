@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
 # Build the branch-review command for a repo and copy it to the clipboard.
 #
-# Usage: review-command.sh [PATH] [BRANCH] [BASE]
+# Usage: review-command.sh [PATH] [BRANCH] [BASE] [FLAG...]
 #
 #   PATH    File or directory inside the repo to review. Default: cwd.
 #   BRANCH  Ref to review. Default: HEAD (includes uncommitted changes).
 #   BASE    Ref to diff against. Default: let branch-review detect it.
+#   FLAG    A branch-review flag to put in the command, such as --no-watch.
+#           Flags may sit anywhere among the other arguments.
 #
 # Prints a state report on stderr and the command on stdout. Refuses a repo
 # path or ref name that holds control or invisible characters.
 
 set -uo pipefail
-
-target="${1:-$PWD}"
-branch="${2:-HEAD}"
-base="${3:-}"
 
 # Inherited by every git call, submodule children included. Optional locks off
 # keeps a submodule status check from rewriting the submodule's index, and a
@@ -73,6 +71,27 @@ escape_hidden() {
 
 die() { printf 'error: %s\n' "$(escape_hidden "$1")" >&2; exit 1; }
 note() { printf '%s\n' "$(escape_hidden "$1")" >&2; }
+
+# The flags branch-review takes. They go into the command as they are, so only
+# these fixed words are let through.
+cli_flags="--watch --no-watch --watch-poll --animations --no-animations --images --no-images"
+flags=""
+positional=()
+for arg in "$@"; do
+  case $arg in
+    --watch | --no-watch | --watch-poll | --animations | --no-animations | --images | --no-images)
+      flags+=" $arg"; continue ;;
+  esac
+  [[ $arg == -* ]] \
+    && die "unknown flag: $arg (branch-review takes $cli_flags; write a path that starts with - as ./$arg)"
+  positional+=("$arg")
+done
+(( ${#positional[@]} <= 3 )) \
+  || die "too many arguments: expected PATH, BRANCH and BASE, got ${#positional[@]} (quote a path that holds spaces)"
+
+target="${positional[0]:-$PWD}"
+branch="${positional[1]:-HEAD}"
+base="${positional[2]:-}"
 
 # The pasted command can't carry these safely: the terminal would act on them
 # or hide them (ESC[201~ ends a bracketed paste early).
@@ -291,7 +310,7 @@ command -v ffprobe >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 \
 # --- command ----------------------------------------------------------------
 
 # Every word is quoted: ref names may hold ;, &, |, $(), backticks and quotes.
-cmd="cd $(shell_quote "$root") && branch-review"
+cmd="cd $(shell_quote "$root") && branch-review$flags"
 if [[ -n $base ]]; then
   cmd+=" $(shell_quote "$branch") $(shell_quote "$base")"
 elif [[ $branch != HEAD ]]; then

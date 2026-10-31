@@ -1,142 +1,119 @@
 ---
 name: branch-review
-description: Produce a ready-to-run `branch-review` command that opens a local PR-style review UI in the user's terminal, scoped to the right repo or git worktree, and copy it to the clipboard. Use when the user wants to eyeball code that was just written — "let me review this", "/branch-review", "I want to look at these changes", "open the review UI", "give me the branch-review command", "let me check the diff before you continue" — or after finishing a task/feature/fix/bug when the user should inspect the result before commit or push. Also use for specific comparisons like "review my-feature against main" or "just show me the uncommitted changes".
+description: Builds a ready-to-run `branch-review` command for the right repo or git worktree and copies it to the clipboard, so the user can open a local PR-style review of a diff in their own terminal. Use when the user wants to look over code that was just written ("let me review this", "/branch-review", "I want to look at these changes", "open the review UI", "give me the branch-review command", "let me check the diff before you continue"), after finishing a task, feature or fix the user should inspect before a commit or push, or for a specific comparison such as "review my-feature against main" or "just show me the uncommitted changes".
 ---
 
 # branch-review
 
-`branch-review` is an interactive terminal UI (Ink + git-delta) for reviewing a
-diff before it reaches GitHub. This skill hands the user one command to run.
+`branch-review` is a full-screen terminal UI for reviewing a diff before it reaches GitHub. This skill hands the user one command to run in their own terminal.
 
-## Never run the CLI yourself
-
-It is a full-screen TTY app: it takes over the alternate screen buffer, captures
-mouse and key input, and only exits on `q`, `Esc` or Ctrl-C. Running it from a
-tool call hangs the turn and returns ANSI garbage. **The deliverable is the
-command text, not its output.** The user runs it in their own terminal.
-
-The same applies to "just checking" — to inspect a diff directly, use `git diff`.
+**Never run `branch-review` from a tool call.** It takes over the screen, reads keys and the mouse, and exits only when the user presses `q`, `Esc` or Ctrl-C, so a tool call hangs. The deliverable is the command text. To look at a diff yourself, use `git diff`.
 
 ## Workflow
 
-### 1. Resolve the target directory
+Copy this checklist and work through it:
 
-`branch-review` reviews the repo containing its working directory, so the
-directory is the whole game. Resolve it in this order:
+```
+branch-review command:
+- [ ] 1. Pick the repo path
+- [ ] 2. Pick the comparison
+- [ ] 3. Run the script
+- [ ] 4. Reply with the command and the state report's summary
+```
+
+### 1. Pick the repo path
+
+The repo path is the file or directory you pass to the script. It decides which checkout the review covers. Pick the first of these that applies:
 
 1. A path the user named ("review the changes in `frontend`").
-2. **The directory holding the files edited this session.** Take a path
-   actually written to and pass it straight to the script — it walks up to the
-   git root itself, so a file path is fine.
-3. The session's cwd, only when there is no better signal.
+2. A file you wrote or edited in this session. Pass the file path as is. The script walks up to the git root.
+3. The session's working directory, when nothing else points anywhere.
 
-Two traps worth naming:
+Two cases catch agents out:
 
-- **The session cwd is often not the repo.** In a directory of sibling
-  checkouts, cwd may be the parent, which is not a git repo at all. Derive the
-  directory from the files that changed instead.
-- **Worktrees are separate checkouts.** Work done in
-  `<repo>.worktrees/<branch>` must be reviewed from that path; the main checkout
-  shows none of it.
+- **The working directory is often not a repo.** In a folder of sibling checkouts, it's the parent. Use an edited file's path instead.
+- **A worktree is its own checkout.** Work done in `<repo>.worktrees/<name>` shows only when you pass a path inside that worktree. The main checkout shows none of it.
 
-If the script reports "not inside a git repository" and no edited-file path is
-available, ask which repo to target rather than guessing.
+If the script reports "not inside a git repository" and you have no edited file to point at, ask the user which repo to review.
 
-### 2. Choose the comparison
+### 2. Pick the comparison
 
-| Situation | Arguments |
+| The user wants | Arguments |
 | --- | --- |
-| Default — anything just built | *(none)* |
+| Everything just built (the default) | none |
 | Only uncommitted edits | `HEAD HEAD` |
-| Named branch vs. its detected base | `<branch>` |
-| Named branch vs. a specific base | `<branch> <base>` |
+| A named branch against its detected base | `BRANCH` |
+| A named branch against a chosen base | `BRANCH BASE` |
 
-Default to no arguments. That reviews `HEAD` + worktree against the detected
-base, so commits made during the task **and** still-uncommitted edits appear in
-one view — the same scope a PR would show. Narrow it only on request.
+With no arguments, the review covers `HEAD` plus the working tree against the detected base. Commits made during the task and edits not yet committed show together, the way a pull request would show them. Narrow it only when the user asks.
 
-Refs resolve locally first, then fall back to `origin/<ref>`, so a base branch
-that was never checked out still works.
+A ref resolves locally first and then as `origin/<ref>`, so a base the user never checked out still works. When the user describes a branch instead of naming it ("that login branch"), find its exact name with `git -C REPO_PATH branch --all --list '*login*'` and pass that name.
 
-### 3. Build and copy the command
+### 3. Run the script
 
-The script ships with this skill. Run it by its full path under the skill's own
-directory: the base directory shown when the skill loads, the folder holding
-this `SKILL.md`. Below, `<skill-dir>` stands for that path. Never resolve the
-script against the session cwd; the repo under review may have a file at the
-same relative path.
+The script ships in this skill's folder, the base directory shown when the skill loads. Below, `<skill-dir>` stands for that folder. Always run the script by that full path. Never run it by a path relative to the working directory, because the repo under review can hold a file at the same relative path.
+
+Run exactly this:
 
 ```bash
-"<skill-dir>/scripts/review-command.sh" <path> [branch] [base]
+"<skill-dir>/scripts/review-command.sh" REPO_PATH [BRANCH] [BASE] [FLAG...]
 ```
 
-The script resolves the git root, reports repo state on stderr, prints the
-command on stdout, and copies it to the clipboard (`pbcopy`, `wl-copy`, `xclip`,
-or `clip.exe`). It warns when the range is empty or when `branch-review` or
-`git-delta` is missing from `PATH`. The command is for POSIX shells and zsh.
-A hint that `ffmpeg`/`ffprobe` is missing is no problem: videos then show their
-size without frames.
+Replace the following:
 
-The script refuses (exit 1) a repo path or ref name that holds control or
-invisible characters: newlines, tabs, escapes, bidi controls, zero-width
-characters. Its messages show them escaped, as `\x1b` or `\u202e`. Tell the
-user which name is the problem; don't rename anything or build the command by
-hand.
+- `REPO_PATH`: the path from step 1.
+- `BRANCH`: the ref to review. Pass `HEAD` when you set only `BASE`.
+- `BASE`: the ref to compare against. Leave it out to let `branch-review` detect it.
+- `FLAG`: a flag from [Flags](#flags), such as `--no-watch`. The script puts it in the command it copies. Leave it out unless the user describes the problem it solves.
 
-Arguments are positional — pass `HEAD` as `branch` when overriding only `base`:
+For example:
 
 ```bash
-"<skill-dir>/scripts/review-command.sh" src/api/auth.ts               # file path → repo root
-"<skill-dir>/scripts/review-command.sh" ~/code/app HEAD HEAD          # uncommitted only
-"<skill-dir>/scripts/review-command.sh" ~/code/app feat/login main    # branch vs base
+"<skill-dir>/scripts/review-command.sh" src/api/auth.ts               # a file path, resolved to its repo root
+"<skill-dir>/scripts/review-command.sh" ~/code/app HEAD HEAD          # uncommitted edits only
+"<skill-dir>/scripts/review-command.sh" ~/code/app feat/login main    # a branch against a base
+"<skill-dir>/scripts/review-command.sh" ~/code/app --no-watch         # a frozen snapshot
 ```
 
-Non-zero exit means nothing was copied. Fix the input and rerun; do not
-hand-assemble a command to paper over an error.
+The script prints the command on stdout and a state report on stderr. The report names the repo, the branch, the base and the counts of commits and changed files. The script copies the command with `pbcopy`, `wl-copy`, `xclip` or `clip.exe`, and the command runs in POSIX shells and zsh. It warns when the range is empty or when `branch-review` or `git-delta` is missing from `PATH`. A hint that `ffmpeg` or `ffprobe` is missing needs no action, since videos then show their size without frames.
 
-### 4. Report back
+Every run replaces the clipboard, so run the script once per reply. When the script exits non-zero, it copied nothing. Read its message, fix the input and run it again. Never write the command by hand to get past an error.
 
-Lead with the command in its own fenced block so it is easy to spot, then one
-line of what it covers, taken from the script's state report. Confirm the
-clipboard copy only if the script did it. A named-branch review covers that
-branch's commits only; the report says so, and the summary should not mention
-uncommitted edits.
+The script refuses a repo path or ref name that holds control or invisible characters, such as newlines, tabs, escapes, bidi controls and zero-width characters. Its message shows each one escaped, as `\x1b` or `\u202e`. Tell the user which name holds it and stop. Write the name in its escaped form, as in `feat/\u202espoof`, because the raw character acts in the user's terminal too. Don't rename anything.
+
+### 4. Reply
+
+Use this template. Put the command first, in its own fenced block. Then write one line on what it covers, taken from the state report.
 
 ````
 ```sh
 cd '/Users/me/code/app' && branch-review
 ```
 
-Copied to your clipboard. Reviews 7 changed files on `feat/login` — 2 commits
-plus 4 uncommitted edits — against `origin/main`.
+Copied to your clipboard. Reviews 7 changed files on `feat/login` against `origin/main`, from 2 commits and 4 uncommitted entries.
 ````
 
-If the report says a count is unknown (the script could not copy the index,
-or a git call failed), say so instead of giving a number.
+Take the file count from the report's `in review` line, and the commits and uncommitted entries from its `commits` and `uncommitted` lines.
 
-Keep it to that. No key-bindings table, no feature tour; the UI is
-self-documenting.
+- Name commits only when there are some, and uncommitted entries likewise: "Reviews 3 changed files on `main` against `main`, from 3 uncommitted entries."
+- For `HEAD HEAD`, the review holds uncommitted edits only: "Reviews 2 uncommitted files on `feat/login`."
+- A review of a named branch covers that branch's commits only. Leave uncommitted entries out.
+- When the report says a count is unknown, say that instead of giving a number.
+- Say "Copied to your clipboard" only when the report says the copy worked.
 
-## Changes spanning several repos
+Add nothing else, such as a key list or a feature tour. The UI explains itself.
 
-Emit the command for the repo with the most changed files and copy that one.
-List the other repos with their paths underneath so the user can ask for those
-next. Do not chain multiple `cd`s into one command — the UI runs until the user
-quits it (`q`, `Esc` or Ctrl-C), so only the first would ever open.
+## Changes in several repos
 
-## Flags worth knowing
+Count the files you changed in each repo this session, or run `git -C REPO status --short` in each. Never run the script to count, because each run replaces the clipboard. Run it once, for the repo with the most changed files, and reply with that command. Under it, list each other repo with its path, so the user can ask for it next. Never join several `cd ... && branch-review` commands into one line. The UI runs until the user quits it with `q`, `Esc` or Ctrl-C, so only the first would open.
 
-Rarely needed, but available when the default misbehaves:
+## Flags
 
-- `--no-watch` — disable live refresh, for a frozen snapshot or when an agent is
-  still writing files and the view would churn.
-- `--watch-poll` — poll instead of using filesystem events, for network mounts
-  and container bind mounts where those events never arrive.
-- `--no-animations` — drop transitions on slow or remote terminals.
-- `--no-images`: show image, SVG and video files as plain diffs, for previews
-  that misbehave in a terminal.
-- `BRANCH_REVIEW_IMAGES=blocks`: draw block previews instead of pictures, for a
-  terminal that claims image support but draws them wrong.
+The default command fits nearly every review. Pass a flag to the script only when the user describes the problem it solves. The script refuses any other flag.
 
-Watch mode is on by default in an interactive terminal, which is what makes a
-review update live while an agent keeps working.
+- `--no-watch`: a frozen snapshot, for when an agent is still writing files and the live view would churn. Watch mode is on by default in an interactive terminal.
+- `--watch-poll`: poll for changes, for network mounts and container bind mounts where file events never arrive.
+- `--no-animations`: no transitions, for slow or remote terminals.
+- `--no-images`: image, SVG and video files show as plain diffs, for previews that misbehave in a terminal.
+
+One fix is an environment variable the script can't carry. `BRANCH_REVIEW_IMAGES=blocks` draws block previews in place of pictures, for a terminal that claims image support and draws images wrong. Put it before `branch-review` in the command the script printed, as in `cd '/Users/me/code/app' && BRANCH_REVIEW_IMAGES=blocks branch-review`, and tell the user the clipboard holds the command without it.

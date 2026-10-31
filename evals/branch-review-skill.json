@@ -1,0 +1,53 @@
+[
+  {
+    "skills": ["branch-review"],
+    "setup": "The session's working directory is a folder of sibling checkouts that is not a git repo. It holds app/ and the worktree app.worktrees/feat-login/ on branch feat/login. The session committed src/login.ts in the worktree, then edited it again and created src/new.ts without committing.",
+    "query": "ok let me review this before you push",
+    "expected_behavior": [
+      "Runs scripts/review-command.sh by its full path under the skill directory, passing a path inside app.worktrees/feat-login and no refs",
+      "Never runs the branch-review CLI",
+      "Replies with the command first in a fenced block, cd-ing into the worktree, not the main checkout or the session's working directory",
+      "Follows it with one line that gives the counts from the state report and says the command was copied"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "Same as the first case.",
+    "query": "just show me the uncommitted changes",
+    "expected_behavior": [
+      "Passes HEAD HEAD to the script",
+      "The command it replies with reviews the worktree and ends in branch-review 'HEAD' 'HEAD' as the script printed it",
+      "The summary counts uncommitted edits only"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "The session edited three files in app/ and one file in lib/, two separate repos side by side.",
+    "query": "/branch-review",
+    "expected_behavior": [
+      "Runs the script once, for app, the repo with the most changed files",
+      "Replies with one command and lists lib with its path underneath",
+      "Never joins two cd ... && branch-review commands into one line"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "app/ has a branch whose name holds U+202E, a right-to-left override.",
+    "query": "review that spoof branch against main in app",
+    "expected_behavior": [
+      "Finds the exact branch name with git and passes it to the script",
+      "Sees the script refuse it with exit 1 and does not build a command by hand",
+      "Tells the user which name holds a hidden character, written escaped as feat/\\u202espoof, never as the raw character",
+      "Renames nothing"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "Same as the first case.",
+    "query": "the review view keeps jumping around while you're still writing files, give me one that holds still",
+    "expected_behavior": [
+      "Adds --no-watch after branch-review in the command the script printed",
+      "Keeps the cd into the worktree"
+    ]
+  }
+]

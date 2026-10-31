@@ -958,6 +958,11 @@ describe('SKILL.md', () => {
     }
   });
 
+  it('holds no raw control or invisible characters, only their escaped spelling', () => {
+    const doc = fs.readFileSync(skillDocPath, 'utf8');
+    expect(doc.replace(/\n/g, ''), 'a raw hidden character in SKILL.md').not.toMatch(rawHidden);
+  });
+
   it('names every quit key wherever it says how the UI exits', () => {
     const paragraphs = fs.readFileSync(skillDocPath, 'utf8').split(/\n\s*\n/);
     const quitting = paragraphs.filter((paragraph) => /`q`/.test(paragraph));
@@ -966,6 +971,43 @@ describe('SKILL.md', () => {
       expect(paragraph).toContain('`Esc`');
       expect(paragraph).toContain('Ctrl-C');
     }
+  });
+});
+
+describe.each(scriptShells)('flags in the printed command under %s', (shell) => {
+  it('puts branch-review flags in the copied command, from anywhere among the arguments', () => {
+    const sandbox = createSandbox();
+    const repo = createRepo(sandbox);
+
+    const run = runScript(sandbox, shell, ['--no-watch', repo, 'feat', '--no-images', 'main']);
+    expect(run.status, run.stderr).toBe(0);
+    expect(fs.readFileSync(sandbox.clipOut, 'utf8')).toBe(run.command);
+    for (const pasteShell of pasteShells(shell)) {
+      expect(paste(sandbox, pasteShell, run.command)).toEqual({cwd: repo, argv: ['--no-watch', '--no-images', 'feat', 'main']});
+    }
+  });
+
+  it('refuses an unknown flag and copies nothing', () => {
+    const sandbox = createSandbox();
+    const repo = createRepo(sandbox);
+
+    for (const arg of ['--bogus', '--no-watch --images', '-n']) {
+      const run = runScript(sandbox, shell, [repo, arg]);
+      expect(run.status).toBe(1);
+      expect(run.stdout).toBe('');
+      expect(run.stderr).toContain(`unknown flag: ${arg}`);
+      expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+    }
+  });
+
+  it('refuses a fourth positional argument', () => {
+    const sandbox = createSandbox();
+    const repo = createRepo(sandbox);
+
+    const run = runScript(sandbox, shell, [repo, 'feat', 'main', 'extra']);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('too many arguments');
+    expect(fs.existsSync(sandbox.clipOut)).toBe(false);
   });
 });
 
