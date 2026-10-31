@@ -1,13 +1,16 @@
 import path from 'node:path';
 import type {FileStatus} from '../git.js';
-import {PAGE_CSS, PAGE_CSS_HASH} from './assets.generated.js';
+import {PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from './assets.generated.js';
 import type {DifferenceKind, RenderedFragment} from './markdown.js';
+import type {RawSource} from './raw.js';
 
 // Whole HTML documents around rendered fragments. A page is one
-// self-contained file: its only style is the inlined stylesheet, allowed by
-// hash, and it has no script, so it reads the same with scripting off. Every
-// repo-supplied string printed here is escaped, and the fragment itself is
-// already sanitized.
+// self-contained file: its only style is the inlined stylesheet and its
+// only script the inlined page script (client/main.ts), each allowed by its
+// hash. The script plays the arrival and adds the page's keys; the page
+// reads as its finished self with scripting off, and the controls that
+// need the script stay hidden. Every repo-supplied string printed here is
+// escaped, and the fragment itself is already sanitized.
 
 /** One entry in the page's rail of rendered files. */
 export type RailEntry = {
@@ -53,13 +56,13 @@ export type PageInput = {
   rail: RailEntry[];
 };
 
-/** The page's whole policy: nothing loads, nothing runs, only our style applies. */
+/** The page's whole policy: nothing loads, and only our own style and script apply. */
 export function contentSecurityPolicy() {
   return [
     "default-src 'none'",
     'img-src data:',
     `style-src '${PAGE_CSS_HASH}'`,
-    "script-src 'none'",
+    `script-src '${PAGE_SCRIPT_HASH}'`,
     "base-uri 'none'",
     "form-action 'none'",
     "frame-src 'none'",
@@ -95,12 +98,44 @@ function documentHead(title: string) {
   ];
 }
 
+// The end of the document: the help the `?` key opens, then the script,
+// once everything it reads is parsed.
+function documentFoot(keys: ReadonlyArray<readonly [string, string]>) {
+  return [
+    '<div class="br-help" id="br-help" role="dialog" aria-label="Keys" hidden>',
+    '<h2>Keys</h2>',
+    '<dl>',
+    ...keys.map(([key, what]) => `<div><dt>${key}</dt><dd>${what}</dd></div>`),
+    '</dl>',
+    '</div>',
+    `<script>${PAGE_SCRIPT}</script>`,
+    '</body>',
+    '</html>',
+    '',
+  ];
+}
+
+const FILE_KEYS = [
+  ['<kbd>[</kbd> <kbd>]</kbd>', 'previous or next change'],
+  ['<kbd>{</kbd> <kbd>}</kbd>', 'previous or next file'],
+  ['<kbd>t</kbd>', 'theme: system, light, dark'],
+  ['<kbd>m</kbd>', 'show or hide the change marks'],
+  ['<kbd>?</kbd>', 'these keys'],
+] as const;
+
+const OVERVIEW_KEYS = [
+  ['<kbd>{</kbd> <kbd>}</kbd>', 'previous or next page'],
+  ['<kbd>⏎</kbd>', 'open it'],
+  ['<kbd>t</kbd>', 'theme: system, light, dark'],
+  ['<kbd>?</kbd>', 'these keys'],
+] as const;
+
 export function assembleFilePage(input: PageInput): string {
   const {title, file, rail} = input;
   return [
     ...documentHead(path.posix.basename(file.path)),
     '<body>',
-    strip(title, file.body.kind === 'rendered' ? file.body.fragment.differences : []),
+    strip(title, file.body.kind === 'rendered' ? file.body.fragment.differences : [], true),
     '<div class="br-layout">',
     railNav(rail, title),
     '<main class="br-main">',
@@ -110,19 +145,22 @@ export function assembleFilePage(input: PageInput): string {
     body(file),
     '</main>',
     '</div>',
-    '</body>',
-    '</html>',
-    '',
+    ...documentFoot(FILE_KEYS),
   ].join('\n');
 }
 
-function strip(title: PageInput['title'], differences: RenderedFragment['differences']) {
+// The strip's controls are buttons for the page script's keys, hidden
+// until it runs. `marks`: the page has change marks to show or hide.
+function strip(title: PageInput['title'], differences: RenderedFragment['differences'], marks: boolean) {
   return [
     '<header class="br-strip">',
     '<span class="br-brand"><span class="br-brand-mark" aria-hidden="true">▍</span><span class="br-brand-word">branch-review</span></span>',
     `<span class="br-refs" title="${escapeHtml(title.repo)}"><span class="br-base">${escapeHtml(title.base)}</span><span class="br-arrow">←</span><span class="br-branch">${escapeHtml(title.branch)}</span></span>`,
     '<div class="br-strip-end">',
     fidelity(differences),
+    '<button type="button" class="br-control br-theme br-js" title="Theme (t)" hidden><span class="br-theme-mark" aria-hidden="true">◐</span><span class="br-control-word br-theme-name">Auto</span></button>',
+    ...(marks ? ['<button type="button" class="br-control br-marks br-js" title="Change marks (m)" aria-pressed="true" hidden><span class="br-marks-bar" aria-hidden="true">▍</span><span class="br-control-word">Changes</span></button>'] : []),
+    '<button type="button" class="br-control br-help-button br-js" title="Keys (?)" aria-label="Keys" aria-controls="br-help" aria-expanded="false" hidden>?</button>',
     '</div>',
     '</header>',
   ].join('\n');
@@ -187,12 +225,20 @@ function railFoot(title: PageInput['title']) {
   return `<p class="br-rail-foot">Rendered offline <time datetime="${renderedAt.toISOString()}">${renderedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC</time>. Nothing left this machine.</p>`;
 }
 
+// The page's keys, as the rail's foot names them once the script runs.
+function railKeys(keys: ReadonlyArray<readonly [string, string]>) {
+  return `<dl class="br-rail-keys br-js" hidden>${keys.map(([key, what]) => `<div><dt>${key}</dt><dd>${what}</dd></div>`).join('')}</dl>`;
+}
+
 function railNav(rail: RailEntry[], title: PageInput['title']) {
   return [
     '<nav class="br-rail" aria-label="Rendered files">',
+    '<div class="br-rail-panel">',
     `<p class="br-rail-title">CHANGED · ${rail.length} rendered</p>`,
     ...railLists(rail),
+    railKeys([['<kbd>[</kbd> <kbd>]</kbd>', 'change'], ['<kbd>{</kbd> <kbd>}</kbd>', 'file'], ['<kbd>t</kbd>', 'theme'], ['<kbd>m</kbd>', 'marks']]),
     railFoot(title),
+    '</div>',
     '</nav>',
   ].join('\n');
 }
@@ -219,10 +265,12 @@ function fileHead(file: PageFile) {
     ? escapeHtml(name)
     : `<span class="br-dir">${escapeHtml(dir.split('/').join(' / '))}</span><span class="br-sep"> / </span>${escapeHtml(name)}`;
   const parts = [statusLetter(file.status)];
+  let total = 0;
   if (file.body.kind === 'rendered') {
     const {changed, removed} = file.body.fragment.changes;
     if (changed > 0) parts.push(`${changed} changed`);
     if (removed > 0) parts.push(`${removed} removed`);
+    total = changed + removed;
   } else {
     parts.push(BODY_STATE[file.body.kind]);
   }
@@ -230,6 +278,14 @@ function fileHead(file: PageFile) {
     '<div class="br-filehead">',
     `<h1 class="br-path">${crumbs}</h1>`,
     `<p class="br-summary">${parts.join(' · ')}</p>`,
+    // Where the reader is among the changes, and a step to either side.
+    ...(total > 0 ? [[
+      '<nav class="br-changes br-js" aria-label="Changes" hidden>',
+      `<span class="br-changes-at" aria-live="polite">change 1 of ${total}</span>`,
+      '<button type="button" class="br-step" data-step="-1" title="Previous change ([)" aria-label="Previous change">↑</button>',
+      '<button type="button" class="br-step" data-step="1" title="Next change (])" aria-label="Next change">↓</button>',
+      '</nav>',
+    ].join('')] : []),
     '</div>',
   ].join('\n');
 }
@@ -258,9 +314,19 @@ const BODY_STATE: Record<Exclude<PageBody['kind'], 'rendered'>, string> = {
 };
 
 function body(file: PageFile) {
-  return file.body.kind === 'rendered'
-    ? `<article class="markdown-body${file.status === 'deleted' ? ' br-dimmed' : ''}">\n${file.body.fragment.html}\n</article>`
-    : `<div class="br-body">\n${cardBody(file.body)}\n</div>`;
+  if (file.body.kind !== 'rendered') return `<div class="br-body">\n${cardBody(file.body)}\n</div>`;
+  const {fragment} = file.body;
+  return [
+    `<article class="markdown-body${file.status === 'deleted' ? ' br-dimmed' : ''}">\n${fragment.html}\n</article>`,
+    ...(fragment.raw ? [rawTemplate(fragment.raw)] : []),
+  ].join('\n');
+}
+
+// The source as the diff showed it, for the page script's first frame:
+// inert in a template, never laid out, read as text. The parser drops a
+// newline right after <pre>, so one goes there to keep a blank first line.
+function rawTemplate(raw: RawSource) {
+  return `<template class="br-raw-source"><pre data-tints="${raw.tints}">\n${escapeHtml(raw.text)}</pre></template>`;
 }
 
 function cardBody(fileBody: Exclude<PageBody, {kind: 'rendered'}>) {
@@ -364,14 +430,17 @@ export function assembleOverview({title, entries, differences}: OverviewInput): 
   return [
     ...documentHead('Overview'),
     '<body>',
-    strip(title, differences),
+    strip(title, differences, false),
     '<div class="br-layout">',
     '<nav class="br-rail" aria-label="Overview">',
+    '<div class="br-rail-panel">',
     '<p class="br-rail-title">OVERVIEW</p>',
     '<ul class="br-rail-stats">',
     ...counts.map((count) => `<li>${count}</li>`),
     '</ul>',
+    railKeys([['<kbd>{</kbd> <kbd>}</kbd>', 'page'], ['<kbd>⏎</kbd>', 'open'], ['<kbd>t</kbd>', 'theme']]),
     railFoot(title),
+    '</div>',
     '</nav>',
     '<main class="br-main br-overview">',
     '<div class="br-filehead">',
@@ -385,8 +454,6 @@ export function assembleOverview({title, entries, differences}: OverviewInput): 
     '</div>',
     '</main>',
     '</div>',
-    '</body>',
-    '</html>',
-    '',
+    ...documentFoot(OVERVIEW_KEYS),
   ].join('\n');
 }

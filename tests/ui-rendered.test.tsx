@@ -139,7 +139,8 @@ describe('r and R', () => {
     expect(calls[0]!.command).toBe('/fake/bin/cmux');
     const url = calls[0]!.args[3]!;
     expect(calls[0]!.args).toEqual(SPLIT_ARGS(url));
-    expect(url).toMatch(/^file:\/\/.+\/rendered\/[0-9a-f]{20}\.html$/);
+    // The page, with the trip's hash: the line on top of the pane, a first visit.
+    expect(url).toMatch(/^file:\/\/.+\/rendered\/[0-9a-f]{20}\.html#at=L1&f=0\.\d+&d=full&m=1&n=1$/);
     expect(fs.existsSync(new URL(url).pathname)).toBe(true);
 
     // The next file, and r again: the same split goes there.
@@ -153,6 +154,33 @@ describe('r and R', () => {
     expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
     expect(calls[1]!.args[4]).not.toBe(url);
     expect(opened).toEqual([]);
+    instance.unmount();
+  });
+
+  it('opens the page at the line on top of the pane, as far down the page as it is down the pane', async () => {
+    const lines = Array.from({length: 60}, (_, index) => `Line ${index + 1} of a long page.`);
+    const fixture = buildFixture([markdownFile('docs/long.md', lines)]);
+    const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
+    const instance = renderFixture({...fixture, rendered: service}, SIZE);
+    await flush();
+    const rows = diffRows(instance.lastFrame());
+    // At the top the block's framed header comes first: line 1 is a few rows down.
+    const first = rows.findIndex((row) => row.includes('Line 1 of'));
+    expect(first).toBeGreaterThan(0);
+    instance.stdin.write('r');
+    await waitForFrame(instance, '⇗ long.md · in the split →');
+    // The pane's view: its rows under the file head, down to its bottom border.
+    const pane = frameLines(instance.lastFrame()).findIndex((line, index) => index > 6 && line.startsWith('╰')) - 6;
+    expect(new URL(calls[0]!.args[3]!).hash).toBe(`#at=L1&f=${Math.round((first / pane) * 100) / 100}&d=full&m=1&n=1`);
+
+    // Scrolled down, the top row is a later line, right at the top.
+    for (let press = 0; press < 12; press += 1) instance.stdin.write('j');
+    await flush(3);
+    const top = /\s(\d+) │Line/.exec(diffRows(instance.lastFrame())[0]!)?.[1];
+    expect(top).toBeDefined();
+    instance.stdin.write('r');
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(new URL(calls[1]!.args[4]!).hash).toBe(`#at=L${top}&f=0&d=short&m=1&n=2`);
     instance.unmount();
   });
 
@@ -191,7 +219,7 @@ describe('r and R', () => {
     await waitForFrame(instance, "⇗ guide.md · cmux didn't answer · opened in your browser");
     expect(opened).toHaveLength(1);
     expect(opened[0]![0]).toBe('/usr/bin/open');
-    expect(opened[0]![1]).toEqual([expect.stringMatching(/^file:\/\/.+\.html$/)]);
+    expect(opened[0]![1]).toEqual([expect.stringMatching(/^file:\/\/.+\.html#at=L1&f=0\.\d+&d=full&m=1&n=1$/)]);
     instance.unmount();
   });
 
@@ -301,6 +329,31 @@ describe('the beam', () => {
     // The band never lands on the header rows, and is gone once the toast shows.
     for (const frame of during) expect(frameLines(frame).slice(0, 6).join('\n')).not.toMatch(BAND);
     expect(diffRows(instance.lastFrame()).some((row) => BAND.test(row))).toBe(false);
+    instance.unmount();
+  });
+
+  it('sweeps only the rows that hold diff text, never a block\'s framed header nor the blank rows under the last line', async () => {
+    const fixture = buildFixture([markdownFile('docs/guide.md', ['# Guide', '', 'Press r to see this page.', 'It opens in a split.'])]);
+    const {service} = fakeRenderedService({review: fixture.review});
+    const instance = renderFixture({...fixture, rendered: service}, SIZE);
+    await flush();
+    const resting = diffRows(instance.lastFrame());
+    // A code row carries delta's gutter; the framed header and the padding don't.
+    const code = resting.map((row) => row.includes('⋮'));
+    expect(code.filter(Boolean)).toHaveLength(4);
+    expect(resting.some((row) => row.includes('docs/guide.md:1:'))).toBe(true);
+    expect(code.lastIndexOf(true)).toBeLessThan(resting.length - 3);
+
+    const from = instance.frames.length;
+    instance.stdin.write('r');
+    await waitForFrame(instance, '⇗ guide.md · in the split →');
+    const during = instance.frames.slice(from).map((frame) => diffRows(frame));
+    expect(during.filter((rows) => rows.some((row) => BAND.test(stripAnsi(row)))).length).toBeGreaterThanOrEqual(2);
+    for (const rows of during) {
+      for (const [index, row] of rows.entries()) {
+        if (!code[index]) expect(row, `row ${index}`).toBe(resting[index]);
+      }
+    }
     instance.unmount();
   });
 

@@ -9,6 +9,7 @@ import {reviewAssetSides, type AssetSides} from './assets.js';
 import type {FragmentRequest, FragmentSummary, PageRequest, RenderedBackend} from './backend.js';
 import {changeGroups} from './changes.js';
 import {failedMarkdownPage, renderableKind} from './classify.js';
+import {formatPageHash, type PageHash} from './hash.js';
 import {fileAlias, OVERVIEW_ALIAS, overviewKey, pageKey, railSignature, renderedPageKey} from './keys.js';
 import type {LinkAnswer, RenderedFragment} from './markdown.js';
 import {resolveMotion, type Motion} from './motion.js';
@@ -25,7 +26,11 @@ import {createRenderedBackend} from './workerClient.js';
 // arrives it renders the review's markdown in the background, the active
 // file first, so a page is usually on disk before anyone asks for it. `r`
 // and `R` come here to open a page on the surface: this side decides
-// whether the TUI plays its crossing, and what the footer says after.
+// whether the TUI plays its crossing, and what the footer says after. Each
+// trip's URL carries a hash for the page script: the line to open at, the
+// full develop on a file's first visit and the short revisit after, motion
+// and the terminal's colors. In watch mode, a page the split shows that a
+// refresh rewrote is sent there again, with the blocks that are new.
 
 // The first review waits for the UI to settle; a watch refresh waits for
 // a burst of writes to end.
@@ -42,6 +47,8 @@ const OVERVIEW_WAIT_MS = 3_000;
 // How many times a pass writes the pages again when a page's render moved
 // the count its own rail shows.
 const MAX_REWRITES = 3;
+// The fewest ms between two live refreshes of the split.
+const LIVE_GAP_MS = 1_000;
 const NOTHING_TO_RENDER = 'nothing to render · no markdown files on this branch';
 
 /**
@@ -62,7 +69,7 @@ export type OpenOutcome = {message: string; kind: 'info' | 'error'};
  */
 export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void};
 
-export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose'>>;
+export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh'>>;
 
 export type SetTimer = (run: () => void, ms: number) => () => void;
 
@@ -92,13 +99,17 @@ type Written = {ok: true; key: string} | {ok: false; reason: string};
 
 type Asking = {epoch: number; fileKey: string; priority: number; controller: AbortController; done: Promise<Answer | null>};
 
-export function createRenderedService({backend, site, surface, motion, now = Date.now, setTimer = defaultTimer}: {
+export function createRenderedService({backend, site, surface, motion, animations = true, colors = {}, now = Date.now, setTimer = defaultTimer}: {
   backend: RenderedBackend;
   site: RenderedSite;
   /** Where pages open. Without one, the service only renders. */
   surface?: PageSurface;
   /** How much the TUI moves, asked once, at the first trip. */
   motion?: () => Promise<Motion>;
+  /** False with `--no-animations`: pages arrive final, with no motion at all. */
+  animations?: boolean;
+  /** The terminal's text and background colors, which the page's first frame paints in. */
+  colors?: {fg?: string; bg?: string};
   now?: () => number;
   setTimer?: SetTimer;
 }) {
@@ -137,6 +148,23 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
   let saidLocal = false;
   // Counts `r` and `R` presses: only the newest one's page is shown.
   let presses = 0;
+  // Counts the URLs sent to the surface, so each one differs and a split
+  // showing the page already still hears it.
+  let trips = 0;
+  // Files whose page opened this session: the next trip is a revisit.
+  const visited = new Set<string>();
+  // The file page the split shows, where it opened it, and the blocks it
+  // had, for live refreshes. Null when the split shows something else.
+  let inSplit: {fileKey: string; key: string; at?: number; f?: number; blocks: Set<string>} | null = null;
+  let lastLive = -Infinity;
+  let cancelLive: (() => void) | null = null;
+  // Presses whose page is still on its way to the surface. A live refresh
+  // waits for them: the press decides what the split shows, and a refresh
+  // still due after it goes then.
+  let travelling = 0;
+  let liveAfterPress = false;
+
+  const tripHash = (hash: Pick<PageHash, 'at' | 'f' | 'd' | 'g'>) => formatPageHash({...hash, m: animations, bg: colors.bg, fg: colors.fg, n: (trips += 1)});
 
   const say = (notice: string) => {
     notices.push(notice);
@@ -354,6 +382,7 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
         }
         if (!stale) break;
       }
+      refreshSplit();
       site.prune({
         current: new Map([...plan.values()].flatMap((planned) => {
           const key = current.get(planned.fileKey);
@@ -441,18 +470,59 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
     return {ok: true, key, url: site.url(key)};
   }
 
+  const blockIds = (planned: Planned) => {
+    const answer = answerFor(planned);
+    return new Set(answer && 'summary' in answer ? answer.summary.blocks.map((block) => block.id) : []);
+  };
+
+  // The split shows a file page a refresh just rewrote: it goes to the new
+  // page where it was, with no develop and a pulse on the blocks that are
+  // new. At most once a second; a refresh inside the second waits, and the
+  // newest page goes then. A split that is gone ends live refreshes until
+  // the next trip opens one.
+  function refreshSplit() {
+    const shown = inSplit;
+    if (!shown || !surface?.refresh || disposed || cancelLive) return;
+    if (travelling > 0) {
+      liveAfterPress = true;
+      return;
+    }
+    const planned = plan.get(shown.fileKey);
+    const key = current.get(shown.fileKey);
+    if (!planned || !key || key === shown.key || !pointedNow(planned)) return;
+    const wait = lastLive + LIVE_GAP_MS - now();
+    if (wait > 0) {
+      cancelLive = setTimer(() => {
+        cancelLive = null;
+        refreshSplit();
+      }, wait);
+      return;
+    }
+    lastLive = now();
+    const blocks = blockIds(planned);
+    const fresh = [...blocks].filter((id) => !shown.blocks.has(id));
+    const place = {...(shown.at !== undefined ? {at: shown.at} : {}), ...(shown.f !== undefined ? {f: shown.f} : {})};
+    const next = {...shown, key, blocks};
+    inSplit = next;
+    void surface.refresh(site.url(key, tripHash({...place, d: 'none', g: fresh}))).then((went) => {
+      if (!went && inSplit === next) inSplit = null;
+    });
+  }
+
   // One trip to a page: the TUI's crossing, played while the page is
   // written and placed on the surface, so the crossing covers the split
   // opening. `name` is how the footer names the page, and `note` what it
   // adds about it. Nothing crosses toward a surface that refuses. A page
   // still unwritten after the crossing is said to be rendering, until the
   // deadline gives up on it, and then it opens nowhere. A press made after
-  // this one wins: this one's page is never shown over it.
-  async function travel(name: string, note: string | null, write: () => Promise<PageOutcome>, trip?: Trip): Promise<OpenOutcome | null> {
+  // this one wins: this one's page is never shown over it. `opened` hears
+  // where the page went once it did.
+  async function travel(name: string, note: string | null, write: () => Promise<PageOutcome>, trip?: Trip, opened?: (where: 'cmux-new' | 'cmux-reuse' | 'browser', key: string) => void): Promise<OpenOutcome | null> {
     const place = surface;
     if (!place) return {kind: 'error', message: 'pages open only in the full app'};
     if (place.refusal) return {kind: 'error', message: place.refusal};
     const press = (presses += 1);
+    travelling += 1;
     motionAsked ??= motion ? motion() : Promise.resolve('off');
     const crossing = motionAsked.then((kind) => trip?.cross(kind));
     let ready = false;
@@ -469,7 +539,17 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
       cancelDeadline();
       // After dispose the session dir is going: nothing is placed.
       if (gaveUp || disposed || press !== presses) return null;
-      return written.ok ? place.show(written.url) : {error: written.reason};
+      if (!written.ok) return {error: written.reason};
+      return place.show(written.url).then((result) => {
+        if ('where' in result) opened?.(result.where, written.key);
+        return result;
+      });
+    });
+    void shown.catch(() => null).then(() => {
+      travelling -= 1;
+      if (travelling > 0 || !liveAfterPress) return;
+      liveAfterPress = false;
+      refreshSplit();
     });
     await crossing;
     if (!ready && press === presses) trip?.waiting(`rendering ${name}…`);
@@ -566,17 +646,29 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
 
     /**
      * Opens the file's page, or the review's first page when the file has
-     * none, with `trip` played on the way. Null when a newer press took
-     * this one's place.
+     * none, with `trip` played on the way. `line` is the source line the
+     * diff shows at the top of the pane, and `fraction` how far down the
+     * pane it is, so the page opens with that block in the same place.
+     * Null when a newer press took this one's place.
      */
-    async open({fileKey}: {fileKey: string}, trip?: Trip): Promise<OpenOutcome | null> {
+    async open({fileKey, line, fraction}: {fileKey: string; line?: number; fraction?: number}, trip?: Trip): Promise<OpenOutcome | null> {
       const off = offReason();
       if (off) return {kind: 'error', message: off};
       const planned = plan.get(fileKey) ?? plan.values().next().value;
       if (!planned) return {kind: 'info', message: NOTHING_TO_RENDER};
       const shownPath = escapeHiddenCharacters(planned.file.path);
       const fallback = planned.fileKey !== fileKey;
-      return travel(fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, () => page(planned.fileKey), trip);
+      // The line belongs to the active file: another file's page opens at its top.
+      const place = fallback ? {} : {...(line !== undefined ? {at: line} : {}), ...(fraction !== undefined ? {f: fraction} : {})};
+      const hash = tripHash({...place, d: visited.has(planned.fileKey) ? 'short' : 'full'});
+      const write = async (): Promise<PageOutcome> => {
+        const written = await page(planned.fileKey);
+        return written.ok ? {...written, url: `${written.url}#${hash}`} : written;
+      };
+      return travel(fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, write, trip, (where, key) => {
+        visited.add(planned.fileKey);
+        inSplit = where === 'browser' ? null : {fileKey: planned.fileKey, key, ...place, blocks: blockIds(planned)};
+      });
     },
 
     /** Opens the overview of the review's pages, like `open`. */
@@ -584,7 +676,10 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
       const off = offReason();
       if (off) return {kind: 'error', message: off};
       if (plan.size === 0) return {kind: 'info', message: NOTHING_TO_RENDER};
-      return travel('overview', null, writeOverview, trip);
+      // The split shows the overview now, which no file's refresh replaces.
+      return travel('overview', null, writeOverview, trip, () => {
+        inSplit = null;
+      });
     },
 
     /** The Rendered button's hint: where its page opens, or why it can't. */
@@ -616,6 +711,7 @@ export function createRenderedService({backend, site, surface, motion, now = Dat
       if (disposed) return;
       disposed = true;
       cancelTimer?.();
+      cancelLive?.();
       surface?.dispose?.();
       for (const running of asking.values()) running.controller.abort();
       asking.clear();
@@ -629,13 +725,19 @@ export type RenderedService = ReturnType<typeof createRenderedService>;
 /** What the TUI uses to open pages and hear the service's notices. */
 export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'>;
 
-/** The service the CLI runs: its own worker, pages in the session dir, and the surface they open on. */
-export function startRenderedService({tempDir, env, cwd, animations = true, opener}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener}) {
+/**
+ * The service the CLI runs: its own worker, pages in the session dir, and
+ * the surface they open on. `colors` are the terminal's, as it answered
+ * them at startup.
+ */
+export function startRenderedService({tempDir, env, cwd, animations = true, opener, colors = {}}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; colors?: {fg?: string; bg?: string}}) {
   const platform = process.platform;
   return createRenderedService({
     backend: createRenderedBackend({tempDir, env, cwd}),
     site: createRenderedSite({tempDir}),
     surface: createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform}),
     motion: () => resolveMotion({env, animations, run: runTool, platform}),
+    animations,
+    colors,
   });
 }

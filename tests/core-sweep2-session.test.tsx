@@ -431,7 +431,8 @@ function lateTerminal(ms: number) {
 
 const SSH_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: '10.0.0.1 22 10.0.0.2 50000', BRANCH_REVIEW_IMAGES: undefined};
 
-const GRAPHICS_QUERY = '\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\\x1B[>0q\x1B[16t\x1B[14t\x1B[c';
+// The probe also asks for the terminal's text and background colors (OSC 10 and 11).
+const GRAPHICS_QUERY = '\x1B_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1B\\\x1B[>0q\x1B[16t\x1B[14t\x1B]10;?\x07\x1B]11;?\x07\x1B[c';
 const GHOSTTY_CLIENT = {termtype: 'ghostty 1.3.2', termname: 'xterm-ghostty'};
 const GHOSTTY_ENV = {...process.env, TERM: 'xterm-256color', TERM_PROGRAM: 'ghostty', TERM_PROGRAM_VERSION: '1.3.2', NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: undefined, BRANCH_REVIEW_IMAGES: undefined};
 

@@ -6,7 +6,7 @@ import {NO_GRAPHICS, type GraphicsCaps, type GraphicsProtocol} from './types.js'
 import {findTool} from './worker/tools.js';
 
 // Finds out what the terminal can draw, once, before Ink owns stdin. One
-// write asks four questions and ends with DA1, which every terminal answers
+// write asks six questions and ends with DA1, which every terminal answers
 // last, so its reply closes the window; a terminal that answers nothing is
 // given up on after a short timeout. Replies arrive on stdin, which is in raw
 // mode for the window, so Ctrl-C arrives as a byte here instead of SIGINT.
@@ -22,6 +22,9 @@ const XTVERSION_QUERY = `${ESC}[>0q`;
 const CELL_SIZE_QUERY = `${ESC}[16t`;
 const TEXT_AREA_QUERY = `${ESC}[14t`;
 const DA1_QUERY = `${ESC}[c`;
+// The text and background colors, which the rendered page's first frame
+// paints in so it looks like the pane it came from.
+const COLORS_QUERY = `${ESC}]10;?\x07${ESC}]11;?\x07`;
 const DEFAULT_TIMEOUT_MS = 300;
 // Replies cross the network over SSH, and tmux answers some itself.
 const SLOW_LINK_TIMEOUT_MS = 1000;
@@ -41,9 +44,14 @@ const REPLY = new RegExp([
   `${ESC}\\[6;(\\d+);(\\d+)t`,
   `${ESC}\\[4;(\\d+);(\\d+)t`,
   `${ESC}\\[\\?[\\d;]*c`,
+  // OSC 10 and 11, ended by ST or BEL. A body that isn't a color is still
+  // a reply, read whole so it never reaches the app as keys.
+  `${ESC}\\](1[01]);([^${ESC}\\x07]*)(?:${ESC}\\\\|\\x07)`,
 ].join('|'), 'g');
 // The start of a reply the window closed on before it finished.
-const PARTIAL_REPLY = new RegExp(`${ESC}(?:_G[^${ESC}]*${ESC}?|P(?:>(?:\\|[^${ESC}]*${ESC}?)?)?|\\[(?:\\?[\\d;]*|>|[46](?:;\\d*){0,2})?)?$`);
+const PARTIAL_REPLY = new RegExp(`${ESC}(?:_G[^${ESC}]*${ESC}?|P(?:>(?:\\|[^${ESC}]*${ESC}?)?)?|\\[(?:\\?[\\d;]*|>|[46](?:;\\d*){0,2})?|\\](?:1[01]?(?:;[^${ESC}\\x07]*${ESC}?)?)?)?$`);
+// `rgb:R/G/B` with one to four hex digits a channel, as XParseColor reads it.
+const RGB = /^rgb:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})$/i;
 
 export type ParsedReplies = {
   // The message of our graphics query's reply: 'OK' or an error code.
@@ -59,6 +67,9 @@ export type ParsedReplies = {
   stray: string;
   // The start of a reply still arriving at the end of the buffer.
   partial: string;
+  // The terminal's text and background colors as `#rrggbb`, when it said them.
+  fg?: string;
+  bg?: string;
 };
 
 export type TtyInput = {
@@ -150,8 +161,11 @@ export function da1ExpectedFor(env: NodeJS.ProcessEnv) {
 /** Pure: the replies found in everything stdin delivered during the window. */
 export function parseReplies(buffer: string): ParsedReplies {
   const parsed: ParsedReplies = {da1: false, da1Count: 0, stray: '', partial: ''};
-  const stray = buffer.replace(REPLY, (whole, keys?: string, message?: string, version?: string, cellH?: string, cellW?: string, areaH?: string, areaW?: string) => {
-    if (keys !== undefined) {
+  const stray = buffer.replace(REPLY, (whole, keys?: string, message?: string, version?: string, cellH?: string, cellW?: string, areaH?: string, areaW?: string, osc?: string, color?: string) => {
+    if (osc !== undefined) {
+      const hex = colorHex(color ?? '');
+      if (hex) parsed[osc === '10' ? 'fg' : 'bg'] = hex;
+    } else if (keys !== undefined) {
       if (keys.split(',').includes('i=31')) parsed.graphics = message;
     } else if (version !== undefined) {
       parsed.xtversion = version;
@@ -168,6 +182,26 @@ export function parseReplies(buffer: string): ParsedReplies {
   parsed.partial = PARTIAL_REPLY.exec(stray)?.[0] ?? '';
   parsed.stray = stray.slice(0, stray.length - parsed.partial.length);
   return parsed;
+}
+
+// An X color spec's channel scaled to eight bits: `f` and `ffff` are both 255.
+function colorHex(spec: string) {
+  const match = RGB.exec(spec);
+  if (!match) return null;
+  const channels = match.slice(1).map((digits) => Math.round((parseInt(digits, 16) / (16 ** digits.length - 1)) * 255));
+  return `#${channels.map((channel) => channel.toString(16).padStart(2, '0')).join('')}`;
+}
+
+// What the terminal said of its colors, and whether its background is dark.
+function terminalColors(replies: ParsedReplies): Pick<GraphicsCaps, 'fg' | 'bg' | 'scheme'> {
+  const colors: Pick<GraphicsCaps, 'fg' | 'bg' | 'scheme'> = {};
+  if (replies.fg) colors.fg = replies.fg;
+  if (replies.bg) {
+    colors.bg = replies.bg;
+    const [r, g, b] = [1, 3, 5].map((at) => parseInt(replies.bg!.slice(at, at + 2), 16));
+    colors.scheme = 0.2126 * r! + 0.7152 * g! + 0.0722 * b! < 128 ? 'dark' : 'light';
+  }
+  return colors;
 }
 
 function imagesSetting(env: NodeJS.ProcessEnv) {
@@ -295,7 +329,8 @@ export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size:
   // Under tmux, tmux's own DA1 comes first; the window is only answered
   // once the outer terminal's DA1 came back too.
   const detectionTimedOut = replies.da1Count < da1ExpectedFor(env);
-  if (protocol === 'none') return {...NO_GRAPHICS, terminal: identity.label, detectionTimedOut};
+  const colors = terminalColors(replies);
+  if (protocol === 'none') return {...NO_GRAPHICS, terminal: identity.label, detectionTimedOut, ...colors};
 
   return {
     protocol,
@@ -306,6 +341,7 @@ export function decideCaps(replies: ParsedReplies, env: NodeJS.ProcessEnv, size:
     tmux,
     terminal: identity.label,
     detectionTimedOut,
+    ...colors,
   };
 }
 
@@ -450,7 +486,7 @@ export function startGraphicsDetection(io: DetectionIo): {
     tmuxClient = io.queryTmuxClient().then((client) => client ?? undefined, () => undefined);
   }
   try {
-    stdout.write(`${graphicsQuery}${XTVERSION_QUERY}${CELL_SIZE_QUERY}${TEXT_AREA_QUERY}${DA1_QUERY}`);
+    stdout.write(`${graphicsQuery}${XTVERSION_QUERY}${CELL_SIZE_QUERY}${TEXT_AREA_QUERY}${COLORS_QUERY}${DA1_QUERY}`);
   } catch {
     finish('cancel');
     return {result, cancel() {}, handOff: () => NOTHING_HANDED};

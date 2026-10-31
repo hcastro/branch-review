@@ -111,6 +111,7 @@ if (!isMainThread && workerData === THREAD_TAG) {
     renderMarkdown({
       path: job.path,
       ...(job.oldPath ? {basePath: job.oldPath} : {}),
+      status: job.status,
       source: job.source,
       groups: job.groups,
       // Within the render deadline, so a slow git costs cards, not the page.

@@ -18,7 +18,9 @@ const DA1 = `${ESC}[?62;22c`;
 const CELL = `${ESC}[6;20;10t`;
 const AREA = `${ESC}[4;800;1200t`;
 const xtversion = (text: string) => `${ESC}P>|${text}${ESC}\\`;
-const FULL_QUERY = `${KITTY_QUERY}${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`;
+// The terminal's text and background colors, for the rendered page's first frame.
+const COLORS_QUERY = `${ESC}]10;?\x07${ESC}]11;?\x07`;
+const FULL_QUERY = `${KITTY_QUERY}${ESC}[>0q${ESC}[16t${ESC}[14t${COLORS_QUERY}${ESC}[c`;
 
 class FakeStdin extends EventEmitter {
   isTTY = true;
@@ -68,7 +70,7 @@ const GHOSTTY_CLIENT: TmuxClient = {termtype: 'ghostty 1.3.2', termname: 'xterm-
 const ghosttyClient = () => Promise.resolve(GHOSTTY_CLIENT);
 // Under tmux the graphics query and a DA1 of its own go out in one
 // passthrough, so the outer terminal answers both; tmux answers the rest.
-const TMUX_QUERY = `${tmuxWrap(`${KITTY_QUERY}${ESC}[c`)}${ESC}[>0q${ESC}[16t${ESC}[14t${ESC}[c`;
+const TMUX_QUERY = `${tmuxWrap(`${KITTY_QUERY}${ESC}[c`)}${ESC}[>0q${ESC}[16t${ESC}[14t${COLORS_QUERY}${ESC}[c`;
 // What tmux 3.4 itself says to DA1.
 const TMUX_DA1 = `${ESC}[?1;2c`;
 
@@ -646,6 +648,69 @@ describe('parseReplies', () => {
     const parsed = parseReplies(`${ESC}_Gi=7;OK${ESC}\\${DA1}`);
     expect(parsed.graphics).toBeUndefined();
     expect(parsed).toMatchObject({da1: true, stray: '', partial: ''});
+  });
+});
+
+// cmux answers OSC 10 and 11 with four hex digits a channel and an ST
+// terminator; xterm answers a BEL-terminated query with BEL.
+const osc = (code: 10 | 11, rgb: string, end = `${ESC}\\`) => `${ESC}]${code};rgb:${rgb}${end}`;
+
+describe('the terminal\'s colors', () => {
+  it('reads a dark terminal\'s text and background from OSC 10 and 11', async () => {
+    const {stdin, detection} = setup(GHOSTTY);
+    stdin.reply(`${OK}${CELL}${osc(10, 'ffff/ffff/ffff')}${osc(11, '0000/0000/0000')}${DA1}`);
+    expect(await detection.result).toMatchObject({protocol: 'kitty', fg: '#ffffff', bg: '#000000', scheme: 'dark'});
+    expect(stdin.unshifted).toEqual([]);
+  });
+
+  it('reads a light one, with two hex digits a channel and a BEL', () => {
+    const parsed = parseReplies(`${osc(10, '1f/22/28', '\x07')}${osc(11, 'fa/fa/f8', '\x07')}${DA1}`);
+    expect(parsed).toMatchObject({fg: '#1f2228', bg: '#fafaf8', stray: ''});
+    expect(decideCaps(parsed, GHOSTTY, {})).toMatchObject({fg: '#1f2228', bg: '#fafaf8', scheme: 'light'});
+  });
+
+  it('scales any channel width to eight bits, as XParseColor does', () => {
+    expect(parseReplies(osc(11, 'f/8/0')).bg).toBe('#ff8800');
+    expect(parseReplies(osc(11, '123/abc/fff')).bg).toBe('#12abff');
+    expect(parseReplies(osc(11, '1e1e/2020/2626')).bg).toBe('#1e2026');
+  });
+
+  it('has no colors when the terminal doesn\'t answer them, even with no graphics', async () => {
+    const {stdin, detection} = setup({TERM: 'xterm-256color', TERM_PROGRAM: 'Apple_Terminal'});
+    stdin.reply(DA1);
+    const caps = await detection.result;
+    expect(caps).not.toHaveProperty('fg');
+    expect(caps).not.toHaveProperty('bg');
+    expect(caps).not.toHaveProperty('scheme');
+    // A terminal with no graphics still says its colors.
+    expect(decideCaps(parseReplies(`${osc(11, '0000/0000/0000')}${DA1}`), {TERM: 'dumb-ish'}, {})).toMatchObject({protocol: 'none', bg: '#000000', scheme: 'dark'});
+  });
+
+  it('drops a malformed answer whole, never as keys', () => {
+    for (const bad of [osc(11, 'zzzz/0000/0000'), osc(11, '0000/0000'), osc(11, '00000/0/0'), `${ESC}]11;rgba:0/0/0/0${ESC}\\`, `${ESC}]11;?${ESC}\\`]) {
+      const parsed = parseReplies(`j${bad}k${DA1}`);
+      expect(parsed.bg, JSON.stringify(bad)).toBeUndefined();
+      expect(parsed.stray).toBe('jk');
+    }
+    // Only our two questions count: another OSC number is not a color.
+    expect(parseReplies(osc(12 as never, 'ffff/0000/0000')).bg).toBeUndefined();
+  });
+
+  it('reads an answer split across reads, its terminator included', async () => {
+    const {stdin, detection} = setup(GHOSTTY);
+    const whole = `${OK}${osc(10, 'e6e6/e6e6/e6e6')}${osc(11, '1111/1313/1818')}${DA1}`;
+    const cut = whole.indexOf('1818') + 5;
+    // The cut falls between the ESC and the backslash of the ST.
+    expect(whole[cut - 1]).toBe(ESC);
+    stdin.reply(whole.slice(0, cut));
+    stdin.reply(whole.slice(cut));
+    expect(await detection.result).toMatchObject({fg: '#e6e6e6', bg: '#111318', scheme: 'dark'});
+    expect(stdin.unshifted).toEqual([]);
+  });
+
+  it('holds an answer the window closed on as the start of a reply, not as keys', () => {
+    expect(parseReplies(`q${ESC}]11;rgb:1111/13`)).toMatchObject({stray: 'q', partial: `${ESC}]11;rgb:1111/13`});
+    expect(parseReplies(`q${ESC}]11;rgb:1111/1313/1818${ESC}`)).toMatchObject({stray: 'q', partial: `${ESC}]11;rgb:1111/1313/1818${ESC}`});
   });
 });
 

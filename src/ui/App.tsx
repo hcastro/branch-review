@@ -40,6 +40,7 @@ import {placeholderRun} from '../media/kitty.js';
 import {formatBytes, formatLabel} from '../media/layout.js';
 import type {MediaService, WantedBox} from '../media/service.js';
 import {LEAVES_PANE, type RenderedPages, type RenderedService, type Trip} from '../rendered/service.js';
+import {anchorLine} from '../rendered/anchor.js';
 import {beamFrame, pressFrame} from '../rendered/beam.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 import {createCrossingClock, type CrossingClock} from './crossing.js';
@@ -1795,6 +1796,26 @@ function buildDiffRows(sections: ViewSection[]): DiffRow[] {
   return rows;
 }
 
+// The first diff line of `fileKey` in the pane's view, as a source line of
+// the side its page shows, and how far down the view it is (0 at the top).
+// Only rows whose hunk line is known count: a block delta drew differently
+// from its hunk names no line. Empty when the view shows none.
+function topSourceLine(rows: readonly DiffRow[], offset: number, viewRows: number, fileKey: string): {line?: number; fraction?: number} {
+  for (let index = offset; index < Math.min(rows.length, offset + viewRows); index += 1) {
+    const row = rows[index]!;
+    if (row.source === undefined || !row.target || row.headerLine === null || reviewFileKey(row.target.file) !== fileKey) continue;
+    // The row's place among its hunk's lines.
+    let ordinal = 0;
+    for (let each = row.headerLine + 1; each < index; each += 1) {
+      if (rows[each]?.block === row.block && rows[each]?.source !== undefined) ordinal += 1;
+    }
+    const line = anchorLine(row.target.file, row.target.block, ordinal);
+    if (line === null) continue;
+    return {line, fraction: viewRows > 0 ? (index - offset) / viewRows : 0};
+  }
+  return {};
+}
+
 type TerminalSize = {columns: number; rows: number};
 
 function readTerminalSize(stdout: NodeJS.WriteStream | undefined): TerminalSize {
@@ -2116,7 +2137,7 @@ function DiffPaneBody({
 }: DiffPaneBodyProps) {
   const inner = Math.max(1, paneWidth - 4);
   // Only this pane reads the crossing's clock, so its 40 ms ticks redraw
-  // the pane alone. Text rows only: picture rows are never redrawn.
+  // the pane alone. Diff text rows only: picture rows are never redrawn.
   const crossingFrame = useSyncExternalStore(crossing.subscribe, crossing.snapshot);
   const beamAccent = palette.beam();
   const beam = (line: string, row: number) => (crossingFrame?.motion === 'full' ? beamFrame(line, row, crossingFrame.t, inner, beamAccent) ?? line : line);
@@ -2168,13 +2189,16 @@ function DiffPaneBody({
 
     const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
     const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-    const paneRow = frameLine(beam(arrivalLine, index), inner, borderAnsi);
+    // The band crosses diff text only: rows with delta's gutter. A block's
+    // framed header and the blank rows between files keep still.
+    const holdsText = row?.kind === 'body' && row.codeColumn !== undefined;
+    const paneRow = frameLine(holdsText ? beam(arrivalLine, index) : arrivalLine, inner, borderAnsi);
     rows.push(marksFocus ? paneRow.replace('│', FOCUS_BAR) : paneRow);
   }
   // A diff shorter than the pane still draws the pane's full height, so the
   // bottom border lines up with the tree pane's.
   while (rows.length < paneHeight - 1) {
-    rows.push(frameLine(beam('', rows.length - 3), inner, borderAnsi));
+    rows.push(frameLine('', inner, borderAnsi));
   }
   rows.push(frameBottomBorder(paneWidth, borderAnsi));
 
@@ -2777,18 +2801,21 @@ function AppContent({
   }, [pages, renderedVersion, showToast]);
 
   // r and R: the active file's page, or the overview. The crossing plays on
-  // the way, and the footer says where the page went once it ends.
+  // the way, and the footer says where the page went once it ends. A file's
+  // page opens on the line the pane shows on top, at the same height.
   const openRendered = useCallback((target: 'file' | 'overview') => {
     if (!pages) return;
     const trip: Trip = {
       cross: (motion) => crossing.start(motion),
       waiting: (message) => showToast(message, undefined, 'info'),
     };
-    const opening = target === 'overview' ? pages.openOverview(trip) : pages.open({fileKey: activeFileKey}, trip);
+    const opening = target === 'overview'
+      ? pages.openOverview(trip)
+      : pages.open({fileKey: activeFileKey, ...topSourceLine(allDiffRows, diffOffset, visibleDiffRows, activeFileKey)}, trip);
     void opening.then((outcome) => {
       if (outcome) showToast(outcome.message, undefined, outcome.kind);
     });
-  }, [activeFileKey, crossing, pages, showToast]);
+  }, [activeFileKey, allDiffRows, crossing, diffOffset, pages, showToast, visibleDiffRows]);
 
   const openMediaFile = useCallback(async (ref: MediaRef, how: 'open' | 'quickLook') => {
     if (!media) return;

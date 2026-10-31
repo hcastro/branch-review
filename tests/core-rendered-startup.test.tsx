@@ -140,7 +140,8 @@ describe('the rendered view\'s trip at startup', () => {
     expect(outcome).toEqual({kind: 'info', message: '⇗ README.md · in the split → · nothing left this machine'});
     expect(crossings).toEqual(['off']);
     const [call] = fs.readFileSync(log, 'utf8').trim().split('\n');
-    expect(call).toMatch(/^--json browser open-split file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html --workspace workspace:test --focus false$/);
+    // With --no-animations the page arrives final: m=0.
+    expect(call).toMatch(/^--json browser open-split file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#d=full&m=0&n=1 --workspace workspace:test --focus false$/);
     expect(call!.startsWith(`--json browser open-split ${new URL(`file://${fs.realpathSync(parent)}`).href}`)).toBe(true);
     expect(opened).toEqual([]);
     proc.emit('exit', 0);
@@ -181,7 +182,7 @@ describe('the rendered view\'s trip at startup', () => {
     const rendered = props.rendered as RenderedService;
     rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
     const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
-    const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html$/;
+    const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#d=full&m=0&n=1$/;
     if (process.platform === 'darwin') {
       expect(outcome).toEqual({kind: 'info', message: "⇗ README.md · cmux didn't answer · opened in your browser · nothing left this machine"});
       expect(opened).toEqual([['/usr/bin/open', [expect.stringMatching(page)]]]);
@@ -210,3 +211,56 @@ describe('the review controller', () => {
     instance.unmount();
   });
 });
+
+describe('the terminal\'s colors', () => {
+  it('reach the page a trip opens, from the terminal\'s answer at startup', async () => {
+    const cwd = initRepo({'README.md': '# Readme\n\nOne.\n'});
+    writeFiles(cwd, {'README.md': '# Readme\n\nOne, edited.\n'});
+    const parent = makeTempDir('branch-review-session-parent-');
+    const proc = new FakeProcess();
+    // A terminal that draws no graphics and answers its colors, then DA1.
+    const stdin = Object.assign(new EventEmitter(), {isTTY: true, setRawMode: () => undefined, resume: () => undefined, pause: () => undefined, unshift: () => undefined});
+    const stdout = {isTTY: true, columns: 120, rows: 40, write: (text: string) => {
+      if (text.includes('\x1B]11;?')) setImmediate(() => stdin.emit('data', Buffer.from('\x1B]10;rgb:d0d0/d4d4/d8d8\x1B\\\x1B]11;rgb:1e1e/2020/2626\x1B\\\x1B[?62c', 'latin1')));
+      return true;
+    }};
+    let tree: unknown;
+    let markRendered!: () => void;
+    const mounted = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+    const opened: Array<[string, string[]]> = [];
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch'],
+      cwd,
+      proc,
+      env: {
+        ...process.env, TERM: 'xterm', TERM_PROGRAM: undefined, COLORTERM: undefined, GHOSTTY_RESOURCES_DIR: undefined, KITTY_WINDOW_ID: undefined,
+        NO_COLOR: undefined, FORCE_COLOR: undefined, TMUX: undefined, SSH_CONNECTION: undefined, CMUX_WORKSPACE_ID: undefined,
+        BRANCH_REVIEW_IMAGES: undefined, BRANCH_REVIEW_MOTION: 'off', BRANCH_REVIEW_TMPDIR: parent,
+      },
+      opener: (command, args) => opened.push([command, args]),
+      stdin: stdin as never,
+      stdout: stdout as never,
+      stderr: {write: () => true},
+      render: (element) => {
+        tree = element;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => undefined};
+      },
+    });
+    await mounted;
+
+    const props = findProps(tree, ReviewController)!;
+    expect(props.graphics).toMatchObject({protocol: 'none', fg: '#d0d4d8', bg: '#1e2026', scheme: 'dark'});
+    const rendered = props.rendered as RenderedService;
+    rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
+    await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
+    if (process.platform === 'darwin') {
+      expect(opened).toHaveLength(1);
+      expect(new URL(opened[0]![1][0]!).hash).toBe('#d=full&m=1&bg=1e2026&fg=d0d4d8&n=1');
+    }
+    proc.emit('exit', 0);
+  }, 60_000);
+});
+

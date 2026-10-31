@@ -6,12 +6,14 @@
 // ends in a tail of its own, such as `c` from `ESC[?62;22` + `c`, which would
 // run that key.
 
-const ONE_REPLY = String.raw`(?:_G[^\x1B]*\x1B\\|\[\?[\d;]*c|P>\|[^\x1B]*\x1B\\|\[[46];\d+;\d+t)`;
+// The color replies (OSC 10 and 11) end with ST or BEL, as detect.ts reads them.
+const ONE_REPLY = String.raw`(?:_G[^\x1B]*\x1B\\|\[\?[\d;]*c|P>\|[^\x1B]*\x1B\\|\[[46];\d+;\d+t|\]1[01];[^\x1B\x07]*(?:\x1B\\|\x07))`;
 const REPLIES = new RegExp(String.raw`^\x1B?${ONE_REPLY}(?:\x1B${ONE_REPLY})*$`);
-// How a reply continues after its ESC.
-const REPLY_REST = /^(?:_G|\[|P)/;
+// How a reply continues after its ESC. A color reply's rest starts `]1`,
+// so `]` alone stays a key.
+const REPLY_REST = /^(?:_G|\[|P|\]1)/;
 // Whole replies, then the start of one that has not finished arriving.
-const UNFINISHED = new RegExp(String.raw`^(?:\x1B${ONE_REPLY})*\x1B(?:_G[^\x1B]*\x1B?|P(?:>(?:\|[^\x1B]*\x1B?)?)?|\[(?:\?[\d;]*|>|[46](?:;\d*){0,2})?)?$`);
+const UNFINISHED = new RegExp(String.raw`^(?:\x1B${ONE_REPLY})*\x1B(?:_G[^\x1B]*\x1B?|P(?:>(?:\|[^\x1B]*\x1B?)?)?|\[(?:\?[\d;]*|>|[46](?:;\d*){0,2})?|\](?:1[01]?(?:;[^\x1B\x07]*\x1B?)?)?)?$`);
 const ESC = '\x1B';
 // Long enough for the rest of a split reply to follow its ESC, short enough
 // that Esc still feels instant.

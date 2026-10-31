@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {describe, expect, it} from 'vitest';
-import {PAGE_CSS_HASH} from '../src/rendered/assets.generated.js';
+import {PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
 import {assembleOverview, contentSecurityPolicy, type OverviewInput} from '../src/rendered/page.js';
 
 // The overview `R` opens: every rendered file of the review with its
@@ -40,12 +40,14 @@ function section(html: string, heading: string) {
 }
 
 describe('assembleOverview', () => {
-  it('puts the same CSP first in <head>, and has no script and no style attribute', () => {
+  it('puts the same CSP first in <head>, and has no script but our own and no style attribute', () => {
     const html = overview();
     const head = html.slice(html.indexOf('<head>') + '<head>'.length).trimStart();
     expect(head.startsWith(`<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy()}">`)).toBe(true);
     expect(contentSecurityPolicy()).toContain(`style-src '${PAGE_CSS_HASH}'`);
-    expect(html).not.toMatch(/<script|\sstyle=|\son[a-z]+=/i);
+    expect(contentSecurityPolicy()).toContain(`script-src '${PAGE_SCRIPT_HASH}'`);
+    expect(html.split(`<script>${PAGE_SCRIPT}</script>`)).toHaveLength(2);
+    expect(html.replace(`<script>${PAGE_SCRIPT}</script>`, '')).not.toMatch(/<script|\sstyle=|\son[a-z]+=/i);
     expect(html).toContain('<title>Overview · branch-review</title>');
   });
 

@@ -19,7 +19,7 @@ type Held = {body: PageBody; summary: FragmentSummary; uses: AssetUse[]};
 // JavaScript strings take two bytes a character.
 function heldBytes(held: Held) {
   const body = held.body;
-  const text = body.kind === 'rendered' ? body.fragment.html : body.kind === 'tooLarge' ? body.head : body.kind === 'failed' ? body.source : '';
+  const text = body.kind === 'rendered' ? body.fragment.html + (body.fragment.raw?.text ?? '') : body.kind === 'tooLarge' ? body.head : body.kind === 'failed' ? body.source : '';
   return text.length * 2 + 1024;
 }
 
@@ -81,7 +81,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     const link: RenderInput['link'] = (repoPath) => (Object.hasOwn(request.links, repoPath) ? request.links[repoPath]! : {kind: 'outside'});
     const body = await pageBody(
       () => sources.read(request.cwd, request.source),
-      (source) => render({path: request.path, ...(request.oldPath ? {basePath: request.oldPath} : {}), source, groups: request.groups, ...lookups, link}),
+      (source) => render({path: request.path, ...(request.oldPath ? {basePath: request.oldPath} : {}), status: request.status, source, groups: request.groups, ...lookups, link}),
     );
     const entry: Held = {body, summary: summarize(body, uses), uses};
     // A failure can depend on the moment (a file mid-write), so it is

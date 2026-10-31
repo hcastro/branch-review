@@ -93,6 +93,18 @@ describe('changeGroups', () => {
 });
 
 describe('change marks on the page', () => {
+  it('counts lines as git does when a lone carriage return sits in the file', async () => {
+    // The parser would end a line at the carriage return; git ends one only
+    // at a newline, and the marks follow git's numbering.
+    const before = 'Intro\rsecond half.\n\nA one.\n\nB two.\n\nC three.\n\nD four.\n\nE five.\n\nF six.\n';
+    const {marked, blocks, fragment} = await marksFor(before, before.replace('E five.', 'E five changed.'));
+    expect(marked).toEqual([{tag: 'p', mark: 'modified', text: 'E five changed.'}]);
+    expect(fragment.changes).toEqual({changed: 1, removed: 0});
+    expect(blocks.map((block) => block.lines)).toEqual([[1, 1], [3, 3], [5, 5], [7, 7], [9, 9], [11, 11], [13, 13]]);
+    // Each block's id comes from its own text, not from an empty slice.
+    expect(new Set(blocks.map((block) => block.id.split('-')[1])).size).toBe(7);
+  });
+
   it('marks an added paragraph as added and leaves its neighbors unmarked', async () => {
     const {marked, removed} = await marksFor('# Title\n\nFirst.\n\nLast.\n', '# Title\n\nFirst.\n\nAdded here.\n\nLast.\n');
     expect(marked).toEqual([{tag: 'p', mark: 'added', text: 'Added here.'}]);
@@ -487,6 +499,15 @@ describe('change marks on the page', () => {
     const [before] = beforeBodies(edited.html);
     expect(before).toMatch(/^<table>[\s\S]*<th>a<\/th>[\s\S]*<td>4<\/td>[\s\S]*<\/table>$/);
     expect(before).not.toContain('<pre>');
+  });
+
+  it('gives an embedded image its own size, so its box holds before it decodes, unless the author sized it or a picture may swap it', async () => {
+    const source = '![Hero](hero.png)\n\n<img src="hero.png" width="90">\n\n<picture>\n<source srcset="hero.png">\n<img src="hero.png">\n</picture>\n';
+    const embed = {kind: 'embed', mime: 'image/png', dataUrl: 'data:image/png;base64,AA==', oid: 'abc', width: 640, height: 260} as const;
+    const fragment = await renderMarkdown({path: 'doc.md', source, groups: [], asset: async () => embed, link: () => ({kind: 'outside'})});
+    expect(fragment.html).toContain('<img src="data:image/png;base64,AA==" alt="Hero" width="640" height="260" data-br-size="">');
+    expect(fragment.html).toMatch(/<img src="data:image\/png;base64,AA==" width="90" data-block=/);
+    expect(fragment.html).toMatch(/<picture[^>]*>\s*<source srcset="data:image\/png;base64,AA==">\s*<img src="data:image\/png;base64,AA==">\s*<\/picture>/);
   });
 
   it('marks an added rule, a lone image and a picture on a box that can draw their bars', async () => {

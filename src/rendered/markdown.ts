@@ -12,10 +12,13 @@ import {nameToEmoji} from 'gemoji';
 import {parse as parseYaml} from 'yaml';
 import type {Element, ElementContent, Parents, Root, RootContent} from 'hast';
 import type {Nodes as MdastNodes, Root as MdastRoot, Yaml} from 'mdast';
+import type {FileStatus} from '../git.js';
 import {remarkAlerts, type AlertType} from './alerts.js';
 import {createBlockIds, privateAttribute} from './blockIds.js';
 import {baseText, markBlocks, type ChangeGroup, type MarkableBlock} from './changes.js';
+import {readPageHash} from './hash.js';
 import {octicon, type OcticonName} from './octicons.js';
+import {rawSource, type RawSource} from './raw.js';
 
 // The offline renderer: markdown in, the HTML GitHub would show for it out,
 // with change marks. Repo text is untrusted all the way through. Raw HTML
@@ -52,6 +55,8 @@ export type RenderInput = {
    * open the review's pages, so they always resolve from `path`.
    */
   basePath?: string;
+  /** How the review sees the file; the first frame of a new or deleted one is all one tint. */
+  status?: FileStatus;
   source: string;
   groups: ChangeGroup[];
   asset: (repoPath: string) => Promise<AssetAnswer>;
@@ -86,6 +91,8 @@ export type RenderedFragment = {
   differences: Array<{kind: DifferenceKind; count: number}>;
   /** Blocks marked changed, and removed-content markers placed. */
   changes: {changed: number; removed: number};
+  /** The source as the diff showed it, for the page's first frame. */
+  raw?: RawSource;
 };
 
 type Lookups = Pick<RenderInput, 'asset' | 'baseAsset' | 'assetChanged' | 'link'>;
@@ -129,14 +136,14 @@ export async function renderMarkdown(input: RenderInput): Promise<RenderedFragme
     assetOids: [...tally.assetOids],
     differences: [...tally.differences].map(([kind, count]) => ({kind, count})),
     changes: rendered.changes,
+    raw: rawSource(input.source, input.groups, input.status),
   };
 }
 
 async function renderTree(source: string, options: TreeOptions, tally: Tally): Promise<RenderedTree> {
   const stamp = privateAttribute();
   const processor = parser(stamp.property);
-  const mdast = processor.parse(source);
-  const raw = await processor.run(mdast) as Root;
+  const {mdast, hast: raw} = await parseOnGitLines(processor, source);
   const sourceLines = source.split('\n');
   const candidates = options.groups ? collectBlocks(raw, sourceLines, stamp.property) : [];
   // Read before the sanitizer runs, from the tree the page is made of.
@@ -247,9 +254,51 @@ function emptySide(): Side {
 async function baseSide(processor: ReturnType<typeof parser>, source: string, groups: ChangeGroup[]): Promise<Side> {
   const text = baseText(source, groups);
   const lines = text.split('\n');
-  const mdast = processor.parse(text);
-  const root = await processor.run(mdast) as Root;
+  const {mdast, hast: root} = await parseOnGitLines(processor, text);
   return {blocks: collectBlocks(root, lines, null), lines, ...sideContext(mdast, root, text)};
+}
+
+/**
+ * Both trees of `text`, their positions counted on git's lines. git ends a
+ * line only at a newline, and every line number a diff gives is git's; the
+ * parser also ends one at a lone carriage return. In a file with one, each
+ * position is read again from its offset, which both counts share.
+ */
+async function parseOnGitLines(processor: ReturnType<typeof parser>, text: string) {
+  const mdast = processor.parse(text);
+  const recount = /\r(?!\n)/.test(text);
+  if (recount) countGitLines(mdast, text);
+  const hast = await processor.run(mdast) as Root;
+  // Raw HTML is parsed again on the way, with the parser's count.
+  if (recount) countGitLines(hast, text);
+  return {mdast, hast};
+}
+
+type Positioned = {position?: {start: {line: number; column: number; offset?: number}; end: {line: number; column: number; offset?: number}}; children?: Positioned[]};
+
+function countGitLines(tree: Positioned, text: string) {
+  const starts = [0];
+  for (let at = text.indexOf('\n'); at >= 0; at = text.indexOf('\n', at + 1)) starts.push(at + 1);
+  const recount = (point: {line: number; column: number; offset?: number}) => {
+    if (point.offset === undefined) return;
+    let low = 0;
+    let high = starts.length - 1;
+    while (low < high) {
+      const middle = (low + high + 1) >> 1;
+      if (starts[middle]! <= point.offset) low = middle;
+      else high = middle - 1;
+    }
+    point.line = low + 1;
+    point.column = point.offset - starts[low]! + 1;
+  };
+  const visit = (node: Positioned) => {
+    if (node.position) {
+      recount(node.position.start);
+      recount(node.position.end);
+    }
+    for (const child of node.children ?? []) visit(child);
+  };
+  visit(tree);
 }
 
 function sideContext(mdast: MdastRoot, hast: Root, source: string): Pick<Side, 'definitions' | 'footnoteLabels' | 'footnoteNumbers'> {
@@ -593,6 +642,11 @@ function resolveLinks(tree: Root, options: TreeOptions, tally: Tally): RenderedF
 
     if (href.startsWith('#')) {
       const target = decodeHash(href.slice(1));
+      if (tripHashLike(href.slice(1)) || tripHashLike(target)) {
+        makeInert(node, 'badAnchor');
+        links.push({href, status: 'badAnchor', line});
+        return;
+      }
       const prefixed = target.startsWith('user-content-') ? target : `user-content-${target}`;
       const found = ids.has(prefixed) || target === '';
       if (ids.has(prefixed)) node.properties.href = `#${prefixed}`;
@@ -608,21 +662,33 @@ function resolveLinks(tree: Root, options: TreeOptions, tally: Tally): RenderedF
 
     const repoPath = repoPathFor(options.path, href);
     const hash = href.includes('#') ? decodeHash(href.slice(href.indexOf('#') + 1)) : undefined;
-    const answer: LinkAnswer = repoPath === null ? {kind: 'outside'} : options.link(repoPath, hash);
+    const answer: LinkAnswer = repoPath === null ? {kind: 'outside'} : hash !== undefined && tripHashLike(hash) ? {kind: 'badAnchor'} : options.link(repoPath, hash);
     if (answer.kind === 'inReview') {
       const suffix = hash ? `#${hash.startsWith('user-content-') ? hash : `user-content-${hash}`}` : '';
       node.properties.href = `${answer.href}${suffix}`;
       links.push({href, status: 'ok', line});
       return;
     }
-    // No page to open for it: the link stays readable, inert, and says why.
-    delete node.properties.href;
-    node.properties.className = ['br-inert'];
-    node.properties.title = answer.kind === 'outside' ? 'not part of this review' : answer.kind === 'missing' ? 'file not found' : 'anchor not found';
+    makeInert(node, answer.kind);
     if (answer.kind === 'outside') count(tally, 'outsideLink');
     links.push({href, status: answer.kind, line});
   });
   return links;
+}
+
+// No page to open for it: the link stays readable, inert, and says why.
+function makeInert(node: Element, kind: Exclude<LinkAnswer['kind'], 'inReview'>) {
+  delete node.properties.href;
+  node.properties.className = ['br-inert'];
+  node.properties.title = kind === 'outside' ? 'not part of this review' : kind === 'missing' ? 'file not found' : 'anchor not found';
+}
+
+// A fragment the page script would read as a trip's hash (`d=full`,
+// `g=<ids>`, colors), which no GitHub heading slug can be: a repo link
+// carrying one could make the page play a develop or a pulse the diff
+// never asked for.
+function tripHashLike(fragment: string) {
+  return Object.keys(readPageHash(fragment)).length > 0;
 }
 
 const REFUSED_TEXT: Record<Extract<AssetAnswer, {kind: 'refused'}>['reason'], string> = {
@@ -706,6 +772,16 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Pr
       tally.assetOids.add(answer.oid);
       if (isSource) node.properties.srcSet = answer.dataUrl;
       else node.properties.src = answer.dataUrl;
+      // The picture's own size, so the page has its final layout before
+      // the image decodes: WebKit decodes a data: image after the page
+      // script has placed the reader's block. Only where the author set no
+      // size and no <source> may swap in another picture; page.css keeps
+      // the height in proportion when the width shrinks to fit.
+      if (!isSource && answer.width && answer.height && node.properties.width === undefined && node.properties.height === undefined && !(parent.type === 'element' && parent.tagName === 'picture')) {
+        node.properties.width = answer.width;
+        node.properties.height = answer.height;
+        node.properties.dataBrSize = '';
+      }
       if (theme && !isSource) node.properties.dataGhTheme = theme;
       // Shown, as the work tree has it, with the same word the page's own
       // banner gives an untracked file.

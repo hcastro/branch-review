@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 import {describe, expect, it} from 'vitest';
-import {PAGE_CSS, PAGE_CSS_HASH} from '../src/rendered/assets.generated.js';
+import {PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
 import {assembleFilePage, contentSecurityPolicy, railLabel, type PageFile, type PageInput} from '../src/rendered/page.js';
 import {renderMarkdown} from '../src/rendered/markdown.js';
+import {rawSource} from '../src/rendered/raw.js';
+import type {ChangeGroup} from '../src/rendered/changes.js';
 
 const VENDORED_CSS = new URL('../src/rendered/assets/github-markdown.css', import.meta.url);
 const CHROME_CSS = fs.readFileSync(new URL('../src/rendered/assets/page.css', import.meta.url), 'utf8');
@@ -62,26 +64,36 @@ async function page(overrides: Partial<PageInput> = {}) {
   return assembleFilePage(input({path: 'docs/page.md', status: 'modified', body: {kind: 'rendered', fragment}}, overrides));
 }
 
+// The page less its own script, so a check for any other script, or for
+// markup a repo string could have opened, reads the rest of the page.
+function withoutOurScript(html: string) {
+  return html.replace(`<script>${PAGE_SCRIPT}</script>`, '');
+}
+
 function sha256Base64(text: string) {
   return createHash('sha256').update(text).digest('base64');
 }
 
 describe('assembleFilePage', () => {
-  it('puts the CSP first in <head>, with nothing allowed to load or run', async () => {
+  it('puts the CSP first in <head>, with nothing allowed to load, and only our own style and script to run', async () => {
     const html = await page();
     expect(html.startsWith('<!doctype html>\n<html lang="en">\n<head>\n<meta http-equiv="Content-Security-Policy" content="')).toBe(true);
     const csp = /<meta http-equiv="Content-Security-Policy" content="([^"]+)">/.exec(html)![1];
     expect(csp).toBe(contentSecurityPolicy());
-    expect(csp).toBe(`default-src 'none'; img-src data:; style-src '${PAGE_CSS_HASH}'; script-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'`);
+    expect(csp).toBe(`default-src 'none'; img-src data:; style-src '${PAGE_CSS_HASH}'; script-src '${PAGE_SCRIPT_HASH}'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'`);
   });
 
-  it('allows each inline style by its hash, and has no script', async () => {
+  it('allows its inline style and its one script by their hashes, and no other script', async () => {
     const html = await page();
     const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((match) => match[1]!);
     expect(styles).toHaveLength(1);
     expect(`sha256-${sha256Base64(styles[0]!)}`).toBe(PAGE_CSS_HASH);
     expect(styles[0]).toBe(PAGE_CSS);
-    expect(html).not.toMatch(/<script\b/i);
+    const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[0]);
+    expect(scripts).toEqual([`<script>${PAGE_SCRIPT}</script>`]);
+    expect(`sha256-${sha256Base64(PAGE_SCRIPT)}`).toBe(PAGE_SCRIPT_HASH);
+    // Last in the body, once everything it reads is parsed.
+    expect(html.endsWith(`<script>${PAGE_SCRIPT}</script>\n</body>\n</html>\n`)).toBe(true);
   });
 
   it('carries no style attribute anywhere, so the CSP never needs unsafe-inline', async () => {
@@ -215,7 +227,7 @@ describe('assembleFilePage', () => {
         rail: [{path: 'a/<b>.md', status: 'modified', href: 'x.html', label: '<1>', current: false}],
       },
     ));
-    expect(html).not.toMatch(/<script|<img src=x|<b>|<repo>|<1>/);
+    expect(withoutOurScript(html)).not.toMatch(/<script|<img src=x|<b>|<repo>|<1>/);
     expect(html).toContain('<span class="br-refs" title="&#x3C;repo>">');
     expect(html).toContain('&#x3C;img src=x onerror=alert(1)>.md');
     expect(html).toContain('&#x26;branch');
@@ -363,11 +375,159 @@ describe('page.css', () => {
     expect(CHROME_CSS).not.toContain('inset 3px 0 0');
   });
 
+  it('runs the rail\'s panel the whole height of the page, with its list sticky in view', async () => {
+    // The rail is the grid's first column, stretched to the row, so its
+    // background and border reach the end of the longest page.
+    const nav = rule('.br-rail');
+    expect(nav).toContain('align-self: stretch;');
+    expect(nav).toContain('background: var(--br-surface);');
+    expect(nav).toContain('border-right: 1px solid var(--br-border);');
+    expect(nav).not.toMatch(/\bheight:|position: sticky/);
+    // What it lists stays under the strip while the page scrolls.
+    const panel = rule('.br-rail-panel');
+    expect(panel).toMatch(/position: sticky;[\s\S]*top: 44px;[\s\S]*max-height: calc\(100vh - 44px\);[\s\S]*overflow-y: auto;/);
+    const html = await page();
+    expect(html).toMatch(/<nav class="br-rail" aria-label="Rendered files">\n<div class="br-rail-panel">\n<p class="br-rail-title">CHANGED · 3 rendered<\/p>[\s\S]*<p class="br-rail-foot">[^\n]*<\/p>\n<\/div>\n<\/nav>/);
+  });
+
   it('starts the file head and banners at the article\'s left edge', () => {
     expect(rule('.br-filehead')).toContain('padding: 22px 45px 0;');
     expect(rule('.br-banners')).toContain('padding: 0 45px;');
     expect(rule('.br-main .markdown-body')).toContain('padding: 32px var(--br-article-pad) 45px;');
     expect(rule('.br-filehead')).not.toContain('border-bottom');
+  });
+});
+
+describe('the raw first frame', () => {
+  const group = (overrides: Partial<ChangeGroup>): ChangeGroup => ({id: 'g0', kind: 'added', after: null, base: null, anchorLine: 1, removedLines: [], ...overrides});
+
+  it('is the source as the diff showed it: added lines tinted, removed ones back in place', () => {
+    const source = '# Title\n\nNew line one,\nnew line two.\n\nTail.\n';
+    const raw = rawSource(source, [
+      group({kind: 'modified', after: [3, 4], base: [3, 3], anchorLine: 3, removedLines: ['Old line.']}),
+      group({id: 'g1', kind: 'removed', base: [7, 7], anchorLine: 7, removedLines: ['Gone at the end.']}),
+    ]);
+    expect(raw.text.split('\n')).toEqual(['# Title', '', 'Old line.', 'New line one,', 'new line two.', '', 'Tail.', 'Gone at the end.']);
+    expect(raw.tints).toBe('  -++  -');
+  });
+
+  it('tints every line of a new file added and every line of a deleted file removed, still counting them as the page\'s own', async () => {
+    const source = '# New\n\nAll of this is new.\n';
+    for (const status of ['added', 'untracked'] as const) {
+      expect(rawSource(source, [], status)).toEqual({text: '# New\n\nAll of this is new.', tints: '+++'});
+    }
+    // A deleted file's page is its base text: red, as the diff drew it,
+    // and still the page's lines, so `x` and never `-`.
+    expect(rawSource(source, [], 'deleted')).toEqual({text: '# New\n\nAll of this is new.', tints: 'xxx'});
+    expect(rawSource(source, [], 'modified').tints).toBe('   ');
+    const fragment = await renderMarkdown({path: 'a.md', status: 'deleted', source, groups: [], asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    expect(fragment.raw?.tints).toBe('xxx');
+  });
+
+  it('has one tint a line, with no line for the final newline and no carriage returns', () => {
+    const raw = rawSource('a\r\nb\r\n', []);
+    expect(raw).toEqual({text: 'a\nb', tints: '  '});
+    expect(rawSource('', [])).toEqual({text: '', tints: ' '});
+  });
+
+  it('rides in the page as escaped text in an inert template, its first blank line kept', async () => {
+    const source = '\n<script>alert(1)</script> & "quotes"\n';
+    const fragment = await renderMarkdown({path: 'a.md', source, groups: [], asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const html = assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'rendered', fragment}}));
+    expect(html).toContain('<template class="br-raw-source"><pre data-tints="  ">\n\n&#x3C;script>alert(1)&#x3C;/script> &#x26; &#x22;quotes&#x22;</pre></template>');
+    // After the article, outside it.
+    expect(html.indexOf('<template class="br-raw-source">')).toBeGreaterThan(html.indexOf('</article>'));
+    // A card has no raw frame.
+    expect(withoutOurScript(assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'empty'}})))).not.toContain('br-raw-source');
+  });
+});
+
+describe('the page\'s keys and controls', () => {
+  it('puts the theme, marks and keys buttons in the strip, hidden until the script runs', async () => {
+    const html = await page();
+    const end = html.slice(html.indexOf('<div class="br-strip-end">'), html.indexOf('</header>'));
+    expect(end.indexOf('br-fidelity')).toBeLessThan(end.indexOf('br-theme'));
+    expect(end).toMatch(/<button type="button" class="br-control br-theme br-js" title="Theme \(t\)" hidden>.*◐.*<span class="br-control-word br-theme-name">Auto<\/span><\/button>/);
+    expect(end).toMatch(/<button type="button" class="br-control br-marks br-js" title="Change marks \(m\)" aria-pressed="true" hidden><span class="br-marks-bar" aria-hidden="true">▍<\/span><span class="br-control-word">Changes<\/span><\/button>/);
+    expect(end).toMatch(/<button type="button" class="br-control br-help-button br-js"[^>]*aria-controls="br-help"[^>]*hidden>\?<\/button>/);
+    // Hidden means hidden, whatever display a control's own rule gives it.
+    expect(CHROME_CSS).toContain('.br-js[hidden] { display: none !important; }');
+  });
+
+  it('keeps the strip readable on a narrow screen: a few letters of the base, and a bar on the marks button', () => {
+    const narrow = CHROME_CSS.slice(CHROME_CSS.indexOf('@media (max-width: 767px)'));
+    expect(narrow).toMatch(/^@media \(max-width: 767px\) \{[^@]*\.br-control-word \{ display: none; \}[^@]*\.br-refs \.br-base \{ min-width: 4ch; \}/);
+    expect(rule('.br-marks[aria-pressed="true"] .br-marks-bar')).toContain('color: var(--br-modified);');
+    expect(rule('.br-marks-bar')).toContain('color: var(--br-faint);');
+  });
+
+  it('leaves the narrow screen\'s layout to its own rule when a theme is forced', () => {
+    // A forced theme's block outranks `:root` in the narrow media query, so
+    // it may carry colors only, never a length the narrow screen changes.
+    const narrow = CHROME_CSS.slice(CHROME_CSS.indexOf('@media (max-width: 767px)'));
+    const layout = [...narrow.match(/:root \{([^}]*)\}/)![1]!.matchAll(/(--br-[\w-]+):/g)].map((match) => match[1]!);
+    expect(layout).toEqual(['--br-bar-x', '--br-article-pad']);
+    for (const forced of PAGE_CSS.matchAll(/:root\[data-theme="(?:light|dark)"\] \{([^}]*)\}/g)) {
+      for (const name of layout) expect(forced[1]).not.toContain(name);
+    }
+  });
+
+  it('keeps an embedded image\'s height in proportion to its width', () => {
+    expect(rule('.markdown-body img[data-br-size]')).toBe('.markdown-body img[data-br-size] { height: auto; }');
+  });
+
+  it('names the keys in the rail and in the help, which opens closed', async () => {
+    const html = await page();
+    expect(html).toMatch(/<dl class="br-rail-keys br-js" hidden><div><dt><kbd>\[<\/kbd> <kbd>\]<\/kbd><\/dt><dd>change<\/dd><\/div><div><dt><kbd>\{<\/kbd> <kbd>\}<\/kbd><\/dt><dd>file<\/dd><\/div><div><dt><kbd>t<\/kbd><\/dt><dd>theme<\/dd><\/div><div><dt><kbd>m<\/kbd><\/dt><dd>marks<\/dd><\/div><\/dl>/);
+    expect(html).toContain('<div class="br-help" id="br-help" role="dialog" aria-label="Keys" hidden>');
+    for (const what of ['previous or next change', 'previous or next file', 'theme: system, light, dark', 'show or hide the change marks', 'these keys']) expect(html).toContain(`<dd>${what}</dd>`);
+  });
+
+  it('says where the reader is among the changes, in the file head, only when there are some', async () => {
+    const fragment = {...await rendered(), changes: {changed: 3, removed: 1}};
+    const html = assembleFilePage(input({path: 'docs/page.md', status: 'modified', body: {kind: 'rendered', fragment}}));
+    expect(html).toContain('<nav class="br-changes br-js" aria-label="Changes" hidden><span class="br-changes-at" aria-live="polite">change 1 of 4</span><button type="button" class="br-step" data-step="-1" title="Previous change ([)" aria-label="Previous change">↑</button><button type="button" class="br-step" data-step="1" title="Next change (])" aria-label="Next change">↓</button></nav>');
+    expect(await page()).not.toContain('<nav class="br-changes');
+  });
+
+  it('forces either theme over the system\'s, both palettes derived from the ones they force', () => {
+    const vendored = fs.readFileSync(VENDORED_CSS, 'utf8');
+    const block = (css: string, opening: string) => css.slice(css.indexOf(opening) + opening.length, css.indexOf('}', css.indexOf(opening))).trim();
+    expect(PAGE_CSS).toContain(`:root[data-theme="dark"] .markdown-body {\n  ${block(vendored, '@media (prefers-color-scheme: dark) {\n  .markdown-body, [data-theme="dark"] {')}\n}`);
+    expect(PAGE_CSS).toContain(`:root[data-theme="light"] .markdown-body {\n  ${block(vendored, '@media (prefers-color-scheme: light) {\n  .markdown-body, [data-theme="light"] {')}\n}`);
+    expect(PAGE_CSS).toContain(`:root[data-theme="dark"] {\n  color-scheme: dark;\n  ${block(CHROME_CSS, '@media (prefers-color-scheme: dark) {\n  :root {')}\n}`);
+    expect(PAGE_CSS).toContain(`:root[data-theme="light"] {\n  ${block(CHROME_CSS, ':root {').replace('color-scheme: light dark;', 'color-scheme: light;')}\n}`);
+    // Theme-only images follow the switch too.
+    expect(CHROME_CSS).toMatch(/:root\[data-theme="dark"\] \.markdown-body :is\(img, \.br-card, \.br-image-note\)\[data-gh-theme="light"\],\n:root\[data-theme="light"\] \.markdown-body :is\(img, \.br-card, \.br-image-note\)\[data-gh-theme="dark"\] \{ display: none; \}/);
+  });
+
+  it('hides every mark with m, and the room the before chips keep', () => {
+    expect(CHROME_CSS).toContain(':root.br-marks-off { --br-chip-room: 0px; }');
+    expect(CHROME_CSS).toMatch(/\.br-marks-off \.markdown-body \[data-mark\]::before,\n\.br-marks-off \.markdown-body tr\[data-mark\] > :first-child::before \{ content: none; \}/);
+    expect(CHROME_CSS).toContain('.br-marks-off .markdown-body :is(details.br-removed, details.br-before, li.br-removed-item, tr.br-removed-row) { display: none; }');
+  });
+
+  it('keeps the develop\'s tints behind the text and gone at rest, its glow at 14% of the accent', () => {
+    const tint = rule('.markdown-body .br-tint');
+    expect(tint).toMatch(/position: absolute;[\s\S]*left: var\(--br-bar-x\);[\s\S]*z-index: -1;[\s\S]*transform: scaleX\(0\);[\s\S]*transform-origin: 0 50%;/);
+    expect(rule('.markdown-body [data-mark]')).toContain('position: relative;');
+    expect(CHROME_CSS).toContain('.markdown-body [data-mark] { isolation: isolate; }');
+    for (const scheme of ['light', 'dark'] as const) {
+      const block = [...CHROME_CSS.matchAll(/:root \{([^}]*)\}/g)].map((match) => match[1]!)[scheme === 'light' ? 0 : 1]!;
+      const accent = /--br-accent: (#[0-9a-f]{6});/.exec(block)![1];
+      expect(block).toContain(`--br-glow: ${accent}24;`);
+    }
+    expect(rule('.br-veil')).toMatch(/position: fixed;[\s\S]*background: var\(--br-veil-bg\);[\s\S]*color: var\(--br-veil-fg\);[\s\S]*pointer-events: none;/);
+  });
+
+  it('gives the overview the theme and keys buttons but no marks to hide', async () => {
+    const {assembleOverview} = await import('../src/rendered/page.js');
+    const html = assembleOverview({title: input({path: 'a.md', status: 'modified', body: {kind: 'empty'}}).title, entries: [], differences: []});
+    expect(html).toContain('class="br-control br-theme br-js"');
+    expect(html).toContain('class="br-control br-help-button br-js"');
+    expect(html).not.toContain('class="br-control br-marks');
+    expect(html).toContain('<dd>previous or next page</dd>');
+    expect(html).toContain('<div><dt><kbd>⏎</kbd></dt><dd>open</dd></div>');
   });
 });
 

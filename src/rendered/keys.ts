@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import type {FileStatus} from '../git.js';
-import {PAGE_CSS_HASH} from './assets.generated.js';
+import {PAGE_CSS_HASH, PAGE_SCRIPT_HASH} from './assets.generated.js';
 import type {ChangeGroup} from './changes.js';
 import {RAIL_PENDING, type OverviewInput, type RailEntry} from './page.js';
 
@@ -27,7 +27,7 @@ export function pageKey(parts: {
   // Named only when there is one, so a file that didn't move keeps its key.
   const moved = parts.oldPath === undefined ? [] : [parts.oldPath];
   return createHash('sha256')
-    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail, ...moved]))
+    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, PAGE_SCRIPT_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail, ...moved]))
     .digest('hex')
     .slice(0, 20);
 }
@@ -68,7 +68,7 @@ export const OVERVIEW_ALIAS = fileAlias('\0overview');
 export function overviewKey({title, entries, differences}: OverviewInput): string {
   const {repo, base, branch, worktree} = title;
   return createHash('sha256')
-    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, 'overview', [repo, base, branch, worktree], entries, differences]))
+    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, PAGE_SCRIPT_HASH, 'overview', [repo, base, branch, worktree], entries, differences]))
     .digest('hex')
     .slice(0, 20);
 }

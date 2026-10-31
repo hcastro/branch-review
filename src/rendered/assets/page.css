@@ -32,10 +32,13 @@
   --br-removed-soft: #c4323c14;
   --br-renamed: #7a49c8;
   --br-shadow: 0 8px 24px #16222626, 0 1px 3px #1622261a;
+  /* The develop: the diff's line tints a changed block starts under, and
+     the accent glow it ends with (14% of the accent). */
+  --br-tint-added: #2b8a3e33;
+  --br-tint-modified: #b8790033;
+  --br-glow: #0a7ea424;
   --br-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --br-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
-  --br-bar-x: -32px;
-  --br-article-pad: 45px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -60,7 +63,18 @@
     --br-removed-soft: #ff6b6b1a;
     --br-renamed: #b597ff;
     --br-shadow: 0 8px 24px #050809cc, 0 1px 3px #05080999;
+    --br-tint-added: #4cc06a33;
+    --br-tint-modified: #e0a43a33;
+    --br-glow: #39c5cf24;
   }
+}
+
+/* Lengths the narrow screen changes. They stay out of the palettes above,
+   which the forced themes copy under a selector that would outrank the
+   narrow screen's own. */
+:root {
+  --br-bar-x: -32px;
+  --br-article-pad: 45px;
 }
 
 * { box-sizing: border-box; }
@@ -161,22 +175,90 @@ html, body {
 .br-popover li + li { margin-top: 4px; }
 .br-popover .br-always { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid var(--br-border-muted); font-size: 12px; }
 
+/* The strip's buttons for the page's keys. They and the other controls
+   marked br-js need the page script, which shows them; without it they
+   stay hidden and the page is its finished self. */
+.br-js[hidden] { display: none !important; }
+.br-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--br-border);
+  border-radius: 999px;
+  background: var(--br-raised);
+  color: var(--br-fg);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.br-control:hover,
+.br-control[aria-expanded="true"] { border-color: var(--br-accent); }
+.br-control:focus-visible { outline: 2px solid var(--br-accent); outline-offset: 2px; }
+.br-theme-mark { color: var(--br-accent); }
+/* The marks button shows a change bar, which still says what it toggles
+   when a narrow strip drops its word. */
+.br-marks-bar { color: var(--br-faint); }
+.br-marks[aria-pressed="true"] .br-marks-bar { color: var(--br-modified); }
+.br-help-button { justify-content: center; width: 26px; padding: 0; font-weight: 600; }
+
+/* The keys, opened by `?` or the strip's last button. */
+.br-help {
+  position: fixed;
+  top: 52px;
+  right: 16px;
+  z-index: 20;
+  width: min(300px, calc(100vw - 32px));
+  padding: 14px 16px;
+  border: 1px solid var(--br-border);
+  border-radius: 8px;
+  background: var(--br-raised);
+  box-shadow: var(--br-shadow);
+  font-size: 13px;
+}
+.br-help h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.br-help dl { display: grid; gap: 8px; margin: 0; }
+.br-help dl > div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.br-help dt, .br-help dd { margin: 0; }
+.br-help dd { color: var(--br-muted); }
+:is(.br-help, .br-rail-keys) kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 4px;
+  border: 1px solid var(--br-border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--br-raised);
+  color: var(--br-fg);
+  font-family: var(--br-mono);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+
 /* Rail on the left, the page on the right. */
 .br-layout {
   display: grid;
   grid-template-columns: 264px minmax(0, 1fr);
   min-height: calc(100vh - 44px);
 }
+/* The rail is stretched to the grid's row, so its panel's color and edge
+   run the whole height of the longest page; what it lists rides along
+   under the strip, scrolling on its own when it is longer than the view. */
 .br-rail {
-  position: sticky;
-  top: 44px;
-  align-self: start;
-  height: calc(100vh - 44px);
-  overflow-y: auto;
-  padding: 18px 12px 24px;
+  align-self: stretch;
   border-right: 1px solid var(--br-border);
   background: var(--br-surface);
   font-size: 13px;
+}
+.br-rail-panel {
+  position: sticky;
+  top: 44px;
+  max-height: calc(100vh - 44px);
+  overflow-y: auto;
+  padding: 18px 12px 24px;
 }
 .br-rail-title {
   margin: 0 8px 12px;
@@ -219,6 +301,17 @@ html, body {
 }
 .br-rail-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .br-rail-count { color: var(--br-muted); font-family: var(--br-mono); font-size: 11px; font-weight: 400; }
+/* The page's keys, two to a row, under the files. */
+.br-rail-keys {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+  margin: 18px 8px 0;
+  color: var(--br-muted);
+  font-size: 11px;
+}
+.br-rail-keys > div { display: flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+.br-rail-keys dt, .br-rail-keys dd { margin: 0; }
 .br-rail-foot {
   margin: 18px 8px 0;
   padding-top: 12px;
@@ -240,16 +333,48 @@ html, body {
 /* The head and banners share the article's box and its 45 px inline
    padding, so their text starts where the article's does. */
 .br-filehead {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 16px;
   max-width: 980px;
   margin: 0 auto;
   padding: 22px 45px 0;
 }
+.br-filehead > :not(.br-changes) { grid-column: 1; }
 .br-filehead::after {
   content: "";
   display: block;
+  grid-column: 1 / -1;
   margin-top: 14px;
   border-bottom: 1px solid var(--br-border-muted);
 }
+/* Where the reader is among the file's changes, at the head's right. */
+.br-changes {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--br-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.br-changes-at { margin-right: 6px; font-variant-numeric: tabular-nums; }
+.br-step {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--br-border);
+  border-radius: 6px;
+  background: var(--br-raised);
+  color: var(--br-fg);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+.br-step:hover { border-color: var(--br-accent); color: var(--br-accent); }
+.br-step:focus-visible { outline: 2px solid var(--br-accent); outline-offset: 1px; }
 .br-path {
   margin: 0;
   overflow-wrap: anywhere;
@@ -285,6 +410,9 @@ html, body {
 /* A deleted file's page dims its pictures and cards only: its text keeps
    the contrast every other page has. */
 .br-main .markdown-body.br-dimmed :is(img, picture, video, .br-card) { opacity: 0.75; }
+/* An embedded image carries its own size, so it holds its box before it
+   decodes; its height follows its width when the column is narrower. */
+.markdown-body img[data-br-size] { height: auto; }
 
 /* The overview: one row per rendered file, in groups, at the article's
    measure. Each row is one link with its status bar on the left, the way
@@ -449,6 +577,64 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 }
 .markdown-body tr[data-mark="modified"] > :first-child::before { background: var(--br-modified); }
 
+/* With the marks hidden (`m`), the page reads as GitHub's alone: no bars,
+   no removed markers, no before chips and no room kept for them. */
+:root.br-marks-off { --br-chip-room: 0px; }
+.br-marks-off .markdown-body [data-mark]::before,
+.br-marks-off .markdown-body tr[data-mark] > :first-child::before { content: none; }
+.br-marks-off .markdown-body :is(details.br-removed, details.br-before, li.br-removed-item, tr.br-removed-row) { display: none; }
+
+/* The develop. A changed block starts under the line tint the diff gave
+   it, which the page script shrinks into the block's bar; the tint sits
+   behind the block's text, inside the block. */
+.markdown-body [data-mark] { isolation: isolate; }
+.markdown-body .br-tint {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: var(--br-bar-x);
+  z-index: -1;
+  border-radius: 2px;
+  transform: scaleX(0);
+  transform-origin: 0 50%;
+  pointer-events: none;
+}
+.markdown-body li > .br-tint { left: calc(-2em + var(--br-bar-x)); }
+.markdown-body :is(blockquote, .markdown-alert) > .br-tint { left: calc(var(--br-bar-x) - 0.25em); }
+.markdown-body .br-tint-added { background: var(--br-tint-added); }
+.markdown-body .br-tint-modified { background: var(--br-tint-modified); }
+/* The raw first frame: the source as the diff drew it, in the terminal's
+   own colors, under the strip. The script places each line and fades the
+   frame out as the blocks develop under it. */
+.br-veil {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 5;
+  overflow: hidden;
+  background: var(--br-veil-bg);
+  color: var(--br-veil-fg);
+  font: 13px/20px var(--br-mono);
+  pointer-events: none;
+}
+/* A picture's box during the develop, before the picture comes in. */
+.br-image-box {
+  position: absolute;
+  border-radius: 6px;
+  background: var(--br-surface);
+  box-shadow: inset 0 0 0 1px var(--br-border);
+  pointer-events: none;
+}
+.br-veil-line { position: absolute; min-height: 20px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.br-veil-text { display: inline-block; }
+.br-veil-added { background: #2b8a3e59; }
+.br-veil-removed, .br-veil-deleted { background: #c4323c59; }
+/* Removed text is not on the page, so it holds one row and no more. */
+.br-veil-removed { height: 20px; overflow: hidden; white-space: pre; text-overflow: ellipsis; }
+.br-veil-removed .br-veil-text { display: inline; }
+
 /* Removed content: a closed marker in the margin's dashed red, the removed
    text on a red tint behind it. */
 .markdown-body details.br-removed { position: relative; margin: 0 0 16px; }
@@ -609,6 +795,15 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
   .markdown-body :is(img, .br-card)[data-gh-theme="dark"] { display: none; }
   .markdown-body .br-image-note[data-gh-theme="dark"] { display: none; }
 }
+/* The theme switch (`t`) wins over the system's scheme. */
+:root[data-theme="dark"] .markdown-body img[data-gh-theme="dark"],
+:root[data-theme="light"] .markdown-body img[data-gh-theme="light"] { display: inline; }
+:root[data-theme="dark"] .markdown-body .br-card[data-gh-theme="dark"],
+:root[data-theme="light"] .markdown-body .br-card[data-gh-theme="light"] { display: inline-flex; }
+:root[data-theme="dark"] .markdown-body .br-image-note[data-gh-theme="dark"],
+:root[data-theme="light"] .markdown-body .br-image-note[data-gh-theme="light"] { display: block; }
+:root[data-theme="dark"] .markdown-body :is(img, .br-card, .br-image-note)[data-gh-theme="light"],
+:root[data-theme="light"] .markdown-body :is(img, .br-card, .br-image-note)[data-gh-theme="dark"] { display: none; }
 
 /* A file that couldn't render as a page, in the article's box and inset,
    so it lines up with the file head. */
@@ -665,12 +860,20 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 }
 
 @media (max-width: 767px) {
+  .br-control-word { display: none; }
+  /* A few letters of the base stay, so the arrow points at something. */
+  .br-refs .br-base { min-width: 4ch; }
+  .br-filehead { grid-template-columns: minmax(0, 1fr); }
+  .br-changes { grid-column: 1; grid-row: auto; margin-top: 8px; }
   .br-groups { padding: 8px 15px 0; }
   .br-groups { grid-template-columns: 34px minmax(0, 1fr) auto; }
   .br-row-note { grid-column: 2 / 3; }
 
   :root { --br-bar-x: -11px; --br-article-pad: 15px; }
   .br-strip { gap: 10px; padding: 0 12px; }
+  /* The strip's buttons push the chip far from the right edge, so here the
+     popover spans the screen just under the strip. */
+  .br-popover { position: fixed; top: 48px; right: 16px; left: 16px; width: auto; }
   .br-main { padding: 0 16px 48px; }
   .br-main .markdown-body { padding-top: 20px; padding-bottom: 32px; }
   .br-filehead { padding-left: 15px; padding-right: 15px; }
@@ -687,6 +890,6 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 }
 
 @media print {
-  .br-strip, .br-rail, .br-switcher, details.br-before { display: none; }
+  .br-strip, .br-rail, .br-switcher, details.br-before, .br-js, .br-help, .br-veil { display: none; }
   .br-layout { display: block; }
 }

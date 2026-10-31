@@ -438,3 +438,81 @@ describe('graphics caps with no protocol', () => {
     expect(await frames({...NO_GRAPHICS, terminal: 'ghostty 1.3.2'})).toEqual(plain);
   });
 });
+
+// The terminal's colors (OSC 10 and 11), as cmux answers them: four hex
+// digits a channel, ended by ST, or by BEL elsewhere.
+describe('late color replies', () => {
+  const OSC = [`${ESC}]11;rgb:0000/0000/0000${ESC}\\`, `${ESC}]10;rgb:ffff/ffff/ffff${ESC}\\`, `${ESC}]11;rgb:1e/20/26\x07`];
+  const guard = (replyHead?: string) => {
+    const quits: string[] = [];
+    const g = createLoneEscapeGuard({armedUntil: Infinity, now: () => 0, setTimer: setTimeout, clearTimer: clearTimeout, ...(replyHead ? {replyHead} : {})});
+    const feed = (input: string, escape = false) => g.onInput(input, {escape}, () => quits.push(input));
+    return {feed, quits, dispose: () => g.dispose()};
+  };
+
+  it('are replies, with or without the ESC that Ink strips, and `]` alone is still a key', () => {
+    for (const reply of OSC) {
+      expect(isTerminalReply(reply), JSON.stringify(reply)).toBe(true);
+      expect(isTerminalReply(reply.slice(1)), JSON.stringify(reply.slice(1))).toBe(true);
+    }
+    expect(isTerminalReply(`]11;rgb:0000/0000/0000${ESC}\\${ESC}[?62;22c`)).toBe(true);
+    for (const key of [']', ']1', ']11', `${ESC}]`]) expect(isTerminalReply(key), JSON.stringify(key)).toBe(false);
+  });
+
+  it('do not quit when split after the ESC, and drop the rest however it arrives', () => {
+    const afterEsc = guard();
+    expect(afterEsc.feed('', true)).toBe('handled');
+    expect(afterEsc.feed(`]11;rgb:0000/0000/0000${ESC}\\`)).toBe('handled');
+    expect(afterEsc.feed('j')).toBe('pass');
+
+    // Cut inside the body: the first read is held, the rest dropped.
+    const inBody = guard();
+    expect(inBody.feed('', true)).toBe('handled');
+    expect(inBody.feed(']11;rgb:00')).toBe('handled');
+    expect(inBody.feed(`00/0000/0000${ESC}\\`.slice(0))).toBe('handled');
+    expect(inBody.feed('j')).toBe('pass');
+
+    // Cut between the ST's ESC and its backslash: the backslash is the reply's.
+    const inSt = guard();
+    expect(inSt.feed(`]11;rgb:0000/0000/0000${ESC}`)).toBe('handled');
+    expect(inSt.feed('\\')).toBe('handled');
+    expect(inSt.feed('j')).toBe('pass');
+    for (const each of [afterEsc, inBody, inSt]) {
+      each.dispose();
+      expect(each.quits).toEqual([]);
+    }
+  });
+
+  it('drop the rest of a color reply detection saw cut off', () => {
+    const {feed, quits} = guard(`${ESC}]11;rgb:00`);
+    expect(feed(`00/0000/0000${ESC}\\`.slice(0))).toBe('handled');
+    expect(feed('j')).toBe('pass');
+    expect(quits).toEqual([]);
+  });
+
+  it('still let Esc then `]` quit, and `]` alone reach the app', () => {
+    const {feed, quits} = guard();
+    expect(feed('', true)).toBe('handled');
+    expect(feed(']')).toBe('handled');
+    expect(quits).toHaveLength(1);
+    expect(feed(']')).toBe('pass');
+  });
+
+  it('do nothing in the app, whole or split after the ESC, following a detection that timed out', async () => {
+    const {instance, state} = start(fixture(TIMED_OUT));
+    await flush();
+    const before = instance.lastFrame();
+    for (const reply of OSC) {
+      instance.stdin.write(reply);
+      await flush(2);
+      instance.stdin.write(ESC);
+      await flush();
+      instance.stdin.write(reply.slice(1));
+      await flush(2);
+    }
+    await wait(120);
+    expect(state.exited).toBe(false);
+    expect(instance.lastFrame()).toBe(before);
+    instance.unmount();
+  });
+});

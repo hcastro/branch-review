@@ -1,6 +1,6 @@
 # Rendered markdown pages
 
-This document describes how `branch-review` renders the branch's changed markdown files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, the `--render-out` option, what a page shows, which images a page includes, how close a page is to github.com, and the JSON report. For the other options, see the [Options](../README.md#options) section of the README.
+This document describes how `branch-review` renders the branch's changed markdown files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, how a page arrives, the `--render-out` option, what a page shows and its keys, which images a page includes, how close a page is to github.com, and the JSON report. For the other options, see the [Options](../README.md#options) section of the README.
 
 ## Open a page from the review
 
@@ -24,6 +24,7 @@ The footer names the following problems:
 | Message | What it means |
 | --- | --- |
 | `cmux didn't answer · opened in your browser` | cmux didn't place the page within 1.5 seconds, so your default browser opened it. If a split from an earlier press was closed, the next press opens a new one without a message. |
+| `in the split → · cmux was slow to answer` | cmux took more than 1.5 seconds to send the split to the page. The page may land a moment late, and the next press uses the same split. |
 | `opened in your browser · cmux's browser is off` | cmux's browser is turned off in its settings. Each press opens the page in your default browser. |
 | `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. |
 | `no browser opener found` | On Linux, no `xdg-open` is on your `PATH`. |
@@ -42,14 +43,38 @@ A page you open before the other files have rendered shows no count beside them 
 
 ### Motion on the way
 
-While the page opens, a shade band sweeps the diff toward the split, for about a third of a second. The band runs only on the diff's text rows, and pictures in the diff stay as they are.
+While the page opens, a shade band sweeps the diff toward the split, for about a third of a second. The band crosses only the rows that hold diff text. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
 
-The following settings change the motion:
+The following settings change the motion in the terminal:
 
 - `--no-animations` turns the band off, along with the review's other motion.
 - `NO_COLOR` turns the band off.
 - With **Reduce motion** on in macOS's accessibility settings, the band gives way to one short flash of the **Rendered ⇗** button. `branch-review` reads the setting once per session, and not over SSH.
 - `BRANCH_REVIEW_MOTION` overrides the macOS setting: `full`, `reduce`, or `off`.
+
+## How a page arrives
+
+A page opens on the block you were reading. `branch-review` takes the diff line at the top of the pane, and the page scrolls so that the block holding that line sits as far down the window as the line sat down the pane. To open a page at a given change, press `]` until the change is at the top of the diff, then press `r`.
+
+The first time a file's page opens in a session, it starts as the text you were reading: the file's source in your terminal's colors, with added lines tinted green and removed lines back in red. A new file starts all green, and a deleted one all red. After a moment the text develops into the rendered page. Each block in view grows from its lines into place while the tints shrink into the bars in the margin. The **before** chips and removed markers appear once their blocks have landed, and then the changed blocks glow once. The page is final in under a second. Any key, click, or scroll finishes the develop at once.
+
+A split in a cmux workspace you aren't looking at holds its page still. A page that opens there plays its develop when you switch to it, unless you pressed a key or scrolled in it first. A develop that the browser holds back past its schedule ends on the final page.
+
+A later trip to a page you've seen this session scrolls to the block and glows it once, with no develop.
+
+`branch-review` asks the terminal for its text and background colors at startup. A terminal that doesn't answer gets light gray text on a near-black background. The colors, the line to open at, and the motion setting ride in the hash of the page's URL, such as `#at=L42&f=0.35&d=full&m=1`, so a page that's already open in the split only gets a new hash.
+
+The following settings change how the page arrives:
+
+- With **Reduce motion** on in your system's accessibility settings, the page fades from the raw text once, with no movement and no glow.
+- `--no-animations` opens the page final at once.
+- With scripts turned off in the browser, the page shows final, and its keys and buttons stay hidden.
+
+### Live updates in watch mode
+
+In watch mode inside cmux, when the file you last opened with `r` changes, the split goes to its new page within a second, at the place you scrolled the split to. The new page doesn't develop. The blocks that are new since the last page glow once instead. The split gets at most one update a second, and an update never takes the place of a page you just opened with `r`. After you close the split, the updates stop until the next `r` opens one. The page in a browser tab, and the overview, don't update.
+
+`branch-review` can't see a move you make inside the split. After you go to another page with `{`, `}` or a link, the next change to the file you opened with `r` brings the split back to that file. To follow the page you moved to, press `r` on its file in the review.
 
 ## Write the pages
 
@@ -84,7 +109,7 @@ A page shows the file the way GitHub's file view renders it, with GitHub's style
 Changes are marked by block. A block is a paragraph, a heading, a code block, a list item, or a table row:
 
 - A green bar in the margin marks a block that the branch added. A table row's bar sits in the same margin, as tall as the row.
-- An amber bar marks a block that the branch changed. A paragraph that was only rewrapped counts as changed. The **before** chip under the right end of a changed block opens the whole block as it was on the base. In a list item, the chip follows the item's text.
+- An amber bar marks a block that the branch changed. A paragraph that was only rewrapped counts as changed. The **before** chip under the right end of a changed block fades in the whole block as it was on the base. In a list item, the chip follows the item's text.
 - A dashed red marker, such as `− 1 paragraph removed · show`, sits where the branch removed content. Click it to see the removed text on a red tint.
 
 When the branch rewrote a stretch of the file, each new block is matched with the old block it replaced, by kind and wording. A matched block is marked changed. A new block with no match is marked added, and an old block with no match gets a removed marker. Blocks match only when their wording is close, so a new paragraph never shows as an edit of unrelated old text. A block of images matches by the images it shows. A block whose text is the same on both sides, such as a heading that Git's diff lists as removed and added again around a rewritten section, carries no mark.
@@ -94,6 +119,20 @@ A block that the diff didn't touch carries no mark. Changes in blank lines alone
 A table is marked by its rows. A change to a column's alignment marks the header row.
 
 On a narrow screen, such as a narrow split, the rail folds into a one-line file switcher above the file's head.
+
+### Keys on a page
+
+A page has keys of its own, which work in the split after you click into it. The following table lists them:
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Scroll to the previous or next change. The file head counts where you are, such as `change 2 of 4`, and its `↑` and `↓` buttons do the same. |
+| `{` / `}` | Open the previous or next file in the rail. On the overview, move to the previous or next row, and press `Enter` to open it. |
+| `t` | Switch the theme between your system's, light, and dark. The **◐** button in the strip does the same. |
+| `m` | Show or hide the change marks: the bars, the removed markers, and the **before** chips. The **▍ Changes** button in the strip does the same. |
+| `?` | Show the keys. `Esc` closes them. |
+
+The browser remembers your theme and marks choice for the pages it opens, when it allows the pages to store it.
 
 A new file shows a `new file` banner in place of bars, and an untracked file shows `untracked · not part of a push yet`. A deleted file shows the base version under `deleted on this branch`, with its images dimmed and its text at full contrast. A renamed file names its old path.
 
@@ -154,9 +193,9 @@ The **≈ GitHub** chip in the strip lists what differs on that page, with a cou
 
 ## What a page can reach
 
-Nothing on a page leaves your machine. A page is one self-contained file with no script, and its content security policy blocks every request: no remote image, font, or stylesheet loads, and the page can't fetch anything or submit a form.
+Nothing on a page leaves your machine. A page is one self-contained file, and its content security policy blocks every request: no remote image, font, or stylesheet loads, and the page can't fetch anything or submit a form. The policy lets only the page's own stylesheet and its own script apply, each allowed by its hash. The script reads the page and the hash of its URL. It puts the repo's text on screen as plain text, never as markup.
 
-Repo content can't run on a page. HTML in a markdown file passes GitHub's sanitizer model, which removes scripts, event handlers, styles, forms, frames, and `javascript:` links, and prefixes ids with `user-content-`. Repo HTML can't add a change bar or forge any other mark.
+Repo content can't run on a page. HTML in a markdown file passes GitHub's sanitizer model, which removes scripts, event handlers, styles, forms, frames, and `javascript:` links, and prefixes ids with `user-content-`. Repo HTML can't add a change bar or forge any other mark. A repo link whose `#` part reads like a page's own hash, such as `#d=full`, shows as an inert link, so repo text can't make a page develop or glow.
 
 `branch-review` reads the files' text and images from Git or from the working tree, the same way the review does. The pages that `r` and `R` open go in the session's temp directory. `--render-out` writes only to the directory you pass it.
 

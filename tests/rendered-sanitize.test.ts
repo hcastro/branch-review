@@ -101,5 +101,30 @@ describe('sanitizer', () => {
     expect(fragment.html).toContain('<span class="br-card br-remote" role="img" aria-label="x · evil.example · not loaded (offline)">');
     expect(fragment.differences).toEqual([{kind: 'remoteImage', count: 1}]);
   });
+
+  it('makes a link inert that the page script would read as a trip, so repo text never plays a develop or a pulse', async () => {
+    const source = [
+      '<a href="#at=L1&d=full&g=b-00000000-1">raw</a>',
+      '',
+      '[pulse](#d=none&g=b-12345678-0) and [colors](#at=L7&f=0&d=full&m=1&bg=ff0000&fg=00ff00&n=99) and [encoded](#d%3Dfull)',
+      '',
+      '[other](other.md#d=full&g=b-12345678-0)',
+      '',
+      '# Title',
+      '',
+      '[heading](#title) and [file](other.md#title)',
+      '',
+    ].join('\n');
+    const fragment = await renderMarkdown({path: 'README.md', source, groups: [], asset: lookups.asset, link: () => ({kind: 'inReview', href: 'f-other.html'})});
+    expect(fragment.html).not.toMatch(/href="[^"]*(?:d=|g=|bg=|d%3D)/);
+    expect(fragment.html.match(/<a class="br-inert" title="anchor not found">/g)).toHaveLength(5);
+    expect(fragment.html).toContain('<a href="#user-content-title">heading</a>');
+    expect(fragment.html).toContain('<a href="f-other.html#user-content-title">file</a>');
+    expect(fragment.links.map((link) => link.status)).toEqual(['badAnchor', 'badAnchor', 'badAnchor', 'badAnchor', 'badAnchor', 'ok', 'ok']);
+  });
+
+  it('keeps a repo\'s own data-br-size off its images', async () => {
+    expect(await html('<img src="x.png" data-br-size width="5">\n')).not.toContain('data-br-size');
+  });
 });
 

@@ -512,7 +512,9 @@ function openingService(backend: RenderedBackend, {
   surface = recordingSurface(),
   motion = 'full' as const,
   site,
-}: {surface?: ReturnType<typeof recordingSurface>; motion?: 'full' | 'reduced' | 'off'; site?: ReturnType<typeof createRenderedSite>} = {}) {
+  colors,
+  animations,
+}: {surface?: ReturnType<typeof recordingSurface>; motion?: 'full' | 'reduced' | 'off'; site?: ReturnType<typeof createRenderedSite>; colors?: {fg?: string; bg?: string}; animations?: boolean} = {}) {
   const clock = fakeTimers();
   const session = makeTempDir('branch-review-open-');
   const usedSite = site ?? createRenderedSite({tempDir: () => session, now: clock.now});
@@ -527,6 +529,8 @@ function openingService(backend: RenderedBackend, {
       motionAsked += 1;
       return motion;
     },
+    ...(colors ? {colors} : {}),
+    ...(animations !== undefined ? {animations} : {}),
   });
   const events: string[] = [];
   const trip = {
@@ -539,18 +543,25 @@ function openingService(backend: RenderedBackend, {
   return {service, clock, surface, trip, events, dir: path.join(session, 'rendered'), motionAsked: () => motionAsked};
 }
 
-function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>} = {}) {
+function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true} = {}) {
   const shown: string[] = [];
+  const refreshed: string[] = [];
   const disposed = {count: 0};
   return {
     kind,
     refusal,
     destination: kind === 'cmux' ? 'in a split to the right' : kind === 'browser' ? 'in your browser' : null,
     shown,
+    refreshed,
     disposed,
     async show(url: string) {
       shown.push(url);
       return answer;
+    },
+    // A live refresh sends the split it opened to `url`; false once it can't.
+    async refresh(url: string) {
+      refreshed.push(url);
+      return refreshes;
     },
     dispose() {
       disposed.count += 1;
@@ -760,7 +771,8 @@ describe('opening pages', () => {
     const fast = await service.page('docs/fast.md');
     held.resolve();
     expect(await older).toBeNull();
-    expect(surface.shown).toEqual([fast.ok && fast.url]);
+    // The second press, and fast.md's first visit.
+    expect(surface.shown).toEqual([`${fast.ok && fast.url}#d=full&m=1&n=2`]);
     // Nor does it say it is still rendering once a newer press took its place.
     expect(events.filter((event) => event.startsWith('waiting'))).toEqual([]);
   });
@@ -1021,5 +1033,182 @@ describe('opening pages', () => {
     expect(service.getVersion()).not.toBe(before);
     expect(service.takeNotices()).toEqual(['✗ rendered view turned off: the worker kept crashing']);
     stop();
+  });
+});
+
+describe('the trip\'s hash', () => {
+  const hashOf = (url: string) => url.slice(url.indexOf('#') + 1);
+  const blocks = (...ids: string[]) => ids.map((id, index) => ({id, kind: 'p', lines: [index * 2 + 1, index * 2 + 1] as const}));
+
+  it('opens a file\'s first visit with the full develop at the line under the reader\'s eyes, and a later one with the short revisit', async () => {
+    const {backend} = scriptedBackend();
+    const {service, clock, surface, trip} = openingService(backend, {colors: {fg: '#e6e6e6', bg: '#000000'}});
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+
+    await service.open({fileKey: 'docs/guide.md', line: 12, fraction: 0.35}, trip);
+    await service.open({fileKey: 'docs/guide.md', line: 30, fraction: 0}, trip);
+    await service.open({fileKey: 'README.md', line: 1, fraction: 0.5}, trip);
+    expect(surface.shown.map(hashOf)).toEqual([
+      'at=L12&f=0.35&d=full&m=1&bg=000000&fg=e6e6e6&n=1',
+      'at=L30&f=0&d=short&m=1&bg=000000&fg=e6e6e6&n=2',
+      'at=L1&f=0.5&d=full&m=1&bg=000000&fg=e6e6e6&n=3',
+    ]);
+    // The hash rides on the page the file names; the page is the same file.
+    expect(new Set(surface.shown.slice(0, 2).map((url) => url.split('#')[0])).size).toBe(1);
+  });
+
+  it('counts a visit only once the page opened, and sends m=0 with --no-animations', async () => {
+    const {backend} = scriptedBackend();
+    const refused = openingService(backend, {surface: recordingSurface({answer: {refused: 'no browser opener found · branch-review --render-out <dir> writes the pages'}}), animations: false});
+    refused.service.setReview(review([edited('README.md')]), CTX);
+    await refused.clock.advance(2_000);
+    await refused.service.open({fileKey: 'README.md'}, refused.trip);
+    await refused.service.open({fileKey: 'README.md'}, refused.trip);
+    expect(refused.surface.shown.map(hashOf)).toEqual(['d=full&m=0&n=1', 'd=full&m=0&n=2']);
+  });
+
+  it('sends no line to the review\'s first page when the active file has none', async () => {
+    const {backend} = scriptedBackend();
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts'), edited('docs/setup.md')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'src/app.ts', line: 40, fraction: 0.2}, trip);
+    expect(surface.shown.map(hashOf)).toEqual(['d=full&m=1&n=1']);
+  });
+
+  it('sends the split a live refresh with the new blocks when the page shown changes, keeping its place, at most once a second', async () => {
+    let ids = ['b-0000000a-0', 'b-0000000b-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md', line: 3, fraction: 0.25}, trip);
+    expect(surface.refreshed).toEqual([]);
+
+    // The agent rewrites a paragraph: one block is new.
+    ids = ['b-0000000a-0', 'b-0000000c-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited again.\n')]), CTX);
+    await clock.advance(250);
+    expect(surface.refreshed.map(hashOf)).toEqual(['at=L3&f=0.25&d=none&m=1&g=b-0000000c-0&n=2']);
+    const first = surface.refreshed[0]!.split('#')[0]!;
+    expect(first).not.toBe(surface.shown[0]!.split('#')[0]);
+    expect(fs.existsSync(new URL(first).pathname)).toBe(true);
+
+    // Two more rewrites inside the second: the newest goes once the second is up.
+    ids = ['b-0000000a-0', 'b-0000000c-0', 'b-0000000d-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, third.\n')]), CTX);
+    await clock.advance(250);
+    ids = ['b-0000000a-0', 'b-0000000c-0', 'b-0000000e-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, fourth.\n')]), CTX);
+    await clock.advance(250);
+    expect(surface.refreshed).toHaveLength(1);
+    // A second after the first refresh, which went at 2250 ms.
+    await clock.advance(499);
+    expect(surface.refreshed).toHaveLength(1);
+    await clock.advance(1);
+    expect(surface.refreshed.map(hashOf)).toEqual(['at=L3&f=0.25&d=none&m=1&g=b-0000000c-0&n=2', 'at=L3&f=0.25&d=none&m=1&g=b-0000000e-0&n=3']);
+    await clock.advance(5_000);
+    expect(surface.refreshed).toHaveLength(2);
+  });
+
+  it('sends no live refresh for a page in the browser, nor after the overview took the split, nor once the split is gone', async () => {
+    let text = 'One, edited.\n';
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(`b-${(text.length % 16).toString(16).padStart(8, '0')}-0`)})}));
+    const edit = async (each: ReturnType<typeof openingService>, next: string) => {
+      text = next;
+      each.service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await each.clock.advance(2_000);
+    };
+
+    const browser = openingService(backend, {surface: recordingSurface({kind: 'browser', answer: {where: 'browser', message: 'opened in your browser'}})});
+    await edit(browser, 'One, edited.\n');
+    await browser.service.open({fileKey: 'docs/guide.md'}, browser.trip);
+    await edit(browser, 'One, edited twice.\n');
+    expect(browser.surface.refreshed).toEqual([]);
+
+    const overview = openingService(backend);
+    await edit(overview, 'One, edited.\n');
+    await overview.service.open({fileKey: 'docs/guide.md'}, overview.trip);
+    await overview.service.openOverview(overview.trip);
+    await edit(overview, 'One, edited twice.\n');
+    expect(overview.surface.refreshed).toEqual([]);
+
+    const closed = openingService(backend, {surface: recordingSurface({refreshes: false})});
+    await edit(closed, 'One, edited.\n');
+    await closed.service.open({fileKey: 'docs/guide.md'}, closed.trip);
+    await edit(closed, 'One, edited twice.\n');
+    await edit(closed, 'One, edited three times.\n');
+    // The split was closed: the first refresh says so, and none follows.
+    expect(closed.surface.refreshed).toHaveLength(1);
+  });
+
+  it('sends no live refresh while a press is on its way, and sends one after it when the split still shows the old page', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend((request) => ({ok: true, summary: summary({blocks: blocks(...(request.path === 'docs/guide.md' ? ids : ['b-0000000f-0']))})}));
+    const surface = recordingSurface();
+    const answers: Array<Deferred<Awaited<ReturnType<Surface['show']>>>> = [];
+    const held = {
+      ...surface,
+      async show(url: string) {
+        surface.shown.push(url);
+        const answer = deferred<Awaited<ReturnType<Surface['show']>>>();
+        answers.push(answer);
+        return answer.promise;
+      },
+    };
+    const {service, clock, trip} = openingService(backend, {surface: held as unknown as ReturnType<typeof recordingSurface>});
+    // The show the surface was asked for, once the page is written.
+    const asked = async (count: number) => {
+      for (let turn = 0; turn < 50 && answers.length < count; turn += 1) await clock.advance(0);
+      return answers[count - 1]!;
+    };
+    const edit = async (next: string) => {
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next), edited('README.md')]), CTX);
+      await clock.advance(2_000);
+    };
+    await edit('One, edited.\n');
+    const first = service.open({fileKey: 'docs/guide.md', line: 1, fraction: 0}, trip);
+    (await asked(1)).resolve({where: 'cmux-new', message: 'in the split →'});
+    await first;
+
+    // The reader presses r on README.md while a pass rewrites the page in the split.
+    const press = service.open({fileKey: 'README.md'}, trip);
+    const pressed = await asked(2);
+    ids = ['b-0000000b-0'];
+    await edit('One, edited again.\n');
+    expect(surface.refreshed).toEqual([]);
+    pressed.resolve({where: 'cmux-reuse', message: 'in the split →'});
+    await press;
+    await clock.advance(1_000);
+    // The split shows README.md now: the old page's refresh is moot.
+    expect(surface.refreshed).toEqual([]);
+    expect(surface.shown.at(-1)).toMatch(/#d=full&m=1&n=2$/);
+
+    // A press that places nothing leaves the split on the old page, and
+    // the refresh due goes once it is over.
+    const back = service.open({fileKey: 'docs/guide.md', line: 1, fraction: 0}, trip);
+    (await asked(3)).resolve({where: 'cmux-reuse', message: 'in the split →'});
+    await back;
+    const refused = service.open({fileKey: 'README.md'}, trip);
+    const refusing = await asked(4);
+    ids = ['b-0000000c-0'];
+    await edit('One, edited a third time.\n');
+    expect(surface.refreshed).toEqual([]);
+    refusing.resolve({refused: 'no browser opener found · branch-review --render-out <dir> writes the pages'});
+    await refused;
+    await clock.advance(1_000);
+    expect(surface.refreshed.map((url) => url.slice(url.indexOf('#') + 1))).toEqual(['at=L1&f=0&d=none&m=1&g=b-0000000c-0&n=5']);
+  });
+
+  it('sends no live refresh when a refresh leaves the page shown as it was', async () => {
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks('b-0000000a-0')})}));
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    service.setReview(review([edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    expect(surface.refreshed).toEqual([]);
   });
 });

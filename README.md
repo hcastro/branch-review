@@ -112,6 +112,8 @@ For more information about terminal support, tmux setup, compare modes, and open
 
 To read a changed markdown file as the page GitHub would show, press `r`. The page is rendered on your machine and marks the blocks the branch added or changed with a bar in the margin, and removed content where it was. In cmux it opens in a browser split to the right, and each later press sends that split to the next page. In other terminals it opens in your default browser. To see an overview of every page, press `R`.
 
+The page opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the rendered page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
+
 To write the pages to a directory without opening the UI, pass `--render-out`:
 
 ```sh
@@ -120,7 +122,7 @@ branch-review --render-out ../rendered
 
 Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
 
-Each page is a single HTML file with no script. Images from the repo travel inside it, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
+Each page is a single HTML file whose only script is its own. Images from the repo travel inside it, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
 
 ## Review untrusted changes safely
 
@@ -209,7 +211,7 @@ branch-review my-feature release/2026.04
 | `--watch` | Refresh live as files change. On by default in an interactive terminal. |
 | `--no-watch` | Open a snapshot that doesn't refresh, for when an agent is mid-write and the view keeps changing. It overrides `--watch` and `--watch-poll`. |
 | `--watch-poll` | Turn on watch mode, and poll for changes in place of filesystem events. Use it on network mounts and container bind mounts. |
-| `--no-animations` | Skip the arrival highlights and the sweep toward a rendered page, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
+| `--no-animations` | Skip the arrival highlights, the sweep toward a rendered page and the page's develop, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
@@ -276,6 +278,16 @@ You can also do most of this with the mouse:
 | Scroll | Scroll whichever pane is under the pointer, three lines per notch |
 
 To see what a button, badge, or label does, hold the pointer over it. A short hint appears in the top bar, such as `copies block with file and line context`.
+
+A rendered page has keys of its own, which work after you click into the page:
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Scroll to the previous or next change |
+| `{` / `}` | Open the previous or next rendered file |
+| `t` | Switch the page's theme between your system's, light, and dark |
+| `m` | Show or hide the change marks |
+| `?` | Show the page's keys |
 
 ### Small terminals
 

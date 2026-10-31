@@ -283,7 +283,7 @@ export async function runCli(io: CliIo) {
   const rendered = renderedModule?.startRenderedService({tempDir: () => {
     sweepOnce();
     return tempDir.get();
-  }, env, cwd, animations: options.animations, opener});
+  }, env, cwd, animations: options.animations, opener, colors: {...(caps.fg ? {fg: caps.fg} : {}), ...(caps.bg ? {bg: caps.bg} : {})}});
   proc.on('exit', () => rendered?.dispose());
   proc.on('exit', tempDir.remove);
   const media = started?.media;

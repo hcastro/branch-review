@@ -90,6 +90,11 @@ export type GraphicsCaps = {
   // Keys typed during detection, which the app reads before the rest of
   // `replyHead`, so that input is not mistaken for the reply's.
   keysBeforeReply?: string;
+  // The terminal's text and background colors (`#rrggbb`) from OSC 10 and
+  // 11, and whether that background is dark, when it answered them.
+  fg?: string;
+  bg?: string;
+  scheme?: 'dark' | 'light';
 };
 
 export const NO_GRAPHICS: GraphicsCaps = Object.freeze({
