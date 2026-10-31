@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import type {ReviewFile} from '../src/review/model.js';
-import {createAssetResolver, pageLookups, reviewAssetSides, type AssetResolver, type AssetSides, type AssetUse} from '../src/rendered/assets.js';
+import {createAssetResolver, LATE_IDENTITY, pageLookups, reviewAssetSides, type AssetResolver, type AssetSides, type AssetUse} from '../src/rendered/assets.js';
 import type {FragmentRequest, FragmentResult, PageResult} from '../src/rendered/backend.js';
 import {changeGroups, type ChangeGroup} from '../src/rendered/changes.js';
 import {renderMarkdown, repoPathFor, PAGE_INLINE_LIMIT, type AssetAnswer} from '../src/rendered/markdown.js';
@@ -637,6 +637,32 @@ describe('fragments in the rendered worker', () => {
     const backward = await signatureWith((index) => (9 - index) * 3);
     expect(forward).not.toBe('');
     expect(backward).toBe(forward);
+  });
+
+  it('says when an image lookup ran out of time, so the render is worth asking for again', async () => {
+    const slow = {
+      answer: () => new Promise(() => {}),
+      identity: async () => 'never',
+      compare: () => new Promise(() => {}),
+    } as unknown as AssetResolver;
+    const uses: AssetUse[] = [];
+    const before = 'Intro.\n\n![Logo](logo.png)\n';
+    const after = 'Intro, edited.\n\n![Logo](logo.png)\n';
+    const fragment = await renderMarkdown({path: 'README.md', source: after, groups: changeGroups(diffFile(before, after)), ...pageLookups(slow, refSides(), false, uses, {budgetMs: 10}), link: () => ({kind: 'outside'})});
+    expect(uses.map((use) => use.identity)).toContain(LATE_IDENTITY);
+    expect(summarize({kind: 'rendered', fragment}, uses)).toMatchObject({late: true});
+    expect(summarize({kind: 'rendered', fragment}, [{side: 'after', path: 'logo.png', identity: 'blob:abc1234'}])).not.toHaveProperty('late');
+  });
+
+  it('says when a page rendered its fragment again rather than use the one held', async () => {
+    const repo = readmeRepo();
+    const handler = createRenderedHandler();
+    const pageOf = async (epoch: number) => await handler.handle({type: 'page', key: `p${epoch}`, title, file: {path: 'README.md', status: 'modified'}, rail: [], content: {fragment: {...request(repo), assets: {...request(repo).assets, epoch}}}}) as PageResult;
+    expect(await handler.handle({type: 'fragment', ...request(repo)}) as FragmentResult).toMatchObject({ok: true});
+    expect(await pageOf(0)).not.toHaveProperty('rerendered');
+    writeBytes(repo, 'logo.png', BLUE);
+    commitAll(repo, 'new logo');
+    expect(await pageOf(1)).toMatchObject({ok: true, rerendered: true});
   });
 
   it('answers a file that will not render with a page saying why, not a failed job', async () => {

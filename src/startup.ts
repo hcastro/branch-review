@@ -12,7 +12,7 @@ import {tmuxPassthrough} from './media/kitty.js';
 import {createMediaService, type MediaService} from './media/service.js';
 import {createWorkerBackend} from './media/workerClient.js';
 import {claimKittyTmux, createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
-import {defaultOpener} from './media/openExternal.js';
+import {defaultOpener, type Opener} from './media/openExternal.js';
 
 type PrepareStartupOptions = {
   /** Where the CLI was started; any directory inside the work tree. */
@@ -85,6 +85,9 @@ export type CliIo = {
   // Under tmux, which terminal the attached client runs in. By default tmux
   // is asked; tests answer in its place.
   queryTmuxClient?: () => Promise<TmuxClient | null>;
+  // What opens a file or page outside the terminal: a player, a viewer, the
+  // default browser. Tests record it in place of opening anything.
+  opener?: Opener;
 };
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIGTERM: 143};
@@ -100,7 +103,7 @@ const TMUX_SHARED_NOTICE = 'another branch-review draws images in this tmux serv
  * hooks kill the media worker and remove the session's temp dir. Nothing is
  * sent before the UI enters the alt screen.
  */
-function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching, animations}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; tempDir: SessionDir; watching: boolean; animations: boolean}): {media: MediaService; caps: GraphicsCaps} {
+function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching, animations, opener}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; tempDir: SessionDir; watching: boolean; animations: boolean; opener: Opener}): {media: MediaService; caps: GraphicsCaps} {
   // Every pane of a tmux server draws on the one outer terminal and its one
   // table of image ids, so only the first session there draws Kitty images.
   let caps = detected;
@@ -126,7 +129,7 @@ function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching,
     backend,
     sink: {write: (sequence) => session.writeGraphics(forTerminal(sequence))},
     tempDir: tempDir.get,
-    opener: defaultOpener,
+    opener,
     env,
     watching,
     animations,
@@ -179,7 +182,7 @@ async function writeRenderedPages({cwd, startDir, range, review, outLabel, json,
  * index copy, and the UI is never mounted.
  */
 export async function runCli(io: CliIo) {
-  const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env} = io;
+  const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env, opener = defaultOpener} = io;
   let options: CliOptions;
   try {
     options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
@@ -274,13 +277,13 @@ export async function runCli(io: CliIo) {
   // Kitty terminals draw pictures and other color terminals block previews;
   // with no graphics the app is exactly as it is without media.
   if (caps.protocol !== 'none') sweepOnce();
-  const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, tempDir, watching: options.watch, animations: options.animations}) : undefined;
+  const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, tempDir, watching: options.watch, animations: options.animations, opener}) : undefined;
   // The rendered view needs no graphics: its pages open in a browser.
   const renderedModule = await loadingRendered;
   const rendered = renderedModule?.startRenderedService({tempDir: () => {
     sweepOnce();
     return tempDir.get();
-  }, env, cwd});
+  }, env, cwd, animations: options.animations, opener});
   proc.on('exit', () => rendered?.dispose());
   proc.on('exit', tempDir.remove);
   const media = started?.media;

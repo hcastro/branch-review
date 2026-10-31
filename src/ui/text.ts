@@ -67,3 +67,50 @@ export function truncateEnd(text: string, maxWidth: number): string {
 export function toDisplayText(text: string): string {
   return escapeHiddenCharacters(text);
 }
+
+const SGR_RESET = '\u001B[0m';
+
+/** One terminal cell's grapheme, its width, and the SGR style active there. */
+export type StyledCell = {
+  char: string;
+  width: number;
+  style: string;
+};
+
+// Splits an ANSI line into one cell per grapheme, each carrying its terminal
+// width and the SGR style active at that point.
+export function toStyledCells(line: string) {
+  const parts = line.split(/(\x1B\[[0-9;:]*[A-Za-z])/);
+  const cells: StyledCell[] = [];
+  let style = '';
+
+  for (const part of parts) {
+    if (!part) continue;
+    if (/^\x1B\[[0-9;:]*[A-Za-z]$/.test(part)) {
+      style = part === SGR_RESET ? '' : style + part;
+      continue;
+    }
+
+    for (const grapheme of graphemes(part)) {
+      cells.push({char: grapheme.text, width: grapheme.width, style});
+    }
+  }
+
+  return cells;
+}
+
+export function renderStyledCells(cells: StyledCell[]) {
+  let output = '';
+  let style = '';
+
+  for (const cell of cells) {
+    if (cell.style !== style) {
+      output += cell.style || SGR_RESET;
+      style = cell.style;
+    }
+
+    output += cell.char;
+  }
+
+  return output + SGR_RESET;
+}

@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import type {FileStatus} from '../git.js';
 import {PAGE_CSS_HASH} from './assets.generated.js';
 import type {ChangeGroup} from './changes.js';
-import type {RailEntry} from './page.js';
+import {RAIL_PENDING, type OverviewInput, type RailEntry} from './page.js';
 
 /** Bumped whenever the renderer's output changes for the same input. */
 export const RENDERER_VERSION = 1;
@@ -38,10 +38,12 @@ export function pageKey(parts: {
  * lists and the refs in its title. The rail's change counts are left out:
  * they come from other files' fragments, and a key that held them would
  * rewrite every page when one file's count moved. A page shows the counts
- * of the moment it was written.
+ * of the moment it was written. Whether each count is known yet is in the
+ * key, so a page written before a file rendered is written again once it
+ * has, and its rail never stays blank.
  */
 export function renderedPageKey(parts: {fragment: string; body: string; assets: string; rail: readonly RailEntry[]; title: {repo: string; base: string; branch: string; worktree: boolean}}): string {
-  const rail = parts.rail.map((entry) => [entry.path, entry.status, entry.href, entry.current]);
+  const rail = parts.rail.map((entry) => [entry.path, entry.status, entry.href, entry.current, ...(entry.label === RAIL_PENDING ? ['pending'] : [])]);
   const {repo, base, branch, worktree} = parts.title;
   return createHash('sha256')
     .update(JSON.stringify([RENDERER_VERSION, parts.fragment, parts.body, parts.assets, rail, [repo, base, branch, worktree]]))
@@ -57,4 +59,16 @@ export function fileAlias(fileKey: string) {
 /** The signature of a rail: which files it lists, in order, and their status. */
 export function railSignature(files: ReadonlyArray<{path: string; status: FileStatus}>) {
   return JSON.stringify(files.map((file) => [file.path, file.status]));
+}
+
+/** The overview's stable page name for the session. No file key holds a NUL, so no file shares it. */
+export const OVERVIEW_ALIAS = fileAlias('\0overview');
+
+/** The overview's file name: a hash of what it lists, leaving out when it was written. */
+export function overviewKey({title, entries, differences}: OverviewInput): string {
+  const {repo, base, branch, worktree} = title;
+  return createHash('sha256')
+    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, 'overview', [repo, base, branch, worktree], entries, differences]))
+    .digest('hex')
+    .slice(0, 20);
 }

@@ -13,7 +13,13 @@ import type {ClipboardWriter} from '../src/commands/execute.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
-import type {RenderedService} from '../src/rendered/service.js';
+import {createRenderedService, type RenderedService} from '../src/rendered/service.js';
+import type {FragmentSummary, PageRequest, RenderedBackend} from '../src/rendered/backend.js';
+import {createRenderedSite} from '../src/rendered/site.js';
+import {createSurface} from '../src/rendered/surface.js';
+import type {RunResult} from '../src/rendered/run.js';
+import type {Motion} from '../src/rendered/motion.js';
+import {makeTempDir} from './core-helpers.js';
 import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult, VideoRequest, VideoResult} from '../src/media/backend.js';
 import type {SideInfo, VideoMeta} from '../src/media/types.js';
 import {KITTY_CAPS, decodePlaceholders, parseApc, pngFixture} from './media-helpers.js';
@@ -112,7 +118,7 @@ export type AppFixtureProps = {
   graphics?: GraphicsCaps;
   addMediaRows?: MediaRowsHook;
   media?: MediaService;
-  rendered?: Pick<RenderedService, 'focus'>;
+  rendered?: Pick<RenderedService, 'focus'> | RenderedService;
 };
 
 export function appElement(
@@ -592,4 +598,83 @@ export function fakeMediaService({caps = KITTY_CAPS, sides, render, video, video
   timelines.set(service, timeline);
   if (review) service.setReview(review, {cwd: '/repo', range: {includeWorktree}});
   return {service, graphicsWrites, timeline, opened, calls: fake.calls, disposedCount: fake.disposedCount};
+}
+
+// A markdown file the way git prints it, so the rendered view plans a page
+// for it: a `diff --git` header, one hunk adding `lines`, and delta-shaped
+// rendered lines.
+export function markdownFile(path: string, lines: string[], status: FileStatus = 'modified'): FixtureFile {
+  const header = [`diff --git a/${path} b/${path}`, 'index 1111111..2222222 100644', `--- a/${path}`, `+++ b/${path}`];
+  return {
+    path,
+    status,
+    rawDiff: [...header, `@@ -1,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join('\n'),
+    rendered: [`• ${path}:1: `, ...lines.map((line, index) => `${gutter(index + 1)}${line}`)],
+  };
+}
+
+/**
+ * The real rendered service over an instant backend, pages in a temp dir,
+ * and a real surface whose cmux calls, tool lookups and browser opens are
+ * all recorded, never run. `cmux` answers each cmux call in turn (the last
+ * one again once they run out); without `env.CMUX_WORKSPACE_ID` pages open
+ * in the "browser".
+ */
+export function fakeRenderedService({
+  review,
+  env = {CMUX_WORKSPACE_ID: 'workspace:1'},
+  cmux = [{ok: true, stdout: '{"created_split":true,"surface_ref":"surface:7"}'}, {ok: true, stdout: ''}],
+  motion = 'full',
+  platform = 'darwin',
+  summary = {},
+  offAfterFirst,
+}: {
+  review?: ReviewModel;
+  env?: NodeJS.ProcessEnv;
+  cmux?: RunResult[];
+  motion?: Motion;
+  platform?: NodeJS.Platform;
+  summary?: Partial<FragmentSummary>;
+  /** The worker gives up, with this reason, after its first fragment. */
+  offAfterFirst?: string;
+} = {}) {
+  const calls: Array<{command: string; args: string[]}> = [];
+  const opened: Array<[string, string[]]> = [];
+  const answers = [...cmux];
+  let off: string | null = null;
+  let fragments = 0;
+  const answer = {kind: 'rendered' as const, changes: {changed: 1, removed: 0}, differences: [], blocks: [], headings: [], links: [], assets: '', ...summary};
+  const backend: RenderedBackend = {
+    async fragment() {
+      fragments += 1;
+      if (off) return {ok: false, state: 'unavailable', reason: off};
+      if (offAfterFirst && fragments > 1) {
+        off = offAfterFirst;
+        return {ok: false, state: 'unavailable', reason: off};
+      }
+      return {ok: true, summary: answer};
+    },
+    prioritize: () => undefined,
+    async page(request: PageRequest) {
+      if (off) return {ok: false, state: 'unavailable', reason: off};
+      return {ok: true, html: `<!doctype html><title>${request.file.path}</title>`, summary: answer};
+    },
+    dispose: () => undefined,
+    disabledReason: () => off,
+  };
+  const dir = makeTempDir('branch-review-ui-rendered-');
+  const surface = createSurface({
+    env,
+    run: async (command, args) => {
+      calls.push({command, args});
+      return answers.length > 1 ? answers.shift()! : answers[0]!;
+    },
+    findTool: (name) => (name === 'cmux' ? '/fake/bin/cmux' : name === 'xdg-open' ? '/fake/bin/xdg-open' : null),
+    opener: (command, args) => opened.push([command, args]),
+    platform,
+  });
+  const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => dir}), surface, motion: async () => motion});
+  if (review) service.setReview(review, {cwd: '/repo/project', range: {base: 'development', branch: 'HEAD', diffArg: 'development...HEAD', includeWorktree: false}});
+  onTestFinished(() => service.dispose());
+  return {service, calls, opened, dir};
 }

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import React from 'react';
 import {render} from 'ink-testing-library';
@@ -8,7 +9,7 @@ import {buildReviewModel} from '../src/review/build.js';
 import type {RenderedService} from '../src/rendered/service.js';
 import {runCli} from '../src/startup.js';
 import {ReviewController} from '../src/ui/ReviewController.js';
-import {cleanupTempDirs, initRepo, makeTempDir, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
 
 // The rendered view starts with the UI whatever the terminal can draw: it
 // needs no graphics, only the session dir, and the exit hooks take its
@@ -91,6 +92,104 @@ describe('the rendered view at startup', () => {
     proc.emit('exit', 0);
     expect(disposed).toBe(1);
     expect(fs.readdirSync(parent)).toEqual([]);
+  }, 60_000);
+});
+
+describe('the rendered view\'s trip at startup', () => {
+  it('opens pages in cmux found on PATH, and plays no crossing under --no-animations', async () => {
+    const cwd = initRepo({'README.md': '# Readme\n\nOne.\n'});
+    writeFiles(cwd, {'README.md': '# Readme\n\nOne, edited.\n'});
+    const parent = makeTempDir('branch-review-session-parent-');
+    // A fake cmux ahead of anything real on PATH, which logs its arguments
+    // and answers the way cmux does when it opens a split.
+    const bin = makeTempDir('branch-review-fake-cmux-');
+    const log = path.join(bin, 'calls.log');
+    writeExecutable(path.join(bin, 'cmux'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\necho '{"created_split":true,"surface_ref":"surface:2"}'\n`);
+    const proc = new FakeProcess();
+    let tree: unknown;
+    let markRendered!: () => void;
+    const mounted = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+    // Should cmux fail, the browser fallback is recorded, never run.
+    const opened: Array<[string, string[]]> = [];
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch', '--no-animations'],
+      cwd,
+      proc,
+      env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, CMUX_WORKSPACE_ID: 'workspace:test', SSH_CONNECTION: undefined, BRANCH_REVIEW_MOTION: undefined, BRANCH_REVIEW_TMPDIR: parent},
+      opener: (command, args) => opened.push([command, args]),
+      stdout: {isTTY: true, columns: 120, write: () => true},
+      stderr: {write: () => true},
+      render: (element) => {
+        tree = element;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => undefined};
+      },
+    });
+    await mounted;
+
+    const props = findProps(tree, ReviewController)!;
+    const rendered = props.rendered as RenderedService;
+    rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
+    const crossings: string[] = [];
+    const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async (motion) => {
+      crossings.push(motion);
+    }, waiting: () => undefined});
+    expect(outcome).toEqual({kind: 'info', message: '⇗ README.md · in the split → · nothing left this machine'});
+    expect(crossings).toEqual(['off']);
+    const [call] = fs.readFileSync(log, 'utf8').trim().split('\n');
+    expect(call).toMatch(/^--json browser open-split file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html --workspace workspace:test --focus false$/);
+    expect(call!.startsWith(`--json browser open-split ${new URL(`file://${fs.realpathSync(parent)}`).href}`)).toBe(true);
+    expect(opened).toEqual([]);
+    proc.emit('exit', 0);
+  }, 60_000);
+
+  it('hands the browser fallback to the opener it was given when cmux is too slow', async () => {
+    const cwd = initRepo({'README.md': '# Readme\n\nOne.\n'});
+    writeFiles(cwd, {'README.md': '# Readme\n\nOne, edited.\n'});
+    const parent = makeTempDir('branch-review-session-parent-');
+    // A fake cmux that never answers in time, so the surface gives up on it.
+    const bin = makeTempDir('branch-review-fake-cmux-');
+    writeExecutable(path.join(bin, 'cmux'), '#!/bin/sh\nexec /bin/sleep 5\n');
+    const proc = new FakeProcess();
+    let tree: unknown;
+    let markRendered!: () => void;
+    const mounted = new Promise<void>((resolve) => {
+      markRendered = resolve;
+    });
+    const opened: Array<[string, string[]]> = [];
+
+    void runCli({
+      argv: ['HEAD', 'main', '--no-watch', '--no-animations'],
+      cwd,
+      proc,
+      env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, CMUX_WORKSPACE_ID: 'workspace:test', SSH_CONNECTION: undefined, BRANCH_REVIEW_MOTION: undefined, BRANCH_REVIEW_TMPDIR: parent},
+      opener: (command, args) => opened.push([command, args]),
+      stdout: {isTTY: true, columns: 120, write: () => true},
+      stderr: {write: () => true},
+      render: (element) => {
+        tree = element;
+        markRendered();
+        return {waitUntilExit: () => new Promise(() => {}), unmount: () => undefined};
+      },
+    });
+    await mounted;
+
+    const props = findProps(tree, ReviewController)!;
+    const rendered = props.rendered as RenderedService;
+    rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
+    const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
+    const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html$/;
+    if (process.platform === 'darwin') {
+      expect(outcome).toEqual({kind: 'info', message: "⇗ README.md · cmux didn't answer · opened in your browser · nothing left this machine"});
+      expect(opened).toEqual([['/usr/bin/open', [expect.stringMatching(page)]]]);
+    } else {
+      // Elsewhere the fallback is xdg-open from PATH, when there is one.
+      expect(opened.length).toBe(outcome?.message.includes('opened in your browser') ? 1 : 0);
+    }
+    proc.emit('exit', 0);
   }, 60_000);
 });
 

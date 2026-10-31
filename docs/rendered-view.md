@@ -1,6 +1,55 @@
 # Rendered markdown pages
 
-This document describes how `branch-review` renders the branch's changed markdown files as the pages GitHub would show, with what changed marked on each page. It covers the `--render-out` option, what a page shows, which images a page includes, how close a page is to github.com, and the JSON report. For the other options, see the [Options](../README.md#options) section of the README.
+This document describes how `branch-review` renders the branch's changed markdown files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, the `--render-out` option, what a page shows, which images a page includes, how close a page is to github.com, and the JSON report. For the other options, see the [Options](../README.md#options) section of the README.
+
+## Open a page from the review
+
+To open the page of the markdown file in view, press `r`, or click **Rendered ⇗** in the file header. The button is the first one in the header of a changed markdown file, and it's the last to go when the pane is too narrow for all of them. To open an overview of every page, press `R`. Neither key changes what the review shows, and you can keep reading while the page opens.
+
+Where the page opens depends on where you run `branch-review`:
+
+| Where you run it | Where the page opens |
+| --- | --- |
+| In a cmux workspace | A browser split to the right of the review. The split doesn't take the keyboard, and each later press sends the same split to the new page. |
+| In cmux, with its browser turned off in its settings | Your default browser. cmux opens it there itself. |
+| In another terminal on macOS or Linux | A new tab in your default browser, on each press. On Linux, `xdg-open` on your `PATH` opens it. |
+| Over SSH | Nothing opens. |
+
+After each press the footer says where the page went, such as `⇗ setup.md · in the split →`. The first page of a session adds `nothing left this machine`. When the file in view has no page, `r` opens the review's first page and names it, such as `⇗ docs/setup.md · first rendered file · in the split →`. When the branch changed no markdown, the footer reads `nothing to render · no markdown files on this branch`.
+
+The pages render in the background while you read, so a page is usually ready before you press `r`. If it isn't, the footer reads `rendering setup.md…` until the page opens. After 5 seconds it gives up with `setup.md took too long to render`.
+
+The footer names the following problems:
+
+| Message | What it means |
+| --- | --- |
+| `cmux didn't answer · opened in your browser` | cmux didn't place the page within 1.5 seconds, so your default browser opened it. If a split from an earlier press was closed, the next press opens a new one without a message. |
+| `opened in your browser · cmux's browser is off` | cmux's browser is turned off in its settings. Each press opens the page in your default browser. |
+| `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. |
+| `no browser opener found` | On Linux, no `xdg-open` is on your `PATH`. |
+| `rendered view turned off` | The renderer failed three times in a minute, so `r` and `R` stay off for the session. Image previews keep working. |
+| `can't write the page: disk full` | The session's temp directory is full. |
+
+The pages live in the session's temp directory, which only you can read, and `branch-review` removes it when you quit. For the temp directory's location, see `BRANCH_REVIEW_TMPDIR` in the [Environment variables](../README.md#environment-variables) section of the README.
+
+### The overview
+
+The overview lists every page of the review, in the review's order. Each row shows the file's status letter, its path, and what its page marks, such as `3 changed · 1 removed`, and opens that page. A deleted file is listed under **Deleted**, and its page shows the base version. The foot of the overview sums the ways the pages differ from github.com.
+
+`R` waits up to 3 seconds for pages that are still rendering. A file whose page isn't ready by then reads `not rendered yet` and has no link. Press `R` again later to see it. A row links only to a page rendered from the review as it is now, so a file you edited since its last page reads `not rendered yet` too. When its page can't be written, the row adds the reason, such as `not rendered yet · disk full`.
+
+A page you open before the other files have rendered shows no count beside them in its rail, and a tooltip on each says `not rendered yet`. Once they render, that page is written again with their counts, and the next `r` opens the new one.
+
+### Motion on the way
+
+While the page opens, a shade band sweeps the diff toward the split, for about a third of a second. The band runs only on the diff's text rows, and pictures in the diff stay as they are.
+
+The following settings change the motion:
+
+- `--no-animations` turns the band off, along with the review's other motion.
+- `NO_COLOR` turns the band off.
+- With **Reduce motion** on in macOS's accessibility settings, the band gives way to one short flash of the **Rendered ⇗** button. `branch-review` reads the setting once per session, and not over SSH.
+- `BRANCH_REVIEW_MOTION` overrides the macOS setting: `full`, `reduce`, or `off`.
 
 ## Write the pages
 
@@ -34,7 +83,7 @@ A page shows the file the way GitHub's file view renders it, with GitHub's style
 
 Changes are marked by block. A block is a paragraph, a heading, a code block, a list item, or a table row:
 
-- A green bar in the margin marks a block that the branch added. A changed table row carries its bar on its first cell, inside the table, since a wide table scrolls sideways on its own.
+- A green bar in the margin marks a block that the branch added. A table row's bar sits in the same margin, as tall as the row.
 - An amber bar marks a block that the branch changed. A paragraph that was only rewrapped counts as changed. The **before** chip under the right end of a changed block opens the whole block as it was on the base. In a list item, the chip follows the item's text.
 - A dashed red marker, such as `− 1 paragraph removed · show`, sits where the branch removed content. Click it to see the removed text on a red tint.
 
@@ -46,7 +95,7 @@ A table is marked by its rows. A change to a column's alignment marks the header
 
 On a narrow screen, such as a narrow split, the rail folds into a one-line file switcher above the file's head.
 
-A new file shows a `new file` banner in place of bars, and an untracked file shows `untracked · not part of a push yet`. A deleted file shows the base version, dimmed, under `deleted on this branch`. A renamed file names its old path.
+A new file shows a `new file` banner in place of bars, and an untracked file shows `untracked · not part of a push yet`. A deleted file shows the base version under `deleted on this branch`, with its images dimmed and its text at full contrast. A renamed file names its old path.
 
 A file that can't render as a page shows a card in its place, and its head names the state, such as `M · couldn't render`:
 
@@ -109,7 +158,9 @@ Nothing on a page leaves your machine. A page is one self-contained file with no
 
 Repo content can't run on a page. HTML in a markdown file passes GitHub's sanitizer model, which removes scripts, event handlers, styles, forms, frames, and `javascript:` links, and prefixes ids with `user-content-`. Repo HTML can't add a change bar or forge any other mark.
 
-`branch-review` reads the files' text and images from Git or from the working tree, the same way the review does. It writes only to the directory you pass to `--render-out`.
+`branch-review` reads the files' text and images from Git or from the working tree, the same way the review does. The pages that `r` and `R` open go in the session's temp directory. `--render-out` writes only to the directory you pass it.
+
+To open a page, `branch-review` runs cmux, `/usr/bin/open` on macOS, or `xdg-open` on Linux, each by its full path. Each one gets the page's file URL, whose name is a hash. cmux also gets the workspace and the split it named. No repo text reaches any of them.
 
 ## Use the JSON report
 

@@ -1,23 +1,31 @@
 import path from 'node:path';
+import {escapeHiddenCharacters} from '../controlChars.js';
 import {fileKey, type DiffRange} from '../git.js';
 import {patchObjectIds} from '../media/classify.js';
+import type {Opener} from '../media/openExternal.js';
+import {findTool} from '../media/worker/tools.js';
 import type {ReviewFile, ReviewModel} from '../review/model.js';
 import {reviewAssetSides, type AssetSides} from './assets.js';
 import type {FragmentRequest, FragmentSummary, PageRequest, RenderedBackend} from './backend.js';
 import {changeGroups} from './changes.js';
 import {failedMarkdownPage, renderableKind} from './classify.js';
-import {fileAlias, pageKey, railSignature, renderedPageKey} from './keys.js';
-import type {LinkAnswer} from './markdown.js';
-import {railLabel, type PageBody, type PageInput, type RailEntry} from './page.js';
+import {fileAlias, OVERVIEW_ALIAS, overviewKey, pageKey, railSignature, renderedPageKey} from './keys.js';
+import type {LinkAnswer, RenderedFragment} from './markdown.js';
+import {resolveMotion, type Motion} from './motion.js';
+import {assembleOverview, railLabel, type OverviewEntry, type PageBody, type PageInput, type RailEntry} from './page.js';
+import {runTool} from './run.js';
 import {createRenderedSite, type RenderedSite} from './site.js';
-import {sourceSpec} from './source.js';
+import {oneLine, sourceSpec} from './source.js';
+import {createSurface, type ShowResult, type Surface} from './surface.js';
 import {createRenderedBackend} from './workerClient.js';
 
 // The UI side of the rendered view. It holds what names and labels the
 // pages (keys, counts, failures), never their HTML: the worker renders,
 // this side writes the finished pages into the session dir. When a review
 // arrives it renders the review's markdown in the background, the active
-// file first, so a page is usually on disk before anyone asks for it.
+// file first, so a page is usually on disk before anyone asks for it. `r`
+// and `R` come here to open a page on the surface: this side decides
+// whether the TUI plays its crossing, and what the footer says after.
 
 // The first review waits for the UI to settle; a watch refresh waits for
 // a burst of writes to end.
@@ -26,8 +34,35 @@ const SETTLE_MS = 250;
 const MAX_PRERENDER = 40;
 // Files this close to the active one in the review's order render next.
 const NEIGHBORS = 3;
+// How long `r` waits for a page that isn't written yet.
+const OPEN_DEADLINE_MS = 5_000;
+// How much of that `R` gives the background pass before it lists what is
+// done so far: the overview never waits on every file of a cold review.
+const OVERVIEW_WAIT_MS = 3_000;
+// How many times a pass writes the pages again when a page's render moved
+// the count its own rail shows.
+const MAX_REWRITES = 3;
+const NOTHING_TO_RENDER = 'nothing to render · no markdown files on this branch';
+
+/**
+ * The mark for "opens outside the pane". `↗` would read better, but
+ * string-width, which Ink lays rows out with, counts it two cells while
+ * terminals draw it in one, so every row holding it would end a cell short.
+ */
+export const LEAVES_PANE = '⇗';
 
 export type PageOutcome = {ok: true; key: string; url: string} | {ok: false; reason: string};
+
+/** What the footer says after `r` or `R`. */
+export type OpenOutcome = {message: string; kind: 'info' | 'error'};
+
+/**
+ * The TUI's part in a trip: `cross` plays the crossing for `motion` and
+ * settles when it ends; `waiting` says the page is still being rendered.
+ */
+export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void};
+
+export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose'>>;
 
 export type SetTimer = (run: () => void, ms: number) => () => void;
 
@@ -57,9 +92,13 @@ type Written = {ok: true; key: string} | {ok: false; reason: string};
 
 type Asking = {epoch: number; fileKey: string; priority: number; controller: AbortController; done: Promise<Answer | null>};
 
-export function createRenderedService({backend, site, now = Date.now, setTimer = defaultTimer}: {
+export function createRenderedService({backend, site, surface, motion, now = Date.now, setTimer = defaultTimer}: {
   backend: RenderedBackend;
   site: RenderedSite;
+  /** Where pages open. Without one, the service only renders. */
+  surface?: PageSurface;
+  /** How much the TUI moves, asked once, at the first trip. */
+  motion?: () => Promise<Motion>;
   now?: () => number;
   setTimer?: SetTimer;
 }) {
@@ -80,14 +119,40 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
   // By file key: the review whose page its stable name points at, so a
   // slower write for an older review never takes it back.
   const aliasedAt = new Map<string, number>();
+  // By file key: why the newest write of its page failed, and for which review.
+  const unwritten = new Map<string, {epoch: number; reason: string}>();
   const notices: string[] = [];
   let saidOff = false;
+  const listeners = new Set<() => void>();
+  let version = 0;
+  // The pass rendering a review in the background, when one runs.
+  let background: {epoch: number; done: Promise<void>} | null = null;
+  // A page's render counted its file differently from the answer its rail
+  // was written with, so that page is written again.
+  let stale = false;
+  // The overview's newest page, kept through prunes.
+  let overview: string | null = null;
+  let motionAsked: Promise<Motion> | null = null;
+  // The first page shown says that it was rendered here.
+  let saidLocal = false;
+  // Counts `r` and `R` presses: only the newest one's page is shown.
+  let presses = 0;
 
+  const say = (notice: string) => {
+    notices.push(notice);
+    version += 1;
+    for (const listener of listeners) listener();
+  };
+
+  // Reasons reach the footer, page cards and the overview as one line with
+  // the home dir as `~`. A worker that crashed is described by its stderr,
+  // which can name any path on the machine.
   const offReason = () => {
-    const reason = backend.disabledReason();
+    const disabled = backend.disabledReason();
+    const reason = disabled ? oneLine(disabled) : null;
     if (reason && !saidOff) {
       saidOff = true;
-      notices.push(`✗ ${reason}`);
+      say(`✗ ${reason}`);
     }
     return reason;
   };
@@ -110,11 +175,15 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
     }
     const askedAt = epoch;
     const controller = new AbortController();
-    const done = backend.fragment(fragmentRequest(planned), controller.signal, priority).then((result): Answer => {
+    const send = () => backend.fragment(fragmentRequest(planned), controller.signal, priority);
+    // A render whose image lookups ran out of time (a cold git) marks less
+    // than its page will once they answer, so it is asked once more before
+    // any rail counts it.
+    const done = send().then((result) => (result.ok && result.summary.late ? send() : result)).then((result): Answer => {
       if (result.ok) return {summary: result.summary};
       // The failure that used up the worker's last strike says so.
       offReason();
-      return {failed: result.reason};
+      return {failed: oneLine(result.reason)};
     }).then((answer) => {
       const known = answers.get(request.key);
       if (!known || known.epoch <= askedAt) answers.set(request.key, {epoch: askedAt, answer});
@@ -136,6 +205,21 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
 
   const answerFor = (planned: Planned) => (planned.request ? answers.get(planned.request.key)?.answer : undefined);
 
+  // A page's render is the newest word on its file: when it counts the file
+  // differently from the fragment's answer (an image lookup that ran out of
+  // time, then answered), the page's count becomes the answer. The overview
+  // and every rail written from then on show it, and the file's own page is
+  // written again so its rail matches what it marks.
+  function revise(key: string, summary: FragmentSummary, askedAt: number) {
+    const known = answers.get(key);
+    if (known && known.epoch > askedAt) return;
+    if (known && 'summary' in known.answer && JSON.stringify(known.answer.summary) === JSON.stringify(summary)) return;
+    answers.set(key, {epoch: askedAt, answer: {summary}});
+    stale = true;
+    // A pass running, or waiting to start, writes them; else one starts.
+    if (askedAt === epoch && background?.epoch !== epoch && !cancelTimer) void prerender();
+  }
+
   // A file whose render failed isn't sent again by later passes while it
   // is unchanged: a file that keeps timing out would cost the worker a
   // strike on every refresh and turn the whole view off. Opening its page
@@ -151,7 +235,7 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
       path: each.file.path,
       status: each.file.status,
       href: `${each.alias}.html`,
-      label: railLabel(each.file.status, answer && 'summary' in answer && answer.summary.kind === 'rendered' ? answer.summary.changes : null),
+      label: railLabel(each.file.status, each.request && !answer ? 'pending' : answer && 'summary' in answer && answer.summary.kind === 'rendered' ? answer.summary.changes : null),
       current: each === planned,
     };
   });
@@ -178,9 +262,14 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
       rail,
       title: title!,
     });
-    if (current.get(planned.fileKey) === key && site.has(key)) return {ok: true, key};
-
     const askedAt = epoch;
+    // The page on disk, which the stable name already points at, is the one
+    // this review wants: the name now stands for this review too.
+    if (current.get(planned.fileKey) === key && site.has(key)) {
+      if ((aliasedAt.get(planned.fileKey) ?? -1) < askedAt) aliasedAt.set(planned.fileKey, askedAt);
+      return {ok: true, key};
+    }
+
     let pending = writing.get(key);
     if (!pending) {
       const request: PageRequest = {
@@ -193,12 +282,13 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
       pending = backend.page(request, new AbortController().signal).then((result): Written => {
         if (!result.ok) {
           offReason();
-          return {ok: false, reason: result.reason};
+          return {ok: false, reason: oneLine(result.reason)};
         }
+        if (result.rerendered && 'fragment' in request.content) revise(request.content.fragment.key, result.summary, askedAt);
         try {
           site.write(key, result.html);
         } catch (error) {
-          return {ok: false, reason: error instanceof Error ? error.message : String(error)};
+          return {ok: false, reason: oneLine(error)};
         }
         return {ok: true, key};
       }).finally(() => writing.delete(key));
@@ -207,8 +297,15 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
     // Each review that asked for this page settles its own stable name: a
     // write one review started can finish for a later one that wants it.
     const written = await pending;
-    return written.ok ? point(planned, key, askedAt) : written;
+    const settled = written.ok ? point(planned, key, askedAt) : written;
+    if (!settled.ok) unwritten.set(planned.fileKey, {epoch: askedAt, reason: settled.reason});
+    return settled;
   }
+
+  // Whether the file's stable name opens a page written for the review as
+  // it is now. An older review's page may count other changes, so the
+  // overview never links to one.
+  const pointedNow = (planned: Planned) => aliasedAt.get(planned.fileKey) === epoch;
 
   // Points the file's stable name at the page `askedAt`'s review wrote,
   // unless a newer review's page got there first: this one then stays on
@@ -218,7 +315,7 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
     try {
       site.alias(planned.alias, key);
     } catch (error) {
-      return {ok: false, reason: error instanceof Error ? error.message : String(error)};
+      return {ok: false, reason: oneLine(error)};
     }
     aliasedAt.set(planned.fileKey, askedAt);
     const was = current.get(planned.fileKey);
@@ -231,25 +328,44 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
   // writes the pages: their rails count every file's changes, so pages wait
   // for the fragments. A file past the limit gets a page saying it isn't
   // rendered yet, so the rail and the links that point at it never open
-  // nothing, nor an older review's page.
-  async function prerender() {
+  // nothing, nor an older review's page. A file this review already has an
+  // answer for isn't asked again.
+  function prerender() {
     started = true;
     cancelTimer = null;
-    const pass = epoch;
-    const chosen = [...plan.values()].sort((left, right) => priorityOf(left) - priorityOf(right) || left.order - right.order).slice(0, MAX_PRERENDER);
-    await Promise.all(chosen.filter((planned) => planned.request && !failedBefore(planned)).map((planned) => ask(planned, priorityOf(planned))));
-    if (disposed || pass !== epoch || offReason()) return;
-    for (const planned of [...plan.values()]) {
-      await writePage(planned, true);
-      if (disposed || pass !== epoch) return;
+    const running = {epoch, done: Promise.resolve()};
+    background = running;
+    running.done = renderPass(running);
+    return running.done;
+  }
+
+  async function renderPass(running: {epoch: number}) {
+    const pass = running.epoch;
+    try {
+      const chosen = [...plan.values()].sort((left, right) => priorityOf(left) - priorityOf(right) || left.order - right.order).slice(0, MAX_PRERENDER);
+      const unanswered = chosen.filter((planned) => planned.request && !failedBefore(planned) && answers.get(planned.request.key)?.epoch !== pass);
+      await Promise.all(unanswered.map((planned) => ask(planned, priorityOf(planned))));
+      if (disposed || pass !== epoch || offReason()) return;
+      for (let round = 0; round < MAX_REWRITES; round += 1) {
+        stale = false;
+        for (const planned of [...plan.values()]) {
+          await writePage(planned, true);
+          if (disposed || pass !== epoch) return;
+        }
+        if (!stale) break;
+      }
+      site.prune({
+        current: new Map([...plan.values()].flatMap((planned) => {
+          const key = current.get(planned.fileKey);
+          return key ? [[planned.alias, key] as const] : [];
+        }).concat(overview ? [[OVERVIEW_ALIAS, overview] as const] : [])),
+        previous: new Set([...plan.keys()].flatMap((key) => (previous.has(key) ? [previous.get(key)!] : []))),
+      });
+    } finally {
+      // In the same turn as the last check above, so a count that moves
+      // after it finds no pass running and starts one.
+      if (background === running) background = null;
     }
-    site.prune({
-      current: new Map([...plan.values()].flatMap((planned) => {
-        const key = current.get(planned.fileKey);
-        return key ? [[planned.alias, key] as const] : [];
-      })),
-      previous: new Set([...plan.keys()].flatMap((key) => (previous.has(key) ? [previous.get(key)!] : []))),
-    });
   }
 
   const schedule = () => {
@@ -258,6 +374,116 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
     cancelTimer?.();
     cancelTimer = setTimer(() => void prerender(), started ? SETTLE_MS : FIRST_DELAY_MS);
   };
+
+  /** The file's newest page, rendered and written now if it isn't yet. */
+  async function page(fileKey: string): Promise<PageOutcome> {
+    const planned = plan.get(fileKey);
+    if (!planned) return {ok: false, reason: 'no rendered page for this file'};
+    const off = offReason();
+    if (off) return {ok: false, reason: off};
+    if (planned.request && answers.get(planned.request.key)?.epoch !== epoch) await ask(planned, 0);
+    // The review may have moved on while it rendered.
+    const latest = plan.get(fileKey);
+    if (!latest) return {ok: false, reason: 'no rendered page for this file'};
+    const answered = answerFor(latest);
+    let written = await writePage(latest);
+    // Its render counted the file anew: the page shown has a rail that says so.
+    if (written.ok && answerFor(latest) !== answered) written = await writePage(latest);
+    return written.ok ? {...written, url: site.url(written.key)} : written;
+  }
+
+  // Writes the overview of the review as it is now. The pages are written
+  // first, by a background pass started now if none is running, for as long
+  // as the deadline allows. A row with no page yet has no link.
+  async function writeOverview(): Promise<PageOutcome> {
+    if (background?.epoch !== epoch) {
+      cancelTimer?.();
+      void prerender();
+    }
+    if (background) {
+      let stop = () => {};
+      await Promise.race([background.done, new Promise<void>((resolve) => {
+        stop = setTimer(resolve, OVERVIEW_WAIT_MS);
+      })]);
+      stop();
+    }
+    const off = offReason();
+    if (off) return {ok: false, reason: off};
+    const differences = new Map<RenderedFragment['differences'][number]['kind'], number>();
+    const entries = [...plan.values()].map((planned): OverviewEntry => {
+      const answer = answerFor(planned);
+      const summary = answer && 'summary' in answer ? answer.summary : undefined;
+      const failure = planned.failure ?? (answer && 'failed' in answer ? answer.failed : undefined);
+      for (const difference of summary?.differences ?? []) differences.set(difference.kind, (differences.get(difference.kind) ?? 0) + difference.count);
+      const written = pointedNow(planned);
+      // A row with no page says why this review's write failed, if it did.
+      const notWritten = unwritten.get(planned.fileKey);
+      const reason = written ? failure ?? summary?.reason : notWritten?.epoch === epoch ? notWritten.reason : undefined;
+      return {
+        path: planned.file.path,
+        status: planned.file.status,
+        ...(planned.file.oldPath ? {oldPath: planned.file.oldPath} : {}),
+        href: written ? `${planned.alias}.html` : null,
+        state: !written ? 'pending' : failure !== undefined ? 'failed' : summary?.kind ?? 'pending',
+        changes: summary?.kind === 'rendered' ? summary.changes : null,
+        ...(reason !== undefined ? {reason} : {}),
+      };
+    });
+    const input = {title: {...title!, renderedAt: now()}, entries, differences: [...differences].map(([kind, count]) => ({kind, count}))};
+    const key = overviewKey(input);
+    try {
+      if (!site.has(key)) site.write(key, assembleOverview(input));
+      site.alias(OVERVIEW_ALIAS, key);
+    } catch (error) {
+      return {ok: false, reason: oneLine(error)};
+    }
+    overview = key;
+    return {ok: true, key, url: site.url(key)};
+  }
+
+  // One trip to a page: the TUI's crossing, played while the page is
+  // written and placed on the surface, so the crossing covers the split
+  // opening. `name` is how the footer names the page, and `note` what it
+  // adds about it. Nothing crosses toward a surface that refuses. A page
+  // still unwritten after the crossing is said to be rendering, until the
+  // deadline gives up on it, and then it opens nowhere. A press made after
+  // this one wins: this one's page is never shown over it.
+  async function travel(name: string, note: string | null, write: () => Promise<PageOutcome>, trip?: Trip): Promise<OpenOutcome | null> {
+    const place = surface;
+    if (!place) return {kind: 'error', message: 'pages open only in the full app'};
+    if (place.refusal) return {kind: 'error', message: place.refusal};
+    const press = (presses += 1);
+    motionAsked ??= motion ? motion() : Promise.resolve('off');
+    const crossing = motionAsked.then((kind) => trip?.cross(kind));
+    let ready = false;
+    let gaveUp = false;
+    let cancelDeadline = () => {};
+    const late = new Promise<'late'>((resolve) => {
+      cancelDeadline = setTimer(() => {
+        gaveUp = true;
+        resolve('late');
+      }, OPEN_DEADLINE_MS);
+    });
+    const shown = write().then<ShowResult | {error: string} | null>((written) => {
+      ready = true;
+      cancelDeadline();
+      // After dispose the session dir is going: nothing is placed.
+      if (gaveUp || disposed || press !== presses) return null;
+      return written.ok ? place.show(written.url) : {error: written.reason};
+    });
+    await crossing;
+    if (!ready && press === presses) trip?.waiting(`rendering ${name}…`);
+    const outcome = await Promise.race([shown, late]);
+    // A newer press's toast is on screen by now, and its page is the one shown.
+    if (outcome === 'late') return press === presses ? {kind: 'error', message: `${name} took too long to render`} : null;
+    if (outcome === null || 'superseded' in outcome) return null;
+    if ('error' in outcome) return {kind: 'error', message: outcome.error};
+    if ('refused' in outcome) return {kind: 'error', message: outcome.refused};
+    const parts = [`${LEAVES_PANE} ${name}`, ...(note ? [note] : []), outcome.message];
+    if (!saidLocal) parts.push('nothing left this machine');
+    saidLocal = true;
+    return {kind: 'info', message: parts.join(' · ')};
+  }
 
   return {
     /**
@@ -336,17 +562,49 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
     },
 
     /** The file's newest page, rendered and written now if it isn't yet. */
-    async page(fileKey: string): Promise<PageOutcome> {
-      const planned = plan.get(fileKey);
-      if (!planned) return {ok: false, reason: 'no rendered page for this file'};
+    page,
+
+    /**
+     * Opens the file's page, or the review's first page when the file has
+     * none, with `trip` played on the way. Null when a newer press took
+     * this one's place.
+     */
+    async open({fileKey}: {fileKey: string}, trip?: Trip): Promise<OpenOutcome | null> {
       const off = offReason();
-      if (off) return {ok: false, reason: off};
-      if (planned.request && answers.get(planned.request.key)?.epoch !== epoch) await ask(planned, 0);
-      // The review may have moved on while it rendered.
-      const latest = plan.get(fileKey);
-      if (!latest) return {ok: false, reason: 'no rendered page for this file'};
-      const written = await writePage(latest);
-      return written.ok ? {...written, url: site.url(written.key)} : written;
+      if (off) return {kind: 'error', message: off};
+      const planned = plan.get(fileKey) ?? plan.values().next().value;
+      if (!planned) return {kind: 'info', message: NOTHING_TO_RENDER};
+      const shownPath = escapeHiddenCharacters(planned.file.path);
+      const fallback = planned.fileKey !== fileKey;
+      return travel(fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, () => page(planned.fileKey), trip);
+    },
+
+    /** Opens the overview of the review's pages, like `open`. */
+    async openOverview(trip?: Trip): Promise<OpenOutcome | null> {
+      const off = offReason();
+      if (off) return {kind: 'error', message: off};
+      if (plan.size === 0) return {kind: 'info', message: NOTHING_TO_RENDER};
+      return travel('overview', null, writeOverview, trip);
+    },
+
+    /** The Rendered button's hint: where its page opens, or why it can't. */
+    openHint() {
+      if (!surface) return null;
+      // A refusal's reason, without the alternative it goes on to name.
+      return surface.destination ? `r · opens the rendered page ${surface.destination}` : `r · ${(surface.refusal ?? '').split(' · ')[0]}`;
+    },
+
+    /** Calls `listener` whenever there is a notice to take. */
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+
+    /** Changes whenever a notice arrives. */
+    getVersion() {
+      return version;
     },
 
     /** Messages for the footer since the last call. */
@@ -358,6 +616,7 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
       if (disposed) return;
       disposed = true;
       cancelTimer?.();
+      surface?.dispose?.();
       for (const running of asking.values()) running.controller.abort();
       asking.clear();
       backend.dispose();
@@ -367,7 +626,16 @@ export function createRenderedService({backend, site, now = Date.now, setTimer =
 
 export type RenderedService = ReturnType<typeof createRenderedService>;
 
-/** The service the CLI runs: its own worker, and pages in the session dir. */
-export function startRenderedService({tempDir, env, cwd}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string}) {
-  return createRenderedService({backend: createRenderedBackend({tempDir, env, cwd}), site: createRenderedSite({tempDir})});
+/** What the TUI uses to open pages and hear the service's notices. */
+export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'>;
+
+/** The service the CLI runs: its own worker, pages in the session dir, and the surface they open on. */
+export function startRenderedService({tempDir, env, cwd, animations = true, opener}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener}) {
+  const platform = process.platform;
+  return createRenderedService({
+    backend: createRenderedBackend({tempDir, env, cwd}),
+    site: createRenderedSite({tempDir}),
+    surface: createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform}),
+    motion: () => resolveMotion({env, animations, run: runTool, platform}),
+  });
 }

@@ -282,7 +282,84 @@ html, body {
   padding: 32px var(--br-article-pad) 45px;
   background: transparent;
 }
-.br-main .markdown-body.br-dimmed { opacity: 0.75; }
+/* A deleted file's page dims its pictures and cards only: its text keeps
+   the contrast every other page has. */
+.br-main .markdown-body.br-dimmed :is(img, picture, video, .br-card) { opacity: 0.75; }
+
+/* The overview: one row per rendered file, in groups, at the article's
+   measure. Each row is one link with its status bar on the left, the way
+   the rail marks the current file. */
+.br-rail .br-rail-stats { margin: 0 8px 12px; padding: 0; list-style: none; color: var(--br-fg); line-height: 1.9; }
+.br-overview .br-path { font-family: var(--br-sans); font-weight: 500; }
+.br-overview .br-path .br-branch { font-family: var(--br-mono); font-weight: 600; }
+/* One grid for every group, so each row's note starts at one x. Groups,
+   lists, items and rows take its columns as subgrids; the first column
+   holds the row's 16 px inset and its status letter. */
+.br-groups {
+  display: grid;
+  grid-template-columns: 34px minmax(0, max-content) minmax(0, 1fr) auto;
+  column-gap: 12px;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 8px 45px 0;
+}
+.br-group, .br-rows, .br-rows > li {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+}
+.br-group-title, .br-overview-foot { grid-column: 1 / -1; }
+.br-group { margin-top: 22px; }
+.br-group-title {
+  margin: 0 0 6px;
+  color: var(--br-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.br-rows { margin: 0; padding: 0; list-style: none; }
+.br-row {
+  position: relative;
+  display: grid;
+  /* Its own columns where subgrid isn't supported. */
+  grid-template-columns: 18px minmax(0, max-content) minmax(0, 1fr) auto;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: baseline;
+  column-gap: 12px;
+  padding: 7px 10px 7px 16px;
+  border-radius: 6px;
+  color: var(--br-fg);
+  font-size: 14px;
+  text-decoration: none;
+}
+a.br-row:hover { background: var(--br-accent-soft); }
+a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2px; }
+.br-row-bar {
+  position: absolute;
+  left: 4px;
+  top: 7px;
+  bottom: 7px;
+  width: 3px;
+  border-radius: 2px;
+}
+.br-row-modified .br-row-bar, .br-row-renamed .br-row-bar { background: var(--br-modified); }
+.br-row-added .br-row-bar, .br-row-untracked .br-row-bar { background: var(--br-added); }
+/* A deleted file has nothing on the branch to mark: a dash on its first
+   line, as the rail shows. */
+.br-row-deleted .br-row-bar { top: 17px; bottom: auto; width: 8px; height: 2px; background: var(--br-removed); }
+.br-row-path { overflow-wrap: anywhere; font-family: var(--br-mono); font-size: 13px; }
+.br-row-note { color: var(--br-muted); font-size: 13px; }
+.br-row-open { color: var(--br-accent); font-size: 13px; white-space: nowrap; }
+.br-row-none .br-row-note { font-style: italic; }
+.br-overview-foot {
+  margin: 28px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--br-border-muted);
+  color: var(--br-muted);
+  font-size: 12px;
+}
 
 /* GitHub's heading markup puts the anchor beside the heading. */
 .markdown-body .markdown-heading { position: relative; }
@@ -319,10 +396,7 @@ html, body {
   border: 0;
 }
 
-/* Change bars: 3 px in the margin, green for added, amber for modified.
-   Table rows carry theirs on the first cell, inside the table: GitHub's
-   table is its own sideways scroller and clips anything drawn past its
-   left edge, and a bar outside it can't take the row's height. */
+/* Change bars: 3 px in the margin, green for added, amber for modified. */
 .markdown-body [data-mark] { position: relative; }
 .markdown-body [data-mark]::before {
   content: "";
@@ -351,8 +425,29 @@ html, body {
 .markdown-body > :is(a, b, code, em, i, img, kbd, picture, small, span, strong, sub, sup) + .br-marked::before { left: -5px; }
 .markdown-body tr[data-mark] { position: static; }
 .markdown-body tr[data-mark]::before { content: none; }
-.markdown-body tr[data-mark] > :first-child { box-shadow: inset 3px 0 0 var(--br-added); }
-.markdown-body tr[data-mark="modified"] > :first-child { box-shadow: inset 3px 0 0 var(--br-modified); }
+/* A table row's bar is in the margin with the rest. GitHub's table is its
+   own sideways scroller and clips what is drawn past its padding box, so a
+   table with a marked row reaches into the margin by the bar's offset, on
+   padding that keeps its cells where they were. The row's first cell holds
+   the bar, so it takes the row's height; the cell's 1 px border is the
+   rest of the way to the margin's column. */
+.markdown-body table:has(tr[data-mark]) {
+  margin-left: var(--br-bar-x);
+  padding-left: calc(0px - var(--br-bar-x));
+  max-width: calc(100% - var(--br-bar-x));
+}
+.markdown-body tr[data-mark] > :first-child { position: relative; }
+.markdown-body tr[data-mark] > :first-child::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: calc(var(--br-bar-x) - 1px);
+  width: 3px;
+  border-radius: 2px;
+  background: var(--br-added);
+}
+.markdown-body tr[data-mark="modified"] > :first-child::before { background: var(--br-modified); }
 
 /* Removed content: a closed marker in the margin's dashed red, the removed
    text on a red tint behind it. */
@@ -570,13 +665,20 @@ html, body {
 }
 
 @media (max-width: 767px) {
+  .br-groups { padding: 8px 15px 0; }
+  .br-groups { grid-template-columns: 34px minmax(0, 1fr) auto; }
+  .br-row-note { grid-column: 2 / 3; }
+
   :root { --br-bar-x: -11px; --br-article-pad: 15px; }
   .br-strip { gap: 10px; padding: 0 12px; }
   .br-main { padding: 0 16px 48px; }
   .br-main .markdown-body { padding-top: 20px; padding-bottom: 32px; }
   .br-filehead { padding-left: 15px; padding-right: 15px; }
   .br-banners, .br-switcher { padding: 0 15px; }
-  .markdown-body .markdown-heading .anchor { display: none; }
+  /* No room for the link icon beside a heading, but the anchor keeps its
+     box: it carries the heading's id, and a #link scrolls to it. */
+  .markdown-body .markdown-heading .anchor,
+  .markdown-body .markdown-heading .octicon-link { visibility: hidden; }
 }
 
 /* Out of sight, still read aloud. */

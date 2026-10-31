@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import {createHash} from 'node:crypto';
 import {describe, expect, it} from 'vitest';
 import {PAGE_CSS, PAGE_CSS_HASH} from '../src/rendered/assets.generated.js';
-import {assembleFilePage, contentSecurityPolicy, type PageFile, type PageInput} from '../src/rendered/page.js';
+import {assembleFilePage, contentSecurityPolicy, railLabel, type PageFile, type PageInput} from '../src/rendered/page.js';
 import {renderMarkdown} from '../src/rendered/markdown.js';
 
 const VENDORED_CSS = new URL('../src/rendered/assets/github-markdown.css', import.meta.url);
@@ -270,7 +270,11 @@ describe('page.css', () => {
       expect(CHROME_CSS).toContain(selector);
     }
     expect(CHROME_CSS).not.toMatch(/br-(removed|before)-body[^{]*\{[^}]*opacity/);
-    expect(rule('.br-main .markdown-body.br-dimmed')).toContain('opacity: 0.75;');
+    // A deleted file's page dims its pictures and cards, and its text keeps
+    // full contrast.
+    expect(rule('.br-main .markdown-body.br-dimmed :is(img, picture, video, .br-card)')).toContain('opacity: 0.75;');
+    expect(rule('.br-main .markdown-body.br-dimmed')).toBe('');
+    expect(CHROME_CSS).not.toMatch(/\.br-dimmed[^{,]*\{[^}]*opacity/);
   });
 
   it('takes the closed before chip out of the flow, so it adds no space under its block', () => {
@@ -322,6 +326,41 @@ describe('page.css', () => {
   it('hides the card of a theme-only image in the other theme, as it hides the image', () => {
     expect(CHROME_CSS).toMatch(/@media \(prefers-color-scheme: dark\) \{\s*\.markdown-body :is\(img, \.br-card\)\[data-gh-theme="light"\] \{ display: none; \}/);
     expect(CHROME_CSS).toMatch(/@media \(prefers-color-scheme: light\) \{\s*\.markdown-body :is\(img, \.br-card\)\[data-gh-theme="dark"\] \{ display: none; \}/);
+  });
+
+  it('shows no count in the rail for a file not rendered yet, and says so on hover', async () => {
+    expect(railLabel('modified', 'pending')).toBe('');
+    expect(railLabel('renamed', 'pending')).toBe('');
+    // A new or deleted file's mark needs no render.
+    expect(railLabel('added', 'pending')).toBe('+');
+    expect(railLabel('deleted', 'pending')).toBe('−');
+    expect(railLabel('modified', null)).toBe('·');
+    const html = await page({rail: [
+      {path: 'docs/page.md', status: 'modified', href: 'aaaa.html', label: '3', current: true},
+      {path: 'README.md', status: 'modified', href: 'cccc.html', label: '', current: false},
+    ]});
+    expect(html).toContain('<span class="br-rail-name">README.md</span><span class="br-rail-count" title="not rendered yet"></span>');
+    expect(html).toContain('<span class="br-rail-name">page.md</span><span class="br-rail-count">3</span>');
+  });
+
+  it('keeps a heading\'s anchor in the layout on a narrow screen, so a #link still scrolls to it', () => {
+    const narrow = CHROME_CSS.slice(CHROME_CSS.indexOf('@media (max-width: 767px)'));
+    const block = narrow.slice(0, narrow.indexOf('\n}\n'));
+    expect(block).not.toMatch(/\.anchor[^{]*\{[^}]*display: none/);
+    expect(block).toMatch(/\.markdown-body \.markdown-heading \.anchor,\n\s*\.markdown-body \.markdown-heading \.octicon-link \{ visibility: hidden; \}/);
+  });
+
+  it('draws a table row\'s bar in the margin with the other bars, inside the table\'s own scroller', () => {
+    // The table reaches into the margin by the bar's offset and gives it back as padding.
+    const table = rule('.markdown-body table:has(tr[data-mark])');
+    expect(table).toContain('margin-left: var(--br-bar-x);');
+    expect(table).toContain('padding-left: calc(0px - var(--br-bar-x));');
+    expect(table).toContain('max-width: calc(100% - var(--br-bar-x));');
+    expect(rule('.markdown-body tr[data-mark] > :first-child')).toContain('position: relative;');
+    const bar = rule('.markdown-body tr[data-mark] > :first-child::before');
+    expect(bar).toMatch(/position: absolute;[\s\S]*left: calc\(var\(--br-bar-x\) - 1px\);[\s\S]*width: 3px;/);
+    expect(rule('.markdown-body tr[data-mark="modified"] > :first-child::before')).toContain('background: var(--br-modified);');
+    expect(CHROME_CSS).not.toContain('inset 3px 0 0');
   });
 
   it('starts the file head and banners at the article\'s left edge', () => {

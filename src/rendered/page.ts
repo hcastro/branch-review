@@ -20,10 +20,18 @@ export type RailEntry = {
   current: boolean;
 };
 
-/** A rail entry's count: `+` for a new file, `−` for a deleted one, else its changed and removed blocks, `·` for none. */
-export function railLabel(status: FileStatus, changes: RenderedFragment['changes'] | null) {
+/** The rail's count for a file not rendered yet: blank, never a count it might not have. */
+export const RAIL_PENDING = '';
+
+/**
+ * A rail entry's count: `+` for a new file, `−` for a deleted one, else its
+ * changed and removed blocks, `·` for none. `pending` is a file whose
+ * render hasn't answered yet, which has no count to show.
+ */
+export function railLabel(status: FileStatus, changes: RenderedFragment['changes'] | null | 'pending') {
   if (status === 'added' || status === 'untracked') return '+';
   if (status === 'deleted') return '−';
+  if (changes === 'pending') return RAIL_PENDING;
   const total = changes ? changes.changed + changes.removed : 0;
   return total > 0 ? String(total) : '·';
 }
@@ -71,9 +79,8 @@ function statusLetter(status: FileStatus) {
   return `<span class="br-status br-status-${status}">${STATUS_LETTERS[status]}</span>`;
 }
 
-export function assembleFilePage(input: PageInput): string {
-  const {title, file, rail} = input;
-  const name = path.posix.basename(file.path);
+// The document up to <body>: the policy first, then our one stylesheet.
+function documentHead(title: string) {
   return [
     '<!doctype html>',
     '<html lang="en">',
@@ -82,9 +89,16 @@ export function assembleFilePage(input: PageInput): string {
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
     '<meta name="referrer" content="no-referrer">',
-    `<title>${escapeHtml(name)} · branch-review</title>`,
+    `<title>${escapeHtml(title)} · branch-review</title>`,
     `<style>${PAGE_CSS}</style>`,
     '</head>',
+  ];
+}
+
+export function assembleFilePage(input: PageInput): string {
+  const {title, file, rail} = input;
+  return [
+    ...documentHead(path.posix.basename(file.path)),
     '<body>',
     strip(title, file.body.kind === 'rendered' ? file.body.fragment.differences : []),
     '<div class="br-layout">',
@@ -160,7 +174,7 @@ function railLists(rail: RailEntry[]) {
         `<li><a class="br-rail-file${current}" href="${escapeHtml(entry.href)}"${ariaCurrent}>`,
         statusLetter(entry.status),
         `<span class="br-rail-name">${escapeHtml(path.posix.basename(entry.path))}</span>`,
-        `<span class="br-rail-count">${escapeHtml(entry.label)}</span>`,
+        entry.label === RAIL_PENDING ? '<span class="br-rail-count" title="not rendered yet"></span>' : `<span class="br-rail-count">${escapeHtml(entry.label)}</span>`,
         '</a></li>',
       ].join('');
     }),
@@ -168,13 +182,17 @@ function railLists(rail: RailEntry[]) {
   ].join('\n'));
 }
 
-function railNav(rail: RailEntry[], title: PageInput['title']) {
+function railFoot(title: PageInput['title']) {
   const renderedAt = new Date(title.renderedAt);
+  return `<p class="br-rail-foot">Rendered offline <time datetime="${renderedAt.toISOString()}">${renderedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC</time>. Nothing left this machine.</p>`;
+}
+
+function railNav(rail: RailEntry[], title: PageInput['title']) {
   return [
     '<nav class="br-rail" aria-label="Rendered files">',
     `<p class="br-rail-title">CHANGED · ${rail.length} rendered</p>`,
     ...railLists(rail),
-    `<p class="br-rail-foot">Rendered offline <time datetime="${renderedAt.toISOString()}">${renderedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC</time>. Nothing left this machine.</p>`,
+    railFoot(title),
     '</nav>',
   ].join('\n');
 }
@@ -260,4 +278,115 @@ function cardBody(fileBody: Exclude<PageBody, {kind: 'rendered'}>) {
     case 'pending':
       return state('not rendered yet · opening this file in branch-review renders it');
   }
+}
+
+/** One file on the overview. `href` is its page, or null while it has none. */
+export type OverviewEntry = {
+  path: string;
+  status: FileStatus;
+  oldPath?: string;
+  href: string | null;
+  state: PageBody['kind'];
+  /** What its page marks, once it is rendered. */
+  changes: RenderedFragment['changes'] | null;
+  /** Why it failed to render, when it did. */
+  reason?: string;
+};
+
+export type OverviewInput = {
+  title: PageInput['title'];
+  /** In the review's order. */
+  entries: OverviewEntry[];
+  /** What the pages do differently from github.com, summed. */
+  differences: RenderedFragment['differences'];
+};
+
+const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
+
+// What an overview row says of its file: how it got there, then what its
+// page shows. A deleted file's page is its base side, so that is all its
+// row says, unless the page is a card.
+function overviewNote(entry: OverviewEntry, base: string) {
+  if (entry.status === 'deleted' && entry.state === 'rendered') return `shown dimmed from ${base}`;
+  const notes: string[] = [];
+  if (entry.status === 'added') notes.push('new file');
+  if (entry.status === 'renamed' && entry.oldPath) notes.push(`renamed from ${entry.oldPath}`);
+  if (entry.status === 'untracked') notes.push(entry.state === 'rendered' ? 'untracked · not part of a push yet' : 'untracked');
+  if (entry.state !== 'rendered') {
+    // A failed render, or a page that couldn't be written, says why.
+    const why = (entry.state === 'failed' || entry.state === 'pending') && entry.reason ? ` · ${entry.reason}` : '';
+    notes.push(`${BODY_STATE[entry.state]}${why}`);
+  } else {
+    const {changed, removed} = entry.changes ?? {changed: 0, removed: 0};
+    if (changed > 0) notes.push(`${changed} changed`);
+    if (removed > 0) notes.push(`${removed} removed`);
+    if (notes.length === 0) notes.push('no blocks marked');
+  }
+  return notes.join(' · ');
+}
+
+function overviewRow(entry: OverviewEntry, base: string) {
+  const parts = [
+    '<span class="br-row-bar" aria-hidden="true"></span>',
+    statusLetter(entry.status),
+    `<span class="br-row-path">${escapeHtml(entry.path)}</span>`,
+    `<span class="br-row-note">${escapeHtml(overviewNote(entry, base))}</span>`,
+  ].join('');
+  const kind = `br-row br-row-${entry.status}`;
+  return entry.href === null
+    ? `<li><div class="${kind} br-row-none">${parts}</div></li>`
+    : `<li><a class="${kind}" href="${escapeHtml(entry.href)}">${parts}<span class="br-row-open">open ›</span></a></li>`;
+}
+
+function overviewGroup(heading: string, entries: OverviewEntry[], base: string) {
+  if (entries.length === 0) return '';
+  return [
+    '<section class="br-group">',
+    `<h2 class="br-group-title">${heading}</h2>`,
+    '<ul class="br-rows">',
+    ...entries.map((entry) => overviewRow(entry, base)),
+    '</ul>',
+    '</section>',
+  ].join('\n');
+}
+
+/**
+ * The overview: every rendered file of the review, deleted ones apart, each
+ * row opening its page, and what the pages do differently from github.com.
+ */
+export function assembleOverview({title, entries, differences}: OverviewInput): string {
+  const pages = entries.filter((entry) => entry.status !== 'deleted');
+  const deleted = entries.filter((entry) => entry.status === 'deleted');
+  // Each count matches its group's rows.
+  const counts = [plural(pages.length, 'page'), ...(deleted.length > 0 ? [`${deleted.length} deleted`] : [])];
+  const total = differences.reduce((sum, difference) => sum + difference.count, 0);
+  const foot = total === 0 ? '' : ` · ${plural(total, 'difference')}: ${differences.map((difference) => DIFFERENCE_TEXT[difference.kind](difference.count)).join(', ')}`;
+  return [
+    ...documentHead('Overview'),
+    '<body>',
+    strip(title, differences),
+    '<div class="br-layout">',
+    '<nav class="br-rail" aria-label="Overview">',
+    '<p class="br-rail-title">OVERVIEW</p>',
+    '<ul class="br-rail-stats">',
+    ...counts.map((count) => `<li>${count}</li>`),
+    '</ul>',
+    railFoot(title),
+    '</nav>',
+    '<main class="br-main br-overview">',
+    '<div class="br-filehead">',
+    `<h1 class="br-path">Rendered view of <span class="br-branch">${escapeHtml(title.branch)}</span></h1>`,
+    `<p class="br-summary">${counts.join(' · ')}</p>`,
+    '</div>',
+    '<div class="br-groups">',
+    overviewGroup('Pages', pages, title.base),
+    overviewGroup('Deleted', deleted, title.base),
+    `<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub's stylesheet${escapeHtml(foot)}</p>`,
+    '</div>',
+    '</main>',
+    '</div>',
+    '</body>',
+    '</html>',
+    '',
+  ].join('\n');
 }

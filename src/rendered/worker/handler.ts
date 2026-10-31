@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {createLru} from '../../media/lru.js';
 import type {WorkerFailure} from '../../media/workerClient.js';
-import {createAssetResolver, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
+import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
 import type {FragmentRequest, FragmentResult, FragmentSummary, PageResult, RenderedWorkerRequest} from '../backend.js';
 import {renderMarkdown, type RenderInput, type RenderedFragment} from '../markdown.js';
 import {assembleFilePage, type PageBody} from '../page.js';
@@ -28,12 +28,13 @@ export function summarize(body: PageBody, uses: readonly AssetUse[] = []): Fragm
   // reads them sorted and once each: the same images, the same signature.
   const named = [...new Set(uses.map((use) => JSON.stringify([use.side, use.path, use.identity])))].sort();
   const assets = named.length === 0 ? '' : createHash('sha256').update(JSON.stringify(named)).digest('hex').slice(0, 20);
+  const late = uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {};
   const empty: Pick<RenderedFragment, 'changes' | 'differences' | 'blocks' | 'headings' | 'links'> = {changes: {changed: 0, removed: 0}, differences: [], blocks: [], headings: [], links: []};
   if (body.kind === 'rendered') {
     const {changes, differences, blocks, headings, links} = body.fragment;
-    return {kind: 'rendered', changes, differences, blocks, headings, links, assets};
+    return {kind: 'rendered', changes, differences, blocks, headings, links, assets, ...late};
   }
-  return {kind: body.kind, ...empty, assets, ...(body.kind === 'failed' ? {reason: body.reason} : {})};
+  return {kind: body.kind, ...empty, assets, ...late, ...(body.kind === 'failed' ? {reason: body.reason} : {})};
 }
 
 type HandlerOptions = {
@@ -69,7 +70,8 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     return true;
   };
 
-  async function fragment(request: FragmentRequest): Promise<Held> {
+  // `fresh`: rendered now, not taken from the cache.
+  async function fragment(request: FragmentRequest): Promise<Held & {fresh?: true}> {
     const known = held.get(request.key);
     if (known && await current(known, request.cwd, request.assets)) return known;
 
@@ -85,7 +87,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     // A failure can depend on the moment (a file mid-write), so it is
     // rendered again next time rather than held.
     if (body.kind !== 'failed') held.set(request.key, entry);
-    return entry;
+    return {...entry, fresh: true};
   }
 
   return {
@@ -95,9 +97,9 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
           const {type: _type, ...request} = message;
           return {ok: true, summary: (await fragment(request)).summary};
         }
-        const {body, summary} = 'fragment' in message.content ? await fragment(message.content.fragment) : {body: message.content.body, summary: summarize(message.content.body)};
+        const {body, summary, fresh} = 'fragment' in message.content ? await fragment(message.content.fragment) : {body: message.content.body, summary: summarize(message.content.body), fresh: undefined};
         const html = assembleFilePage({title: message.title, file: {...message.file, body}, rail: message.rail});
-        return {ok: true, html, summary};
+        return {ok: true, html, summary, ...(fresh ? {rerendered: true as const} : {})};
       } catch (error) {
         return {ok: false, state: 'error', reason: oneLine(error)} satisfies WorkerFailure;
       }

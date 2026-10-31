@@ -25,7 +25,7 @@ import {
   type SectionRow,
   type WrappedSection,
 } from '../sections.js';
-import {graphemes, toDisplayText, truncateEnd, truncateStart, type Grapheme} from './text.js';
+import {graphemes, renderStyledCells, toDisplayText, toStyledCells, truncateEnd, truncateStart, type Grapheme, type StyledCell} from './text.js';
 import {palette, plainDiffMode} from './palette.js';
 import {DiffErrorBoundary, renderFailureText} from './DiffErrorBoundary.js';
 import {blockSourceLines, mapDrawnToRaw} from './rawText.js';
@@ -39,8 +39,10 @@ import {createLoneEscapeGuard} from '../media/replyGuard.js';
 import {placeholderRun} from '../media/kitty.js';
 import {formatBytes, formatLabel} from '../media/layout.js';
 import type {MediaService, WantedBox} from '../media/service.js';
-import type {RenderedService} from '../rendered/service.js';
+import {LEAVES_PANE, type RenderedPages, type RenderedService, type Trip} from '../rendered/service.js';
+import {beamFrame, pressFrame} from '../rendered/beam.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
+import {createCrossingClock, type CrossingClock} from './crossing.js';
 
 /**
  * Adds media rows to the wrapped sections, before blocks are folded, and may
@@ -70,8 +72,9 @@ type AppProps = {
   addMediaRows?: MediaRowsHook;
   // Draws media files as pictures, when the terminal can.
   media?: MediaService;
-  // Renders the review's markdown in the background, the active file first.
-  rendered?: Pick<RenderedService, 'focus'>;
+  // Renders the review's markdown in the background, the active file first,
+  // and opens its pages on r and R.
+  rendered?: Pick<RenderedService, 'focus'> & Partial<RenderedPages>;
 };
 
 const SCROLL_STEP = 3;
@@ -113,6 +116,10 @@ const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
 const TREE_EXPAND_LABEL = '›';
 type FileAction = {readonly id: string; readonly label: string};
+// The rendered page leads a renderable file's actions, so it is the last
+// to drop when the header narrows.
+const RENDERED_ACTION: FileAction = {id: 'rendered.open', label: `Rendered ${LEAVES_PANE}`};
+export const RENDERED_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'j/k scroll', '[/] block', 't tree'];
 const FILE_ACTIONS: readonly FileAction[] = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -935,50 +942,6 @@ function shouldRevealAbsolutePathAction(hoveredAction?: string, copiedAction?: s
     || hoveredAction === 'copy.absolutePath'
     || copiedAction === 'copy.path'
     || copiedAction === ABSOLUTE_PATH_ACTION.id;
-}
-
-type StyledCell = {
-  char: string;
-  width: number;
-  style: string;
-};
-
-// Splits an ANSI line into one cell per grapheme, each carrying its terminal
-// width and the SGR style active at that point.
-function toStyledCells(line: string) {
-  const parts = line.split(/(\x1B\[[0-9;:]*[A-Za-z])/);
-  const cells: StyledCell[] = [];
-  let style = '';
-
-  for (const part of parts) {
-    if (!part) continue;
-    if (/^\x1B\[[0-9;:]*[A-Za-z]$/.test(part)) {
-      style = part === ANSI_RESET ? '' : style + part;
-      continue;
-    }
-
-    for (const grapheme of graphemes(part)) {
-      cells.push({char: grapheme.text, width: grapheme.width, style});
-    }
-  }
-
-  return cells;
-}
-
-function renderStyledCells(cells: StyledCell[]) {
-  let output = '';
-  let style = '';
-
-  for (const cell of cells) {
-    if (cell.style !== style) {
-      output += cell.style || ANSI_RESET;
-      style = cell.style;
-    }
-
-    output += cell.char;
-  }
-
-  return output + ANSI_RESET;
 }
 
 function compareSelectionPoints(a: CodeSelectionPoint, b: CodeSelectionPoint) {
@@ -1972,12 +1935,16 @@ type DiffPaneBodyProps = {
   copiedAction: CopiedAction | null;
   selection: CodeSelection | null;
   media?: MediaService;
+  // The crossing toward a rendered page, and the Rendered button's label
+  // columns on the file row, when it is drawn.
+  crossing: CrossingClock;
+  renderedSpan: {start: number; end: number} | null;
 };
 
 const LOADING_LABEL = 'loading preview…';
 
-const noMediaUpdates = () => () => undefined;
-const noMediaVersion = () => 0;
+const noUpdates = () => () => undefined;
+const noVersion = () => 0;
 
 // The metrics row for a media file once its shown side is inspected: format,
 // pixel size and bytes in place of line counts. A modified file with both
@@ -2144,11 +2111,19 @@ function DiffPaneBody({
   copiedAction,
   selection,
   media,
+  crossing,
+  renderedSpan,
 }: DiffPaneBodyProps) {
   const inner = Math.max(1, paneWidth - 4);
+  // Only this pane reads the crossing's clock, so its 40 ms ticks redraw
+  // the pane alone. Text rows only: picture rows are never redrawn.
+  const crossingFrame = useSyncExternalStore(crossing.subscribe, crossing.snapshot);
+  const beamAccent = palette.beam();
+  const beam = (line: string, row: number) => (crossingFrame?.motion === 'full' ? beamFrame(line, row, crossingFrame.t, inner, beamAccent) ?? line : line);
+  const pressedRow = crossingFrame ? pressFrame(fileRow, renderedSpan, crossingFrame.t, crossingFrame.motion, beamAccent) : null;
   const rows: string[] = [
     frameTopBorder(paneWidth, borderAnsi),
-    frameLine(applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
+    frameLine(pressedRow ?? applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
     frameLine(metricsRow, inner, borderAnsi),
   ];
   if (!hasChanges) {
@@ -2193,13 +2168,13 @@ function DiffPaneBody({
 
     const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
     const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-    const paneRow = frameLine(arrivalLine, inner, borderAnsi);
+    const paneRow = frameLine(beam(arrivalLine, index), inner, borderAnsi);
     rows.push(marksFocus ? paneRow.replace('│', FOCUS_BAR) : paneRow);
   }
   // A diff shorter than the pane still draws the pane's full height, so the
   // bottom border lines up with the tree pane's.
   while (rows.length < paneHeight - 1) {
-    rows.push(frameLine('', inner, borderAnsi));
+    rows.push(frameLine(beam('', rows.length - 3), inner, borderAnsi));
   }
   rows.push(frameBottomBorder(paneWidth, borderAnsi));
 
@@ -2268,7 +2243,7 @@ function AppContent({
   // Media draws only when the terminal can; otherwise the app is exactly as
   // without it.
   const mediaOn = Boolean(media && media.caps.protocol !== 'none');
-  const mediaVersion = useSyncExternalStore(media ? media.subscribe : noMediaUpdates, media ? media.getVersion : noMediaVersion);
+  const mediaVersion = useSyncExternalStore(media ? media.subscribe : noUpdates, media ? media.getVersion : noVersion);
   const mediaPlanVersion = mediaOn ? media!.planVersion() : 0;
   // Boxes are sized to the viewport once it holds still, like the wrap width.
   const mediaViewportRows = useSettledValue(mediaOn ? visibleDiffRows : 0, WRAP_SETTLE_MS);
@@ -2431,6 +2406,11 @@ function AppContent({
   useEffect(() => {
     if (activeFileKey) rendered?.focus(activeFileKey);
   }, [activeFileKey, rendered]);
+  // A view that only follows focus, as a stub can, opens no pages.
+  const pages = rendered?.open ? rendered as RenderedPages : undefined;
+  const activeRenderable = Boolean(pages && activeFileKey && pages.renderable(activeFileKey));
+  const [crossing] = useState(createCrossingClock);
+  useEffect(() => () => crossing.dispose(), [crossing]);
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
     [allDiffRows],
@@ -2457,15 +2437,16 @@ function AppContent({
   const activeMediaMetrics = activeMediaRef && activeSection ? mediaMetricsText(media!, activeMediaRef, formatMetrics(activeSection.metrics)) : null;
   const fileHover = hoveredAction?.kind === 'file-header' ? hoveredAction.id : undefined;
   const fileCopied = copiedAction?.kind === 'file-header' ? copiedAction.id : undefined;
+  const fileActionsHere = activeMediaRef?.kind === 'raster'
+    ? RASTER_FILE_ACTIONS
+    : activeMediaRef?.kind === 'video'
+      ? media!.platform === 'darwin' ? VIDEO_FILE_ACTIONS : VIDEO_FILE_ACTIONS_ELSEWHERE
+      : FILE_ACTIONS;
   const diffHeader = buildDiffHeader({
     path: activeFilePath,
     status: activeFile?.status,
     showActions: Boolean(review) && sections.length > 0,
-    actions: activeMediaRef?.kind === 'raster'
-      ? RASTER_FILE_ACTIONS
-      : activeMediaRef?.kind === 'video'
-        ? media!.platform === 'darwin' ? VIDEO_FILE_ACTIONS : VIDEO_FILE_ACTIONS_ELSEWHERE
-        : FILE_ACTIONS,
+    actions: activeRenderable ? [RENDERED_ACTION, ...fileActionsHere] : fileActionsHere,
     hoveredAction: fileHover,
     copiedAction: fileCopied,
     metricsCore: activeSection
@@ -2475,6 +2456,8 @@ function AppContent({
   });
   const diffHeaderRef = useRef(diffHeader);
   diffHeaderRef.current = diffHeader;
+  const renderedButton = diffHeader.fileSpans.find((span) => span.id === RENDERED_ACTION.id);
+  const renderedSpan = useMemo(() => (renderedButton ? {start: renderedButton.start, end: renderedButton.end} : null), [renderedButton?.start, renderedButton?.end]);
 
   const stateRef = useRef({
     treeOffset,
@@ -2784,6 +2767,28 @@ function AppContent({
     const notices = media?.takeNotices() ?? [];
     if (notices.length > 0) showToast(notices.at(-1)!, undefined, 'info');
   }, [media, mediaVersion, showToast]);
+
+  // The rendered view's notices, such as the worker giving up, are said in
+  // the footer when they happen.
+  const renderedVersion = useSyncExternalStore(pages ? pages.subscribe : noUpdates, pages ? pages.getVersion : noVersion);
+  useEffect(() => {
+    const notices = pages?.takeNotices() ?? [];
+    if (notices.length > 0) showToast(notices.at(-1)!, undefined, 'info');
+  }, [pages, renderedVersion, showToast]);
+
+  // r and R: the active file's page, or the overview. The crossing plays on
+  // the way, and the footer says where the page went once it ends.
+  const openRendered = useCallback((target: 'file' | 'overview') => {
+    if (!pages) return;
+    const trip: Trip = {
+      cross: (motion) => crossing.start(motion),
+      waiting: (message) => showToast(message, undefined, 'info'),
+    };
+    const opening = target === 'overview' ? pages.openOverview(trip) : pages.open({fileKey: activeFileKey}, trip);
+    void opening.then((outcome) => {
+      if (outcome) showToast(outcome.message, undefined, outcome.kind);
+    });
+  }, [activeFileKey, crossing, pages, showToast]);
 
   const openMediaFile = useCallback(async (ref: MediaRef, how: 'open' | 'quickLook') => {
     if (!media) return;
@@ -3234,7 +3239,7 @@ function AppContent({
           const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
           if (actionId) {
             nextHoveredAction = {kind: 'file-header', id: actionId};
-            nextInfoTip = copyActionHint(actionId);
+            nextInfoTip = actionId === RENDERED_ACTION.id ? pages?.openHint() ?? null : copyActionHint(actionId);
           }
         } else {
           const diffLineIndex = diffOffset + relativeY - 3;
@@ -3285,6 +3290,7 @@ function AppContent({
     hoveredBlockLineIndex,
     media,
     mouse,
+    pages,
     scheduleTreeTooltip,
     sections,
     terminalRows,
@@ -3456,7 +3462,9 @@ function AppContent({
       if (relativeY === 1 || relativeY === 2) {
         const header = diffHeaderRef.current;
         const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
-        if (actionId === 'media.open' || actionId === 'media.play' || actionId === 'media.quickLook') {
+        if (actionId === RENDERED_ACTION.id) {
+          openRendered('file');
+        } else if (actionId === 'media.open' || actionId === 'media.play' || actionId === 'media.quickLook') {
           if (activeMediaRef) void openMediaFile(activeMediaRef, actionId === 'media.quickLook' ? 'quickLook' : 'open');
         } else if (actionId) {
           void runCopyCommand(actionId, activeFile, focusedBlock, {kind: 'file-header', id: actionId});
@@ -3496,6 +3504,7 @@ function AppContent({
     media,
     visibleDiffRows,
     openMediaFile,
+    openRendered,
     allDiffRows,
     blockHeaderSpans,
     clearTreeTooltip,
@@ -3581,6 +3590,13 @@ function AppContent({
     const focusedTarget = focusedBlockLineIndex === null ? undefined : allDiffRows[focusedBlockLineIndex]?.target;
     if (key.return || input === ' ') {
       toggleFocusedBlock();
+      return;
+    }
+
+    // The rendered page of the active file, and the overview of them all,
+    // whatever the terminal can draw.
+    if (input === 'r' || input === 'R') {
+      openRendered(input === 'R' ? 'overview' : 'file');
       return;
     }
 
@@ -3671,7 +3687,7 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeRenderable ? RENDERED_KEY_HINT_ITEMS : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
   // A block preview is rough on purpose; while one is on screen the footer
   // says why the picture is not drawn properly.
   const footerRight = activeMediaRef && media?.caps.protocol === 'blocks' ? 'no image support detected' : `${displayBase}...${displayBranch}`;
@@ -3789,6 +3805,8 @@ function AppContent({
               copiedAction={copiedAction}
               selection={codeSelection?.lines === allDiffLines ? codeSelection : null}
               media={mediaOn ? media : undefined}
+              crossing={crossing}
+              renderedSpan={renderedSpan}
             />
           </DiffErrorBoundary>
         </DiffPane>

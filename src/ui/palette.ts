@@ -62,6 +62,8 @@ export type Palette = {
   // An Ink colour prop, or undefined (the terminal's default) without colour.
   ink: <T extends string>(color: T) => T | undefined;
   arrivalBackground: (kind: ArrivalKind, progress: number) => string | null;
+  // The rendered view's beam accent, or null with color off: no color, no beam.
+  beam: () => string | null;
 };
 
 export function createPalette(depth: ColorDepth): Palette {
@@ -96,6 +98,7 @@ export function createPalette(depth: ColorDepth): Palette {
       if (depth < 3) return step < 4 ? ARRIVAL_ANSI16 : null;
       return ARRIVAL_RAMPS[kind][step]!;
     },
+    beam: () => (enabled ? '\u001B[36m' : null),
   };
 }
 

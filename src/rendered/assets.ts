@@ -396,6 +396,9 @@ export type AssetResolver = ReturnType<typeof createAssetResolver>;
 /** An image a render looked up, and what its answer depended on. */
 export type AssetUse = {side: AssetSide; path: string; identity: string};
 
+/** The identity of a lookup that ran out of time: no image has it, so a page that used it renders again. */
+export const LATE_IDENTITY = 'late';
+
 /**
  * The image lookups for one page's render. The page's own text is the
  * after side, or for a deleted file the base side; `before` views and
@@ -415,10 +418,10 @@ export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted:
       resolve(value);
     });
   }));
-  // `late` is no identity the resolver gives, so a page that showed a late
-  // card renders again next time.
+  // LATE_IDENTITY is no identity the resolver gives, so a page that showed a
+  // late card renders again next time.
   const lookup = (side: AssetSide) => async (repoPath: string) => {
-    const {answer, identity} = await inTime(resolver.answer(sides, side, repoPath), {answer: unreadable(UNREADABLE.late), identity: 'late'});
+    const {answer, identity} = await inTime(resolver.answer(sides, side, repoPath), {answer: unreadable(UNREADABLE.late), identity: LATE_IDENTITY});
     uses.push({side, path: repoPath, identity});
     return answer;
   };
@@ -426,7 +429,7 @@ export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted:
     asset: lookup(deleted ? 'base' : 'after'),
     baseAsset: lookup('base'),
     async assetChanged(repoPath: string, basePath = repoPath) {
-      const {changed, base, after} = await inTime(resolver.compare(sides, repoPath, basePath), {changed: false, base: 'late', after: 'late'});
+      const {changed, base, after} = await inTime(resolver.compare(sides, repoPath, basePath), {changed: false, base: LATE_IDENTITY, after: LATE_IDENTITY});
       uses.push({side: 'base', path: basePath, identity: base}, {side: 'after', path: repoPath, identity: after});
       return changed;
     },

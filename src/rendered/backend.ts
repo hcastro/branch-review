@@ -39,6 +39,8 @@ export type FragmentSummary = {
   reason?: string;
   /** Names the images the page embeds and how each resolved: it changes when one of them does. */
   assets: string;
+  /** An image lookup ran out of time, so rendering again can show and mark more. */
+  late?: true;
 };
 
 export type FragmentResult = {ok: true; summary: FragmentSummary} | WorkerFailure;
@@ -56,7 +58,9 @@ export type PageRequest = {
   content: {fragment: FragmentRequest} | {body: PageBody};
 };
 
-export type PageResult = {ok: true; html: string; summary: FragmentSummary} | WorkerFailure;
+// `rerendered`: the page rendered its fragment again rather than use the one
+// held, so its summary can count differently from the fragment's answer.
+export type PageResult = {ok: true; html: string; summary: FragmentSummary; rerendered?: true} | WorkerFailure;
 
 export interface RenderedBackend {
   // `priority`: lower runs first; the active file asks with 0.
