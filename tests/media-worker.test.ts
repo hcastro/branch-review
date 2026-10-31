@@ -496,7 +496,7 @@ describe('a media worker that hangs', {timeout: 30_000}, () => {
 
   it('leaves the UI taking keys while it hangs, then says previews are off', async () => {
     const cwd = initRepo();
-    const {backend} = backendFor({modulePath: HANGING_WORKER, deadlinesMs: {inspect: 300}, backoffMs: [100, 100, 100]});
+    const {backend} = backendFor({modulePath: HANGING_WORKER, deadlinesMs: {inspect: 1_000}, backoffMs: [100, 100, 100]});
     const lines = Array.from({length: 40}, (_, index) => `${gutter(index + 1)}notes line ${index}`);
     // Three images: three jobs that time out turn previews off.
     const fixture = buildFixture([
@@ -514,22 +514,27 @@ describe('a media worker that hangs', {timeout: 30_000}, () => {
     expect(frameLines(instance.lastFrame()).join('\n')).toContain('loading preview…');
     const seen: Array<string | undefined> = [];
     for (let press = 0; press < 6; press += 1) {
+      const before = top();
       instance.stdin.write('j');
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      // A loaded CI runner can take longer than one fixed sleep to redraw, so
+      // wait for this press's frame; a UI blocked on the worker never moves.
+      await waitFor(() => top() !== before, 5_000);
       seen.push(top());
+      // The first press lands while the worker still sits on the job.
+      if (press === 0) expect(frameLines(instance.lastFrame()).join('\n')).toContain('loading preview…');
     }
     // Every press moved the view while the worker sat on the job.
     expect(new Set(seen).size).toBe(seen.length);
 
     instance.stdin.write('g');
     // The rows say it in the same commit that turns previews off; the toast
-    // follows from an effect one frame later, so wait for the footer itself.
-    await waitFor(() => (frameLines(instance.lastFrame()).at(-2) ?? '').includes('previews turned off: timed out'), 15_000);
-    const shown = frameLines(instance.lastFrame());
-    expect(shown.join('\n')).not.toContain('loading preview…');
-    // In each file's rows, and once in the footer.
-    expect(shown.slice(0, -3).filter((line) => line.includes('previews turned off: timed out')).length).toBeGreaterThanOrEqual(2);
-    expect(shown.at(-2)).toContain('previews turned off: timed out');
+    // follows from an effect one frame later. The toast lasts 2.2 s and can
+    // come and go during the presses on a slow runner, so look for it in every
+    // frame drawn, and for the rows in the latest one.
+    const footerSaidIt = () => instance.frames.some((frame) => (frameLines(frame).at(-2) ?? '').includes('previews turned off: timed out'));
+    const rowsSayIt = () => frameLines(instance.lastFrame()).slice(0, -3).filter((line) => line.includes('previews turned off: timed out')).length >= 2;
+    await waitFor(() => footerSaidIt() && rowsSayIt(), 20_000);
+    expect(frameLines(instance.lastFrame()).join('\n')).not.toContain('loading preview…');
     instance.stdin.write('k');
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(top()).not.toBe(seen.at(-1));

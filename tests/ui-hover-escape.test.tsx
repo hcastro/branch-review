@@ -27,10 +27,15 @@ describe('hover text with hidden characters', () => {
     const row = lines.findIndex((line) => line.includes('• a-file-name'));
     expect(row).toBeGreaterThanOrEqual(0);
     await emitMouseMoveAt(lines[row]!.indexOf('a-file-name') + 2, row);
-    await new Promise((resolve) => setTimeout(resolve, 350));
-    await flush();
 
     const escaped = 'a-file-name-long-enough-to-truncate<U+202E>gnp.exe<U+200B>-in-the-tree.ts';
+    // The tooltip opens after a 300 ms delay; a loaded CI runner can draw it
+    // later than that, so wait for it instead of sleeping a fixed time.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !frameLines(instance.lastFrame()).join('\n').includes(`│ ${escaped} │`)) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await flush();
     expect(frameLines(instance.lastFrame()).join('\n')).toContain(`│ ${escaped} │`);
     expectNoHiddenCharacters(instance.lastFrame());
 
