@@ -31,7 +31,7 @@ describe('the beam with NO_COLOR', () => {
     await flush();
     const from = instance.frames.length;
     instance.stdin.write('r');
-    await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain('⇗ guide.md · in the split →'), {timeout: 4_000});
+    await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain('⇗ guide.md opened in the browser split'), {timeout: 4_000});
     expect(calls).toHaveLength(1);
     for (const frame of instance.frames.slice(from)) {
       expect(frameLines(frame).slice(6).join('\n')).not.toMatch(/[░▒▓]{3,}/);

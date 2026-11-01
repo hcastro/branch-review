@@ -55,24 +55,29 @@ describe('parseCliArgs', () => {
     });
   });
 
-  it('reads --render-out with its directory, as a separate argument or after =, and --json with it', () => {
-    expect(parseCliArgs(['--render-out', 'out'], {interactive: true})).toMatchObject({renderOut: 'out', requestedBranch: 'HEAD'});
-    expect(parseCliArgs(['feature', '--render-out=./pages', '--json', 'main'], {interactive: false})).toMatchObject({
+  it('reads --export-html with its directory, as a separate argument or after =, and --json with it', () => {
+    expect(parseCliArgs(['--export-html', 'out'], {interactive: true})).toMatchObject({renderOut: 'out', requestedBranch: 'HEAD'});
+    expect(parseCliArgs(['feature', '--export-html=./pages', '--json', 'main'], {interactive: false})).toMatchObject({
       renderOut: './pages',
       json: true,
       requestedBranch: 'feature',
       requestedBase: 'main',
     });
     // Headless output never watches, even in a terminal.
-    expect(parseCliArgs(['--render-out', 'out', '--watch'], {interactive: true}).watch).toBe(false);
+    expect(parseCliArgs(['--export-html', 'out', '--watch'], {interactive: true}).watch).toBe(false);
     expect(parseCliArgs([], {interactive: true})).not.toHaveProperty('renderOut');
     expect(parseCliArgs([], {interactive: true})).not.toHaveProperty('json');
   });
 
-  it('refuses --render-out with no directory, and --json without --render-out', () => {
-    expect(() => parseCliArgs(['--render-out'], {interactive: true})).toThrow('--render-out needs a directory, for example --render-out ./rendered');
-    expect(() => parseCliArgs(['--render-out', '--json'], {interactive: true})).toThrow('--render-out needs a directory');
-    expect(() => parseCliArgs(['--render-out='], {interactive: true})).toThrow('--render-out needs a directory');
-    expect(() => parseCliArgs(['--json'], {interactive: true})).toThrow('--json works only with --render-out');
+  it('refuses --export-html with no directory, and --json without --export-html', () => {
+    expect(() => parseCliArgs(['--export-html'], {interactive: true})).toThrow('--export-html needs a directory, for example --export-html ./pages');
+    expect(() => parseCliArgs(['--export-html', '--json'], {interactive: true})).toThrow('--export-html needs a directory');
+    expect(() => parseCliArgs(['--export-html='], {interactive: true})).toThrow('--export-html needs a directory');
+    expect(() => parseCliArgs(['--json'], {interactive: true})).toThrow('--json works only with --export-html');
+  });
+
+  it('has no --render-out: the flag is --export-html, with no alias', () => {
+    expect(parseCliArgs(['--render-out', 'out'], {interactive: true})).not.toHaveProperty('renderOut');
+    expect(parseCliArgs(['--render-out=out'], {interactive: true})).not.toHaveProperty('renderOut');
   });
 });

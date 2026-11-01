@@ -17,7 +17,7 @@ import {createRenderThread} from './renderThread.js';
 import {writeErrorReason} from './site.js';
 import {createSourceReader, oneLine, pageBody, sourceSpec, type SourceSpec} from './source.js';
 
-// `--render-out <dir>`: the review's pages written to a directory, in this
+// `--export-html <dir>`: the review's pages written to a directory, in this
 // process, with no UI and no browser: its markdown and images, the markdown
 // outside it that shows an image it changed, the overview and links.json.
 // The same renderer, report and page shell as the TUI's pages; this module
@@ -27,12 +27,17 @@ import {createSourceReader, oneLine, pageBody, sourceSpec, type SourceSpec} from
 // it shows its raw text under a one-line reason.
 const RENDER_DEADLINE_MS = 5000;
 
+// The report names a markdown page for the file it is, as `image` names an
+// image's, never by how the page was made.
+export type RenderOutState = 'markdown' | Exclude<PageBody['kind'], 'rendered'>;
+
 export type RenderOutPage = {
   path: string;
   status: FileStatus;
   /** The page's file name inside the out dir. */
   file: string;
-  state: PageBody['kind'];
+  /** What the page shows: `markdown` for a markdown file's page, else its body's kind. */
+  state: RenderOutState;
   changes: RenderedFragment['changes'];
   differences: Array<{kind: DifferenceKind; count: number}>;
   /** An image's page: each side's size and dimensions. */
@@ -228,7 +233,7 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
     path: each.file.path,
     status: each.file.status,
     file: `${each.key}.html`,
-    state: body.kind,
+    state: reportState(body),
     changes: body.kind === 'rendered' ? body.fragment.changes : {changed: 0, removed: 0},
     differences: body.kind === 'rendered' ? body.fragment.differences : [],
     ...(body.kind === 'image' ? {image: imageFacts(body.image)} : {}),
@@ -256,12 +261,12 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
   const report = planned.map((each, index) => pageEntry(each, bodies[index]!));
   const also = alsoPlanned.map((each, index) => pageEntry(each, alsoBodies[index]!));
   if (all.length > 0) {
-    const entry = (page: RenderOutPage): OverviewEntry => ({
+    const entry = (page: RenderOutPage, body: PageBody): OverviewEntry => ({
       path: page.path,
       status: page.status,
       href: page.file,
-      state: page.state,
-      changes: page.state === 'rendered' ? page.changes : null,
+      state: body.kind,
+      changes: changesOf(body),
       ...(page.reason !== undefined ? {reason: page.reason} : {}),
       ...(page.image ? {image: page.image} : {}),
       ...(page.embeds ? {embeds: page.embeds} : {}),
@@ -271,9 +276,9 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
     const fileOf = (repoPath: string) => report.find((page) => page.path === repoPath)?.file ?? null;
     writeFile(outDir, outLabel, OVERVIEW_FILE, assembleOverview({
       title,
-      entries: report.map(entry),
+      entries: report.map((page, index) => entry(page, bodies[index]!)),
       differences: [...differences].map(([kind, count]) => ({kind, count})),
-      ...(also.length > 0 ? {also: also.map(entry)} : {}),
+      ...(also.length > 0 ? {also: also.map((page, index) => entry(page, alsoBodies[index]!))} : {}),
       ...(findings.length > 0 ? {findings: findings.map((finding) => ({...finding, href: fileOf(finding.path)}))} : {}),
     }));
     writeFile(outDir, outLabel, LINKS_FILE, formatLinks(review, sources, findings));
@@ -324,6 +329,10 @@ function writeFile(outDir: string, outLabel: string, name: string, html: string)
   }
 }
 
+function reportState(body: PageBody): RenderOutState {
+  return body.kind === 'rendered' ? 'markdown' : body.kind;
+}
+
 function changesOf(body: PageBody) {
   return body.kind === 'rendered' ? body.fragment.changes : null;
 }
@@ -331,7 +340,7 @@ function changesOf(body: PageBody) {
 const STATUS_LETTERS: Record<FileStatus, string> = {modified: 'M', added: 'A', deleted: 'D', renamed: 'R', untracked: 'U'};
 const STATUS_NOTES: Partial<Record<FileStatus, string>> = {added: 'new file', untracked: 'untracked', deleted: 'deleted', renamed: 'renamed'};
 const LATE_NOTE = 'git was slow · some links and images unchecked';
-const STATE_NOTES: Partial<Record<PageBody['kind'], string>> = {empty: 'empty', tooLarge: 'too large to render', notUtf8: 'not UTF-8 text', failed: "couldn't render"};
+const STATE_NOTES: Partial<Record<RenderOutState, string>> = {empty: 'empty', tooLarge: 'too large to show', notUtf8: 'not UTF-8 text', failed: "couldn't show"};
 
 // What a page's line in the summary says after its file name.
 function pageNote(page: RenderOutPage) {
@@ -358,14 +367,14 @@ function pageNote(page: RenderOutPage) {
  * escapeHiddenCharacters, as everywhere the tool prints them.
  */
 export function formatRenderOutSummary(report: RenderOutReport, outLabel: string) {
-  if (report.pages.length === 0) return 'nothing to render · no markdown, images or SVG on this branch\n';
+  if (report.pages.length === 0) return 'nothing to export · no markdown, images or SVG on this branch\n';
   const dir = outLabel.endsWith('/') ? outLabel : `${outLabel}/`;
   const all = [...report.pages, ...report.also];
   const paths = all.map((page) => escapeHiddenCharacters(page.path));
   const width = Math.max(...paths.map((shown) => shown.length)) + 3;
   const lines = all.map((page, index) => `  ${page.embeds ? '·' : STATUS_LETTERS[page.status]} ${paths[index]!.padEnd(width)}${dir}${page.file}  ${pageNote(page)}`);
   const count = all.length;
-  return [`Rendered ${count} page${count === 1 ? '' : 's'} to ${dir} · nothing left this machine`, ...lines, ''].join('\n');
+  return [`Wrote ${count} page${count === 1 ? '' : 's'} to ${dir} · nothing left this machine`, ...lines, ''].join('\n');
 }
 
 /**

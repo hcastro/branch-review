@@ -102,6 +102,8 @@ function escapeHtml(text: string) {
 }
 
 const STATUS_LETTERS: Record<FileStatus, string> = {modified: 'M', added: 'A', deleted: 'D', renamed: 'R', untracked: 'U'};
+// What each letter stands for, in words.
+const STATUS_WORDS: Record<FileStatus, string> = {modified: 'modified', added: 'new file', deleted: 'deleted', renamed: 'renamed', untracked: 'untracked'};
 
 function statusLetter(status: FileStatus) {
   return `<span class="br-status br-status-${status}">${STATUS_LETTERS[status]}</span>`;
@@ -196,7 +198,7 @@ export function assembleFilePage(input: PageInput): string {
 // the pane around it are one surface. The pane draws the change marks as
 // gutter text and has no pointer on the page, so the page draws no bars, nor
 // the cover a nested list puts over its item's bar, and leaves out the before
-// chip, and the room the chip keeps; a removed block's
+// chip, and the room and cell width the chip keeps; a removed block's
 // marker stays, folded, and names where to open it, so the gutter has a row
 // to mark. The chip hides with an important rule because the page places it
 // in list items and table cells with rules more specific than the tile's.
@@ -205,6 +207,7 @@ const TILE_CSS = [
   'html, body { min-height: 0; height: auto; background: var(--br-tile-bg); }',
   'html { width: var(--br-tile-width); scroll-padding-top: 0; }',
   ':root { --br-chip-room: 0px; --br-row-chip-room: 0px; }',
+  ':root { --br-row-chip-cell: 0px; }',
   '.br-tile .markdown-body { max-width: none; margin: 0; padding: 16px 16px 24px; background: transparent; }',
   '.br-tile .markdown-body :is([data-mark], details.br-removed)::before, .br-tile .markdown-body tr[data-mark] > :first-child::before { content: none; }',
   '.br-tile details.br-before { display: none !important; }',
@@ -293,7 +296,7 @@ function fidelity(differences: RenderedFragment['differences']) {
     '<details class="br-fidelity">',
     `<summary>${label}</summary>`,
     '<div class="br-popover">',
-    '<h2>Rendered here, offline</h2>',
+    '<h2>Drawn on this machine</h2>',
     '<p>With GitHub\'s parser rules, sanitizer and stylesheet. Nothing on this page left this machine.</p>',
     items.length > 0 ? `<ul>\n${items.join('\n')}\n</ul>` : '<p>No known differences on this page.</p>',
     '<p class="br-always">Code colors come from GitHub\'s grammars and can drift between versions.</p>',
@@ -320,7 +323,7 @@ function railLists(rail: RailEntry[]) {
         `<li><a class="br-rail-file${current}" href="${escapeHtml(entry.href)}"${ariaCurrent}>`,
         entry.also ? '<span class="br-status br-status-also">·</span>' : statusLetter(entry.status),
         `<span class="br-rail-name">${escapeHtml(path.posix.basename(entry.path))}</span>`,
-        entry.label === RAIL_PENDING ? '<span class="br-rail-count" title="not rendered yet"></span>' : `<span class="br-rail-count">${escapeHtml(entry.label)}</span>`,
+        entry.label === RAIL_PENDING ? '<span class="br-rail-count" title="not ready yet"></span>' : `<span class="br-rail-count">${escapeHtml(entry.label)}</span>`,
         '</a></li>',
       ].join('');
     }),
@@ -330,7 +333,7 @@ function railLists(rail: RailEntry[]) {
 
 function railFoot(title: PageInput['title']) {
   const renderedAt = new Date(title.renderedAt);
-  return `<p class="br-rail-foot">Rendered offline <time datetime="${renderedAt.toISOString()}">${renderedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC</time>. Nothing left this machine.</p>`;
+  return `<p class="br-rail-foot">Made <time datetime="${renderedAt.toISOString()}">${renderedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC</time>. Nothing left this machine.</p>`;
 }
 
 // The page's keys, as the rail's foot names them once the script runs.
@@ -370,9 +373,9 @@ function railSections(rail: RailEntry[], notes: readonly string[]) {
 
 function railNav(rail: RailEntry[], title: PageInput['title'], notes: readonly string[], keys: ReadonlyArray<readonly [string, string]>) {
   return [
-    '<nav class="br-rail" aria-label="Rendered files">',
+    '<nav class="br-rail" aria-label="Changed files">',
     '<div class="br-rail-panel">',
-    `<p class="br-rail-title">CHANGED · ${rail.filter((entry) => !entry.also).length} rendered</p>`,
+    `<p class="br-rail-title">CHANGED · ${plural(rail.filter((entry) => !entry.also).length, 'page')}</p>`,
     ...railSections(rail, notes),
     railKeys(keys),
     railFoot(title),
@@ -387,11 +390,11 @@ function railNav(rail: RailEntry[], title: PageInput['title'], notes: readonly s
 function switcher(rail: RailEntry[], file: PageFile, notes: readonly string[]) {
   const review = rail.filter((entry) => !entry.also);
   const index = review.findIndex((entry) => entry.current);
-  const position = rail.some((entry) => entry.current && entry.also) ? 'also looks different' : index < 0 ? `${review.length} rendered` : `${index + 1} of ${review.length}`;
+  const position = rail.some((entry) => entry.current && entry.also) ? 'also looks different' : index < 0 ? plural(review.length, 'page') : `${index + 1} of ${review.length}`;
   return [
     '<details class="br-switcher">',
     `<summary><span class="br-switcher-name">${escapeHtml(path.posix.basename(file.path))}</span><span class="br-switcher-count">${position}</span></summary>`,
-    '<nav class="br-switcher-list" aria-label="Rendered files">',
+    '<nav class="br-switcher-list" aria-label="Changed files">',
     ...railSections(rail, notes),
     '</nav>',
     '</details>',
@@ -420,6 +423,8 @@ function fileHead(file: PageFile) {
   } else {
     parts.push(BODY_STATE[file.body.kind]);
   }
+  // A letter alone says nothing to a reader new to the page: it gets its word.
+  if (parts.length === 1 && !file.also) parts.push(STATUS_WORDS[file.status]);
   return [
     '<div class="br-filehead">',
     `<h1 class="br-path">${crumbs}</h1>`,
@@ -450,13 +455,13 @@ function megabytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// What the head says of a file with no rendered page.
+// What the head says of a file with no page of its own to show.
 const BODY_STATE: Record<Exclude<PageBody['kind'], 'rendered' | 'image'>, string> = {
   empty: 'empty',
-  tooLarge: 'too large to render',
+  tooLarge: 'too large to show',
   notUtf8: 'not UTF-8 text',
-  failed: "couldn't render",
-  pending: 'not rendered yet',
+  failed: "couldn't show",
+  pending: 'not ready yet',
 };
 
 function body(file: PageFile, brokenRefs: readonly number[]) {
@@ -578,13 +583,13 @@ function cardBody(fileBody: Exclude<PageBody, {kind: 'rendered' | 'image'}>) {
     case 'empty':
       return state('this file is empty');
     case 'tooLarge':
-      return `${state(`too large to render (${megabytes(fileBody.bytes)})`)}\n${raw(fileBody.head)}`;
+      return `${state(`too large to show (${megabytes(fileBody.bytes)})`)}\n${raw(fileBody.head)}`;
     case 'notUtf8':
       return state('not UTF-8 text');
     case 'failed':
-      return `${state(`couldn't render this file · ${fileBody.reason}`, true)}\n${raw(fileBody.source)}`;
+      return `${state(`couldn't show this file · ${fileBody.reason}`, true)}\n${raw(fileBody.source)}`;
     case 'pending':
-      return state('not rendered yet · opening this file in branch-review renders it');
+      return state('not ready yet · opening this file in branch-review makes its page');
   }
 }
 
@@ -716,13 +721,13 @@ export function assembleOverview({title, entries, differences, also = [], findin
   const total = differences.reduce((sum, difference) => sum + difference.count, 0);
   const foot = total === 0 ? '' : ` · ${plural(total, 'difference')}: ${differences.map((difference) => DIFFERENCE_TEXT[difference.kind](difference.count)).join(', ')}`;
   return [
-    ...documentHead('Overview'),
+    ...documentHead('All files'),
     '<body>',
     strip(title, differences, false, chip ? `<a class="br-findings" href="#br-findings" ${findingsShort(findings)}>${chip}</a>` : null),
     '<div class="br-layout">',
-    '<nav class="br-rail" aria-label="Overview">',
+    '<nav class="br-rail" aria-label="All files">',
     '<div class="br-rail-panel">',
-    '<p class="br-rail-title">OVERVIEW</p>',
+    '<p class="br-rail-title">ALL FILES</p>',
     '<ul class="br-rail-stats">',
     ...counts.map((count) => `<li>${count}</li>`),
     '</ul>',
@@ -732,7 +737,7 @@ export function assembleOverview({title, entries, differences, also = [], findin
     '</nav>',
     '<main class="br-main br-overview">',
     '<div class="br-filehead">',
-    `<h1 class="br-path">Rendered view of <span class="br-branch">${escapeHtml(title.branch)}</span></h1>`,
+    `<h1 class="br-path">All files in <span class="br-branch">${escapeHtml(title.branch)}</span></h1>`,
     `<p class="br-summary">${counts.join(' · ')}</p>`,
     '</div>',
     '<div class="br-groups">',
@@ -740,7 +745,7 @@ export function assembleOverview({title, entries, differences, also = [], findin
     overviewGroup('Also looks different', also, title.base),
     overviewGroup('Deleted', deleted, title.base),
     group("Won't render on GitHub", findings.map(findingRow), 'br-findings'),
-    `<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub's stylesheet${escapeHtml(foot)}</p>`,
+    `<p class="br-overview-foot">≈ GitHub · drawn on this machine with GitHub's stylesheet${escapeHtml(foot)}</p>`,
     '</div>',
     '</main>',
     '</div>',

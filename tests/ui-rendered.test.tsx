@@ -19,7 +19,7 @@ import {
 } from './ui-fixtures.js';
 import {cleanupTempDirs} from './core-helpers.js';
 
-// The trip from the TUI to a rendered page: the Rendered button and its
+// The trip from the TUI to a page in the browser: the Review in browser button and its
 // hint, `r` and `R`, the footer's hints and toasts, and the beam the TUI
 // plays on the way. The surface is real, with cmux, the browser opener and
 // tool lookup recorded, so these tests see the exact commands a press
@@ -47,20 +47,20 @@ async function waitForFrame(instance: {lastFrame: () => string | undefined}, nee
   await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain(needle), {timeout: 4_000, interval: 20});
 }
 
-describe('the Rendered button', () => {
+describe('the Review in browser button', () => {
   it('leads a markdown file\'s header actions, and stays off every other file', async () => {
     const fixture = docs();
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     const header = frameLines(instance.lastFrame())[4]!;
-    expect(header).toMatch(/docs\/guide\.md\s+╭─Rendered ⇗─╮ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
+    expect(header).toMatch(/docs\/guide\.md\s+╭─Review in browser ⇗─╮ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
 
     instance.stdin.write('\u001B[B');
     await flush(2);
     const other = frameLines(instance.lastFrame())[4]!;
     expect(other).toContain('src/app.ts');
-    expect(other).not.toContain('Rendered');
+    expect(other).not.toContain('Review');
     instance.unmount();
   });
 
@@ -69,16 +69,16 @@ describe('the Rendered button', () => {
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/hero\.png\s+╭─Rendered ⇗─╮/);
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/hero\.png\s+╭─Review in browser ⇗─╮/);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ hero.png · in the split → · nothing left this machine');
+    await waitForFrame(instance, '⇗ hero.png opened in the browser split');
     expect(calls[0]!.args.slice(0, 3)).toEqual(['--json', 'browser', 'open-split']);
 
     instance.stdin.write('\u001B[B');
     await flush(2);
-    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/flow\.svg\s+╭─Rendered ⇗─╮/);
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/flow\.svg\s+╭─Review in browser ⇗─╮/);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ flow.svg · in the split →');
+    await waitForFrame(instance, '⇗ flow.svg opened in the browser split');
     expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
     instance.unmount();
   });
@@ -86,7 +86,7 @@ describe('the Rendered button', () => {
   it('is the last header action to drop when the pane narrows', async () => {
     const fixture = docs();
     const {service} = fakeRenderedService({review: fixture.review});
-    for (const [columns, shown] of [[96, ['Rendered ⇗', 'Copy path', 'Copy diff']], [74, ['Rendered ⇗']]] as const) {
+    for (const [columns, shown] of [[96, ['Review in browser ⇗', 'Copy path']], [74, ['Review in browser ⇗']]] as const) {
       const instance = renderFixture({...fixture, rendered: service}, {columns, rows: 30});
       await flush();
       const header = frameLines(instance.lastFrame())[4]!;
@@ -101,10 +101,10 @@ describe('the Rendered button', () => {
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    const at = cellPosition(instance.lastFrame(), ['Rendered ⇗'], 'Rendered');
+    const at = cellPosition(instance.lastFrame(), ['Review in browser ⇗'], 'Review');
     await emitMouseMoveAt(at.column + 2, at.row);
     await flush(2);
-    expect(frameLines(instance.lastFrame())[1]).toContain('r · opens the rendered page in a split to the right');
+    expect(frameLines(instance.lastFrame())[1]).toContain("Open this file's changes in a browser split, as GitHub shows them");
     instance.unmount();
   });
 
@@ -113,9 +113,9 @@ describe('the Rendered button', () => {
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    const at = cellPosition(instance.lastFrame(), ['Rendered ⇗'], 'Rendered');
+    const at = cellPosition(instance.lastFrame(), ['Review in browser ⇗'], 'Review');
     await emitMousePressAt(at.column + 1, at.row);
-    await waitForFrame(instance, '⇗ guide.md · in the split →');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     expect(calls).toHaveLength(1);
     instance.unmount();
   });
@@ -127,7 +127,7 @@ describe('the footer', () => {
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    expect(frameLines(instance.lastFrame()).find((line) => line.includes('q quit'))).toContain('q quit • ↑/↓ jump file • r rendered ⇗ • R all • j/k scroll • [/] block • t tree');
+    expect(frameLines(instance.lastFrame()).find((line) => line.includes('q quit'))).toContain('q quit • ↑/↓ jump file • r review in browser • R all files in browser • j/k scroll • [/] block • t tree');
     instance.stdin.write('\u001B[B');
     await flush(2);
     expect(frameLines(instance.lastFrame()).find((line) => line.includes('q quit'))).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold');
@@ -154,7 +154,7 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ guide.md · in the split → · nothing left this machine');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     expect(calls).toHaveLength(1);
     expect(calls[0]!.command).toBe('/fake/bin/cmux');
     const url = calls[0]!.args[3]!;
@@ -169,7 +169,7 @@ describe('r and R', () => {
     instance.stdin.write('\u001B[B');
     await flush(2);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ README.md · in the split →');
+    await waitForFrame(instance, '⇗ README.md opened in the browser split');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('nothing left this machine');
     expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
     expect(calls[1]!.args[4]).not.toBe(url);
@@ -188,7 +188,7 @@ describe('r and R', () => {
     const first = rows.findIndex((row) => row.includes('Line 1 of'));
     expect(first).toBeGreaterThan(0);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ long.md · in the split →');
+    await waitForFrame(instance, '⇗ long.md opened in the browser split');
     // The pane's view: its rows under the file head, down to its bottom border.
     const pane = frameLines(instance.lastFrame()).findIndex((line, index) => index > 6 && line.startsWith('╰')) - 6;
     expect(new URL(calls[0]!.args[3]!).hash).toBe(`#at=L1&f=${Math.round((first / pane) * 100) / 100}&d=full&m=1&n=1`);
@@ -212,7 +212,7 @@ describe('r and R', () => {
     instance.stdin.write('\u001B[B');
     await flush(2);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ docs/guide.md · first rendered file · in the split →');
+    await waitForFrame(instance, '⇗ docs/guide.md opened in the browser split · the first file with a page');
     instance.unmount();
   });
 
@@ -222,9 +222,9 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('R');
-    await waitForFrame(instance, '⇗ overview · in the split →');
+    await waitForFrame(instance, '⇗ all files opened in the browser split');
     const html = fs.readFileSync(new URL(calls[0]!.args[3]!).pathname, 'utf8');
-    expect(html).toContain('<title>Overview · branch-review</title>');
+    expect(html).toContain('<title>All files · branch-review</title>');
     expect(html).toContain('docs/guide.md');
     expect(html).toContain('README.md');
     instance.unmount();
@@ -236,7 +236,7 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, "⇗ guide.md · cmux didn't answer · opened in your browser");
+    await waitForFrame(instance, "⇗ guide.md opened in your browser · cmux didn't answer");
     expect(opened).toHaveLength(1);
     expect(opened[0]![0]).toBe('/usr/bin/open');
     expect(opened[0]![1]).toEqual([expect.stringMatching(/^file:\/\/.+\.html#at=L1&f=0\.\d+&d=full&m=1&n=1$/)]);
@@ -249,7 +249,7 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ guide.md · opened in your browser');
+    await waitForFrame(instance, '⇗ guide.md opened in your browser');
     instance.stdin.write('r');
     await vi.waitFor(() => expect(opened).toHaveLength(2));
     expect(calls).toEqual([]);
@@ -263,7 +263,7 @@ describe('r and R', () => {
     await flush();
     const framesBefore = instance.frames.length;
     instance.stdin.write('r');
-    await waitForFrame(instance, "✗ open isn't available over SSH · branch-review --render-out <dir> writes the pages");
+    await waitForFrame(instance, "✗ open isn't available over SSH · branch-review --export-html <dir> writes the pages");
     for (const frame of instance.frames.slice(framesBefore)) expect(stripAnsi(frame)).not.toMatch(BAND);
     expect(calls).toEqual([]);
     expect(opened).toEqual([]);
@@ -276,7 +276,7 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service, graphics: {protocol: 'none', detectionTimedOut: false} as never}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ guide.md · in the split →');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     expect(calls).toHaveLength(1);
     instance.unmount();
   });
@@ -287,31 +287,31 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, 'nothing to render · no markdown, images or SVG on this branch');
+    await waitForFrame(instance, 'nothing to open in the browser · no markdown, images or SVG on this branch');
     instance.stdin.write('R');
     await flush(2);
     expect(calls).toEqual([]);
     instance.unmount();
   });
 
-  it('says once, in the footer, that the rendered view turned off', async () => {
+  it('says once, in the footer, that Preview and Review in browser turned off', async () => {
     const fixture = docs();
-    const {service} = fakeRenderedService({review: fixture.review, motion: 'off', offAfterFirst: 'rendered view turned off: the worker kept crashing'});
+    const {service} = fakeRenderedService({review: fixture.review, motion: 'off', offAfterFirst: 'Preview and Review in browser turned off: the worker kept crashing'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('R');
-    await waitForFrame(instance, '✗ rendered view turned off: the worker kept crashing');
+    await waitForFrame(instance, '✗ Preview and Review in browser turned off: the worker kept crashing');
     instance.unmount();
   });
 
   it('says in the footer, with no key pressed, that the worker gave up during the background render', async () => {
     const fixture = docs();
-    const {service} = fakeRenderedService({review: fixture.review, offAfterFirst: 'rendered view turned off: the worker kept crashing'});
+    const {service} = fakeRenderedService({review: fixture.review, offAfterFirst: 'Preview and Review in browser turned off: the worker kept crashing'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('turned off');
     // The background pass starts 2 s after the review, and its second fragment turns the view off.
-    await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✗ rendered view turned off: the worker kept crashing'), {timeout: 6_000, interval: 20});
+    await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain('✗ Preview and Review in browser turned off: the worker kept crashing'), {timeout: 6_000, interval: 20});
     instance.unmount();
   });
 });
@@ -339,12 +339,12 @@ describe('the beam', () => {
 
     const from = instance.frames.length;
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ guide.md · in the split →');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     const during = instance.frames.slice(from);
     const swept = during.filter((frame) => diffRows(frame).some((row) => BAND.test(row)));
     expect(swept.length).toBeGreaterThanOrEqual(2);
     // The press shows on the button first, in inverse.
-    expect(during.some((frame) => frame.includes('\u001B[7mRendered ⇗'))).toBe(true);
+    expect(during.some((frame) => frame.includes('\u001B[7mReview in browser ⇗'))).toBe(true);
     for (const frame of during) expect(pictureRows(frame)).toEqual(resting);
     // The band never lands on the header rows, and is gone once the toast shows.
     for (const frame of during) expect(frameLines(frame).slice(0, 6).join('\n')).not.toMatch(BAND);
@@ -366,7 +366,7 @@ describe('the beam', () => {
 
     const from = instance.frames.length;
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ guide.md · in the split →');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     const during = instance.frames.slice(from).map((frame) => diffRows(frame));
     expect(during.filter((rows) => rows.some((row) => BAND.test(stripAnsi(row)))).length).toBeGreaterThanOrEqual(2);
     for (const rows of during) {
@@ -385,10 +385,10 @@ describe('the beam', () => {
       await flush();
       const from = instance.frames.length;
       instance.stdin.write('r');
-      await waitForFrame(instance, '⇗ guide.md · in the split →');
+      await waitForFrame(instance, '⇗ guide.md opened in the browser split');
       const during = instance.frames.slice(from).map((frame) => stripAnsi(frame));
       for (const frame of during) expect(diffRows(frame).join('\n')).not.toMatch(BAND);
-      expect(during.some((frame) => frameLines(frame)[4]!.includes('╭─░░░░░░░░░░─╮')), motion).toBe(motion === 'reduced');
+      expect(during.some((frame) => frameLines(frame)[4]!.includes(`╭─${'░'.repeat('Review in browser ⇗'.length)}─╮`)), motion).toBe(motion === 'reduced');
       instance.unmount();
     }
   });
@@ -403,7 +403,7 @@ describe('the beam', () => {
     const from = instance.frames.length;
     const started = performance.now();
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ long.md · in the split →');
+    await waitForFrame(instance, '⇗ long.md opened in the browser split');
     const elapsed = performance.now() - started;
     const frames = instance.frames.slice(from);
     const swept = frames.filter((frame) => BAND.test(stripAnsi(frame)));
@@ -427,20 +427,20 @@ describe('the footer of an image or an SVG with the rendered view on', () => {
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, media: media.service, rendered: service}, WIDE);
     await flush(8);
-    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • o open • v text • j/k scroll • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • o open • v text • j/k scroll • r review in browser • t tree');
     expect(footerOf(instance.lastFrame())).not.toContain('R all');
     instance.stdin.write('\u001B[B');
     await flush(8);
-    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • ⏎ unfold source • v source only • [/] block • o open • y d f c p b copy • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • ⏎ unfold source • v source only • [/] block • o open • y d f c p b copy • r review in browser • t tree');
     expect(footerOf(instance.lastFrame())).not.toContain('R all');
     // Markdown keeps its own list, and a code file the base one.
     instance.stdin.write('\u001B[B');
     await flush(8);
-    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • r rendered ⇗ • R all • j/k scroll • [/] block • t tree');
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • r review in browser • R all files in browser • j/k scroll • [/] block • t tree');
     instance.stdin.write('\u001B[B');
     await flush(8);
     expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • t tree');
-    expect(footerOf(instance.lastFrame())).not.toContain('r rendered');
+    expect(footerOf(instance.lastFrame())).not.toContain('r review in browser');
     instance.unmount();
   });
 
@@ -449,7 +449,7 @@ describe('the footer of an image or an SVG with the rendered view on', () => {
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, rendered: service}, WIDE);
     await flush(8);
-    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • r review in browser • t tree');
     expect(footerOf(instance.lastFrame())).not.toContain('R all');
     instance.unmount();
   });

@@ -105,28 +105,28 @@ function featureRepo() {
 }
 
 describe('startup cost', () => {
-  it('loads the renderer only for --render-out, so the UI starts without it', () => {
+  it('loads the renderer only for --export-html, so the UI starts without it', () => {
     const startup = fs.readFileSync(fileURLToPath(new URL('../src/startup.ts', import.meta.url)), 'utf8');
     expect(startup).not.toMatch(/^import .* from '\.\/rendered\//m);
     expect(startup).toContain("await import('./rendered/renderOut.js')");
   });
 });
 
-describe('--render-out', () => {
+describe('--export-html', () => {
   it('writes one page per markdown file and prints a JSON report of them', () => {
     const repo = featureRepo();
     const out = path.join(makeTempDir('branch-review-out-'), 'pages');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
 
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report).toMatchObject({version: 1, base: 'main', branch: 'feature', dir: out});
     expect(report.pages.map((page) => [page.path, page.status, page.state])).toEqual([
-      ['docs/guide.md', 'modified', 'rendered'],
-      ['docs/new.md', 'added', 'rendered'],
-      ['docs/old.md', 'deleted', 'rendered'],
-      ['docs/renamed.md', 'renamed', 'rendered'],
+      ['docs/guide.md', 'modified', 'markdown'],
+      ['docs/new.md', 'added', 'markdown'],
+      ['docs/old.md', 'deleted', 'markdown'],
+      ['docs/renamed.md', 'renamed', 'markdown'],
     ]);
     const guide = report.pages[0]!;
     expect(guide.changes).toEqual({changed: 1, removed: 1});
@@ -157,7 +157,7 @@ describe('--render-out', () => {
     });
     commitAll(repo, 'links');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     const file = (repoPath: string) => report.pages.find((page) => page.path === repoPath)!.file;
@@ -177,7 +177,7 @@ describe('--render-out', () => {
     const before = snapshotTree(repo);
     const out = makeTempDir('branch-review-out-');
 
-    const result = runCli(path.join(repo, 'notes'), ['HEAD', 'main', '--render-out', out, '--json']);
+    const result = runCli(path.join(repo, 'notes'), ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
@@ -196,26 +196,26 @@ describe('--render-out', () => {
     const repo = initRepo({'docs/a.md': '# A\n'});
     writeFiles(repo, {'docs/a.md': '# A\n\nMore.\n'});
     const work = makeTempDir('branch-review-work-');
-    const first = runCli(work, ['--render-out', 'rendered']);
+    const first = runCli(work, ['--export-html', 'rendered']);
     expect(first.status).toBe(1);
     expect(first.stderr).toMatch(/^branch-review: not a git repository/);
 
-    const inRepo = runCli(path.join(repo, 'docs'), ['--render-out', 'rendered', '--json']);
+    const inRepo = runCli(path.join(repo, 'docs'), ['--export-html', 'rendered', '--json']);
     expect(inRepo.status).toBe(0);
     const report = JSON.parse(inRepo.stdout) as Report;
     expect(report.dir).toBe(path.join(repo, 'docs', 'rendered'));
-    const again = runCli(path.join(repo, 'docs'), ['--render-out', 'rendered', '--json']);
+    const again = runCli(path.join(repo, 'docs'), ['--export-html', 'rendered', '--json']);
     expect(again.status).toBe(0);
     expect(fs.readdirSync(path.join(repo, 'docs', 'rendered')).sort()).toEqual([report.pages[0]!.file, 'links.json', 'overview.html'].sort());
   });
 
   it('prints a short summary without --json, with paths as given', () => {
     const repo = featureRepo();
-    const result = runCli(repo, ['feature', 'main', '--render-out', 'out']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', 'out']);
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const lines = result.stdout.trimEnd().split('\n');
-    expect(lines[0]).toBe('Rendered 4 pages to out/ · nothing left this machine');
+    expect(lines[0]).toBe('Wrote 4 pages to out/ · nothing left this machine');
     expect(lines.slice(1).map((line) => line.replace(/[0-9a-f]{20}/, 'KEY'))).toEqual([
       '  M docs/guide.md     out/KEY.html  1 changed · 1 removed',
       '  A docs/new.md       out/KEY.html  new file · 1 difference',
@@ -226,14 +226,14 @@ describe('--render-out', () => {
     expect(result.stdout).not.toContain('\u001B');
   });
 
-  it('says there is nothing to render when no markdown changed', () => {
+  it('says there is nothing to export when no markdown changed', () => {
     const repo = initRepo({'a.ts': 'x\n'});
     writeFiles(repo, {'a.ts': 'y\n'});
     const out = makeTempDir('branch-review-out-');
-    const text = runCli(repo, ['HEAD', 'main', '--render-out', out]);
+    const text = runCli(repo, ['HEAD', 'main', '--export-html', out]);
     expect(text.status).toBe(0);
-    expect(text.stdout).toBe('nothing to render · no markdown, images or SVG on this branch\n');
-    const json = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    expect(text.stdout).toBe('nothing to export · no markdown, images or SVG on this branch\n');
+    const json = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(json.status).toBe(0);
     expect((JSON.parse(json.stdout) as Report).pages).toEqual([]);
     expect(fs.readdirSync(out)).toEqual([]);
@@ -245,12 +245,12 @@ describe('--render-out', () => {
     fs.writeFileSync(path.join(repo, 'big.md'), `# Big\n\n${'word '.repeat(450_000)}\n`);
     fs.writeFileSync(path.join(repo, 'latin.md'), Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]));
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state])).toEqual([['big.md', 'tooLarge'], ['empty.md', 'empty'], ['latin.md', 'notUtf8']]);
     const big = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
-    expect(big).toContain('too large to render (2.1 MB)');
+    expect(big).toContain('too large to show (2.1 MB)');
     expect(big).toContain('<pre class="br-raw"># Big');
     for (const page of report.pages) {
       expect(fs.readFileSync(path.join(out, page.file), 'utf8')).not.toMatch(/\/Users\/|\/home\/|\n {4}at /);
@@ -262,7 +262,7 @@ describe('--render-out', () => {
     writeFiles(repo, {'a.md': '# A\n\nB.\n'});
     const parent = makeTempDir('branch-review-out-');
     fs.writeFileSync(path.join(parent, 'taken'), 'a file, not a dir');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', path.join(parent, 'taken')]);
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', path.join(parent, 'taken')]);
     expect(result.status).toBe(1);
     expect(result.stdout).toBe('');
     expect(result.stderr).toMatch(/^branch-review: can't write the pages to .*taken: not a directory\n$/);
@@ -270,12 +270,12 @@ describe('--render-out', () => {
 
   it('refuses a missing directory and a lone --json with a usage line', () => {
     const repo = initRepo({'a.md': '# A\n'});
-    const missing = runCli(repo, ['--render-out']);
+    const missing = runCli(repo, ['--export-html']);
     expect(missing.status).toBe(1);
-    expect(missing.stderr).toBe('branch-review: --render-out needs a directory, for example --render-out ./rendered\n');
+    expect(missing.stderr).toBe('branch-review: --export-html needs a directory, for example --export-html ./pages\n');
     const lone = runCli(repo, ['--json']);
     expect(lone.status).toBe(1);
-    expect(lone.stderr).toBe('branch-review: --json works only with --render-out\n');
+    expect(lone.stderr).toBe('branch-review: --json works only with --export-html\n');
   });
 
   it('writes the whole report into a pipe that is read late, past the pipe\'s 64 KiB buffer', async () => {
@@ -287,13 +287,13 @@ describe('--render-out', () => {
     writeFiles(repo, files);
     const out = makeTempDir('branch-review-out-');
 
-    const json = await runCliIntoSlowPipe(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const json = await runCliIntoSlowPipe(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(json.stderr).toBe('');
     expect(json.status).toBe(0);
     expect(Buffer.byteLength(json.stdout)).toBeGreaterThan(64 * 1024);
     expect((JSON.parse(json.stdout) as Report).pages).toHaveLength(75);
 
-    const text = await runCliIntoSlowPipe(repo, ['HEAD', 'main', '--render-out', out]);
+    const text = await runCliIntoSlowPipe(repo, ['HEAD', 'main', '--export-html', out]);
     expect(text.status).toBe(0);
     const lines = text.stdout.trimEnd().split('\n');
     expect(Buffer.byteLength(text.stdout)).toBeGreaterThan(64 * 1024);
@@ -309,16 +309,16 @@ describe('--render-out', () => {
     writeFiles(repo, {'a-slow.md': `${'*a'.repeat(100_000)}\n`, 'b-fine.md': '# Fine\n'});
     const out = makeTempDir('branch-review-out-');
     const started = Date.now();
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     expect(Date.now() - started).toBeLessThan(30_000);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state, page.reason])).toEqual([
-      ['a-slow.md', 'failed', 'took too long to render'],
-      ['b-fine.md', 'rendered', undefined],
+      ['a-slow.md', 'failed', 'took too long to prepare'],
+      ['b-fine.md', 'markdown', undefined],
     ]);
     const slow = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
-    expect(slow).toContain("couldn't render this file · took too long to render");
+    expect(slow).toContain("couldn't show this file · took too long to prepare");
     expect(slow).toContain('<pre class="br-raw">*a*a*a');
   });
 
@@ -328,14 +328,14 @@ describe('--render-out', () => {
     writeFiles(repo, {[name]: '# Evil\n'});
     const out = makeTempDir('branch-review-out-');
 
-    const json = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const json = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(json.status).toBe(0);
     expect(json.stdout).not.toMatch(HIDDEN);
     expect(json.stdout).not.toContain('\u001B');
     expect(json.stdout).toContain('evil\\u009b31m\\u202eDM\\u001b[2J.md');
     expect((JSON.parse(json.stdout) as Report).pages.map((page) => page.path)).toEqual([name]);
 
-    const text = runCli(repo, ['HEAD', 'main', '--render-out', out]);
+    const text = runCli(repo, ['HEAD', 'main', '--export-html', out]);
     expect(text.status).toBe(0);
     expect(text.stdout).not.toMatch(HIDDEN);
     expect(text.stdout).not.toContain('\u001B');
@@ -350,27 +350,27 @@ describe('--render-out', () => {
     // Past the 16 MiB read limit the review uses for other files.
     writeFiles(repo, {'huge.md': `# Huge\n\n${'word '.repeat(3_600_000)}\n`});
 
-    const worktree = runCli(repo, ['HEAD', 'main', '--render-out', makeTempDir('branch-review-out-'), '--json']);
+    const worktree = runCli(repo, ['HEAD', 'main', '--export-html', makeTempDir('branch-review-out-'), '--json']);
     expect(worktree.status).toBe(0);
     const pages = (JSON.parse(worktree.stdout) as Report).pages;
     expect(pages.map((page) => [page.path, page.state])).toEqual([['committed.md', 'tooLarge'], ['huge.md', 'tooLarge']]);
     const huge = fs.readFileSync(path.join((JSON.parse(worktree.stdout) as Report).dir, pages[1]!.file), 'utf8');
-    expect(huge).toContain('too large to render (17.2 MB)');
+    expect(huge).toContain('too large to show (17.2 MB)');
     expect(huge).toContain('<pre class="br-raw"># Huge');
 
-    const atRef = runCli(repo, ['feature', 'main', '--render-out', makeTempDir('branch-review-out-'), '--json']);
+    const atRef = runCli(repo, ['feature', 'main', '--export-html', makeTempDir('branch-review-out-'), '--json']);
     expect(atRef.status).toBe(0);
     const report = JSON.parse(atRef.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state])).toEqual([['committed.md', 'tooLarge']]);
     const committed = fs.readFileSync(path.join(report.dir, report.pages[0]!.file), 'utf8');
-    expect(committed).toContain('too large to render (3.3 MB)');
+    expect(committed).toContain('too large to show (3.3 MB)');
     expect(committed).toContain('<pre class="br-raw"># Committed');
   });
 
   it('leaves the OS temp dir as it was', () => {
     const repo = featureRepo();
     const osTmp = makeTempDir('branch-review-os-tmp-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', makeTempDir('branch-review-out-')], {osTmp});
+    const result = runCli(repo, ['feature', 'main', '--export-html', makeTempDir('branch-review-out-')], {osTmp});
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     // tsx, which runs the CLI from source here, keeps its compile cache there.
@@ -382,7 +382,7 @@ describe('--render-out', () => {
     writeFiles(repo, {'docs/guide.md': '# Guide\n\nStep one, edited.\n\nSee the [old notes](old.md).\n\nStep three.\n'});
     commitAll(repo, 'link to the deleted file');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     const guide = fs.readFileSync(path.join(out, report.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
@@ -399,14 +399,14 @@ describe('--render-out', () => {
     git(repo, 'mv', 'big.md', 'bigger.md');
     commitAll(repo, 'renames');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.status, page.state, page.reason])).toEqual([
       ['bigger.md', 'renamed', 'tooLarge', undefined],
       ['moved.md', 'renamed', 'notUtf8', undefined],
     ]);
-    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toContain('too large to render (2.1 MB)');
+    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toContain('too large to show (2.1 MB)');
   });
 
   it('marks only the edited block of a doc moved with its images', () => {
@@ -418,7 +418,7 @@ describe('--render-out', () => {
     writeFiles(repo, {'guide/guide.md': '# Guide\n\nIntro, edited.\n\n![Logo](logo.png)\n'});
     commitAll(repo, 'move the guide');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.status, page.changes])).toEqual([['guide/guide.md', 'renamed', {changed: 1, removed: 0}]]);
@@ -430,16 +430,16 @@ describe('--render-out', () => {
     writeFiles(repo, {'a.md': '# A\n\nBREAKDELTA here, edited.\n', 'b.md': '# B\n\nFine, edited.\n'});
     const binDir = wrappedDelta('input=$(cat); case "$input" in *BREAKDELTA*) echo "delta broke" >&2; exit 1;; esac; printf \'%s\\n\' "$input" |');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json'], {binDir});
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json'], {binDir});
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state, page.changes])).toEqual([
-      ['a.md', 'rendered', {changed: 1, removed: 0}],
-      ['b.md', 'rendered', {changed: 1, removed: 0}],
+      ['a.md', 'markdown', {changed: 1, removed: 0}],
+      ['b.md', 'markdown', {changed: 1, removed: 0}],
     ]);
     expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toMatch(/<p [^>]*data-mark="modified">BREAKDELTA here, edited\./);
 
-    const summary = runCli(repo, ['HEAD', 'main', '--render-out', out], {binDir});
+    const summary = runCli(repo, ['HEAD', 'main', '--export-html', out], {binDir});
     expect(summary.stdout).toMatch(/^ {2}M a\.md /m);
   });
 
@@ -447,7 +447,7 @@ describe('--render-out', () => {
     const repo = initRepo({'README.md': '# Readme\n'});
     writeFiles(repo, {'README.md': '# Readme\n\n[a](constructor), [b](toString), [c](__proto__) and [d](missing.md).\n'});
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     const readme = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
@@ -465,12 +465,12 @@ describe('--render-out', () => {
     // editor or an agent can while branch-review runs.
     const binDir = wrappedDelta(`printf '# A\\n\\nNew first.\\n\\nOne, edited.\\n\\nTwo.\\n' > '${path.join(repo, 'a.md')}'`);
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json'], {binDir});
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json'], {binDir});
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state, page.changes, page.reason])).toEqual([
       ['a.md', 'failed', {changed: 0, removed: 0}, "doesn't match the diff: changed since the review read it, or changed by a git filter"],
-      ['b.md', 'rendered', {changed: 1, removed: 0}, undefined],
+      ['b.md', 'markdown', {changed: 1, removed: 0}, undefined],
     ]);
     const page = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
     expect(page).not.toMatch(/<[a-z]+ [^>]*data-mark=/);
@@ -491,7 +491,7 @@ describe('--render-out', () => {
     writeFiles(repo, {'notes/draft.png': 'not committed'});
     const out = makeTempDir('branch-review-out-');
 
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.stderr).toBe('');
     const report = JSON.parse(result.stdout) as Report;
     const readme = report.pages.find((page) => page.path === 'README.md')!;
@@ -517,7 +517,7 @@ describe('--render-out', () => {
     const repo = initRepo({'README.md': '# Readme\n'});
     writeFiles(repo, {'a-slow.md': `${'*a'.repeat(100_000)}\n`, 'b-fine.md': '# Fine\n\nText.\n'});
     const out = makeTempDir('branch-review-out-');
-    const result = spawnSync(process.execPath, [path.join(build, 'dist/cli.js'), 'HEAD', 'main', '--render-out', out, '--json'], {
+    const result = spawnSync(process.execPath, [path.join(build, 'dist/cli.js'), 'HEAD', 'main', '--export-html', out, '--json'], {
       cwd: repo,
       env: {...process.env, BRANCH_REVIEW_TMPDIR: makeTempDir('branch-review-render-tmp-')},
       encoding: 'utf8',
@@ -527,14 +527,14 @@ describe('--render-out', () => {
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     expect(report.pages.map((page) => [page.path, page.state, page.reason])).toEqual([
-      ['a-slow.md', 'failed', 'took too long to render'],
-      ['b-fine.md', 'rendered', undefined],
+      ['a-slow.md', 'failed', 'took too long to prepare'],
+      ['b-fine.md', 'markdown', undefined],
     ]);
     expect(fs.readFileSync(path.join(out, report.pages[1]!.file), 'utf8')).toMatch(/<p data-block="[^"]+" data-lines="3-3">Text\.<\/p>/);
   });
 });
 
-describe('--render-out over the whole branch', () => {
+describe('--export-html over the whole branch', () => {
   type Whole = Report & {also: Report['pages']; findings: Array<{path: string; line: number; target: string; what: string; kind: string; reason: string}>};
   type Links = {version: number; findings: Whole['findings']; links: Array<{path: string; line: number; href: string; status: string}>};
 
@@ -558,14 +558,14 @@ describe('--render-out over the whole branch', () => {
   it('shows the README that embeds a changed image under "also looks different", with the image\'s page saying where it appears', () => {
     const repo = heroRepo();
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
     expect(report.pages.map((page) => [page.path, page.state])).toEqual([['docs/hero.png', 'image']]);
     // Its text didn't change; the image it shows did. A file that only
     // names the image in its text shows nothing that changed.
-    expect(report.also.map((page) => [page.path, page.status, page.state, page.changes])).toEqual([['README.md', 'modified', 'rendered', {changed: 1, removed: 0}]]);
+    expect(report.also.map((page) => [page.path, page.status, page.state, page.changes])).toEqual([['README.md', 'modified', 'markdown', {changed: 1, removed: 0}]]);
 
     const overview = fs.readFileSync(path.join(out, 'overview.html'), 'utf8');
     expect(overview).toContain('<h2 class="br-group-title">Also looks different</h2>');
@@ -630,7 +630,7 @@ describe('--render-out over the whole branch', () => {
     fs.writeFileSync(path.join(repo, 'docs/new.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="blue"/></svg>\n');
     commitAll(repo, 'move the logo');
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
     expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/new.svg', 'renamed']]);
@@ -646,7 +646,7 @@ describe('--render-out over the whole branch', () => {
     git(repo, 'mv', 'docs/old.md', 'docs/new.md');
     fs.writeFileSync(path.join(repo, 'docs/hero.png'), pngFixture(4, 5, [40, 40, 200, 255]));
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
     expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/hero.png', 'modified'], ['docs/new.md', 'renamed']]);
@@ -663,7 +663,7 @@ describe('--render-out over the whole branch', () => {
     git(repo, 'checkout', '-q', '-b', 'feature');
     fs.writeFileSync(path.join(repo, name), pngFixture(4, 5, [40, 40, 200, 255]));
     commitAll(repo, 'a new hero');
-    const text = runCli(repo, ['feature', 'main', '--render-out', makeTempDir('branch-review-out-')]);
+    const text = runCli(repo, ['feature', 'main', '--export-html', makeTempDir('branch-review-out-')]);
     expect(text.status).toBe(0);
     expect(text.stdout).not.toMatch(HIDDEN);
     expect(text.stdout).toContain('text unchanged · embeds docs/x<U+202E>gnp.<U+009B>31mexe.png');
@@ -672,7 +672,7 @@ describe('--render-out over the whole branch', () => {
   it('finds a planted bad anchor and a link to a file that isn\'t there, in links.json, the overview and the page', () => {
     const repo = heroRepo({'docs/guide.md': '# Guide\n\n## Install\n\nRun it. Then [read the readme](../README.md#nope), the [install step](#install) and [the notes](notes.md).\n'});
     const out = makeTempDir('branch-review-out-');
-    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
     // The README isn't in the review: its anchors come from the file git holds.
@@ -693,7 +693,7 @@ describe('--render-out over the whole branch', () => {
     // With the README in the review, its anchors are known: #nope isn't one.
     const both = heroRepo({'docs/guide.md': '# Guide\n\nRead the [readme](../README.md#nope) or [its top](../README.md#project).\n', 'README.md': '# Project\n\nThe hero, now:\n\n![Hero](docs/hero.png)\n'});
     const again = makeTempDir('branch-review-out-');
-    const second = JSON.parse(runCli(both, ['feature', 'main', '--render-out', again, '--json']).stdout) as Whole;
+    const second = JSON.parse(runCli(both, ['feature', 'main', '--export-html', again, '--json']).stdout) as Whole;
     expect(second.findings).toEqual([{path: 'docs/guide.md', line: 3, target: '../README.md#nope', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}]);
     const guide = fs.readFileSync(path.join(again, second.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
     const readmeFile = second.pages.find((page) => page.path === 'README.md')!.file;

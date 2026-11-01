@@ -49,7 +49,7 @@ describe('assembleOverview', () => {
     expect(html.split(`<script>${PAGE_SCRIPT}</script>`)).toHaveLength(2);
     expect(html.split(`<script>${HEAD_SCRIPT}</script>`)).toHaveLength(2);
     expect(html.replace(`<script>${HEAD_SCRIPT}</script>`, '').replace(`<script>${PAGE_SCRIPT}</script>`, '')).not.toMatch(/<script|\sstyle=|\son[a-z]+=/i);
-    expect(html).toContain('<title>Overview · branch-review</title>');
+    expect(html).toContain('<title>All files · branch-review</title>');
   });
 
   it('lists the pages in review order with status, what changed and a link, and deleted files apart', () => {
@@ -66,10 +66,10 @@ describe('assembleOverview', () => {
 
   it('counts the pages in the rail and the head, and names the branch', () => {
     const html = overview();
-    expect(html).toContain('<p class="br-rail-title">OVERVIEW</p>');
+    expect(html).toContain('<p class="br-rail-title">ALL FILES</p>');
     // Each count matches its group: three rows under Pages, one under Deleted.
     expect(html).toMatch(/<ul class="br-rail-stats">\s*<li>3 pages<\/li>\s*<li>1 deleted<\/li>\s*<\/ul>/);
-    expect(html).toContain('<h1 class="br-path">Rendered view of <span class="br-branch">feature/rich-view</span></h1>');
+    expect(html).toContain('<h1 class="br-path">All files in <span class="br-branch">feature/rich-view</span></h1>');
     expect(html).toContain('<p class="br-summary">3 pages · 1 deleted</p>');
     expect(section(html, 'Pages')).toHaveLength(3);
     expect(section(html, 'Deleted')).toHaveLength(1);
@@ -80,17 +80,17 @@ describe('assembleOverview', () => {
   it('says what each state is, and gives a file with no page yet no link', () => {
     const html = overview({entries: [
       {path: 'a.md', status: 'modified', href: 'f-aaaaaaaaaaaaaaaaaaaa.html', state: 'rendered', changes: {changed: 0, removed: 0}},
-      {path: 'b.md', status: 'modified', href: 'f-bbbbbbbbbbbbbbbbbbbb.html', state: 'failed', changes: null, reason: 'took too long to render'},
+      {path: 'b.md', status: 'modified', href: 'f-bbbbbbbbbbbbbbbbbbbb.html', state: 'failed', changes: null, reason: 'took too long to prepare'},
       {path: 'c.md', status: 'renamed', oldPath: 'old/c.md', href: 'f-cccccccccccccccccccc.html', state: 'rendered', changes: {changed: 2, removed: 0}},
       {path: 'd.md', status: 'untracked', href: 'f-dddddddddddddddddddd.html', state: 'empty', changes: null},
       {path: 'e.md', status: 'modified', href: null, state: 'pending', changes: null},
     ]});
     expect(section(html, 'Pages')).toEqual([
       'M a.md no blocks marked open ›',
-      "M b.md couldn't render · took too long to render open ›",
+      "M b.md couldn't show · took too long to prepare open ›",
       'R c.md renamed from old/c.md · 2 changed open ›',
       'U d.md untracked · empty open ›',
-      'M e.md not rendered yet',
+      'M e.md not ready yet',
     ]);
     expect(html).toContain('<div class="br-row br-row-modified br-row-none">');
   });
@@ -103,15 +103,15 @@ describe('assembleOverview', () => {
       {path: 'old/d.md', status: 'deleted', href: 'f-dddddddddddddddddddd.html', state: 'rendered', changes: null},
     ]});
     expect(section(html, 'Deleted')).toEqual([
-      "D old/b.md couldn't render · parser gave up open ›",
-      'D old/c.md not rendered yet',
+      "D old/b.md couldn't show · parser gave up open ›",
+      'D old/c.md not ready yet',
       'D old/d.md shown dimmed from main open ›',
     ]);
   });
 
   it('says why a file has no page when its page couldn\'t be written', () => {
     const html = overview({entries: [{path: 'a.md', status: 'modified', href: null, state: 'pending', changes: null, reason: 'disk full'}]});
-    expect(section(html, 'Pages')).toEqual(['M a.md not rendered yet · disk full']);
+    expect(section(html, 'Pages')).toEqual(['M a.md not ready yet · disk full']);
   });
 
   it('lines every row\'s note up in one column across the groups', () => {
@@ -138,8 +138,8 @@ describe('assembleOverview', () => {
   it('sums what the pages do differently from github.com, in the strip and the foot', () => {
     const html = overview({differences: [{kind: 'mermaid', count: 1}, {kind: 'remoteImage', count: 2}]});
     expect(html).toContain('<summary>≈ GitHub · 3 differences</summary>');
-    expect(html).toContain('<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub\'s stylesheet · 3 differences: 1 Mermaid diagram shown as code, 2 remote images not loaded: the page works offline</p>');
-    expect(overview({differences: []})).toContain('<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub\'s stylesheet</p>');
+    expect(html).toContain('<p class="br-overview-foot">≈ GitHub · drawn on this machine with GitHub\'s stylesheet · 3 differences: 1 Mermaid diagram shown as code, 2 remote images not loaded: the page works offline</p>');
+    expect(overview({differences: []})).toContain('<p class="br-overview-foot">≈ GitHub · drawn on this machine with GitHub\'s stylesheet</p>');
   });
 
   // The whole branch: an image and an SVG among the pages, a page whose text

@@ -17,7 +17,7 @@ import type {RenderedFragment} from './markdown.js';
 import type {PageBody} from './page.js';
 
 // A markdown file's text for its page, read the same way for the TUI's
-// pages and for `--render-out`: the side the review shows, proven to be the
+// pages and for `--export-html`: the side the review shows, proven to be the
 // text its diff was read from, or a card that says why not.
 
 // Larger files show a card and their first bytes instead of a page, and no
@@ -89,7 +89,7 @@ export function createSourceReader({sleep = (ms) => new Promise((resolve) => set
     return {
       kind: 'mismatch',
       bytes: again.bytes,
-      reason: same ? "doesn't match the diff: changed since the review read it, or changed by a git filter" : 'changed on disk while rendering',
+      reason: same ? "doesn't match the diff: changed since the review read it, or changed by a git filter" : 'changed on disk while its page was made',
     };
   }
 

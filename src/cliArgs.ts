@@ -7,18 +7,18 @@ export type CliOptions = {
   // Image previews: 'off' from --no-images, 'auto' from --images; unset
   // means auto. Set only when a flag was given.
   images?: 'auto' | 'off';
-  // --render-out <dir>: write the rendered pages there and exit, with no
-  // UI. Set only when given, as is --json, which prints the report as JSON.
+  // --export-html <dir>: write the pages that Review in browser opens there
+  // and exit, with no UI. Set only when given, as is --json, which prints the report as JSON.
   renderOut?: string;
   json?: boolean;
 };
 
-const RENDER_OUT = '--render-out';
-const NEEDS_DIRECTORY = '--render-out needs a directory, for example --render-out ./rendered';
+const RENDER_OUT = '--export-html';
+const NEEDS_DIRECTORY = '--export-html needs a directory, for example --export-html ./pages';
 
 /**
  * The options in `argv`. Throws with a one-line usage message for a
- * `--render-out` with no directory, or a `--json` without one.
+ * `--export-html` with no directory, or a `--json` without one.
  */
 export function parseCliArgs(argv: string[], {interactive}: {interactive: boolean}): CliOptions {
   const positional: string[] = [];
@@ -83,7 +83,7 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
     positional.push(arg);
   }
 
-  if (json && renderOut === undefined) throw new Error('--json works only with --render-out');
+  if (json && renderOut === undefined) throw new Error('--json works only with --export-html');
 
   return {
     requestedBranch: positional[0] ?? 'HEAD',

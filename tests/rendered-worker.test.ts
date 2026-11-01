@@ -87,12 +87,12 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     for (let strike = 0; strike < 3; strike += 1) {
       expect(await rendered.fragment(fragmentOf(cwd, `hang-${strike}.md`), never)).toEqual({ok: false, state: 'error', reason: 'timed out'});
     }
-    expect(rendered.disabledReason()).toBe('rendered view turned off: timed out');
+    expect(rendered.disabledReason()).toBe('Preview and Review in browser turned off: timed out');
     expect(offReasons).toEqual(['timed out']);
     // Off: answered at once, with no fourth worker.
-    expect(await rendered.fragment(fragmentOf(cwd, 'answer.md'), never)).toEqual({ok: false, state: 'unavailable', reason: 'rendered view turned off: timed out'});
+    expect(await rendered.fragment(fragmentOf(cwd, 'answer.md'), never)).toEqual({ok: false, state: 'unavailable', reason: 'Preview and Review in browser turned off: timed out'});
     expect(await rendered.page({key: 'k', title: {repo: 'r', base: 'main', branch: 'b', worktree: false, renderedAt: 0}, file: {path: 'answer.md', status: 'modified'}, rail: [], content: {body: {kind: 'empty'}}}, never))
-      .toEqual({ok: false, state: 'unavailable', reason: 'rendered view turned off: timed out'});
+      .toEqual({ok: false, state: 'unavailable', reason: 'Preview and Review in browser turned off: timed out'});
     expect(renderedLog(tempDir).filter((entry) => entry.event === 'start')).toHaveLength(3);
 
     // The media worker never saw a strike and still answers.

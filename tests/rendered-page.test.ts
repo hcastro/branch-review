@@ -146,8 +146,8 @@ describe('assembleFilePage', () => {
     expect(html).toContain('<title>page.md · branch-review</title>');
     expect(html).toContain('<article class="markdown-body">');
     expect(html).toMatch(/<header class="br-strip">.*branch-review.*main.*←.*feature\/rich-view/s);
-    expect(html).toContain('<nav class="br-rail" aria-label="Rendered files">');
-    expect(html).toContain('CHANGED · 3 rendered');
+    expect(html).toContain('<nav class="br-rail" aria-label="Changed files">');
+    expect(html).toContain('CHANGED · 3 pages');
     expect(html).toContain('<a class="br-rail-file br-current" href="aaaa.html" aria-current="page">');
     expect(html).toContain('<a class="br-rail-file" href="bbbb.html">');
     expect(html).toMatch(/<span class="br-rail-dir">docs\/<\/span>.*<span class="br-rail-dir">\(root\)<\/span>/s);
@@ -171,6 +171,18 @@ describe('assembleFilePage', () => {
     expect(html).toContain('<p class="br-summary"><span class="br-status br-status-modified">M</span> · 3 changed · 1 removed</p>');
   });
 
+  it('says in a word what a file head\'s letter means when nothing else follows it', async () => {
+    const fragment = await rendered('Text.\n');
+    const head = (file: Partial<PageFile>) => /<p class="br-summary">(.*)<\/p>/.exec(assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'rendered', fragment}, ...file} as PageFile)))![1];
+    expect(head({status: 'added'})).toBe('<span class="br-status br-status-added">A</span> · new file');
+    expect(head({status: 'deleted'})).toBe('<span class="br-status br-status-deleted">D</span> · deleted');
+    expect(head({status: 'untracked'})).toBe('<span class="br-status br-status-untracked">U</span> · untracked');
+    expect(head({status: 'renamed', oldPath: 'docs/old.md'})).toBe('<span class="br-status br-status-renamed">R</span> · renamed');
+    expect(head({status: 'modified'})).toBe('<span class="br-status br-status-modified">M</span> · modified');
+    // A count already says what changed, so the letter keeps it company.
+    expect(head({status: 'added', body: {kind: 'rendered', fragment: {...fragment, changes: {changed: 2, removed: 0}}}})).toBe('<span class="br-status br-status-added">A</span> · 2 changed');
+  });
+
   it('shows a banner for a new, untracked, deleted or renamed file', async () => {
     const fragment = await rendered('Text.\n');
     const banner = (file: Partial<PageFile>) => assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'rendered', fragment}, ...file} as PageFile));
@@ -185,21 +197,21 @@ describe('assembleFilePage', () => {
     const page = (body: PageFile['body']) => assembleFilePage(input({path: 'a.md', status: 'modified', body}));
     expect(page({kind: 'empty'})).toContain('<p class="br-state">this file is empty</p>');
     const large = page({kind: 'tooLarge', bytes: 2.4 * 1024 * 1024, head: '# Head <b>raw</b>'});
-    expect(large).toContain('<p class="br-state">too large to render (2.4 MB)</p>');
+    expect(large).toContain('<p class="br-state">too large to show (2.4 MB)</p>');
     expect(large).toContain('<pre class="br-raw"># Head &#x3C;b>raw&#x3C;/b></pre>');
     expect(page({kind: 'notUtf8'})).toContain('<p class="br-state">not UTF-8 text</p>');
     const failed = page({kind: 'failed', reason: 'parser gave up', source: 'raw <script>'});
-    expect(failed).toContain("<p class=\"br-state br-state-error\">couldn't render this file · parser gave up</p>");
+    expect(failed).toContain("<p class=\"br-state br-state-error\">couldn't show this file · parser gave up</p>");
     expect(failed).toContain('<pre class="br-raw">raw &#x3C;script></pre>');
   });
 
   it('sets a file with no rendered page in the article\'s box, and says its state in the head', () => {
     const page = (body: PageFile['body']) => assembleFilePage(input({path: 'a.md', status: 'modified', body}));
-    const failed = page({kind: 'failed', reason: 'took too long to render', source: '# Raw'});
-    expect(failed).toContain('<div class="br-body">\n<p class="br-state br-state-error">couldn\'t render this file · took too long to render</p>\n<pre class="br-raw"># Raw</pre>\n</div>');
-    expect(failed).toContain('<p class="br-summary"><span class="br-status br-status-modified">M</span> · couldn\'t render</p>');
+    const failed = page({kind: 'failed', reason: 'took too long to prepare', source: '# Raw'});
+    expect(failed).toContain('<div class="br-body">\n<p class="br-state br-state-error">couldn\'t show this file · took too long to prepare</p>\n<pre class="br-raw"># Raw</pre>\n</div>');
+    expect(failed).toContain('<p class="br-summary"><span class="br-status br-status-modified">M</span> · couldn\'t show</p>');
     expect(page({kind: 'empty'})).toContain('M</span> · empty</p>');
-    expect(page({kind: 'tooLarge', bytes: 3 * 1024 * 1024, head: ''})).toContain('M</span> · too large to render</p>');
+    expect(page({kind: 'tooLarge', bytes: 3 * 1024 * 1024, head: ''})).toContain('M</span> · too large to show</p>');
     expect(page({kind: 'notUtf8'})).toContain('M</span> · not UTF-8 text</p>');
     // The article's measure and inset, at every width; the card and raw
     // text set no width of their own.
@@ -243,10 +255,10 @@ describe('assembleFilePage', () => {
     expect(CHROME_CSS).toMatch(/@media \(max-width: 479px\) \{\s*\.br-brand-word \{ position: absolute;[^}]*clip: rect\(0, 0, 0, 0\);/);
   });
 
-  it('says a file the background render hasn\'t reached is not rendered yet', () => {
+  it('says a file the background render hasn\'t reached is not ready yet', () => {
     const html = assembleFilePage(input({path: 'a.md', status: 'modified', body: {kind: 'pending'}}));
-    expect(html).toContain('<p class="br-state">not rendered yet · opening this file in branch-review renders it</p>');
-    expect(html).toContain('M</span> · not rendered yet</p>');
+    expect(html).toContain('<p class="br-state">not ready yet · opening this file in branch-review makes its page</p>');
+    expect(html).toContain('M</span> · not ready yet</p>');
   });
 
   it('escapes every repo-supplied string it prints', async () => {
@@ -345,7 +357,7 @@ describe('page.css', () => {
     const narrow = CHROME_CSS.slice(CHROME_CSS.indexOf('@media (max-width: 900px)'));
     expect(narrow).toMatch(/^@media \(max-width: 900px\) \{[^@]*\.br-rail \{ display: none; \}[^@]*\.br-switcher \{ display: block; \}/);
     const html = await page();
-    expect(html).toMatch(/<main class="br-main">\n<details class="br-switcher">\n<summary><span class="br-switcher-name">page\.md<\/span><span class="br-switcher-count">1 of 3<\/span><\/summary>\n<nav class="br-switcher-list" aria-label="Rendered files">/);
+    expect(html).toMatch(/<main class="br-main">\n<details class="br-switcher">\n<summary><span class="br-switcher-name">page\.md<\/span><span class="br-switcher-count">1 of 3<\/span><\/summary>\n<nav class="br-switcher-list" aria-label="Changed files">/);
     expect(html.match(/href="bbbb\.html"/g)).toHaveLength(2);
   });
 
@@ -357,10 +369,11 @@ describe('page.css', () => {
     expect(rule('.br-popover')).toMatch(/white-space: normal;[\s\S]*text-align: left;/);
   });
 
-  it('keeps a closed before chip in a table cell beside the cell\'s text', () => {
+  it('keeps a closed before chip in a table cell at the foot of the cell, out of the cells\' flow', () => {
     // As specific as the closed chip's own rule, and after it, so it wins.
     const cell = '.markdown-body :is(td, th) > details.br-before:not([open])';
-    expect(rule(cell)).toMatch(/position: static;[\s\S]*transform: none;/);
+    expect(rule(cell)).toMatch(/right: 13px;[\s\S]*transform: none;/);
+    expect(rule('.markdown-body :is(td, th) > details.br-before')).toMatch(/position: absolute;[\s\S]*right: 13px;[\s\S]*bottom: 6px;/);
     expect(CHROME_CSS.indexOf(`${cell} {`)).toBeGreaterThan(CHROME_CSS.indexOf('.markdown-body details.br-before:not([open]) {'));
   });
 
@@ -381,7 +394,7 @@ describe('page.css', () => {
     expect(CHROME_CSS).toMatch(/@media \(prefers-color-scheme: light\) \{\s*\.markdown-body :is\(img, \.br-card\)\[data-gh-theme="dark"\] \{ display: none; \}/);
   });
 
-  it('shows no count in the rail for a file not rendered yet, and says so on hover', async () => {
+  it('shows no count in the rail for a file not ready yet, and says so on hover', async () => {
     expect(railLabel('modified', 'pending')).toBe('');
     expect(railLabel('renamed', 'pending')).toBe('');
     // A new or deleted file's mark needs no render.
@@ -392,7 +405,7 @@ describe('page.css', () => {
       {path: 'docs/page.md', status: 'modified', href: 'aaaa.html', label: '3', current: true},
       {path: 'README.md', status: 'modified', href: 'cccc.html', label: '', current: false},
     ]});
-    expect(html).toContain('<span class="br-rail-name">README.md</span><span class="br-rail-count" title="not rendered yet"></span>');
+    expect(html).toContain('<span class="br-rail-name">README.md</span><span class="br-rail-count" title="not ready yet"></span>');
     expect(html).toContain('<span class="br-rail-name">page.md</span><span class="br-rail-count">3</span>');
   });
 
@@ -428,7 +441,9 @@ describe('page.css', () => {
     const panel = rule('.br-rail-panel');
     expect(panel).toMatch(/position: sticky;[\s\S]*top: 44px;[\s\S]*max-height: calc\(100vh - 44px\);[\s\S]*overflow-y: auto;/);
     const html = await page();
-    expect(html).toMatch(/<nav class="br-rail" aria-label="Rendered files">\n<div class="br-rail-panel">\n<p class="br-rail-title">CHANGED · 3 rendered<\/p>[\s\S]*<p class="br-rail-foot">[^\n]*<\/p>\n<\/div>\n<\/nav>/);
+    expect(html).toMatch(/<nav class="br-rail" aria-label="Changed files">\n<div class="br-rail-panel">\n<p class="br-rail-title">CHANGED · 3 pages<\/p>[\s\S]*<p class="br-rail-foot">[^\n]*<\/p>\n<\/div>\n<\/nav>/);
+    // When it was made, and that nothing left this machine, said once.
+    expect(html).toMatch(/<p class="br-rail-foot">Made <time datetime="[^"]+">[^<]+ UTC<\/time>\. Nothing left this machine\.<\/p>/);
   });
 
   it('starts the file head and banners at the article\'s left edge', () => {
@@ -583,7 +598,7 @@ describe('the rail and strip of a page in a review with findings', () => {
       report: {own: [{path: 'docs/page.md', line: 1, target: '#nowhere', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}], notes: ['1 link won\'t resolve', '1 image: case mismatch']},
     }));
     const rail = html.slice(html.indexOf('<nav class="br-rail"'), html.indexOf('</nav>', html.indexOf('<nav class="br-rail"')));
-    expect(rail).toContain('<p class="br-rail-title">CHANGED · 1 rendered</p>');
+    expect(rail).toContain('<p class="br-rail-title">CHANGED · 1 page</p>');
     expect(rail).toMatch(/<p class="br-rail-title">ALSO LOOKS DIFFERENT<\/p>\n<span class="br-rail-dir">\(root\)<\/span>\n<ul>\n<li><a class="br-rail-file" href="bbbb\.html"><span class="br-status br-status-also">·<\/span><span class="br-rail-name">CONTRIBUTING\.md<\/span><span class="br-rail-count">img<\/span><\/a><\/li>/);
     expect(rail).toContain('<ul class="br-rail-findings"><li>1 link won&#x27;t resolve</li><li>1 image: case mismatch</li></ul>'.replace('&#x27;', "'"));
     expect(html).toContain('<span class="br-findings" title="Won\'t resolve on GitHub" data-short="✗ 1">1 broken link</span>');

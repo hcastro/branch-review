@@ -119,6 +119,9 @@ export type AppFixtureProps = {
   addMediaRows?: MediaRowsHook;
   media?: MediaService;
   rendered?: Pick<RenderedService, 'focus'> | RenderedService;
+  // The first-time tip in the footer. Off unless a test is about it, so a
+  // footer read at startup shows the key hints.
+  tips?: boolean;
 };
 
 export function appElement(
@@ -142,6 +145,7 @@ export function appElement(
       {...(fixture.addMediaRows ? {addMediaRows: fixture.addMediaRows} : {})}
       {...(fixture.media ? {media: fixture.media} : {})}
       {...(fixture.rendered ? {rendered: fixture.rendered} : {})}
+      tips={fixture.tips ?? false}
     />
   );
 }

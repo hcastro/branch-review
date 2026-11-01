@@ -137,7 +137,7 @@ describe('the rendered view\'s trip at startup', () => {
     const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async (motion) => {
       crossings.push(motion);
     }, waiting: () => undefined});
-    expect(outcome).toEqual({kind: 'info', message: '⇗ README.md · in the split → · nothing left this machine'});
+    expect(outcome).toEqual({kind: 'info', message: '⇗ README.md opened in the browser split'});
     expect(crossings).toEqual(['off']);
     const [call] = fs.readFileSync(log, 'utf8').trim().split('\n');
     // With --no-animations the page arrives final: m=0.
@@ -184,7 +184,7 @@ describe('the rendered view\'s trip at startup', () => {
     const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
     const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#d=full&m=0&n=1$/;
     if (process.platform === 'darwin') {
-      expect(outcome).toEqual({kind: 'info', message: "⇗ README.md · cmux didn't answer · opened in your browser · nothing left this machine"});
+      expect(outcome).toEqual({kind: 'info', message: "⇗ README.md opened in your browser · cmux didn't answer"});
       expect(opened).toEqual([['/usr/bin/open', [expect.stringMatching(page)]]]);
     } else {
       // Elsewhere the fallback is xdg-open from PATH, when there is one.

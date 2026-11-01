@@ -791,7 +791,7 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
     }
   }, 30_000);
 
-  it('keeps a table row\'s before chip past its cells, so its column stays aligned and opening it reflows nothing', async () => {
+  it('keeps a table row\'s before chip out of its cells\' flow, so its column stays aligned and opening it reflows nothing', async () => {
     const before = '# Features\n\n| Feature | Status | Notes |\n| --- | :---: | ---: |\n| Offline mode | done | 12 |\n| Sync | planned | 3 |\n\n- [x] First release\n- [ ] Plugin system\n- [ ] Remote widgets\n';
     const after = before.replace('| Sync | planned | 3 |', '| Sync | in progress | 5 |\n| Themes | planned | 1 |').replace('- [ ] Plugin system', '- [x] Plugin system');
     const fragment = await renderMarkdown({path: 'README.md', source: after, groups: changeGroups(diffFile(before, after, 'README.md')), asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
@@ -820,6 +820,76 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
     // The old row lies over the rows after it, not under them.
     const onTop = await evaluate<boolean>('(() => { const view = document.querySelector("table .br-before-body").getBoundingClientRect(); return document.elementFromPoint(view.left + view.width / 2, view.top + view.height / 2).closest(".br-before-body") !== null; })()');
     expect(onTop).toBe(true);
+  }, 30_000);
+
+  it('puts each table row\'s before chip at the foot of the row\'s last cell, at one place on every row, crossing no border, and leaves the cells their widths', async () => {
+    const before = '# Options\n\n| Option | Default | Meaning |\n| --- | --- | --- |\n| `size` | `12` | Size in pixels |\n| `color` | `blue` | Fill color |\n| `label` | none | Accessible name |\n';
+    const after = before.replace('Size in pixels', 'Widget size in pixels').replace('`blue`', '`teal`');
+    const fragment = await renderMarkdown({path: 'README.md', source: after, groups: changeGroups(diffFile(before, after, 'README.md')), asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const title: PageInput['title'] = {repo: 'project', base: 'main', branch: 'feature', worktree: false, renderedAt: 0};
+    fs.writeFileSync(path.join(pageDir, 'widths.html'), assembleFilePage({title, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment}}, rail: []}));
+    type Shown = {widths: number[][]; chips: Array<{chip: number[]; cell: number[]}>};
+    // Each row's cell widths, and each chip's box with its row's last cell's.
+    const measure = `(() => {
+      const rows = [...document.querySelectorAll('.markdown-body > table > tbody > tr')];
+      const box = (element) => { const rect = element.getBoundingClientRect(); return [rect.left, rect.top, rect.right, rect.bottom].map(Math.round); };
+      return {
+        widths: rows.map((row) => [...row.children].map((cell) => Math.round(cell.getBoundingClientRect().width))),
+        chips: rows.flatMap((row) => { const chip = row.querySelector(':scope > :last-child > details.br-before > summary'); return chip ? [{chip: box(chip), cell: box(row.lastElementChild)}] : []; }),
+      };
+    })()`;
+    try {
+      for (const width of [VIEW.width, 400]) {
+        await page('Emulation.setDeviceMetricsOverride', {width, height: VIEW.height, deviceScaleFactor: 1, mobile: false});
+        await load('m=0&n=185', urlOf('widths.html'));
+        const shown = await evaluate<Shown>(measure);
+        expect(shown.chips, `${width}`).toHaveLength(2);
+        for (const {chip, cell} of shown.chips) {
+          const [left, top, right, bottom] = cell as [number, number, number, number];
+          expect(chip[0]!, `${width} left`).toBeGreaterThanOrEqual(left);
+          expect(chip[1]!, `${width} top`).toBeGreaterThanOrEqual(top);
+          expect(chip[2]!, `${width} right`).toBeLessThanOrEqual(right);
+          expect(chip[3]!, `${width} bottom`).toBeLessThanOrEqual(bottom);
+        }
+        expect(new Set(shown.chips.map(({chip}) => chip[2])).size, `${width}`).toBe(1);
+        // GitHub's widths are the cells' with the marks off, which shows no chip.
+        await evaluate('document.documentElement.classList.add("br-marks-off")');
+        expect(shown.widths, `${width}`).toEqual((await evaluate<Shown>(measure)).widths);
+      }
+    } finally {
+      await page('Emulation.setDeviceMetricsOverride', {...VIEW, deviceScaleFactor: 1, mobile: false});
+    }
+  }, 30_000);
+
+  it('keeps the words on the GitHub chip and the Changes button on a 400 px screen', async () => {
+    await page('Emulation.setDeviceMetricsOverride', {width: 400, height: VIEW.height, deviceScaleFactor: 1, mobile: false});
+    try {
+      await load('m=0&n=187');
+      expect(await evaluate<string>('getComputedStyle(document.querySelector(".br-fidelity > summary"), "::before").content')).toMatch(/^"≈ GitHub"/);
+      const word = await evaluate<{width: number; text: string}>('(() => { const word = document.querySelector(".br-marks .br-control-word"); return {width: word.getBoundingClientRect().width, text: word.textContent}; })()');
+      expect(word.text).toBe('Changes');
+      expect(word.width).toBeGreaterThan(0);
+    } finally {
+      await page('Emulation.setDeviceMetricsOverride', {...VIEW, deviceScaleFactor: 1, mobile: false});
+    }
+  }, 30_000);
+
+  it('scrolls to a heading from the link GitHub writes for it, #slug, on load and on a later hash', async () => {
+    const heading = 'document.getElementById("user-content-how-the-trip-works")';
+    const top = `Math.round(${heading}.getBoundingClientRect().top)`;
+    await load('how-the-trip-works');
+    expect(await evaluate<number>('scrollY')).toBeGreaterThan(0);
+    // Under the strip, at the page's scroll padding.
+    expect(await evaluate<number>(top)).toBe(52);
+    await load('m=0&n=186');
+    expect(await evaluate<number>('scrollY')).toBe(0);
+    await evaluate('location.hash = "how-the-trip-works"');
+    await frames();
+    expect(await evaluate<number>(top)).toBe(52);
+    // A slug that names no heading leaves the page where it is.
+    await evaluate('scrollTo(0, 0); location.hash = "no-such-heading"');
+    await frames();
+    expect(await evaluate<number>('scrollY')).toBe(0);
   }, 30_000);
 
   it('fits a narrow screen: a forced theme keeps its lengths, the popover stays on screen, and the raw lines wrap', async () => {

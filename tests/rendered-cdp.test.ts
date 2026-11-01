@@ -539,10 +539,10 @@ describe('the tile jobs', () => {
     now += 1_000;
     expect((await tile() as {tilesOff?: true}).tilesOff).toBeUndefined();
     // The third failure in the minute is the one that turns tiles off, and says so.
-    expect(await tile()).toMatchObject({ok: false, tilesOff: true, reason: 'in-pane view turned off: the browser exited (code 3)'});
+    expect(await tile()).toMatchObject({ok: false, tilesOff: true, reason: 'the browser exited (code 3) · off for this session'});
     now += 1_000;
     const off = await tile();
-    expect(off).toMatchObject({ok: false, tilesOff: true, reason: 'in-pane view turned off: the browser exited (code 3)'});
+    expect(off).toMatchObject({ok: false, tilesOff: true, reason: 'the browser exited (code 3) · off for this session'});
     expect(calls).toBe(4);
     // Still the rendered view: a page job works.
     expect(await handler.handle({type: 'layout', source: source(dir)})).toMatchObject({ok: false, tilesOff: true});

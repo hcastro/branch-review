@@ -8,8 +8,8 @@ import {BROWSER_JOB_DEADLINES_MS, type RenderedBackend, type RenderedJobs} from 
 
 const RENDERED_WORKER: ForkedWorkerSpec<keyof RenderedJobs> = {
   entry: 'renderedWorker',
-  label: 'rendered worker',
-  offLabel: 'rendered view turned off',
+  label: 'page worker',
+  offLabel: 'Preview and Review in browser turned off',
   tempSubdir: 'rendered-worker',
   deadlinesMs: {
     fragment: 5_000,

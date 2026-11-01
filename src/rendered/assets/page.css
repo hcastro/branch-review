@@ -213,8 +213,8 @@ html, body {
 .br-control[aria-expanded="true"] { border-color: var(--br-accent); }
 .br-control:focus-visible { outline: 2px solid var(--br-accent); outline-offset: 2px; }
 .br-theme-mark { color: var(--br-accent); }
-/* The marks button shows a change bar, which still says what it toggles
-   when a narrow strip drops its word. */
+/* The marks button shows a change bar beside its word, the color of the
+   bars it toggles. */
 .br-marks-bar { color: var(--br-faint); }
 .br-marks[aria-pressed="true"] .br-marks-bar { color: var(--br-modified); }
 .br-help-button { justify-content: center; width: 26px; padding: 0; font-weight: 600; }
@@ -745,7 +745,7 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 /* With the marks hidden (`m`), the page reads as GitHub's alone: no bars,
    no removed markers, no before chips and no room kept for them. */
 :root.br-marks-off { --br-chip-room: 0px; }
-:root.br-marks-off { --br-row-chip-room: 0px; }
+:root.br-marks-off { --br-row-chip-room: 0px; --br-row-chip-cell: 0px; }
 .br-marks-off .markdown-body [data-mark]::before,
 .br-marks-off .markdown-body tr[data-mark] > :first-child::before { content: none; }
 .br-marks-off .markdown-body :is(details.br-removed, details.br-before, li.br-removed-item, tr.br-removed-row) { display: none; }
@@ -879,27 +879,30 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 .markdown-body li > p + details.br-before:not([open]) { position: absolute; right: 0; transform: translateY(calc(-100% - 16px)); }
 .markdown-body li > p + details.br-before[open] { margin: 0 0 8px; }
 .markdown-body li > p + details.br-before[open] > summary { position: absolute; top: -16px; right: 0; transform: translateY(-100%); }
-/* A row's chip follows its last cell's text and takes none of the cell's
-   width: its end margin gives back its whole box, so no column changes
-   its width or alignment, and the room the table keeps at its right holds
-   it. Opened, it stays there, and the old row, under its table's header,
-   lies over what follows the row; the table stops clipping while it
-   shows, and never reflows around it. */
-/* The gap clears the cell's padding and border, so the chip sits past the cell. */
-:root { --br-row-chip: 60px; --br-row-chip-gap: 22px; --br-row-chip-room: 76px; }
-.markdown-body table:has(details.br-before) { padding-right: var(--br-row-chip-room); }
-.markdown-body :is(td, th):has(> details.br-before) { position: relative; }
-.markdown-body :is(td, th) > details.br-before { display: inline-block; margin: -2px calc(0px - var(--br-row-chip-gap) - var(--br-row-chip)) -2px var(--br-row-chip-gap); vertical-align: middle; }
-/* As specific as the closed chip's rule above, so it wins in a cell. */
-.markdown-body :is(td, th) > details.br-before:not([open]) { position: static; right: auto; transform: none; }
-.markdown-body :is(td, th) > details.br-before[open] { position: static; margin: -2px calc(0px - var(--br-row-chip-gap) - var(--br-row-chip)) -2px var(--br-row-chip-gap); }
+/* A row's chip sits at the right end of its row, under the row's last
+   line, in room the row keeps at its foot, as a paragraph's does: out of
+   the cells' flow, so no column changes its width, wraps or moves its
+   alignment, and inside the row's last cell, so it crosses no border and
+   sits at the same place on every row. Opened, it stays there, and the old
+   row, under its table's header, lies over what follows the row; the table
+   stops clipping while it shows, and never reflows around it. */
+:root { --br-row-chip: 60px; --br-row-chip-room: 28px; --br-row-chip-cell: calc(var(--br-row-chip) + 26px); }
+/* Every cell of the row keeps the room, so their text still lines up. */
+.markdown-body tr:has(> :is(td, th) > details.br-before) > :is(td, th) { padding-bottom: calc(6px + var(--br-row-chip-room)); }
+/* A column narrower than the chip and the cell's padding widens to hold it. */
+.markdown-body :is(td, th):has(> details.br-before) { position: relative; min-width: var(--br-row-chip-cell); }
+/* Inside the cell's 13 px and 6 px of padding. */
+.markdown-body :is(td, th) > details.br-before { display: inline-block; position: absolute; right: 13px; bottom: 6px; margin: 0; }
+/* As specific as the closed and open chips' rules above, so these win in a cell. */
+.markdown-body :is(td, th) > details.br-before:not([open]) { right: 13px; transform: none; }
+.markdown-body :is(td, th) > details.br-before[open] { position: absolute; margin: 0; }
 .markdown-body :is(td, th) > details.br-before[open] > summary { position: static; transform: none; }
 .markdown-body :is(td, th) > details.br-before > summary { box-sizing: border-box; width: var(--br-row-chip); justify-content: center; }
 .markdown-body :is(td, th) > details.br-before > .br-before-body {
   position: absolute;
   top: calc(100% + 4px);
-  /* Its right edge under the chip's: past the cell's 13 px of padding. */
-  right: calc(13px - var(--br-row-chip-gap) - var(--br-row-chip));
+  /* Its right edge under the chip's. */
+  right: 0;
   z-index: 1;
   width: max-content;
   background: linear-gradient(var(--br-modified-soft), var(--br-modified-soft)), var(--br-bg);
@@ -1054,6 +1057,9 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 
 @media (max-width: 767px) {
   .br-control-word { display: none; }
+  /* The marks button keeps its word: a bar alone says nothing to a reader
+     new to the page. */
+  .br-marks .br-control-word { display: inline; }
   /* A few letters of the base stay, so the arrow points at something. */
   .br-refs .br-base { min-width: 4ch; }
   .br-filehead { grid-template-columns: minmax(0, 1fr); }
@@ -1067,16 +1073,16 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 
   :root { --br-bar-x: -11px; --br-article-pad: 15px; }
   .br-strip { gap: 10px; padding: 0 12px; }
-  /* The two chips give up their words before the strip runs off the
-     screen, and never half a word: the fidelity chip keeps its sign, the
-     findings chip its sign and count. The fidelity chip's popover and the
-     findings chip's steps say it all again, and a screen reader still
-     reads the words, which only shrink to nothing. The refs give up the
-     rest of the room. */
+  /* The two chips give up words before the strip runs off the screen, and
+     never half a word: the fidelity chip keeps its sign and the word
+     GitHub, the findings chip its sign and count. The fidelity chip's
+     popover and the findings chip's steps say it all again, and a screen
+     reader still reads the words, which only shrink to nothing. The refs
+     give up the rest of the room. */
   .br-strip-end { gap: 8px; }
   .br-fidelity > summary,
   .br-findings[data-short] { font-size: 0; }
-  .br-fidelity > summary::before { content: "≈"; content: "≈" / ""; font-size: 12px; }
+  .br-fidelity > summary::before { content: "≈ GitHub"; content: "≈ GitHub" / ""; font-size: 12px; }
   .br-findings[data-short]::before { content: attr(data-short); content: attr(data-short) / ""; font-size: 12px; }
   /* The strip's buttons push the chip far from the right edge, so here the
      popover spans the screen just under the strip. */
@@ -1094,6 +1100,12 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 /* Out of sight, still read aloud. */
 @media (max-width: 479px) {
   .br-brand-word { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+}
+
+/* Below 400 px the fidelity chip keeps only its sign, so the strip still
+   fits with the longest findings chip. */
+@media (max-width: 399px) {
+  .br-fidelity > summary::before { content: "≈"; content: "≈" / ""; }
 }
 
 @media print {

@@ -65,7 +65,7 @@ function layoutOf(rows: number): PageLayout {
   };
 }
 
-function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, layoutError, layoutOf: answerFor, disabled = null, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides, crossingMotion}: {
+function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PREVIEW: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, layoutError, layoutOf: answerFor, disabled = null, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides, crossingMotion}: {
   // How much the crossing moves, as the service asks the OS for it.
   crossingMotion?: () => Promise<'full' | 'reduced' | 'off'>;
   // With media previews, the sides they read by id.
@@ -150,6 +150,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
       dimensions={dimensions}
       graphics={caps}
       animations={animations}
+      tips={false}
       rendered={{focus: (key) => pane.focus(key), pane, ...(crossingMotion ? {crossingMotion} : {})}}
       {...(media ? {media} : {})}
     />
@@ -198,14 +199,15 @@ describe('the page in the pane', () => {
   it('says it is the page in the header and the footer, with the Diff button first', async () => {
     const {instance} = setup();
     await settle();
-    expect(text(instance.lastFrame())).toContain('v here');
+    expect(text(instance.lastFrame())).toContain('v preview');
+    expect(text(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Preview─╮ ╭─Copy path─╮/);
     await press(instance, 'v');
     const shown = text(instance.lastFrame());
-    // The Diff button leads; this review has no split, so no Rendered button.
+    // The Diff button leads; this review opens no browser, so there is no Review in browser button.
     expect(shown).toMatch(/docs\/page\.md +╭─Diff─╮ ╭─Copy path─╮/);
-    expect(shown).toContain('rendered here · [ ] between changes · c copies a block');
-    expect(shown).toContain('v diff • [/] change • j/k scroll • c copy block');
-    expect(shown).toContain('◆ rendered · local');
+    expect(shown).toContain('Preview · [ ] between changes · c copies a block');
+    expect(shown).toContain('v back to diff • [/] change • j/k scroll • c copy block');
+    expect(shown).toContain('◆ Preview · as GitHub shows it');
     instance.unmount();
   });
 
@@ -278,7 +280,7 @@ describe('the page in the pane', () => {
     instance.unmount();
   });
 
-  it('holds the crossing on the mosaic while the tiles are on their way, and says it is developing', async () => {
+  it('holds the crossing on the mosaic while the tiles are on their way, and says it is drawing the page', async () => {
     let answer: (() => void) | null = null;
     const {instance} = setup({
       animations: true,
@@ -290,13 +292,13 @@ describe('the page in the pane', () => {
     await press(instance, 'v');
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     await settle();
-    expect(text(instance.lastFrame())).toContain('developing');
+    expect(text(instance.lastFrame())).toContain('drawing the page…');
     expect(instance.frames.every((frame) => decodePlaceholders(frame).length === 0)).toBe(true);
     answer!();
     await new Promise((resolve) => setTimeout(resolve, 900));
     await settle();
     expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
-    expect(text(instance.lastFrame())).not.toContain('developing');
+    expect(text(instance.lastFrame())).not.toContain('drawing the page…');
     instance.unmount();
   });
 
@@ -307,14 +309,14 @@ describe('the page in the pane', () => {
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     await settle();
     // No tile exists yet to wait for, and still the crossing holds.
-    expect(text(instance.lastFrame())).toContain('developing');
+    expect(text(instance.lastFrame())).toContain('drawing the page…');
     expect(text(instance.lastFrame())).not.toContain('laying out the page');
     expect(tiles).toHaveLength(0);
     await new Promise((resolve) => setTimeout(resolve, 2_000));
     await settle();
     expect(tiles.length).toBeGreaterThan(0);
     expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
-    expect(text(instance.lastFrame())).not.toContain('developing');
+    expect(text(instance.lastFrame())).not.toContain('drawing the page…');
     instance.unmount();
   });
 
@@ -324,7 +326,7 @@ describe('the page in the pane', () => {
     await settle();
     await press(instance, 'v');
     let lines = frameLines(instance.lastFrame());
-    const top = lines.findIndex((line) => stripAnsi(line).includes('rendered here')) + 1;
+    const top = lines.findIndex((line) => stripAnsi(line).includes('Preview · [ ]')) + 1;
     const diffLeft = stripAnsi(lines[top]!).indexOf('││') + 1;
     await emitMousePressAt(diffLeft + 2 + 3 + 10, top + 1 + 7);
     await settle();
@@ -341,7 +343,7 @@ describe('the page in the pane', () => {
   // The first row under the file header: the diff's top line, or the page's.
   const topRow = (frame: string | undefined) => {
     const lines = frameLines(frame);
-    return {line: lines[lines.findIndex((each) => /file \d+\/\d+|rendered here/.test(stripAnsi(each))) + 1] ?? '', index: lines.findIndex((each) => /file \d+\/\d+|rendered here/.test(stripAnsi(each))) + 1};
+    return {line: lines[lines.findIndex((each) => /file \d+\/\d+|Preview · \[ \]/.test(stripAnsi(each))) + 1] ?? '', index: lines.findIndex((each) => /file \d+\/\d+|Preview · \[ \]/.test(stripAnsi(each))) + 1};
   };
 
   for (const layoutDelay of [0, 300]) {
@@ -634,7 +636,7 @@ describe('the page in the pane', () => {
     expect(text(instance.lastFrame())).not.toContain('picture · rendered from the SVG source');
     expect(text(instance.lastFrame())).not.toContain('lines folded');
     expect(pane.mode()).toBe('diff');
-    expect(text(instance.lastFrame())).not.toContain('rendered here');
+    expect(text(instance.lastFrame())).not.toContain('Preview · [ ]');
     instance.unmount();
   });
 
@@ -690,7 +692,7 @@ describe('the page in the pane', () => {
     await press(instance, ']');
     // The added paragraph's first row is at the top of the pane.
     let lines = raw(instance.lastFrame());
-    const top = lines.findIndex((line) => stripAnsi(line).includes('rendered here')) + 1;
+    const top = lines.findIndex((line) => stripAnsi(line).includes('Preview · [ ]')) + 1;
     expect(stripAnsi(lines[top]!)).toContain('│  ▌ ');
     await press(instance, ']');
     lines = raw(instance.lastFrame());
@@ -706,7 +708,7 @@ describe('the page in the pane', () => {
     await settle();
     await press(instance, 'v');
     const lines = frameLines(instance.lastFrame());
-    const top = lines.findIndex((line) => stripAnsi(line).includes('rendered here')) + 1;
+    const top = lines.findIndex((line) => stripAnsi(line).includes('Preview · [ ]')) + 1;
     // Page row 7 holds the link, under the label row; the sheet starts
     // after the diff pane's border, a space and the gutter.
     const diffLeft = stripAnsi(lines[top]!).indexOf('││') + 1;
@@ -723,7 +725,7 @@ describe('the page in the pane', () => {
     await settle();
     await press(instance, 'v');
     const lines = frameLines(instance.lastFrame());
-    const top = lines.findIndex((line) => stripAnsi(line).includes('rendered here')) + 1;
+    const top = lines.findIndex((line) => stripAnsi(line).includes('Preview · [ ]')) + 1;
     const diffLeft = stripAnsi(lines[top]!).indexOf('││') + 1;
     await emitMousePressAt(diffLeft + 2 + 3 + 10, top + 1 + 7);
     await settle();
@@ -763,19 +765,19 @@ describe('whether the page in the pane is offered', () => {
   it('is offered by default in a terminal that draws Kitty images, with Chromium found', async () => {
     const {instance} = setup({env: {}});
     await settle();
-    expect(text(instance.lastFrame())).toContain('v here');
+    expect(text(instance.lastFrame())).toContain('v preview');
     await press(instance, 'v');
     expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
-    expect(text(instance.lastFrame())).toContain('◆ rendered · local');
+    expect(text(instance.lastFrame())).toContain('◆ Preview · as GitHub shows it');
     instance.unmount();
   });
 
-  it('with BRANCH_REVIEW_PANE=off, 0, false or none, v does nothing on markdown and the footer does not name it', async () => {
+  it('with BRANCH_REVIEW_PREVIEW=off, 0, false or none, v does nothing on markdown and the footer does not name it', async () => {
     for (const value of ['off', '0', 'false', 'none']) {
-      const {instance, tiles, asked} = setup({env: {BRANCH_REVIEW_PANE: value}});
+      const {instance, tiles, asked} = setup({env: {BRANCH_REVIEW_PREVIEW: value}});
       await settle();
       const before = text(instance.lastFrame());
-      expect(before).not.toContain('v here');
+      expect(before).not.toContain('v preview');
       await press(instance, 'v');
       expect(text(instance.lastFrame())).toBe(before);
       expect(tiles).toEqual([]);
@@ -789,7 +791,7 @@ describe('whether the page in the pane is offered', () => {
     await settle();
     await press(instance, 'v');
     expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
-    expect(text(instance.lastFrame())).not.toContain('rendered here');
+    expect(text(instance.lastFrame())).not.toContain('Preview · [ ]');
     expect(tiles).toEqual([]);
     instance.unmount();
   });
@@ -797,7 +799,7 @@ describe('whether the page in the pane is offered', () => {
   it('names Chrome when none is found, keeps the diff, and the footer does not name v', async () => {
     const {instance} = setup({chrome: false});
     await settle();
-    expect(text(instance.lastFrame())).not.toContain('v here');
+    expect(text(instance.lastFrame())).not.toContain('v preview');
     await press(instance, 'v');
     expect(text(instance.lastFrame())).toContain(PANE_NEEDS_CHROME.slice(0, 40));
     expect(text(instance.lastFrame())).toContain('A new paragraph.');
@@ -806,11 +808,11 @@ describe('whether the page in the pane is offered', () => {
   });
 
   it('does not name v once the rendered worker turned off before the first v, and v says why', async () => {
-    const {instance} = setup({env: {}, disabled: 'rendered view turned off: the worker exited 3 times in a minute'});
+    const {instance} = setup({env: {}, disabled: 'Preview and Review in browser turned off: the worker exited 3 times in a minute'});
     await settle();
-    expect(text(instance.lastFrame())).not.toContain('v here');
+    expect(text(instance.lastFrame())).not.toContain('v preview');
     await press(instance, 'v');
-    expect(text(instance.lastFrame())).toContain('✗ rendered view turned off: the worker exited 3 times in a minute');
+    expect(text(instance.lastFrame())).toContain('✗ Preview and Review in browser turned off: the worker exited 3 times in a minute');
     expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
     instance.unmount();
   });
@@ -825,7 +827,7 @@ describe('whether the page in the pane is offered', () => {
       return {all, asked};
     };
     const on = await frames({});
-    const off = await frames({BRANCH_REVIEW_PANE: 'off'});
+    const off = await frames({BRANCH_REVIEW_PREVIEW: 'off'});
     expect(on.all).toEqual(off.all);
     expect(on.asked).toEqual({chrome: 0, layouts: 0});
   });
@@ -842,7 +844,7 @@ describe('whether the page in the pane is offered', () => {
       instance.unmount();
       return motions;
     };
-    expect(await asked([CODE], {})).toBe(await asked([CODE], {BRANCH_REVIEW_PANE: 'off'}));
+    expect(await asked([CODE], {})).toBe(await asked([CODE], {BRANCH_REVIEW_PREVIEW: 'off'}));
     expect(await asked([CODE], {})).toBe(0);
     // With a page for v to draw, it is asked once, ahead of the first press.
     expect(await asked([PAGE, CODE], {})).toBe(1);
@@ -866,7 +868,7 @@ describe('when the page in the pane fails', () => {
   const LONG_LAYOUT: PageLayout = {heightCss: 160 * ROW, blocks: Array.from({length: 80}, (_, index) => ({id: `b-${index}`, top: 2 * index * ROW, bottom: (2 * index + 2) * ROW, lines: [index + 1, index + 1] as const})), removed: [], links: [], anchors: []};
   const topLine = (frame: string | undefined) => {
     const lines = frameLines(frame);
-    return stripAnsi(lines[lines.findIndex((each) => /file \d+\/\d+|rendered here/.test(stripAnsi(each))) + 1] ?? '');
+    return stripAnsi(lines[lines.findIndex((each) => /file \d+\/\d+|Preview · \[ \]/.test(stripAnsi(each))) + 1] ?? '');
   };
   const sheet = (request: TileRequest): TileResult => {
     const {geometry} = request.source;
@@ -895,8 +897,8 @@ describe('when the page in the pane fails', () => {
     expect(decodePlaceholders(instance.frames[before])).toEqual([]);
     expect(topLine(instance.frames[before])).toContain(`│Line ${top + 2}`);
     const shown = text(instance.lastFrame());
-    expect(shown).toContain('✗ in-pane view: the browser exited (code 3) · r opens it in the browser');
-    expect(shown).not.toContain('rendered here');
+    expect(shown).toContain('✗ Preview isn\'t available: the browser exited (code 3) · r opens it in the browser');
+    expect(shown).not.toContain('Preview · [ ]');
     expect(topLine(instance.lastFrame())).toContain(`│Line ${top + 2}`);
     expect(instance.frames.slice(before).every((frame) => decodePlaceholders(frame).length === 0)).toBe(true);
     // The next v asks again, and draws.
@@ -949,7 +951,7 @@ describe('when the page in the pane fails', () => {
     await press(instance, '\u001B[A');
     const there = text(instance.lastFrame());
     expect(there).toContain('Alpha 1');
-    expect(there).toContain('✗ in-pane view: timed out · r opens it in the browser');
+    expect(there).toContain('✗ Preview isn\'t available: timed out · r opens it in the browser');
     instance.unmount();
   });
 
@@ -960,7 +962,7 @@ describe('when the page in the pane fails', () => {
     const before = topLine(instance.lastFrame());
     await press(instance, 'v');
     const shown = text(instance.lastFrame());
-    expect(shown).toContain('✗ in-pane view: timed out · r opens it in the browser');
+    expect(shown).toContain('✗ Preview isn\'t available: timed out · r opens it in the browser');
     expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
     expect(topLine(instance.lastFrame())).toBe(before);
     instance.unmount();
@@ -974,7 +976,7 @@ describe('when the page in the pane fails', () => {
     expect(text(cold.instance.lastFrame())).toContain('laying out the page');
     await new Promise((resolve) => setTimeout(resolve, 400));
     await settle();
-    expect(text(cold.instance.lastFrame())).toContain('✗ in-pane view: the browser exited (code 3) · r opens it in the browser');
+    expect(text(cold.instance.lastFrame())).toContain('✗ Preview isn\'t available: the browser exited (code 3) · r opens it in the browser');
     expect(text(cold.instance.lastFrame())).not.toContain('laying out the page');
     expect(topLine(cold.instance.lastFrame())).toBe(was);
     cold.instance.unmount();
@@ -984,16 +986,16 @@ describe('when the page in the pane fails', () => {
     const {instance} = setup({tile: () => new Promise(() => undefined)});
     await settle();
     await press(instance, 'v');
-    expect(text(instance.lastFrame())).toContain('rendered here');
+    expect(text(instance.lastFrame())).toContain('Preview · [ ]');
     await new Promise((resolve) => setTimeout(resolve, 4_000));
     await settle();
-    expect(text(instance.lastFrame())).toContain('rendered here');
+    expect(text(instance.lastFrame())).toContain('Preview · [ ]');
     await new Promise((resolve) => setTimeout(resolve, 1_300));
     await settle();
     const shown = text(instance.lastFrame());
-    expect(shown).toContain("✗ in-pane view: the page didn't draw within 5 s · r opens it in the browser");
+    expect(shown).toContain("✗ Preview isn't available: the page didn't draw within 5 s · r opens it in the browser");
     expect(shown).toContain('A new paragraph.');
-    expect(shown).not.toContain('rendered here');
+    expect(shown).not.toContain('Preview · [ ]');
     instance.unmount();
   }, 20_000);
 
@@ -1008,7 +1010,7 @@ describe('when the page in the pane fails', () => {
     await press(instance, 'v');
     await new Promise((resolve) => setTimeout(resolve, 1_000));
     await settle();
-    expect(text(instance.lastFrame())).toContain('developing');
+    expect(text(instance.lastFrame())).toContain('drawing the page…');
     const before = instance.frames.length;
     failTile();
     await settle();
@@ -1016,11 +1018,11 @@ describe('when the page in the pane fails', () => {
     await new Promise((resolve) => setTimeout(resolve, 700));
     await settle();
     const after = instance.frames.slice(before).map(text);
-    const failed = after.findIndex((frame) => frame.includes('✗ in-pane view: the browser exited (code 3)'));
+    const failed = after.findIndex((frame) => frame.includes('✗ Preview isn\'t available: the browser exited (code 3)'));
     expect(failed).toBeGreaterThanOrEqual(0);
     // No frame from the toast on draws the crossing: no scanline, no shade, no developing.
     for (const frame of after.slice(failed)) {
-      expect(frame).not.toContain('developing');
+      expect(frame).not.toContain('drawing the page…');
       expect(frame).not.toMatch(/[▀░▒▓]/);
       expect(frame).toContain('A new paragraph.');
     }
@@ -1028,10 +1030,10 @@ describe('when the page in the pane fails', () => {
   });
 
   it('stays off for the session after the browser gave up, and v says why', async () => {
-    const {instance} = setup({tile: async () => ({ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited 3 times in a minute', tilesOff: true})});
+    const {instance} = setup({tile: async () => ({ok: false, state: 'unavailable', reason: 'the browser exited 3 times in a minute · off for this session', tilesOff: true})});
     await settle();
     await press(instance, 'v');
-    const turnedOff = '✗ in-pane view turned off: the browser exited 3 times in a minute · r opens it in the browser';
+    const turnedOff = '✗ Preview isn\'t available: the browser exited 3 times in a minute · off for this session · r opens it in the browser';
     let shown = text(instance.lastFrame());
     expect(shown).toContain(turnedOff);
     expect(shown).toContain('A new paragraph.');
@@ -1040,7 +1042,7 @@ describe('when the page in the pane fails', () => {
     await settle();
     shown = text(instance.lastFrame());
     expect(shown).not.toContain(turnedOff);
-    expect(shown).not.toContain('v here');
+    expect(shown).not.toContain('v preview');
     await press(instance, 'v');
     shown = text(instance.lastFrame());
     expect(shown).toContain(turnedOff);

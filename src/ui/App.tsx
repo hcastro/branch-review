@@ -45,6 +45,7 @@ import {anchorLine} from '../rendered/anchor.js';
 import {isMarkdownName} from '../rendered/classify.js';
 import {beamFrame, pressFrame} from '../rendered/beam.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
+import {firstTip, keyHelpGroups, keyHelpLines} from './keyHelp.js';
 import {createCrossingClock, type CrossingClock} from './crossing.js';
 import {createPaneClock, type PaneClock} from './paneCrossing.js';
 import {addRenderedRows, renderPaneRow} from './renderedRows.js';
@@ -82,6 +83,9 @@ type AppProps = {
   // Renders the review's markdown in the background, the active file first,
   // and opens its pages on r and R.
   rendered?: Pick<RenderedService, 'focus'> & Partial<RenderedPages>;
+  // The footer's one-time tip, the first time a file can use Preview or
+  // Review in browser. On unless turned off.
+  tips?: boolean;
 };
 
 const SCROLL_STEP = 3;
@@ -102,6 +106,13 @@ const MIN_TERMINAL_COLUMNS = COLLAPSED_TREE_WIDTH + MIN_DIFF_WIDTH;
 // Narrowest right-hand label worth showing in the top bar or footer.
 const MIN_BAR_RIGHT_WIDTH = 10;
 const TOAST_TIMEOUT_MS = 2200;
+// How long the first-time tip stays when no key is pressed.
+const TIP_TIMEOUT_MS = 6000;
+// What the terminal sends for a mouse move, wheel or click with mouse
+// tracking on, as Ink hands it to the key handler (one or more reports, the
+// leading Esc dropped). The mouse handler acts on these, so the key handler
+// treats them as no key.
+const MOUSE_REPORT = /^(?:\u001B?\[<\d+;\d+;\d+[Mm])+$/;
 const COPY_SUCCESS_TIMEOUT_MS = 1200;
 const CODE_SELECTION_RENDER_INTERVAL_MS = 33;
 // How long the diff pane's width must hold still before the review is wrapped
@@ -123,24 +134,32 @@ const TREE_HEADER_COPY_LABEL = 'Copy tree';
 const TREE_COLLAPSE_LABEL = '‹';
 const TREE_EXPAND_LABEL = '›';
 type FileAction = {readonly id: string; readonly label: string};
-// The rendered page leads a renderable file's actions, so it is the last
-// to drop when the header narrows.
-const RENDERED_ACTION: FileAction = {id: 'rendered.open', label: `Rendered ${LEAVES_PANE}`};
-export const RENDERED_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'j/k scroll', '[/] block', 't tree'];
-// While the pane shows a markdown file's page (`v`), its first button goes
-// back to the diff.
+// Preview (`v`) draws a markdown file's page in the diff pane; Review in
+// browser (`r`) opens the page in a split or the browser. They lead a
+// file's actions, so they are the last to drop when the header narrows,
+// and they and their hints say what they do in words.
+const PREVIEW_ACTION: FileAction = {id: 'rendered.preview', label: 'Preview'};
+const RENDERED_ACTION: FileAction = {id: 'rendered.open', label: `Review in browser ${LEAVES_PANE}`};
+// While the Preview shows, its button goes back to the diff.
 const DIFF_ACTION: FileAction = {id: 'rendered.diff', label: 'Diff'};
-export const PANE_OFFER_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'v here', 'j/k scroll', '[/] block', 't tree'];
+const OPEN_HINT = 'r review in browser';
+const ALL_HINT = 'R all files in browser';
+export const RENDERED_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', OPEN_HINT, ALL_HINT, 'j/k scroll', '[/] block', 't tree'];
+export const PANE_OFFER_HINT_ITEMS = ['q quit', '↑/↓ jump file', 'v preview', OPEN_HINT, ALL_HINT, 'j/k scroll', '[/] block', 't tree'];
 // An image's or an SVG's own hints, with `r` before `t tree`, its last.
 function withRenderedHint(items: readonly string[]) {
   const tree = items.indexOf('t tree');
   const at = tree < 0 ? items.length : tree;
-  return [...items.slice(0, at), `r rendered ${LEAVES_PANE}`, ...items.slice(at)];
+  return [...items.slice(0, at), OPEN_HINT, ...items.slice(at)];
 }
-export const PANE_KEY_HINT_ITEMS = ['q quit', 'v diff', '[/] change', 'j/k scroll', 'c copy block', `r open ${LEAVES_PANE}`, 't tree'];
-const PANE_REST = '◆ rendered · local';
-const PANE_DEVELOPING = 'developing';
-const PANE_METRICS = 'rendered here · [ ] between changes · c copies a block';
+export const PANE_KEY_HINT_ITEMS = ['q quit', 'v back to diff', '[/] change', 'j/k scroll', 'c copy block', OPEN_HINT, 't tree'];
+// The footer's last hint, kept when the others drop, in a review with
+// anything to preview or open: `?` lists every key.
+const KEYS_HINT = '? keys';
+const HELP_HINT_ITEMS = ['q quit', 'Esc or ? close'];
+const PANE_REST = '◆ Preview · as GitHub shows it';
+const PANE_DEVELOPING = 'drawing the page…';
+const PANE_METRICS = 'Preview · [ ] between changes · c copies a block';
 const FILE_ACTIONS: readonly FileAction[] = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -654,7 +673,8 @@ function copyActionHint(actionId: string) {
   if (actionId === 'media.open') return 'opens the image in the default viewer';
   if (actionId === 'media.play') return 'plays the video in the default player';
   if (actionId === 'media.quickLook') return 'shows the video in Quick Look';
-  if (actionId === 'rendered.diff') return 'back to the diff · v';
+  if (actionId === 'rendered.preview') return 'Show this file the way GitHub draws it, right here';
+  if (actionId === 'rendered.diff') return "Go back to this file's diff";
   return null;
 }
 
@@ -1996,10 +2016,17 @@ function addFileErrorRows(sections: KeyedSection[]) {
 }
 
 // The footer's left text for a row of `width` cells: the status, then as many
-// whole key hints as fit, always starting with `q quit`. A status too long to
-// leave room for `q quit` is cut to fit before it.
-export function footerHintText(status: string | undefined, width: number, items: ReadonlyArray<string> = KEY_HINT_ITEMS) {
+// whole key hints as fit, always starting with `q quit`, then `last` when
+// given: the hints before it drop first, and it goes only when `q quit` and
+// it don't fit together. A status too long to leave room for `q quit` is cut
+// to fit before it.
+export function footerHintText(status: string | undefined, width: number, items: ReadonlyArray<string> = KEY_HINT_ITEMS, last?: string) {
   const prefix = status ? `${status}${KEY_HINT_SEPARATOR}` : '';
+  const end = last ? `${KEY_HINT_SEPARATOR}${last}` : '';
+  for (let count = items.length; count > 0; count -= 1) {
+    const text = `${prefix}${items.slice(0, count).join(KEY_HINT_SEPARATOR)}`;
+    if (visibleWidth(text + end) <= width) return text + end;
+  }
   for (let count = items.length; count > 0; count -= 1) {
     const text = `${prefix}${items.slice(0, count).join(KEY_HINT_SEPARATOR)}`;
     if (visibleWidth(text) <= width) return text;
@@ -2399,6 +2426,7 @@ function AppContent({
   addMediaRows,
   media,
   rendered,
+  tips = true,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -2445,7 +2473,7 @@ function AppContent({
   // Boxes are sized to the viewport once it holds still, like the wrap width.
   const mediaViewportRows = useSettledValue(mediaOn ? visibleDiffRows : 0, WRAP_SETTLE_MS);
   // The page in the pane (`v`), when it is offered here: a Kitty terminal
-  // where BRANCH_REVIEW_PANE doesn't turn it off. Without it nothing below
+  // where BRANCH_REVIEW_PREVIEW doesn't turn it off. Without it nothing below
   // changes a row.
   const pane = rendered?.pane?.offered() ? rendered.pane : undefined;
   const paneVersion = useSyncExternalStore(pane ? pane.subscribe : noUpdates, pane ? pane.getVersion : noVersion);
@@ -2568,6 +2596,24 @@ function AppContent({
   const codeSelectionRenderTimerRef = useRef<NodeJS.Timeout | null>(null);
   const lastCodeSelectionRenderAtRef = useRef(0);
   const [toast, setToast] = useState<Toast | null>(null);
+  // The first-time tip in the footer, shown once a session. A toast asked
+  // for while it shows waits in `heldToast` until it ends; the tip waits for
+  // a toast on screen. The ref is read in callbacks between renders.
+  const [tip, setTip] = useState<string | null>(null);
+  const tipRef = useRef<string | null>(null);
+  const tipSpent = useRef(!tips);
+  const heldToast = useRef<Toast | null>(null);
+  const endTip = useCallback(() => {
+    if (tipRef.current === null) return;
+    tipRef.current = null;
+    setTip(null);
+    const held = heldToast.current;
+    heldToast.current = null;
+    if (held) setToast(held);
+  }, []);
+  // The `?` overlay of every key, and how far it is scrolled.
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpOffset, setHelpOffset] = useState(0);
   // Armed from mount: replies the detection gave up on wait in stdin until
   // Ink first reads it.
   const [escapeGuard] = useState(() => createLoneEscapeGuard({
@@ -2699,7 +2745,30 @@ function AppContent({
   const paneAdvertisedHere = paneOfferedHere && pane!.advertised();
   const headerActions = activeInPane
     ? [DIFF_ACTION, ...(activeRenderable ? [RENDERED_ACTION] : []), ...FILE_ACTIONS]
-    : activeRenderable ? [RENDERED_ACTION, ...fileActionsHere] : fileActionsHere;
+    : [...(paneAdvertisedHere ? [PREVIEW_ACTION] : []), ...(activeRenderable ? [RENDERED_ACTION] : []), ...fileActionsHere];
+  // `?` and its hint, in a review with a file to preview or open: a review
+  // with neither draws as it always has.
+  const keyHelpOn = useMemo(() => Boolean(review?.files.some((file) => pages?.renderable(reviewFileKey(file)) || pane?.covers(reviewFileKey(file)))), [pages, pane, review]);
+  // The first-time tip for the file in view: what `v` and `r` do on it, where they work.
+  const tipHere = firstTip({preview: paneAdvertisedHere, browser: activeRenderable && (pages?.opens?.() ?? true)});
+  useEffect(() => {
+    if (tipSpent.current) return;
+    // A reader who opened a Preview has found `v`, and the tip there would
+    // hide the Preview's own hints and hold back a failure's toast.
+    if (activeInPane) {
+      tipSpent.current = true;
+      return;
+    }
+    if (!tipHere || toast || helpOpen || tooSmall) return;
+    tipSpent.current = true;
+    tipRef.current = tipHere;
+    setTip(tipHere);
+  }, [activeInPane, helpOpen, tipHere, toast, tooSmall]);
+  useEffect(() => {
+    if (!tip) return undefined;
+    const timeout = setTimeout(endTip, TIP_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [endTip, tip]);
   const diffHeader = buildDiffHeader({
     path: activeFilePath,
     status: activeFile?.status,
@@ -3037,7 +3106,9 @@ function AppContent({
   ), []);
 
   const showToast = useCallback((message: string, hint?: string, kind: ToastKind = 'success') => {
-    setToast({text: toDisplayText(makeToast(message, hint)), kind});
+    const next = {text: toDisplayText(makeToast(message, hint)), kind};
+    if (tipRef.current !== null) heldToast.current = next;
+    else setToast(next);
   }, []);
 
   // After each commit: send the images of boxes near the viewport, render
@@ -3838,6 +3909,8 @@ function AppContent({
 
   useEffect(() => {
     const handleClick = (position: {x: number; y: number}, action: 'press' | 'release' | null) => {
+      // A click ends the first-time tip like a key, so the toast it brings shows at once.
+      endTip();
       const mousePosition = normalizeMousePosition(position);
       if (action === 'release') {
         if (treeResizingRef.current) {
@@ -3948,7 +4021,7 @@ function AppContent({
         const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
         if (actionId === RENDERED_ACTION.id) {
           openRendered('file');
-        } else if (actionId === DIFF_ACTION.id) {
+        } else if (actionId === DIFF_ACTION.id || actionId === PREVIEW_ACTION.id) {
           togglePane();
         } else if (actionId === 'media.open' || actionId === 'media.play' || actionId === 'media.quickLook') {
           if (activeMediaRef) void openMediaFile(activeMediaRef, actionId === 'media.quickLook' ? 'quickLook' : 'open');
@@ -3991,6 +4064,7 @@ function AppContent({
     return () => mouse.events.off('click', handleClick);
   }, [
     activeFile,
+    endTip,
     activeMediaRef,
     media,
     visibleDiffRows,
@@ -4029,6 +4103,21 @@ function AppContent({
     // A late reply to the startup queries, whole or in parts, does nothing.
     if (escapeGuard.onInput(input, key, exit) === 'handled') return;
 
+    // Any key ends the first-time tip, before it does what it does. A
+    // pointer moving over the terminal is no key, and a click ends the tip
+    // in the mouse handler.
+    if (!MOUSE_REPORT.test(input)) endTip();
+
+    // The key list takes the keys while it is open: Esc and `?` close it,
+    // `q` still quits, and the rest scroll it or do nothing.
+    if (helpOpen) {
+      if (key.escape || input === '?') setHelpOpen(false);
+      else if (input === 'q' && !key.ctrl && !key.meta) exit();
+      else if (input === 'j' || key.downArrow) setHelpOffset(Math.min(helpTop + 1, Math.max(0, helpLines.length - helpRows)));
+      else if (input === 'k' || key.upArrow) setHelpOffset(Math.max(0, helpTop - 1));
+      return;
+    }
+
     // Ink reports Esc with `meta` set, so quitting is checked before the
     // modifier guard below. Alt-q and Ctrl-q are not quit keys.
     if (key.escape || (input === 'q' && !key.ctrl && !key.meta)) {
@@ -4038,6 +4127,12 @@ function AppContent({
 
     // The too-small view shows no panes, so no other key acts on them.
     if (tooSmall) return;
+
+    if (input === '?' && keyHelpOn) {
+      setHelpOffset(0);
+      setHelpOpen(true);
+      return;
+    }
 
     if (key.downArrow) {
       jumpToSection(topSectionIndex + 1);
@@ -4195,16 +4290,28 @@ function AppContent({
     Math.max(1, columns - 4),
     shownInfoTip ? truncateStart : truncateEnd,
   );
-  const footerStatus: BarPart = toast
-    ? toast.kind === 'error'
-      ? {text: `✗ ${toast.text}`, style: ANSI_RED}
-      : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneAdvertisedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable && activeIsMarkdown ? RENDERED_KEY_HINT_ITEMS : activeRenderable ? withRenderedHint(mediaHintItems(media, activeMediaRef)) : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+  // The key list's lines at the inner width of its box, and how far they scroll.
+  const helpLines = helpOpen ? keyHelpLines(keyHelpGroups({preview: Boolean(pane)}), Math.max(1, columns - 4)) : [];
+  const helpRows = Math.max(1, contentHeight - 2);
+  const helpTop = Math.min(helpOffset, Math.max(0, helpLines.length - helpRows));
+  const hintItems = helpOpen
+    ? [...HELP_HINT_ITEMS, ...(helpLines.length > helpRows ? ['j/k scroll'] : [])]
+    : activeInPane ? PANE_KEY_HINT_ITEMS : paneAdvertisedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable && activeIsMarkdown ? RENDERED_KEY_HINT_ITEMS : activeRenderable ? withRenderedHint(mediaHintItems(media, activeMediaRef)) : mediaHintItems(media, activeMediaRef);
   // A block preview is rough on purpose; while one is on screen the footer
   // says why the picture is not drawn properly.
   const footerRight = activeInPane
     ? paneDeveloping ? PANE_DEVELOPING : PANE_REST
     : activeMediaRef && media?.caps.protocol === 'blocks' ? 'no image support detected' : `${displayBase}...${displayBranch}`;
+  // In a Preview the footer's right end says it is one, and whether it is
+  // still drawing, so the hints leave it room; elsewhere they come first.
+  const footerKept = activeInPane ? visibleWidth(footerRight) + 1 : 0;
+  const footerStatus: BarPart = toast
+    ? toast.kind === 'error'
+      ? {text: `✗ ${toast.text}`, style: ANSI_RED}
+      : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
+    : tip
+      ? {text: tip, style: ANSI_CYAN}
+      : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4 - footerKept), hintItems, keyHelpOn && !helpOpen ? KEYS_HINT : undefined), style: ANSI_GRAY};
   const footerLine = composeBar(
     [footerStatus],
     {text: footerRight, style: ANSI_GRAY},
@@ -4228,7 +4335,13 @@ function AppContent({
         <Text wrap="truncate">{topBarLine}</Text>
       </Box>
 
-      <Box>
+      {/* The key list takes the panes' place; they stay mounted under it. */}
+      {helpOpen ? (
+        <Box width={columns} height={contentHeight} flexDirection="column" borderStyle="round" borderColor={palette.ink('cyan')} paddingX={1}>
+          {helpLines.slice(helpTop, helpTop + helpRows).map((line, index) => <Text key={index} wrap="truncate">{line || ' '}</Text>)}
+        </Box>
+      ) : null}
+      <Box display={helpOpen ? 'none' : 'flex'}>
         <TreePane
           panelRef={treePanelRef}
           width={leftWidth}

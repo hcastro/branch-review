@@ -21,9 +21,16 @@ describe('footerHintText', () => {
     expect(footerHintText(undefined, 200)).toBe('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • t tree');
   });
 
-  it('names r and R right after the file keys on a file with a rendered page', () => {
-    expect(footerHintText(undefined, 200, RENDERED_KEY_HINT_ITEMS)).toBe('q quit • ↑/↓ jump file • r rendered ⇗ • R all • j/k scroll • [/] block • t tree');
-    expect(footerHintText(undefined, 48, RENDERED_KEY_HINT_ITEMS)).toBe('q quit • ↑/↓ jump file • r rendered ⇗ • R all');
-    expect(footerHintText('updated now', 51, RENDERED_KEY_HINT_ITEMS)).toBe('updated now • q quit • ↑/↓ jump file • r rendered ⇗');
+  it('names r and R in words right after the file keys on a file with a page in the browser', () => {
+    expect(footerHintText(undefined, 200, RENDERED_KEY_HINT_ITEMS)).toBe('q quit • ↑/↓ jump file • r review in browser • R all files in browser • j/k scroll • [/] block • t tree');
+    expect(footerHintText(undefined, 70, RENDERED_KEY_HINT_ITEMS)).toBe('q quit • ↑/↓ jump file • r review in browser • R all files in browser');
+    expect(footerHintText('updated now', 60, RENDERED_KEY_HINT_ITEMS)).toBe('updated now • q quit • ↑/↓ jump file • r review in browser');
+  });
+
+  it('keeps a last hint after the others, dropping the ones before it first, and it only when q quit alone is left', () => {
+    expect(footerHintText(undefined, 200, MEDIA_ITEMS, '? keys')).toBe(`${MEDIA_ITEMS.join(' • ')} • ? keys`);
+    expect(footerHintText(undefined, 49, MEDIA_ITEMS, '? keys')).toBe('q quit • ↑/↓ jump file • o open • v text • ? keys');
+    expect(footerHintText(undefined, 15, MEDIA_ITEMS, '? keys')).toBe('q quit • ? keys');
+    expect(footerHintText(undefined, 12, MEDIA_ITEMS, '? keys')).toBe('q quit');
   });
 });

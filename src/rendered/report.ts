@@ -6,7 +6,7 @@ import {anchorTarget, imageFinding, linkReason} from './words.js';
 // they are on GitHub. Each page's render says how its links and images
 // resolved; a link to a heading on another rendered page is checked here,
 // against that page's anchors, since one render never sees another page.
-// Pure: the TUI's service and `--render-out` both read their pages' answers
+// Pure: the TUI's service and `--export-html` both read their pages' answers
 // through it.
 
 /** A page as the report reads it: what its render said of its links, images and anchors. */

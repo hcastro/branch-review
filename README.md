@@ -108,29 +108,31 @@ A modified image opens with its old and new versions side by side. To flip betwe
 
 For more information about terminal support, tmux setup, compare modes, and opening a file in a viewer, see [Image and video previews](docs/media-previews.md).
 
-## Read the markdown as GitHub will show it
+## Preview markdown and review it in the browser
 
-To read a changed markdown file as the page GitHub would show, press `r`. The page is rendered on your machine and marks the blocks the branch added or changed with a bar in the margin, and removed content where it was. In cmux it opens in a browser split to the right, and each later press sends that split to the next page. In other terminals it opens in your default browser. To see an overview of every page, press `R`.
+To read a changed markdown file the way GitHub shows it, press `v`, and **Preview** draws its page right in the review, with a bar in the margin beside each block the branch added or changed. To open the file's changes in a browser, press `r`, and **Review in browser** opens the same page in a browser split beside the review in cmux, or in your default browser in other terminals. To open a page that lists every changed markdown, image, and SVG file, press `R` for **All files in browser**. To list every key, press `?`.
 
-The page opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the rendered page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
+The first time a file can use them, the footer says so in one line, such as `Tip: press v to preview this file as GitHub shows it, or r to open its changes in the browser`. The file header has the same actions as buttons: **Preview**, which reads **Diff** while the Preview shows, and **Review in browser ⇗**.
 
-To read the page inside the diff pane in Ghostty, cmux, or Kitty, press `v` on a markdown file. A headless Chromium already on disk draws the page there, with the change marks in the margin, and `v` again brings the diff back. When the page can't be drawn, the pane goes back to the diff where you were reading, and the footer says why. To turn this view off, set `BRANCH_REVIEW_PANE=off`.
+Preview needs Ghostty, cmux, or Kitty, and a headless Chromium already on disk. Where either is missing, the footer leaves `v` out, and `r` still works. When Preview can't draw a page, the diff comes back where you were reading, and the footer says why. To turn Preview off, set `BRANCH_REVIEW_PREVIEW=off`.
 
-On a changed image or SVG, `r` opens a page that compares its versions side by side, by flipping, or as a difference, on the same `1`, `2`, and `3` keys as the diff, and names the lines of the review's markdown that show it. A markdown file the branch didn't touch gets a page too when it shows an image the branch changed, since it will look different on GitHub. Each page draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading, and the overview lists them all.
+A page in the browser opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
 
-To write the pages to a directory without opening the UI, pass `--render-out`:
+On a changed image or SVG, `r` opens a page that compares its versions side by side, by flipping, or as a difference, on the same `1`, `2`, and `3` keys as the diff, and names the lines of the review's markdown that show it. A markdown file the branch didn't touch gets a page too when it shows an image the branch changed, since it will look different on GitHub. Each page draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading, and the page of all files lists them all.
+
+To write the pages to a directory without opening the UI, pass `--export-html`:
 
 ```sh
-branch-review --render-out ../rendered
+branch-review --export-html ../pages
 ```
 
 Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
 
-Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets the overview, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, the in-pane view, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
+Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets the page of all files, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
 
 ## Review untrusted changes safely
 
-`branch-review` is built for reading changes that an agent or a teammate wrote, before you trust them. It doesn't write to the repo it reviews, except for pages you ask `--render-out` to write into a directory there. The index, the working tree, refs, the stash, config, and hooks stay as they were, and Git runs on a private copy of the index.
+`branch-review` is built for reading changes that an agent or a teammate wrote, before you trust them. It doesn't write to the repo it reviews, except for pages you ask `--export-html` to write into a directory there. The index, the working tree, refs, the stash, config, and hooks stay as they were, and Git runs on a private copy of the index.
 
 `branch-review` ignores repo settings that could change the diff or run a program, such as `diff.external`, textconv drivers, `core.fsmonitor`, and `diff.noprefix`. The patch that you read and copy is Git's own output.
 
@@ -215,12 +217,12 @@ branch-review my-feature release/2026.04
 | `--watch` | Refresh live as files change. On by default in an interactive terminal. |
 | `--no-watch` | Open a snapshot that doesn't refresh, for when an agent is mid-write and the view keeps changing. It overrides `--watch` and `--watch-poll`. |
 | `--watch-poll` | Turn on watch mode, and poll for changes in place of filesystem events. Use it on network mounts and container bind mounts. |
-| `--no-animations` | Skip the arrival highlights, the sweep toward a rendered page and the page's develop, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
+| `--no-animations` | Skip the arrival highlights, the sweep toward a page in the browser, the page's develop and Preview's arrival, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
-| `--render-out DIR` | Write a page for each changed markdown, image, and SVG file to `DIR`, with `overview.html` and `links.json`, print a summary, and exit without opening the UI. |
-| `--json` | With `--render-out`, print the report as JSON. |
+| `--export-html DIR` | Write the pages that Review in browser opens, one for each changed markdown, image, and SVG file, to `DIR`, with the page of all files, `overview.html`, and `links.json`. Then print a summary and exit without opening the UI. |
+| `--json` | With `--export-html`, print the report as JSON. |
 
 For `--animations` and `--images`, the last flag of each pair wins.
 
@@ -234,10 +236,10 @@ For `--animations` and `--images`, the last flag of each pair wins.
 | `FORCE_COLOR` | `0` or `false` turns off color and image previews. |
 | `TERM` | `dumb` turns off color and image previews. `linux`, and `screen*` outside tmux, turn off image previews. |
 | `BRANCH_REVIEW_IMAGES` | `auto`, the default, detects what the terminal can draw. `kitty` forces pictures in a terminal that supports them but isn't recognized. `blocks` forces the block preview. `off`, `none`, `0`, or `false` turns previews off. |
-| `BRANCH_REVIEW_MOTION` | `full`, `reduce`, or `off` sets the motion on the way to a rendered page, in place of the macOS **Reduce motion** setting. |
-| `BRANCH_REVIEW_PANE` | `off`, `0`, `false`, or `none` turns off the in-pane view, which draws a markdown file's rendered page in the diff pane on `v`, in a terminal that draws Kitty images. `on`, like any other value, leaves it on. |
-| `BRANCH_REVIEW_CHROME` | The absolute path of the headless Chromium or Chrome that the in-pane view draws pages with, in place of the one `branch-review` finds on disk. |
-| `BRANCH_REVIEW_PANE_DPR` | A fixed scale for the in-pane view's pages, such as `2`, in place of the one that makes their text as tall as the terminal's. For comparing the two. |
+| `BRANCH_REVIEW_MOTION` | `full`, `reduce`, or `off` sets the motion of Preview and on the way to a page in the browser, in place of the macOS **Reduce motion** setting. |
+| `BRANCH_REVIEW_PREVIEW` | `off`, `0`, `false`, or `none` turns Preview off, the page a markdown file shows in the review on `v`, in a terminal that draws Kitty images. `on`, like any other value, leaves it on. |
+| `BRANCH_REVIEW_CHROME` | The absolute path of the headless Chromium or Chrome that Preview draws pages with, in place of the one `branch-review` finds on disk. |
+| `BRANCH_REVIEW_PREVIEW_DPR` | A fixed scale for Preview's pages, such as `2`, in place of the one that makes their text as tall as the terminal's. For comparing the two. |
 | `BRANCH_REVIEW_TMPDIR` | The directory for temp files, such as the private index copy and media files. The default is the system temp directory. |
 
 The same settings turn off color in delta's diffs and in the rest of `branch-review`. With color off, diffs keep their `+` and `-` markers, and a selection shows in inverse video.
@@ -254,9 +256,10 @@ The following table lists the keys for moving through a review:
 | `[` / `]` | Focus the previous or next diff block |
 | `Enter` / `Space` | Collapse or expand the focused block |
 | `t` | Show or hide the file tree |
-| `r` | Open the rendered page of the markdown, image, or SVG file in view, or of the review's first such file |
-| `R` | Open an overview of every rendered page |
-| `v` | On a markdown file, in a terminal that draws Kitty images, show its rendered page in the diff pane and back. On the page, `[` and `]` move between changes and `c` copies the markdown of the block at the top. |
+| `v` | Preview: on a markdown file, in a terminal that draws Kitty images, show the file as GitHub shows it, in place of its diff, and back. In a Preview, `[` and `]` move between changes and `c` copies the markdown of the block at the top. |
+| `r` | Review in browser: open the changes of the markdown, image, or SVG file in view as a page in a browser split or your browser, or the review's first such file |
+| `R` | All files in browser: open a page that lists every changed markdown, image, and SVG file |
+| `?` | List every key, in a review with a file to preview or open. `Esc` or `?` closes the list. |
 | `q` / `Esc` / `Control+C` | Quit |
 
 The tree highlights the file at the top of the diff and keeps that row in view as you scroll. That file's header shows its added, deleted, and changed line counts and its place in the review, such as `file 6/8`. Each block header names the file and the block's first line, such as `src/middleware/rateLimit.ts:1:`.
@@ -279,9 +282,10 @@ You can also do most of this with the mouse:
 | Click a file | Jump the diff to that file |
 | Click a folder | Collapse or expand it |
 | Click a block header | Collapse or expand that diff block |
-| Click **Rendered ⇗** in a file header | Open that file's rendered page, like `r` |
-| Click **Diff** in a file header | Go back from the page in the pane to the diff, like `v` |
-| Click a link on the page in the pane | Scroll to a heading on the page, open another file of the review, or copy a web address |
+| Click **Preview** in a file header | Show the file's Preview, like `v` |
+| Click **Diff** in a file header | Go back from the Preview to the diff, like `v` |
+| Click **Review in browser ⇗** in a file header | Open that file's changes in the browser, like `r` |
+| Click a link in a Preview | Scroll to a heading on the page, open another file of the review, or copy a web address |
 | Drag across code | Select lines and copy them |
 | Drag the tree's right border | Resize the file tree. Dragging it to its minimum width collapses it to a rail. |
 | Click `‹` or `›` in the tree header | Collapse or expand the file tree |
@@ -289,12 +293,12 @@ You can also do most of this with the mouse:
 
 To see what a button, badge, or label does, hold the pointer over it. A short hint appears in the top bar, such as `copies block with file and line context`.
 
-A rendered page has keys of its own, which work after you click into the page:
+A page in the browser has keys of its own, which work after you click into the page:
 
 | Key | Action |
 | --- | --- |
 | `[` / `]` | Scroll to the previous or next change |
-| `{` / `}` | Open the previous or next rendered file |
+| `{` / `}` | Open the previous or next file's page |
 | `t` | Switch the page's theme between your system's, light, and dark |
 | `m` | Show or hide the change marks |
 | `1` / `2` / `3` | On an image's page, compare its versions side by side, by flipping, or as a difference. `2` again, or `f`, flips to the other version. |
@@ -354,4 +358,4 @@ MIT © hcastro
 
 Image decoding uses [sharp](https://sharp.pixelplumbing.com/), which ships prebuilt binaries of libvips. libvips is licensed under LGPL-3.0.
 
-Rendered pages carry a copy of [github-markdown-css](https://github.com/sindresorhus/github-markdown-css) and icons from [Octicons](https://github.com/primer/octicons), both licensed under MIT. Their license files are in `src/rendered/assets/`.
+The pages that Preview and Review in browser show carry a copy of [github-markdown-css](https://github.com/sindresorhus/github-markdown-css) and icons from [Octicons](https://github.com/primer/octicons), both licensed under MIT. Their license files are in `src/rendered/assets/`.

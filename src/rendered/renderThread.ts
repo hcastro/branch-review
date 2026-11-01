@@ -6,7 +6,7 @@ import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, typ
 import type {ChangeGroup} from './changes.js';
 import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown.js';
 
-// `--render-out` renders each file in a worker thread under a deadline. The
+// `--export-html` renders each file in a worker thread under a deadline. The
 // markdown parser is synchronous, and some inputs (thousands of nested list
 // levels, a long run of emphasis markers) keep it busy for minutes; only a
 // thread can be stopped in the middle of that. One thread serves every file
@@ -73,7 +73,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
     return new Promise<Worker>((resolve, reject) => {
       worker.once('message', () => resolve(worker));
       worker.once('error', reject);
-      worker.once('exit', () => reject(new Error('the render thread stopped while starting')));
+      worker.once('exit', () => reject(new Error('the page thread stopped while starting')));
     });
   };
 
@@ -114,11 +114,11 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
           void stop();
           reject(error);
         };
-        const onExit = () => onError(new Error('the render thread stopped'));
+        const onExit = () => onError(new Error('the page thread stopped'));
         const timer = setTimeout(() => {
           finish();
           void stop();
-          reject(new Error('took too long to render'));
+          reject(new Error('took too long to prepare'));
         }, deadlineMs);
         worker.on('message', onMessage);
         worker.on('error', onError);

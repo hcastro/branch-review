@@ -63,7 +63,7 @@ const OVERVIEW_WAIT_MS = 3_000;
 const MAX_REWRITES = 3;
 // The fewest ms between two live refreshes of the split.
 const LIVE_GAP_MS = 1_000;
-const NOTHING_TO_RENDER = 'nothing to render · no markdown, images or SVG on this branch';
+const NOTHING_TO_RENDER = 'nothing to open in the browser · no markdown, images or SVG on this branch';
 
 export {LEAVES_PANE} from './marks.js';
 
@@ -167,8 +167,6 @@ export function createRenderedService({backend, site, surface, motion, animation
   // The overview's newest page, kept through prunes.
   let overview: string | null = null;
   let motionAsked: Promise<Motion> | null = null;
-  // The first page shown says that it was rendered here.
-  let saidLocal = false;
   // Counts `r` and `R` presses: only the newest one's page is shown.
   let presses = 0;
   // Counts the URLs sent to the surface, so each one differs and a split
@@ -572,13 +570,13 @@ export function createRenderedService({backend, site, surface, motion, animation
   /** The file's newest page, rendered and written now if it isn't yet. */
   async function page(fileKey: string): Promise<PageOutcome> {
     const planned = plan.get(fileKey);
-    if (!planned) return {ok: false, reason: 'no rendered page for this file'};
+    if (!planned) return {ok: false, reason: 'no page for this file'};
     const off = offReason();
     if (off) return {ok: false, reason: off};
     if (planned.request && answers.get(planned.request.key)?.epoch !== epoch) await ask(planned, 0);
     // The review may have moved on while it rendered.
     const latest = plan.get(fileKey);
-    if (!latest) return {ok: false, reason: 'no rendered page for this file'};
+    if (!latest) return {ok: false, reason: 'no page for this file'};
     const answered = answerFor(latest);
     let written = await writePage(latest);
     // Its render counted the file anew: the page shown has a rail that says so.
@@ -765,25 +763,26 @@ export function createRenderedService({backend, site, surface, motion, animation
       refreshSplit();
     });
     await crossing;
-    if (!ready && press === presses) trip?.waiting(`rendering ${name}…`);
+    if (!ready && press === presses) trip?.waiting(`preparing ${name}…`);
     const outcome = await Promise.race([shown, late]);
     // A newer press's toast is on screen by now, and its page is the one shown.
-    if (outcome === 'late') return press === presses ? {kind: 'error', message: `${name} took too long to render`} : null;
+    if (outcome === 'late') return press === presses ? {kind: 'error', message: `${name} took too long to prepare`} : null;
     if (outcome === null || 'superseded' in outcome) return null;
     if ('error' in outcome) return {kind: 'error', message: outcome.error};
     if ('refused' in outcome) return {kind: 'error', message: outcome.refused};
-    const parts = [`${LEAVES_PANE} ${name}`, ...(note ? [note] : []), outcome.message];
-    if (!saidLocal) parts.push('nothing left this machine');
-    saidLocal = true;
-    return {kind: 'info', message: parts.join(' · ')};
+    return {kind: 'info', message: [`${LEAVES_PANE} ${name} ${outcome.message}`, ...(note ? [note] : [])].join(' · ')};
   }
+
+  // Whether `r` and `R` open anything here: not over SSH, nor with no
+  // browser opener. Preview's toasts point to `r` only when it does.
+  const opens = () => surface !== undefined && surface.kind !== 'none';
 
   // The page the pane draws for a review file: its markdown fragment, with
   // the links its file page draws broken.
   const pane: RenderedPane | null = paneOptions ? createRenderedPane({
     backend,
     ...paneOptions,
-    browserOpens: surface !== undefined && surface.kind !== 'none',
+    browserOpens: opens(),
     source: (fileKey) => {
       const planned = plan.get(fileKey);
       if (planned?.kind !== 'markdown' || !planned.request || !title) return null;
@@ -903,7 +902,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         const written = await page(planned.fileKey);
         return written.ok ? {...written, url: `${written.url}#${hash}`} : written;
       };
-      return travel(fileKey, fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, write, trip, (where, key) => {
+      return travel(fileKey, fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'the first file with a page' : null, write, trip, (where, key) => {
         visited.add(planned.fileKey);
         setSplit(where === 'browser' ? null : {fileKey: planned.fileKey, key, content: contentOf(key), ...place, blocks: blockIds(planned), seq: (seqs += 1)});
       });
@@ -915,7 +914,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       if (off) return {kind: 'error', message: off};
       if (plan.size === 0) return {kind: 'info', message: NOTHING_TO_RENDER};
       // The split shows the overview now, which no file's refresh replaces.
-      return travel(null, 'overview', null, writeOverview, trip, () => {
+      return travel(null, 'all files', null, writeOverview, trip, () => {
         setSplit(null);
       });
     },
@@ -926,12 +925,15 @@ export function createRenderedService({backend, site, surface, motion, animation
       return motionAsked;
     },
 
-    /** The Rendered button's hint: where its page opens, or why it can't. */
+    /** The Review in browser button's hover tip: what it opens and where, or why it can't. */
     openHint() {
       if (!surface) return null;
       // A refusal's reason, without the alternative it goes on to name.
-      return surface.destination ? `r · opens the rendered page ${surface.destination}` : `r · ${(surface.refusal ?? '').split(' · ')[0]}`;
+      return surface.destination ? `Open this file's changes ${surface.destination}, as GitHub shows them` : (surface.refusal ?? '').split(' · ')[0]!;
     },
+
+    /** Whether `r` and `R` open anything here. */
+    opens,
 
     /** Calls `listener` whenever there is a notice to take. */
     subscribe(listener: () => void) {
@@ -968,7 +970,7 @@ export function createRenderedService({backend, site, surface, motion, animation
 export type RenderedService = ReturnType<typeof createRenderedService>;
 
 /** What the TUI uses to open pages and hear the service's notices. */
-export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'> & Partial<Pick<RenderedService, 'pane' | 'crossingMotion'>>;
+export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'> & Partial<Pick<RenderedService, 'pane' | 'crossingMotion' | 'opens'>>;
 
 /**
  * The service the CLI runs: its own worker, pages in the session dir, and

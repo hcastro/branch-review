@@ -280,11 +280,11 @@ describe('the rendered service', () => {
   it('says the rendered view is off once, and refuses pages with the reason', async () => {
     const {backend, turnOff} = scriptedBackend();
     const {service, clock} = serviceWith(backend);
-    turnOff('rendered view turned off: timed out');
+    turnOff('Preview and Review in browser turned off: timed out');
     service.setReview(review([edited('README.md')]), CTX);
     await clock.advance(2_000);
-    expect(await service.page('README.md')).toEqual({ok: false, reason: 'rendered view turned off: timed out'});
-    expect(service.takeNotices()).toEqual(['✗ rendered view turned off: timed out']);
+    expect(await service.page('README.md')).toEqual({ok: false, reason: 'Preview and Review in browser turned off: timed out'});
+    expect(service.takeNotices()).toEqual(['✗ Preview and Review in browser turned off: timed out']);
     await service.page('README.md');
     expect(service.takeNotices()).toEqual([]);
   });
@@ -316,13 +316,13 @@ describe('the rendered service', () => {
     const scripted = scriptedBackend(() => {
       asked += 1;
       if (asked < 3) return {ok: false, state: 'error', reason: 'timed out'};
-      scripted.turnOff('rendered view turned off: timed out');
+      scripted.turnOff('Preview and Review in browser turned off: timed out');
       return {ok: false, state: 'error', reason: 'timed out'};
     });
     const {service, clock} = serviceWith(scripted.backend);
     service.setReview(review([edited('a.md'), edited('b.md'), edited('c.md')]), CTX);
     await clock.advance(2_000);
-    expect(service.takeNotices()).toEqual(['✗ rendered view turned off: timed out']);
+    expect(service.takeNotices()).toEqual(['✗ Preview and Review in browser turned off: timed out']);
     expect(scripted.pages).toHaveLength(0);
   });
 
@@ -502,7 +502,7 @@ describe('the rendered service', () => {
     const {backend} = scriptedBackend();
     const {service} = serviceWith(backend);
     service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts')]), CTX);
-    expect(await service.page('src/app.ts')).toEqual({ok: false, reason: 'no rendered page for this file'});
+    expect(await service.page('src/app.ts')).toEqual({ok: false, reason: 'no page for this file'});
   });
 });
 
@@ -549,7 +549,7 @@ function openingService(backend: RenderedBackend, {
   return {service, clock, surface, trip, events, dir: path.join(session, 'rendered'), motionAsked: () => motionAsked};
 }
 
-function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true as boolean | 'skipped' | 'superseded', opensSplit = undefined as (() => boolean) | undefined} = {}) {
+function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'opened in the browser split'} as Awaited<ReturnType<Surface['show']>>, refreshes = true as boolean | 'skipped' | 'superseded', opensSplit = undefined as (() => boolean) | undefined} = {}) {
   const shown: string[] = [];
   const refreshed: string[] = [];
   // The page names each refresh said the split may show.
@@ -560,7 +560,7 @@ function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal
     showing,
     kind,
     refusal,
-    destination: kind === 'cmux' ? 'in a split to the right' : kind === 'browser' ? 'in your browser' : null,
+    destination: kind === 'cmux' ? 'in a browser split' : kind === 'browser' ? 'in your browser' : null,
     shown,
     refreshed,
     disposed,
@@ -582,21 +582,21 @@ function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal
 }
 
 describe('opening pages', () => {
-  it('shows the file\'s page after the crossing, and says nothing left this machine the first time only', async () => {
+  it('shows the file\'s page after the crossing, and says where it opened, the same way each time', async () => {
     const {backend} = scriptedBackend();
     const {service, clock, surface, trip, events, dir} = openingService(backend);
     service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
     await clock.advance(2_000);
 
     const outcome = await service.open({fileKey: 'docs/guide.md'}, trip);
-    expect(outcome).toEqual({kind: 'info', message: '⇗ guide.md · in the split → · nothing left this machine'});
+    expect(outcome).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
     expect(events).toEqual(['cross full']);
     expect(surface.shown).toHaveLength(1);
     const shown = new URL(surface.shown[0]!).pathname;
     expect(fs.realpathSync(path.dirname(shown))).toBe(fs.realpathSync(dir));
     expect(fs.readFileSync(shown, 'utf8')).toMatch(/^<p>[0-9a-f]{20}<\/p>$/);
 
-    expect(await service.open({fileKey: 'docs/guide.md'}, trip)).toEqual({kind: 'info', message: '⇗ guide.md · in the split →'});
+    expect(await service.open({fileKey: 'docs/guide.md'}, trip)).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
   });
 
   it('opens the first rendered file when the active file has no page, and says which', async () => {
@@ -604,7 +604,7 @@ describe('opening pages', () => {
     const {service, clock, surface, trip} = openingService(backend);
     service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts'), edited('docs/setup.md'), edited('README.md')]), CTX);
     await clock.advance(2_000);
-    expect(await service.open({fileKey: 'src/app.ts'}, trip)).toEqual({kind: 'info', message: '⇗ docs/setup.md · first rendered file · in the split → · nothing left this machine'});
+    expect(await service.open({fileKey: 'src/app.ts'}, trip)).toEqual({kind: 'info', message: '⇗ docs/setup.md opened in the browser split · the first file with a page'});
     expect(surface.shown).toHaveLength(1);
   });
 
@@ -612,10 +612,10 @@ describe('opening pages', () => {
     const {backend, turnOff} = scriptedBackend();
     const nothing = openingService(backend);
     nothing.service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts')]), CTX);
-    expect(await nothing.service.open({fileKey: 'src/app.ts'}, nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown, images or SVG on this branch'});
-    expect(await nothing.service.openOverview(nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown, images or SVG on this branch'});
+    expect(await nothing.service.open({fileKey: 'src/app.ts'}, nothing.trip)).toEqual({kind: 'info', message: 'nothing to open in the browser · no markdown, images or SVG on this branch'});
+    expect(await nothing.service.openOverview(nothing.trip)).toEqual({kind: 'info', message: 'nothing to open in the browser · no markdown, images or SVG on this branch'});
 
-    const refusal = "open isn't available over SSH · branch-review --render-out <dir> writes the pages";
+    const refusal = "open isn't available over SSH · branch-review --export-html <dir> writes the pages";
     const ssh = openingService(backend, {surface: recordingSurface({kind: 'none', refusal})});
     ssh.service.setReview(review([edited('README.md')]), CTX);
     expect(await ssh.service.open({fileKey: 'README.md'}, ssh.trip)).toEqual({kind: 'error', message: refusal});
@@ -623,8 +623,8 @@ describe('opening pages', () => {
 
     const off = openingService(backend);
     off.service.setReview(review([edited('README.md')]), CTX);
-    turnOff('rendered view turned off: the worker kept crashing');
-    expect(await off.service.open({fileKey: 'README.md'}, off.trip)).toEqual({kind: 'error', message: 'rendered view turned off: the worker kept crashing'});
+    turnOff('Preview and Review in browser turned off: the worker kept crashing');
+    expect(await off.service.open({fileKey: 'README.md'}, off.trip)).toEqual({kind: 'error', message: 'Preview and Review in browser turned off: the worker kept crashing'});
 
     for (const each of [nothing, ssh, off]) {
       expect(each.events).toEqual([]);
@@ -646,10 +646,10 @@ describe('opening pages', () => {
     service.setReview(review([edited('docs/slow.md')]), CTX);
     const opening = service.open({fileKey: 'docs/slow.md'}, trip);
     for (let turn = 0; turn < 3; turn += 1) await new Promise((resolve) => setImmediate(resolve));
-    expect(events).toEqual(['cross full', 'waiting rendering slow.md…']);
+    expect(events).toEqual(['cross full', 'waiting preparing slow.md…']);
     expect(surface.shown).toEqual([]);
     release();
-    expect(await opening).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ slow\.md · in the split →/)});
+    expect(await opening).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ slow\.md opened in the browser split/)});
     expect(surface.shown).toHaveLength(1);
   });
 
@@ -661,7 +661,7 @@ describe('opening pages', () => {
     const opening = service.open({fileKey: 'docs/stuck.md'}, trip);
     await clock.advance(4_999);
     await clock.advance(1);
-    expect(await opening).toEqual({kind: 'error', message: 'stuck.md took too long to render'});
+    expect(await opening).toEqual({kind: 'error', message: 'stuck.md took too long to prepare'});
     // The render finishes after all, and its page is written: it still
     // opens nowhere, since the footer already said it wouldn't.
     held.resolve({ok: true, summary: summary()});
@@ -682,9 +682,9 @@ describe('opening pages', () => {
     full.service.setReview(review([edited('README.md')]), CTX);
     expect(await full.service.open({fileKey: 'README.md'}, full.trip)).toEqual({kind: 'error', message: "can't write the page: disk full"});
 
-    const none = openingService(backend, {surface: recordingSurface({answer: {refused: 'no browser opener found · branch-review --render-out <dir> writes the pages'}})});
+    const none = openingService(backend, {surface: recordingSurface({answer: {refused: 'no browser opener found · branch-review --export-html <dir> writes the pages'}})});
     none.service.setReview(review([edited('README.md')]), CTX);
-    expect(await none.service.open({fileKey: 'README.md'}, none.trip)).toEqual({kind: 'error', message: 'no browser opener found · branch-review --render-out <dir> writes the pages'});
+    expect(await none.service.open({fileKey: 'README.md'}, none.trip)).toEqual({kind: 'error', message: 'no browser opener found · branch-review --export-html <dir> writes the pages'});
   });
 
   it('says nothing for a press a newer one replaced, and reads the motion setting once', async () => {
@@ -715,11 +715,11 @@ describe('opening pages', () => {
 
     // Before the background render starts: the overview renders what it lists.
     const outcome = await service.openOverview(trip);
-    expect(outcome).toEqual({kind: 'info', message: '⇗ overview · in the split → · nothing left this machine'});
+    expect(outcome).toEqual({kind: 'info', message: '⇗ all files opened in the browser split'});
     expect(events).toEqual(['cross full']);
     const file = new URL(surface.shown[0]!).pathname;
     const html = fs.readFileSync(file, 'utf8');
-    expect(html).toContain('<title>Overview · branch-review</title>');
+    expect(html).toContain('<title>All files · branch-review</title>');
     expect(html).toContain('2 changed · 1 removed');
     expect(html).toContain('new file');
     expect(html).toContain('shown dimmed from main');
@@ -735,7 +735,7 @@ describe('opening pages', () => {
     await clock.advance(5_000);
     expect(fs.existsSync(file)).toBe(true);
     expect(fs.readdirSync(dir).filter((name) => name.startsWith('f-'))).toHaveLength(4);
-    expect(await service.openOverview(trip)).toEqual({kind: 'info', message: '⇗ overview · in the split →'});
+    expect(await service.openOverview(trip)).toEqual({kind: 'info', message: '⇗ all files opened in the browser split'});
     expect(fs.readdirSync(dir).filter((name) => name.endsWith('.html')).length).toBeGreaterThan(0);
   });
 
@@ -764,7 +764,7 @@ describe('opening pages', () => {
     expect(surface.shown).toHaveLength(1);
     expect(toast).toBeNull();
     crossing.resolve();
-    expect(await opening).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ guide\.md · in the split →/)});
+    expect(await opening).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ guide\.md opened in the browser split/)});
     expect(events).toEqual(['cross starts', 'cross ends, shown 1']);
   });
 
@@ -778,7 +778,7 @@ describe('opening pages', () => {
     service.setReview(review([edited('docs/slow.md'), edited('docs/fast.md')]), CTX);
     const older = service.open({fileKey: 'docs/slow.md'}, trip);
     const newer = service.open({fileKey: 'docs/fast.md'}, trip);
-    expect(await newer).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ fast\.md · in the split →/)});
+    expect(await newer).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ fast\.md opened in the browser split/)});
     // The page fast.md opened with, while slow.md's count was still unknown.
     const fast = await service.page('docs/fast.md');
     held.resolve();
@@ -802,7 +802,7 @@ describe('opening pages', () => {
     expect(row('README.md')).toMatch(/^<a class="br-row br-row-modified" href="f-[0-9a-f]{20}\.html">/);
     expect(row('docs/broken.md')).toMatch(/^<div class="br-row br-row-modified br-row-none">/);
     expect(row('docs/broken.md')).not.toContain('href=');
-    expect(row('docs/broken.md')).toContain('not rendered yet');
+    expect(row('docs/broken.md')).toContain('not ready yet');
   });
 
   it('asks the worker for no fragment again on R once this review\'s are in', async () => {
@@ -832,9 +832,9 @@ describe('opening pages', () => {
     });
     await clock.advance(3_000);
     await clock.advance(2_000);
-    expect(toast).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ overview · in the split →/)});
+    expect(toast).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ all files opened in the browser split/)});
     const html = fs.readFileSync(new URL(surface.shown[0]!).pathname, 'utf8');
-    expect(html).toContain('<span class="br-row-path">docs/cold.md</span><span class="br-row-note">not rendered yet</span>');
+    expect(html).toContain('<span class="br-row-path">docs/cold.md</span><span class="br-row-note">not ready yet</span>');
     held.resolve({ok: true, summary: summary()});
   });
 
@@ -904,10 +904,10 @@ describe('opening pages', () => {
       const written = fs.readdirSync(dir).filter((name) => name.endsWith('.html')).map((name) => fs.readFileSync(path.join(dir, name), 'utf8'));
 
       // Every place a reason shows was reached.
-      expect(said.at(-1)).toMatchObject({kind: 'error', message: expect.stringMatching(/^rendered view turned off: rendered worker exited \(code 1\): Error: ENOENT/)});
+      expect(said.at(-1)).toMatchObject({kind: 'error', message: expect.stringMatching(/^Preview and Review in browser turned off: page worker exited \(code 1\): Error: ENOENT/)});
       expect(notices).toEqual([`✗ ${said.at(-1)!.message}`]);
       expect(written.some((html) => html.includes('"kind":"failed"'))).toBe(true);
-      expect(written.some((html) => html.includes('<title>Overview · branch-review</title>') && html.includes("couldn't render · rendered worker exited"))).toBe(true);
+      expect(written.some((html) => html.includes('<title>All files · branch-review</title>') && html.includes("couldn't show · page worker exited"))).toBe(true);
       for (const text of [...said.map((outcome) => JSON.stringify(outcome)), ...notices, ...written]) {
         expect(text).not.toContain(os.homedir());
         expect(text).not.toMatch(/\/Users\/|\/home\/| {4}at /);
@@ -930,7 +930,7 @@ describe('opening pages', () => {
     void service.open({fileKey: 'docs/slow.md'}, trip).then((outcome) => {
       older = outcome;
     });
-    expect(await service.open({fileKey: 'docs/fast.md'}, trip)).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ fast\.md · in the split →/)});
+    expect(await service.open({fileKey: 'docs/fast.md'}, trip)).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ fast\.md opened in the browser split/)});
     // slow.md's 5 s run out while fast.md's toast and page are on screen.
     await clock.advance(5_000);
     expect(older).toBeNull();
@@ -972,7 +972,7 @@ describe('opening pages', () => {
     await waiting;
     expect(row('README.md')).toMatch(/^<div class="br-row br-row-modified br-row-none">/);
     expect(row('README.md')).not.toContain('href=');
-    expect(row('README.md')).toContain('<span class="br-row-note">not rendered yet</span>');
+    expect(row('README.md')).toContain('<span class="br-row-note">not ready yet</span>');
     held.resolve({ok: true, summary: summary()});
     await clock.advance(0);
 
@@ -983,7 +983,7 @@ describe('opening pages', () => {
     await clock.advance(250);
     await service.openOverview(trip);
     expect(row('README.md')).toMatch(/^<div class="br-row br-row-modified br-row-none">/);
-    expect(row('README.md')).toContain('<span class="br-row-note">not rendered yet · renderer crashed</span>');
+    expect(row('README.md')).toContain('<span class="br-row-note">not ready yet · renderer crashed</span>');
     expect(row('docs/guide.md')).toMatch(/^<a class="br-row br-row-modified" href="f-[0-9a-f]{20}\.html">/);
   });
 
@@ -1022,12 +1022,12 @@ describe('opening pages', () => {
     expect(surface.shown).toEqual([]);
   });
 
-  it('names where a page opens, for the button\'s hint', () => {
+  it('says in plain words where the button opens the page, for its hover tip', () => {
     const {backend} = scriptedBackend();
-    expect(openingService(backend).service.openHint()).toBe('r · opens the rendered page in a split to the right');
-    expect(openingService(backend, {surface: recordingSurface({kind: 'browser'})}).service.openHint()).toBe('r · opens the rendered page in your browser');
-    expect(openingService(backend, {surface: recordingSurface({kind: 'none', refusal: "open isn't available over SSH · branch-review --render-out <dir> writes the pages"})}).service.openHint())
-      .toBe("r · open isn't available over SSH");
+    expect(openingService(backend).service.openHint()).toBe("Open this file's changes in a browser split, as GitHub shows them");
+    expect(openingService(backend, {surface: recordingSurface({kind: 'browser'})}).service.openHint()).toBe("Open this file's changes in your browser, as GitHub shows them");
+    expect(openingService(backend, {surface: recordingSurface({kind: 'none', refusal: "open isn't available over SSH · branch-review --export-html <dir> writes the pages"})}).service.openHint())
+      .toBe("open isn't available over SSH");
   });
 
   it('tells its listeners when it has something to say', async () => {
@@ -1039,11 +1039,11 @@ describe('opening pages', () => {
     });
     const before = service.getVersion();
     service.setReview(review([edited('README.md')]), CTX);
-    turnOff('rendered view turned off: the worker kept crashing');
+    turnOff('Preview and Review in browser turned off: the worker kept crashing');
     await clock.advance(2_000);
     expect(heard).toBeGreaterThan(0);
     expect(service.getVersion()).not.toBe(before);
-    expect(service.takeNotices()).toEqual(['✗ rendered view turned off: the worker kept crashing']);
+    expect(service.takeNotices()).toEqual(['✗ Preview and Review in browser turned off: the worker kept crashing']);
     stop();
   });
 });
@@ -1072,7 +1072,7 @@ describe('the trip\'s hash', () => {
 
   it('counts a visit only once the page opened, and sends m=0 with --no-animations', async () => {
     const {backend} = scriptedBackend();
-    const refused = openingService(backend, {surface: recordingSurface({answer: {refused: 'no browser opener found · branch-review --render-out <dir> writes the pages'}}), animations: false});
+    const refused = openingService(backend, {surface: recordingSurface({answer: {refused: 'no browser opener found · branch-review --export-html <dir> writes the pages'}}), animations: false});
     refused.service.setReview(review([edited('README.md')]), CTX);
     await refused.clock.advance(2_000);
     await refused.service.open({fileKey: 'README.md'}, refused.trip);
@@ -1181,7 +1181,7 @@ describe('the trip\'s hash', () => {
     };
     await edit('One, edited.\n');
     const first = service.open({fileKey: 'docs/guide.md', line: 1, fraction: 0}, trip);
-    (await asked(1)).resolve({where: 'cmux-new', message: 'in the split →'});
+    (await asked(1)).resolve({where: 'cmux-new', message: 'opened in the browser split'});
     await first;
 
     // The reader presses r on README.md while a pass rewrites the page in the split.
@@ -1190,7 +1190,7 @@ describe('the trip\'s hash', () => {
     ids = ['b-0000000b-0'];
     await edit('One, edited again.\n');
     expect(surface.refreshed).toEqual([]);
-    pressed.resolve({where: 'cmux-reuse', message: 'in the split →'});
+    pressed.resolve({where: 'cmux-reuse', message: 'opened in the browser split'});
     await press;
     await clock.advance(1_000);
     // The split shows README.md now: the old page's refresh is moot.
@@ -1200,14 +1200,14 @@ describe('the trip\'s hash', () => {
     // A press that places nothing leaves the split on the old page, and
     // the refresh due goes once it is over.
     const back = service.open({fileKey: 'docs/guide.md', line: 1, fraction: 0}, trip);
-    (await asked(3)).resolve({where: 'cmux-reuse', message: 'in the split →'});
+    (await asked(3)).resolve({where: 'cmux-reuse', message: 'opened in the browser split'});
     await back;
     const refused = service.open({fileKey: 'README.md'}, trip);
     const refusing = await asked(4);
     ids = ['b-0000000c-0'];
     await edit('One, edited a third time.\n');
     expect(surface.refreshed).toEqual([]);
-    refusing.resolve({refused: 'no browser opener found · branch-review --render-out <dir> writes the pages'});
+    refusing.resolve({refused: 'no browser opener found · branch-review --export-html <dir> writes the pages'});
     await refused;
     await clock.advance(1_000);
     expect(surface.refreshed.map((url) => url.slice(url.indexOf('#') + 1))).toEqual(['at=L1&f=0&d=none&m=1&g=b-0000000c-0&n=5']);
@@ -1823,7 +1823,7 @@ describe('the rendered service with the in-pane view', () => {
       pane: {
         registry: createImageRegistry({write: (sequence) => writes.push(sequence)}),
         caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
-        env: {BRANCH_REVIEW_PANE: 'on'},
+        env: {BRANCH_REVIEW_PREVIEW: 'on'},
         chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
       },
     });
@@ -1860,7 +1860,7 @@ describe('the rendered service with the in-pane view', () => {
       pane: {
         registry: createImageRegistry({write: () => undefined}),
         caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
-        env: {BRANCH_REVIEW_PANE: 'on'},
+        env: {BRANCH_REVIEW_PREVIEW: 'on'},
         chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
       },
     });
@@ -1894,7 +1894,7 @@ describe('the rendered service with the in-pane view', () => {
       pane: {
         registry: createImageRegistry({write: () => undefined}),
         caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
-        env: {BRANCH_REVIEW_PANE: 'on'},
+        env: {BRANCH_REVIEW_PREVIEW: 'on'},
         chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
       },
     });
@@ -1935,16 +1935,16 @@ describe('the service the CLI runs, over SSH', () => {
       service.dispose();
       return outcome;
     };
-    expect(await said(path.join(outside, 'missing'))).toEqual({kind: 'error', message: "open isn't available over SSH · branch-review --render-out <dir> writes the pages"});
-    expect(await said(chrome)).toEqual({kind: 'error', message: "open isn't available over SSH · v draws it here"});
+    expect(await said(path.join(outside, 'missing'))).toEqual({kind: 'error', message: "open isn't available over SSH · branch-review --export-html <dir> writes the pages"});
+    expect(await said(chrome)).toEqual({kind: 'error', message: "open isn't available over SSH · v previews it"});
   });
 
-  it('names v in the refusal only on a file whose page the pane draws, and the in-pane toasts name --render-out in place of r', async () => {
+  it('names v in the refusal only on a file whose page the pane draws, and the Preview toasts name --export-html in place of r', async () => {
     const outside = makeTempDir('branch-review-chrome-');
     const chrome = path.join(outside, 'chrome-headless-shell');
     fs.writeFileSync(chrome, '#!/bin/sh\nexit 1\n');
     fs.chmodSync(chrome, 0o755);
-    const headless = 'branch-review --render-out <dir> writes the pages';
+    const headless = 'branch-review --export-html <dir> writes the pages';
     const started = (browser: string) => {
       const session = makeTempDir('branch-review-session-');
       const service = startRenderedService({
@@ -1962,11 +1962,11 @@ describe('the service the CLI runs, over SSH', () => {
     // An image keeps its media meaning for v, and the overview is no one file's page.
     expect(await drawn.open({fileKey: 'docs/hero.png'})).toEqual({kind: 'error', message: `open isn't available over SSH · ${headless}`});
     expect(await drawn.openOverview()).toEqual({kind: 'error', message: `open isn't available over SSH · ${headless}`});
-    expect(await drawn.open({fileKey: 'README.md'})).toEqual({kind: 'error', message: "open isn't available over SSH · v draws it here"});
+    expect(await drawn.open({fileKey: 'README.md'})).toEqual({kind: 'error', message: "open isn't available over SSH · v previews it"});
     drawn.dispose();
 
     const missing = started(path.join(outside, 'missing'));
-    expect(missing.pane!.enter()).toEqual({ok: false, message: `the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · ${headless}`});
+    expect(missing.pane!.enter()).toEqual({ok: false, message: `✗ Preview isn't available: no Chrome found · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · ${headless}`});
     missing.dispose();
   });
 });

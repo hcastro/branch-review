@@ -821,8 +821,27 @@ function wire() {
     details.querySelector('.br-before-body')?.animate([{opacity: 0}, {opacity: 1}], {duration: 120, easing: 'ease-out'});
   }, true);
   // A later trip to this page in the same split is a new hash, not a reload.
-  addEventListener('hashchange', () => arrive(readPageHash(location.hash)));
+  addEventListener('hashchange', arriveAtLocation);
+}
+
+// The sanitizer gives every id on the page GitHub's `user-content-` prefix,
+// and github.com still takes a heading's link as `#slug`: a pasted or typed
+// one lands on its heading here too. The browser finds a hash that names an
+// id itself, and our trip's hash has `=` in it, which no slug has.
+function slugTarget(hash: string) {
+  const slug = hash.replace(/^#/, '');
+  if (slug === '' || slug.includes('=')) return null;
+  try {
+    return document.getElementById(`user-content-${decodeURIComponent(slug)}`);
+  } catch {
+    return null;
+  }
+}
+
+function arriveAtLocation() {
+  arrive(readPageHash(location.hash));
+  slugTarget(location.hash)?.scrollIntoView({block: 'start', behavior: 'instant'});
 }
 
 wire();
-arrive(readPageHash(location.hash));
+arriveAtLocation();

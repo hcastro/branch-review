@@ -29,8 +29,8 @@ const CMUX_TIMEOUT_MS = 1500;
 // answers late is still the split, and later presses go to it.
 const OPEN_SPLIT_KILL_MS = 10_000;
 /** Where to get the pages when nothing here opens them. */
-export const HEADLESS = 'branch-review --render-out <dir> writes the pages';
-const IN_SPLIT = 'in the split →';
+export const HEADLESS = 'branch-review --export-html <dir> writes the pages';
+const IN_SPLIT = 'opened in the browser split';
 const IN_BROWSER = 'opened in your browser';
 // A split name cmux gives, such as `surface:17`; anything else is not used.
 const SURFACE_REF = /^[A-Za-z0-9:._-]{1,64}$/;
@@ -96,7 +96,7 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   // On macOS the first `open` on PATH inside cmux is its own wrapper.
   const browser = ssh ? null : platform === 'darwin' ? '/usr/bin/open' : platform === 'linux' || platform === 'freebsd' || platform === 'openbsd' ? findTool('xdg-open') : null;
   const refused = ssh || (!cmux && !browser);
-  const refusalFor = (fileKey: string | null) => (!refused ? null : ssh ? `open isn't available over SSH · ${(typeof inPane === 'function' ? inPane(fileKey) : inPane) ? 'v draws it here' : HEADLESS}` : `no browser opener found · ${HEADLESS}`);
+  const refusalFor = (fileKey: string | null) => (!refused ? null : ssh ? `open isn't available over SSH · ${(typeof inPane === 'function' ? inPane(fileKey) : inPane) ? 'v previews it' : HEADLESS}` : `no browser opener found · ${HEADLESS}`);
   const kind: SurfaceKind = refused ? 'none' : cmux ? 'cmux' : 'browser';
 
   let split: string | null = null;
@@ -170,7 +170,7 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
       if (reuseOnly) return {gone: true};
     }
     const url = href();
-    const slow = () => (inBrowser(url) ? {where: 'browser' as const, message: `cmux didn't answer · ${IN_BROWSER}`} : {refused: `cmux didn't answer · no browser opener found · ${HEADLESS}`});
+    const slow = () => (inBrowser(url) ? {where: 'browser' as const, message: `${IN_BROWSER} · cmux didn't answer`} : {refused: `cmux didn't answer · no browser opener found · ${HEADLESS}`});
     if (lateSplit) return slow();
     // cmux has `timeoutMs` to answer before the page opens in the browser;
     // the call itself runs on, to its own kill, and a split it answers late
@@ -248,7 +248,7 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
     /** Why `r` on this file opens nothing, or null: over SSH, `v` where the pane draws its page. */
     refusalFor,
     /** Where a page opens, for the button's hint. */
-    destination: kind === 'cmux' ? 'in a split to the right' : kind === 'browser' ? 'in your browser' : null,
+    destination: kind === 'cmux' ? 'in a browser split' : kind === 'browser' ? 'in your browser' : null,
     /**
      * Whether the next page opens a new split beside the TUI, which narrows
      * it: true in cmux while no split is known to be open.

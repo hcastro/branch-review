@@ -32,7 +32,7 @@ const FRAGMENT_CACHE_BYTES = 32 * 1024 * 1024;
 const BROWSER_IDLE_MS = 60_000;
 const BROWSER_FAILURE_WINDOW_MS = 60_000;
 const BROWSER_MAX_FAILURES = 3;
-const TILES_OFF = 'in-pane view turned off';
+const TILES_OFF = 'off for this session';
 // What a browser job leaves of its deadline for cutting the tile to size
 // and sending the answer back.
 const BROWSER_MARGIN_MS = 1_000;
@@ -242,7 +242,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
       if (browserFailures.length < BROWSER_MAX_FAILURES) return {ok: false, state: 'error', reason};
       // The failure that turns tiles off says so, so the pane goes back to
       // the diff now, not on some later job that may never come.
-      tilesOff = `${TILES_OFF}: ${reason}`;
+      tilesOff = `${reason} · ${TILES_OFF}`;
       closeBrowser();
       return {ok: false, state: 'unavailable', reason: tilesOff, tilesOff: true};
     }
