@@ -3,7 +3,8 @@ import path from 'node:path';
 import type {FileStatus} from '../git.js';
 import {HEAD_SCRIPT, HEAD_SCRIPT_HASH, PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from './assets.generated.js';
 import {describeImage, imageFacts, type ImageBody, type ImageFacts, type ImageSide} from './image.js';
-import {refusedCard, type DifferenceKind, type RenderedFragment} from './markdown.js';
+import type {DifferenceKind, RenderedFragment} from './markdown.js';
+import {refusedCard} from './words.js';
 import type {RawSource} from './raw.js';
 import type {Finding} from './report.js';
 
@@ -470,7 +471,7 @@ function body(file: PageFile, brokenRefs: readonly number[]) {
 
 // The attributes of an opening tag as rehype-stringify writes them: each
 // value in double quotes, which a value never holds unescaped.
-const TAG_ATTRIBUTES = /^(?: [^\s"'>/=]+(?:="[^"]*")?)*/;
+const TAG_ATTRIBUTES = /(?: [^\s"'>/=]+(?:="[^"]*")?)*/y;
 const ATTRIBUTE = / ([^\s"'>/=]+)(?:="([^"]*)")?/g;
 
 // A link to another page's heading is known to point nowhere only now,
@@ -481,17 +482,23 @@ const ATTRIBUTE = / ([^\s"'>/=]+)(?:="([^"]*)")?/g;
 function finishRefs(fragment: RenderedFragment, brokenRefs: readonly number[]) {
   const offsets = fragment.refOffsets;
   if (!offsets || brokenRefs.length === 0) return fragment.html;
-  let html = fragment.html;
-  const places = [...new Set(brokenRefs)].flatMap((index) => (offsets[index] === undefined ? [] : [offsets[index]!])).sort((left, right) => right - left);
+  const html = fragment.html;
+  const places = [...new Set(brokenRefs)].flatMap((index) => (offsets[index] === undefined ? [] : [offsets[index]!])).sort((left, right) => left - right);
+  // One pass forward: the text between places as it is, each place's
+  // attributes written again, joined once.
+  const parts: string[] = [];
+  let from = 0;
   for (const at of places) {
-    const written = TAG_ATTRIBUTES.exec(html.slice(at))![0];
+    TAG_ATTRIBUTES.lastIndex = at;
+    const written = TAG_ATTRIBUTES.exec(html)![0];
     const attributes = new Map([...written.matchAll(ATTRIBUTE)].map((match) => [match[1]!, match[2]] as const));
     attributes.set('class', [attributes.get('class'), 'br-broken'].filter(Boolean).join(' '));
     attributes.set('title', 'anchor not found');
-    const rewritten = [...attributes].map(([name, value]) => (value === undefined ? ` ${name}` : ` ${name}="${value}"`)).join('');
-    html = `${html.slice(0, at)}${rewritten}${html.slice(at + written.length)}`;
+    parts.push(html.slice(from, at), [...attributes].map(([name, value]) => (value === undefined ? ` ${name}` : ` ${name}="${value}"`)).join(''));
+    from = at + written.length;
   }
-  return html;
+  parts.push(html.slice(from));
+  return parts.join('');
 }
 
 // The source as the diff showed it, for the page script's first frame:

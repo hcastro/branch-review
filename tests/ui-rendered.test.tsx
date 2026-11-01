@@ -415,3 +415,42 @@ describe('the beam', () => {
     instance.unmount();
   });
 });
+
+describe('the footer of an image or an SVG with the rendered view on', () => {
+  const WIDE = {columns: 200, rows: 30};
+  const BOTH_SIDES = {'029ace0': sideInfo({width: 200, height: 100, bytes: 102_000}), '97fa3ee': sideInfo({width: 200, height: 100, bytes: 88_000})};
+  const footerOf = (frame: string | undefined) => stripAnsi(frameLines(frame).at(-2) ?? '');
+
+  it('keeps the media hints of a modified PNG, an SVG and a PNG without previews, with r before t tree', async () => {
+    const fixture = buildFixture([binaryMediaFile('docs/hero.png'), svgMediaFile('docs/flow.svg'), markdownFile('README.md', ['# Readme']), {path: 'src/app.ts', rawDiff: '@@ -1 +1 @@\n-a\n+b', rendered: ['• src/app.ts:1: ', `${gutter(1)}b`]}]);
+    const media = fakeMediaService({review: fixture.review, sides: {...BOTH_SIDES, '35ecfd6': sideInfo({width: 20, height: 10, bytes: 300})}});
+    const {service} = fakeRenderedService({review: fixture.review});
+    const instance = renderFixture({...fixture, media: media.service, rendered: service}, WIDE);
+    await flush(8);
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • 1/2/3 compare • o open • v text • j/k scroll • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).not.toContain('R all');
+    instance.stdin.write('\u001B[B');
+    await flush(8);
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • ⏎ unfold source • v source only • [/] block • o open • y d f c p b copy • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).not.toContain('R all');
+    // Markdown keeps its own list, and a code file the base one.
+    instance.stdin.write('\u001B[B');
+    await flush(8);
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • r rendered ⇗ • R all • j/k scroll • [/] block • t tree');
+    instance.stdin.write('\u001B[B');
+    await flush(8);
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • t tree');
+    expect(footerOf(instance.lastFrame())).not.toContain('r rendered');
+    instance.unmount();
+  });
+
+  it('adds r to the base hints of a PNG when previews are off', async () => {
+    const fixture = buildFixture([binaryMediaFile('docs/hero.png'), markdownFile('README.md', ['# Readme'])]);
+    const {service} = fakeRenderedService({review: fixture.review});
+    const instance = renderFixture({...fixture, rendered: service}, WIDE);
+    await flush(8);
+    expect(footerOf(instance.lastFrame())).toContain('q quit • ↑/↓ jump file • j/k scroll • [/] block • ⏎ fold • y d f c p b copy • r rendered ⇗ • t tree');
+    expect(footerOf(instance.lastFrame())).not.toContain('R all');
+    instance.unmount();
+  });
+});

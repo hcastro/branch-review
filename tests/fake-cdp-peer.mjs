@@ -1,7 +1,8 @@
 // A stand-in for Chromium on --remote-debugging-pipe, for the CDP and
 // browser tests: it reads NUL-terminated JSON commands on fd 3 and writes
 // answers and events on fd 4, as Chromium does, and never touches the
-// network or the screen. FAKE_CDP_MODE picks a behavior, FAKE_CDP_LOG
+// network or the screen. FAKE_CDP_MODE picks a behavior (`crash:`, `kill:`,
+// `hang:` or `exitafter:` a method, `echo`), FAKE_CDP_LOG
 // names a file that gets one JSON line per command (and the argv first).
 import fs from 'node:fs';
 
@@ -55,10 +56,17 @@ input.on('data', (chunk) => {
     answer(message);
   }
 });
-input.on('end', () => process.exit(0));
+// FAKE_CDP_STAY: outlives its pipe, as a browser stuck in its work can, so
+// only a kill ends it.
+if (process.env.FAKE_CDP_STAY) setInterval(() => undefined, 1_000);
+else input.on('end', () => process.exit(0));
 
 function answer({id, method, params, sessionId}) {
   if (mode === `crash:${method}`) process.exit(3);
+  if (mode === `kill:${method}`) process.kill(process.pid, 'SIGKILL');
+  // Answers, then ends on its own a moment later, between jobs: by a
+  // signal, since an exit would wait for the blocked read of fd 3.
+  if (mode === `exitafter:${method}`) setTimeout(() => process.kill(process.pid, 'SIGTERM'), 50);
   if (mode === `hang:${method}`) return;
   if (mode === 'echo') {
     if (method === 'Test.event') send({method: 'Test.happened', params: {value: params.value}, sessionId: 'S1'});

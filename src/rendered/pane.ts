@@ -6,7 +6,7 @@ import {blockForSourceLine} from './anchor.js';
 import type {FragmentRequest, LayoutResult, RenderedBackend, TileSource} from './backend.js';
 import {FILE_ALIAS_LINK} from './keys.js';
 import {oneLine} from './source.js';
-import {planRenderedRows, rowAt, rowMarks, rowSpan, type LayoutBlock, type PageLayout} from './plan.js';
+import {planRenderedRows, rowAt, rowMarks, rowSpan, type LayoutBlock, type LayoutBox, type LayoutLink, type PageLayout} from './plan.js';
 import {geometryKey, GUTTER_COLS, pageCut, pageRows, SHORT_TILE_ROWS, tileGeometry, type DprMode, type PageGeometry} from './tileGeometry.js';
 import type {ChromeBinary} from './worker/chrome.js';
 
@@ -33,6 +33,8 @@ const TILE_CACHE_BYTES = 48 * 1024 * 1024;
 // The terminal background when it didn't answer OSC 11.
 const FALLBACK = {bg: '#111318', scheme: 'dark' as const};
 const LAYING_OUT = 'laying out the page…';
+// The shade a page row holds at until its tile comes.
+const SHADE = '░';
 const TOO_NARROW = 'the pane is too narrow for the page · r opens it rendered';
 const TOO_LARGE = 'too large · r opens it rendered';
 const TOO_LONG = 'the page is too long to draw here · r opens it rendered';
@@ -40,6 +42,10 @@ const TOO_LONG = 'the page is too long to draw here · r opens it rendered';
 // (priority 0 on it, 1 near it), then every other page the pane covers.
 const ACTIVE_LAYOUT = 0;
 const OTHER_LAYOUT = 2;
+// A layout that drew an image or link that didn't answer in time is asked
+// for again this long after, at most this many times.
+const LATE_RETRY_MS = 1_000;
+const LATE_RETRIES = 3;
 
 /**
  * The page's scale: type-matched, or the one BRANCH_REVIEW_PANE_DPR names,
@@ -50,8 +56,15 @@ export function paneDpr(env: NodeJS.ProcessEnv): DprMode {
   return env.BRANCH_REVIEW_PANE_DPR && Number.isFinite(fixed) && fixed > 0 ? fixed : 'type';
 }
 
-/** What a click on a page row leads to. Repo URLs are copied, never opened. */
-export type LinkTarget = {kind: 'anchor'; row: number} | {kind: 'file'; fileKey: string} | {kind: 'external'; url: string};
+/**
+ * What a click on a page row leads to. Repo URLs are copied, never opened,
+ * and only as a URL parsed clean; one that holds control characters is
+ * `refused`, with the reason the footer shows.
+ */
+export type LinkTarget = {kind: 'anchor'; row: number} | {kind: 'file'; fileKey: string} | {kind: 'external'; url: string} | {kind: 'refused'; reason: string};
+
+/** Why a link isn't copied. */
+export const LINK_HAS_CONTROLS = 'this link holds control characters · not copied';
 
 export type PaneBoxState = {status: 'kitty'; id: number} | {status: 'loading'} | {status: 'error'; reason: string};
 
@@ -60,14 +73,19 @@ export type PaneGeometryInput = {innerCols: number; viewportRows: number};
 type LayoutEntry = {status: 'pending'} | {status: 'ready'; layout: PageLayout; document: string; text?: string} | {status: 'failed'; reason: string};
 type Tile = {png: Uint8Array; mosaic?: Uint8Array};
 // What a tile key stands for, so a want can render it: `document` is the
-// name of the tile document it is cut from.
-type TileMeta = {source: TileSource; document: string; index: number; rows: number};
+// name of the tile document it is cut from, which the file's layout
+// `layoutKey` answered.
+type TileMeta = {source: TileSource; document: string; index: number; rows: number; fileKey: string; layoutKey: string};
 type Failure = Extract<LayoutResult, {ok: false}>;
 
 // The blocks that name the source lines they came from.
 const sourced = (layout: PageLayout) => layout.blocks.filter((block): block is LayoutBlock & {lines: readonly [number, number]} => block.lines !== undefined);
 
-const WEB_LINK = /^(?:https?:|mailto:)/i;
+// C0 controls, DEL and C1 controls: a newline, ESC or BEL in an href
+// would reach the clipboard, and the terminal of whoever pastes it.
+// eslint-disable-next-line no-control-regex
+const CONTROLS = /[\u0000-\u001f\u007f-\u009f]/;
+const WEB_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 
 export function createRenderedPane({backend, registry, caps, env, chrome, source, fileForAlias}: {
   backend: Pick<RenderedBackend, 'layout' | 'tile' | 'disabledReason'> & Partial<Pick<RenderedBackend, 'prioritize'>>;
@@ -102,6 +120,14 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   let focused: string | null = null;
   // By file key: the layout still waiting for an answer, to move ahead when its file becomes active.
   const waiting = new Map<string, AbortController>();
+  // By file key: the layout keys it has entries under, at most the one
+  // drawn and the newest asked for.
+  const fileLayouts = new Map<string, Set<string>>();
+  // How often each late layout was asked for again, and the timers that will.
+  const lateTries = new Map<string, number>();
+  const lateTimers = new Set<ReturnType<typeof setTimeout>>();
+  // Documents the worker no longer holds: their tiles wait for the layout asked again.
+  const staleDocuments = new Set<string>();
   const layoutPriority = (fileKey: string) => (fileKey === focused ? ACTIVE_LAYOUT : OTHER_LAYOUT);
   const tiles = createLru<Tile>(TILE_CACHE_BYTES, (tile) => tile.png.byteLength + (tile.mosaic?.byteLength ?? 0));
   const tileMeta = new Map<string, TileMeta>();
@@ -174,29 +200,115 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   // `text`: the markdown the page was laid out from.
   type Drawn = {layoutKey: string; layout: PageLayout; document: string; geometry: PageGeometry; tileSource: TileSource; text?: string};
   const shown = new Map<string, Drawn>();
+
+  // The block a page row shows: the smallest whose box holds the row's
+  // center, else the one that overlaps the row most, else (a row between
+  // blocks) the next one down. Null past the last block.
+  const blockBoxAt = (page: Drawn, row: number) => {
+    const span = rowSpan(page.geometry, row);
+    const center = (span.top + span.bottom) / 2;
+    const blocks = sourced(page.layout);
+    const size = (block: LayoutBox) => block.bottom - block.top;
+    const overlap = (block: LayoutBox) => Math.min(block.bottom, span.bottom) - Math.max(block.top, span.top);
+    const holding = blocks.filter((block) => block.top <= center && center < block.bottom).sort((left, right) => size(left) - size(right));
+    const crossing = blocks.filter((block) => overlap(block) > 0).sort((left, right) => overlap(right) - overlap(left));
+    return holding[0] ?? crossing[0] ?? blocks.filter((block) => block.top >= span.bottom).sort((left, right) => left.top - right.top)[0] ?? null;
+  };
   const lastCols = new Map<string, number>();
   const known = (fileKey: string) => shown.get(fileKey) ?? null;
 
-  const askLayout = (fileKey: string, layoutKey: string, tileSource: TileSource) => {
+  // Drops what no drawn page names: tile names, errors and short-tile marks
+  // of documents no file draws.
+  const pruneDocuments = () => {
+    const live = new Set([...shown.values()].map((each) => each.document));
+    for (const [key, meta] of tileMeta) if (!live.has(meta.document)) tileMeta.delete(key);
+    for (const key of tileErrors.keys()) if (!tileMeta.has(key)) tileErrors.delete(key);
+    for (const document of shortTiles) if (!live.has(document)) shortTiles.delete(document);
+    for (const document of staleDocuments) if (!live.has(document)) staleDocuments.delete(document);
+  };
+
+  const forget = (fileKey: string, layoutKey: string) => {
+    layouts.delete(layoutKey);
+    lateTries.delete(layoutKey);
+    fileLayouts.get(fileKey)?.delete(layoutKey);
+  };
+
+  // `again`: the page drawn under this key is asked for anew (a late
+  // image), and kept when that answer fails.
+  const askLayout = (fileKey: string, layoutKey: string, tileSource: TileSource, again = false) => {
+    // A file keeps the entry it draws and the one asked for now; any other
+    // is a geometry or a review it has left.
+    const keys = fileLayouts.get(fileKey) ?? new Set<string>();
+    fileLayouts.set(fileKey, keys);
+    const drawnKey = shown.get(fileKey)?.layoutKey;
+    for (const key of [...keys]) if (key !== layoutKey && key !== drawnKey) forget(fileKey, key);
+    keys.add(layoutKey);
+    waiting.get(fileKey)?.abort();
     layouts.set(layoutKey, {status: 'pending'});
     const controller = new AbortController();
     waiting.set(fileKey, controller);
     void backend.layout!({source: tileSource}, controller.signal, layoutPriority(fileKey)).then((result) => {
       if (waiting.get(fileKey) === controller) waiting.delete(fileKey);
-      if (disposed) return;
+      if (disposed || controller.signal.aborted || layouts.get(layoutKey)?.status !== 'pending') return;
       if (result.ok) {
         const text = result.text === undefined ? {} : {text: result.text};
         layouts.set(layoutKey, {status: 'ready', layout: result.layout, document: result.document, ...text});
+        const before = shown.get(fileKey)?.layoutKey;
         shown.set(fileKey, {layoutKey, layout: result.layout, document: result.document, geometry: tileSource.geometry, tileSource, ...text});
+        if (before !== undefined && before !== layoutKey) forget(fileKey, before);
+        staleDocuments.delete(result.document);
+        pruneDocuments();
+        if (result.late) retryLate(fileKey, layoutKey, tileSource);
       } else {
         layouts.set(layoutKey, {status: 'failed', reason: oneLine(result.reason)});
-        gaveUp(result);
+        const drawn = shown.get(fileKey);
+        // A retry that failed leaves the page as it was drawn, and the
+        // retries it has left still come, unless the browser or the worker
+        // gave up for the session. A page whose document the worker no
+        // longer holds can't cut the tiles it still lacks: it stays failed,
+        // so the error row shows and the next `v` asks again.
+        if (!gaveUp(result) && again && drawn?.layoutKey === layoutKey && !staleDocuments.has(drawn.document)) {
+          layouts.set(layoutKey, {status: 'ready', layout: drawn.layout, document: drawn.document, ...(drawn.text === undefined ? {} : {text: drawn.text})});
+          retryLate(fileKey, layoutKey, tileSource);
+        }
       }
       planChanged();
+    }, () => {
+      // Aborted: a newer layout of the file replaced it.
     });
   };
 
+  // A page drawn with an image or link still late is laid out again a
+  // second later, the page on screen kept until the newer answer lands.
+  // At most LATE_RETRIES times per layout key, whether the retries land
+  // late again or fail.
+  const retryLate = (fileKey: string, layoutKey: string, tileSource: TileSource) => {
+    const tries = lateTries.get(layoutKey) ?? 0;
+    if (tries >= LATE_RETRIES) return;
+    lateTries.set(layoutKey, tries + 1);
+    const timer = setTimeout(() => {
+      lateTimers.delete(timer);
+      if (disposed || layouts.get(layoutKey)?.status !== 'ready' || shown.get(fileKey)?.layoutKey !== layoutKey) return;
+      askLayout(fileKey, layoutKey, tileSource, true);
+    }, LATE_RETRY_MS);
+    timer.unref?.();
+    lateTimers.add(timer);
+  };
+
+  // The worker no longer holds the document a tile was to be cut from (it
+  // was evicted, or the worker started anew): the page is laid out again,
+  // and drawn as it is until that lands.
+  const relayout = (meta: TileMeta) => {
+    staleDocuments.add(meta.document);
+    const drawn = shown.get(meta.fileKey);
+    if (!drawn || drawn.document !== meta.document || layouts.get(drawn.layoutKey)?.status === 'pending') return;
+    layouts.delete(drawn.layoutKey);
+    askLayout(meta.fileKey, drawn.layoutKey, drawn.tileSource);
+  };
+
   const textRow = (text: string, tone: 'dim' | 'error'): PlanRow => ({type: 'text', role: tone === 'error' ? 'reason' : 'loading', pieces: [{at: GUTTER_COLS, parts: [{text, tone}]}]});
+  // A page row whose tile is on its way, in the shade the pane holds at.
+  const shadeRow = (geometry: PageGeometry): PlanRow => ({type: 'text', role: 'loading', pieces: [{at: geometry.leftPad, parts: [{text: SHADE.repeat(geometry.sheetCols), tone: 'dim'}]}]});
 
   // With every id in quarantine, a tile on screen waits for the first to
   // come free, and nothing else may wake the pane (an idle session): one
@@ -227,9 +339,15 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   const render = (box: BoxSpec, meta: TileMeta, priority: number) => {
     const controller = new AbortController();
     rendering.set(box.imageKey, controller);
-    void backend.tile!({source: meta.source, index: meta.index, rows: meta.rows, mosaic: !slow}, controller.signal, priority).then((result) => {
+    void backend.tile!({source: meta.source, document: meta.document, index: meta.index, rows: meta.rows, mosaic: !slow}, controller.signal, priority).then((result) => {
       if (controller.signal.aborted || disposed) return;
       rendering.delete(box.imageKey);
+      // A tile of a page the file no longer draws is no tile of its page.
+      if (shown.get(meta.fileKey)?.document !== meta.document) return;
+      if (!result.ok && result.stale) {
+        relayout(meta);
+        return;
+      }
       if (result.ok) {
         const tile: Tile = result.mosaic ? {png: result.png, mosaic: result.mosaic} : {png: result.png};
         tiles.set(box.imageKey, tile);
@@ -305,13 +423,18 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         askLayout(fileKey, page.layoutKey, page.tileSource);
         entry = layouts.get(page.layoutKey)!;
       }
+      const was = shown.get(fileKey)?.layoutKey;
+      if (entry.status === 'ready' && was !== undefined && was !== page.layoutKey) forget(fileKey, was);
       if (entry.status === 'ready') shown.set(fileKey, {layoutKey: page.layoutKey, layout: entry.layout, document: entry.document, geometry: page.geometry, tileSource: page.tileSource, ...(entry.text === undefined ? {} : {text: entry.text})});
       const before = shown.get(fileKey);
       const drawn = entry.status === 'ready' || (entry.status === 'pending' && before && geometryKey(before.geometry) === geometryKey(page.geometry)) ? before! : null;
       if (!drawn) {
         if (entry.status === 'failed') return [label, textRow(`couldn't lay out the page · ${entry.reason} · r opens it rendered`, 'error')];
-        shown.delete(fileKey);
         layingOut.add(fileKey);
+        // A new geometry (a resize): the page's rows at its new size, as
+        // the shade of a page on its way, never the old tiles stretched.
+        // What was drawn stays known, so the reader's place can be found.
+        if (before) return [label, ...Array.from({length: pageRows(page.geometry, before.layout.heightCss)}, () => shadeRow(page.geometry))];
         return [label, textRow(LAYING_OUT, 'dim')];
       }
       const {layout, document} = drawn;
@@ -320,7 +443,7 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       const rows = pageRows(geometry, layout.heightCss);
       return [label, ...planRenderedRows(layout, geometry, (index) => {
         const key = `page:${document}:${geometryKey(geometry)}:${index}`;
-        tileMeta.set(key, {source: tileSource, document, index, rows});
+        tileMeta.set(key, {source: tileSource, document, index, rows, fileKey, layoutKey: drawn.layoutKey});
         return key;
       }), ...(pageCut(geometry, layout.heightCss) ? [textRow(TOO_LONG, 'dim')] : [])];
     },
@@ -358,6 +481,18 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         return;
       }
       visibleKeys = visible;
+      // A tile still waiting for the worker follows the screen: first when
+      // it is on screen, next when near; one the screen has gone past (out
+      // of the window `boxes` covers) is dropped, not cut for nothing.
+      const near = new Set(boxes.map(({box}) => box.imageKey));
+      for (const [key, controller] of rendering) {
+        if (!near.has(key)) {
+          controller.abort();
+          rendering.delete(key);
+          continue;
+        }
+        backend.prioritize?.(controller.signal, visible.has(key) ? 0 : 1);
+      }
       let lastVisible = -1;
       if (slow) for (const [at, {box}] of boxes.entries()) if (visible.has(box.imageKey)) lastVisible = at;
       let changed = false;
@@ -375,7 +510,7 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
           continue;
         }
         const meta = tileMeta.get(key);
-        if (meta && !rendering.has(key)) render(box, meta, visible.has(key) ? 0 : 1);
+        if (meta && !rendering.has(key) && !staleDocuments.has(meta.document)) render(box, meta, visible.has(key) ? 0 : 1);
       }
       if (changed) notify();
     },
@@ -390,6 +525,7 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         rendering.delete(key);
       }
       registry.sweep(live, visible, 'page');
+      pruneDocuments();
     },
 
     /**
@@ -408,20 +544,42 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       }
     },
 
-    /** Whether the file's layout failed, so its rows say why and no page rows will come. */
+    /**
+     * Whether the file's layout at the width it was last planned at failed,
+     * so its rows say why and no page rows will come, though a page drawn
+     * at another width (before a resize) is still known.
+     */
     layoutFailed(fileKey: string) {
       const cols = lastCols.get(fileKey);
       const page = cols === undefined ? null : pageFor(fileKey, cols);
       const entry = page?.geometry ? layouts.get(page.layoutKey) : undefined;
-      return !shown.has(fileKey) && entry?.status === 'failed';
+      return entry?.status === 'failed' && shown.get(fileKey)?.layoutKey !== page!.layoutKey;
     },
 
-    /** The page row that shows source line `line`, for opening the pane where the diff was. */
-    rowForLine(fileKey: string, line: number): number | null {
+    /**
+     * The page row that shows source line `line`, for opening the pane
+     * where the diff was: its block's first row, or the row `within` (0 to
+     * 1) of the way down the block.
+     */
+    rowForLine(fileKey: string, line: number, within = 0): number | null {
       const page = known(fileKey);
       const blocks = page ? sourced(page.layout) : [];
       const block = blocks[blockForSourceLine(blocks, line)];
-      return page && block ? rowAt(page.geometry, block.top) : null;
+      return page && block ? rowAt(page.geometry, block.top + within * (block.bottom - block.top)) : null;
+    },
+
+    /**
+     * Where a page row is in the source: the first line of the block it
+     * shows and how far down that block the row's top is (0 to 1), for
+     * keeping the reader's place when the page is laid out anew.
+     */
+    placeAt(fileKey: string, row: number): {line: number; within: number} | null {
+      const page = known(fileKey);
+      const block = page ? blockBoxAt(page, row) : null;
+      if (!page || !block) return null;
+      const height = block.bottom - block.top;
+      const top = rowSpan(page.geometry, row).top;
+      return {line: block.lines[0], within: height > 0 ? Math.min(1, Math.max(0, (top - block.top) / height)) : 0};
     },
 
     /**
@@ -444,17 +602,23 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     },
 
     /**
-     * The block a page row shows: the innermost one that crosses it, else
-     * the next one down. Null past the last block.
+     * The block a page row shows: the smallest whose box holds the row's
+     * center, else the one that overlaps the row most, else (a row between
+     * blocks) the next one down. Null past the last block.
      */
     blockAt(fileKey: string, row: number): {id: string; lines: readonly [number, number]} | null {
       const page = known(fileKey);
-      if (!page) return null;
-      const span = rowSpan(page.geometry, row);
-      const blocks = sourced(page.layout);
-      const crossing = blocks.filter((block) => block.top < span.bottom && block.bottom > span.top).sort((left, right) => (left.bottom - left.top) - (right.bottom - right.top));
-      const block = crossing[0] ?? blocks.filter((block) => block.top >= span.bottom).sort((left, right) => left.top - right.top)[0];
+      const block = page ? blockBoxAt(page, row) : null;
       return block ? {id: block.id, lines: block.lines} : null;
+    },
+
+    /**
+     * The mark the page gave the block `blockAt` names: `added` or
+     * `modified`, or null for a block the branch didn't change or no block.
+     */
+    markAt(fileKey: string, row: number): 'added' | 'modified' | null {
+      const page = known(fileKey);
+      return (page ? blockBoxAt(page, row)?.mark : undefined) ?? null;
     },
 
     /** The page rows where a run of marked rows starts, top to bottom. */
@@ -476,7 +640,20 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       const {cellPx, dpr, leftPad} = page.geometry;
       const x = ((col - leftPad + 0.5) * cellPx.w) / dpr;
       const y = ((row + 0.5) * cellPx.h) / dpr;
-      const link = page.layout.links.find((each) => x >= each.left && x <= each.right && y >= each.top && y <= each.bottom);
+      // A link is under the point when one of its boxes is; of several,
+      // the one whose box there is smallest, the most specific.
+      let link: LayoutLink | null = null;
+      let smallest = Infinity;
+      for (const each of page.layout.links) {
+        for (const rect of each.rects) {
+          if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) continue;
+          const area = (rect.right - rect.left) * (rect.bottom - rect.top);
+          if (area < smallest) {
+            smallest = area;
+            link = each;
+          }
+        }
+      }
       if (!link) return null;
       if (link.href.startsWith('#')) {
         let id = link.href.slice(1);
@@ -493,7 +670,14 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         const fileKey = fileForAlias(alias);
         return fileKey ? {kind: 'file', fileKey} : null;
       }
-      return WEB_LINK.test(link.href) ? {kind: 'external', url: link.href} : null;
+      if (CONTROLS.test(link.href)) return {kind: 'refused', reason: LINK_HAS_CONTROLS};
+      let parsed: URL;
+      try {
+        parsed = new URL(link.href);
+      } catch {
+        return null;
+      }
+      return WEB_PROTOCOLS.has(parsed.protocol) ? {kind: 'external', url: parsed.href} : null;
     },
 
     subscribe(listener: () => void) {
@@ -509,9 +693,14 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     takeNotices: () => notices.splice(0),
     /** Whether tiles cross a slow link: SSH or tmux. */
     slow,
+    /** For tests: how much per-file state the pane holds. */
+    stateSizes: () => ({layouts: layouts.size, tileMeta: tileMeta.size, tileErrors: tileErrors.size, shortTiles: shortTiles.size, waiting: waiting.size}),
     dispose() {
       disposed = true;
       if (idRetry) clearTimeout(idRetry);
+      for (const timer of lateTimers) clearTimeout(timer);
+      lateTimers.clear();
+      for (const controller of waiting.values()) controller.abort();
       for (const controller of rendering.values()) controller.abort();
       rendering.clear();
     },

@@ -1,10 +1,11 @@
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 import {createImageRegistry} from '../src/media/imageRegistry.js';
 import type {PlanBoxRow, PlanRow} from '../src/media/layout.js';
 import type {FragmentRequest, LayoutRequest, LayoutResult, RenderedBackend, TileRequest, TileResult} from '../src/rendered/backend.js';
 import {fileAlias} from '../src/rendered/keys.js';
 import {createRenderedPane, PANE_NEEDS_CELL_SIZE, PANE_NEEDS_CHROME} from '../src/rendered/pane.js';
 import type {PageLayout} from '../src/rendered/plan.js';
+import {parseSnapshot} from '../src/rendered/worker/browser.js';
 import {KITTY_CAPS, BLOCKS_CAPS, parseApc, pngHeaderOnly} from './media-helpers.js';
 
 // The UI side of the in-pane view: whether it is offered, what `v` says
@@ -34,10 +35,10 @@ const LAYOUT: PageLayout = {
   ],
   removed: [{top: 30 * ROW, bottom: 31 * ROW}],
   links: [
-    {href: '#user-content-usage', left: 16, right: 80, top: 4 * ROW, bottom: 5 * ROW},
-    {href: `${OTHER_ALIAS}.html#user-content-x`, left: 100, right: 180, top: 4 * ROW, bottom: 5 * ROW},
-    {href: 'https://example.com/docs', left: 200, right: 300, top: 4 * ROW, bottom: 5 * ROW},
-    {href: 'javascript:alert(1)', left: 320, right: 400, top: 4 * ROW, bottom: 5 * ROW},
+    {href: '#user-content-usage', rects: [{left: 16, right: 80, top: 4 * ROW, bottom: 5 * ROW}]},
+    {href: `${OTHER_ALIAS}.html#user-content-x`, rects: [{left: 100, right: 180, top: 4 * ROW, bottom: 5 * ROW}]},
+    {href: 'https://example.com/docs', rects: [{left: 200, right: 300, top: 4 * ROW, bottom: 5 * ROW}]},
+    {href: 'javascript:alert(1)', rects: [{left: 320, right: 400, top: 4 * ROW, bottom: 5 * ROW}]},
   ],
   anchors: [{id: 'user-content-usage', top: 100 * ROW}],
 };
@@ -598,13 +599,29 @@ describe('rows and clicks on the page', () => {
     expect(pane.hitTest('docs/page.md', 9, col(20))).toBeNull();
   });
 
+  it('takes the link whose box under the click is smallest where two links overlap, whichever comes first', async () => {
+    const overlapping: PageLayout = {
+      ...LAYOUT,
+      links: [
+        {href: 'https://wide.example/', rects: [{left: 0, right: 400, top: 4 * ROW, bottom: 6 * ROW}]},
+        {href: 'https://narrow.example/', rects: [{left: 100, right: 180, top: 4 * ROW, bottom: 5 * ROW}]},
+      ],
+    };
+    const {pane} = await ready(setup({layout: async (request) => ({ok: true, layout: overlapping, document: documentOf(request)})}));
+    const geometry = {leftPad: 3 + Math.floor((200 - 3 - 122) / 2), cell: 10 / 1.25};
+    const col = (css: number) => geometry.leftPad + Math.floor(css / geometry.cell);
+    expect(pane.hitTest('docs/page.md', 4, col(120))).toEqual({kind: 'external', url: 'https://narrow.example/'});
+    expect(pane.hitTest('docs/page.md', 4, col(20))).toEqual({kind: 'external', url: 'https://wide.example/'});
+    expect(pane.hitTest('docs/page.md', 5, col(120))).toEqual({kind: 'external', url: 'https://wide.example/'});
+  });
+
   it('takes a heading link with a malformed escape as written, never throwing on the repo\'s text', async () => {
     const odd: PageLayout = {
       ...LAYOUT,
       links: [
-        {href: '#%E0%A4', left: 16, right: 80, top: 4 * ROW, bottom: 5 * ROW},
-        {href: '#%E0', left: 100, right: 180, top: 4 * ROW, bottom: 5 * ROW},
-        {href: '#caf%C3%A9', left: 200, right: 300, top: 4 * ROW, bottom: 5 * ROW},
+        {href: '#%E0%A4', rects: [{left: 16, right: 80, top: 4 * ROW, bottom: 5 * ROW}]},
+        {href: '#%E0', rects: [{left: 100, right: 180, top: 4 * ROW, bottom: 5 * ROW}]},
+        {href: '#caf%C3%A9', rects: [{left: 200, right: 300, top: 4 * ROW, bottom: 5 * ROW}]},
       ],
       anchors: [{id: 'user-content-%E0', top: 20 * ROW}, {id: 'user-content-café', top: 40 * ROW}],
     };
@@ -614,5 +631,642 @@ describe('rows and clicks on the page', () => {
     expect(pane.hitTest('docs/page.md', 4, col(20))).toBeNull();
     expect(pane.hitTest('docs/page.md', 4, col(120))).toEqual({kind: 'anchor', row: 20});
     expect(pane.hitTest('docs/page.md', 4, col(220))).toEqual({kind: 'anchor', row: 40});
+  });
+});
+
+describe('the document each tile is cut from', () => {
+  const firstBox = (pane: ReturnType<typeof setup>['pane']) => boxRows(pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+  const want = async (env: ReturnType<typeof setup>, box: PlanBoxRow['boxes'][number]) => {
+    env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    env.pane.sweep(new Set([box.imageKey]), new Set([box.imageKey]));
+    await flush();
+  };
+
+  it('names the document its layout answered in every tile it asks for', async () => {
+    const env = await ready();
+    const box = firstBox(env.pane);
+    await want(env, box);
+    expect(env.tiles[0]!.document).toBe('doc-frag-abc');
+  });
+
+  it('lays the page out again when the worker no longer holds its document, drawing the page it has meanwhile', async () => {
+    let stale = true;
+    let laidOut = 0;
+    let answer: () => void = () => undefined;
+    const env = await ready(setup({
+      layout: async (request) => {
+        laidOut += 1;
+        // The layout asked again waits until the test lets it answer.
+        if (laidOut > 1) {
+          await new Promise<void>((resolve) => {
+            answer = resolve;
+          });
+        }
+        return {ok: true, layout: LAYOUT, document: documentOf(request)};
+      },
+      tile: async (request) => (stale
+        ? {ok: false, state: 'error', reason: 'the page changed since it was laid out', stale: true}
+        : {ok: true, png: pngHeaderOnly(request.source.geometry.sheetCols * 10, request.source.geometry.tileRows * 20)}),
+    }));
+    const box = firstBox(env.pane);
+    await want(env, box);
+    expect(env.layouts).toHaveLength(2);
+    expect(env.pane.boxState(box)).toEqual({status: 'loading'});
+    // Still the page it had, at the same geometry, while that layout is on its way,
+    // and no tile of the document the worker dropped is asked for again.
+    expect(firstBox(env.pane).imageKey).toBe(box.imageKey);
+    await want(env, box);
+    expect(env.tiles).toHaveLength(1);
+    stale = false;
+    answer();
+    await flush();
+    await want(env, firstBox(env.pane));
+    expect(env.tiles).toHaveLength(2);
+    expect(env.pane.boxState(firstBox(env.pane)).status).toBe('kitty');
+    expect(env.layouts).toHaveLength(2);
+  });
+
+  it('drops a tile answer for a document the file no longer draws', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let document = 'doc-1';
+    const env = setup({
+      layout: async () => ({ok: true, layout: LAYOUT, document}),
+      tile: async (request) => {
+        await gate;
+        // With a mosaic, so a tile kept from the old document would show in mosaic().
+        return {ok: true, png: pngHeaderOnly(request.source.geometry.sheetCols * 10, request.source.geometry.tileRows * 20), mosaic: new Uint8Array(3)};
+      },
+    });
+    await ready(env);
+    const old = firstBox(env.pane);
+    env.pane.want([{fileKey: 'docs/page.md', box: old}], new Set([old.imageKey]));
+    // The file changes while its tile is cut: a new review, a new document.
+    document = 'doc-2';
+    env.pane.rows('docs/page.md', {...GEOM, innerCols: 120});
+    await flush();
+    env.pane.rows('docs/page.md', GEOM);
+    await flush();
+    expect(firstBox(env.pane).imageKey).toContain('doc-2');
+    release();
+    await flush();
+    expect(env.registry.idFor(old.imageKey)).toBeUndefined();
+    expect(env.pane.mosaic(old)).toBeNull();
+  });
+
+  it('says the layout failed when the retry of a late layout fails after the worker let its document go, and v asks again', async () => {
+    let calls = 0;
+    let failRetry: (result: LayoutResult) => void = () => undefined;
+    const env = setup({
+      layout: async () => {
+        calls += 1;
+        if (calls === 1) return {ok: true, layout: LAYOUT, document: 'doc-late', late: true};
+        if (calls === 2) return new Promise<LayoutResult>((resolve) => {
+          failRetry = resolve;
+        });
+        return {ok: true, layout: LAYOUT, document: 'doc-new'};
+      },
+      tile: async () => ({ok: false, state: 'error', reason: 'the page changed since it was laid out', stale: true}),
+    });
+    env.pane.enter();
+    env.pane.rows('docs/page.md', GEOM);
+    await flush();
+    // The late page's retry is on its way when a tile of it answers stale.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(env.layouts).toHaveLength(2);
+    await want(env, firstBox(env.pane));
+    failRetry({ok: false, state: 'error', reason: 'the browser exited (signal SIGKILL)'});
+    await flush();
+    await flush();
+    const rows = JSON.stringify(env.pane.rows('docs/page.md', GEOM));
+    expect(rows).toContain("couldn't lay out the page · the browser exited (signal SIGKILL)");
+    // Nothing more is asked by itself; the next v asks again and draws.
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(env.layouts).toHaveLength(2);
+    env.pane.enter();
+    env.pane.rows('docs/page.md', GEOM);
+    await flush();
+    expect(env.layouts).toHaveLength(3);
+    expect(firstBox(env.pane).imageKey).toContain('doc-new');
+  });
+});
+
+describe('a layout that drew something late', () => {
+  it('is asked for again a second later, and the newer answer is drawn', async () => {
+    vi.useFakeTimers();
+    try {
+      let answers = 0;
+      const env = setup({layout: async () => {
+        answers += 1;
+        return answers === 1 ? {ok: true, layout: LAYOUT, document: 'doc-late', late: true} : {ok: true, layout: LAYOUT, document: 'doc-whole'};
+      }});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!.imageKey).toContain('doc-late');
+      await vi.advanceTimersByTimeAsync(999);
+      expect(env.layouts).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(env.layouts).toHaveLength(2);
+      // Drawn as it was until the newer answer lands, then the newer one.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!.imageKey).toContain('doc-whole');
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(env.layouts).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is asked for again at most three times, and one that was on time never', async () => {
+    vi.useFakeTimers();
+    try {
+      const late = setup({layout: async () => ({ok: true, layout: LAYOUT, document: 'doc-late', late: true})});
+      late.pane.enter();
+      late.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(late.layouts).toHaveLength(4);
+      const onTime = setup();
+      onTime.pane.enter();
+      onTime.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(onTime.layouts).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('asking again for a page already drawn', () => {
+  it('keeps the page it drew when the retry of a late layout fails, and says nothing', async () => {
+    vi.useFakeTimers();
+    try {
+      let answers = 0;
+      const env = setup({layout: async () => {
+        answers += 1;
+        return answers === 1 ? {ok: true, layout: LAYOUT, document: 'doc-late', late: true} : {ok: false, state: 'error', reason: 'the browser exited (signal SIGKILL)'};
+      }});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      const drawn = boxRows(env.pane.rows('docs/page.md', GEOM)).map((row) => row.boxes[0]!.imageKey);
+      expect(drawn[0]).toContain('doc-late');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(env.layouts).toHaveLength(2);
+      const after = env.pane.rows('docs/page.md', GEOM);
+      expect(JSON.stringify(after)).not.toContain("couldn't lay out the page");
+      expect(boxRows(after).map((row) => row.boxes[0]!.imageKey)).toEqual(drawn);
+      expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
+      expect(env.pane.mode()).toBe('rendered');
+      expect(env.pane.takeNotices()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('asks again after a failed retry of a late layout, and draws the page that comes back whole', async () => {
+    vi.useFakeTimers();
+    try {
+      let answers = 0;
+      const env = setup({layout: async () => {
+        answers += 1;
+        if (answers === 1) return {ok: true, layout: LAYOUT, document: 'doc-late', late: true};
+        if (answers === 2) return {ok: false, state: 'error', reason: 'the browser exited (signal SIGKILL)'};
+        return {ok: true, layout: LAYOUT, document: 'doc-whole'};
+      }});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      for (let second = 0; second < 5; second += 1) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        env.pane.rows('docs/page.md', GEOM);
+      }
+      expect(env.layouts).toHaveLength(3);
+      expect(boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!.imageKey).toContain('doc-whole');
+      expect(env.pane.takeNotices()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stops asking after three retries of a late layout that all fail, and keeps the page it drew', async () => {
+    vi.useFakeTimers();
+    try {
+      let answers = 0;
+      const env = setup({layout: async () => {
+        answers += 1;
+        return answers === 1 ? {ok: true, layout: LAYOUT, document: 'doc-late', late: true} : {ok: false, state: 'error', reason: 'the browser exited (signal SIGKILL)'};
+      }});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      for (let second = 0; second < 10; second += 1) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        env.pane.rows('docs/page.md', GEOM);
+      }
+      expect(env.layouts).toHaveLength(4);
+      const rows = env.pane.rows('docs/page.md', GEOM);
+      expect(JSON.stringify(rows)).not.toContain("couldn't lay out the page");
+      expect(boxRows(rows)[0]!.boxes[0]!.imageKey).toContain('doc-late');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still turns itself off when the retry of a late layout finds the browser gave up', async () => {
+    vi.useFakeTimers();
+    try {
+      let answers = 0;
+      const env = setup({layout: async () => {
+        answers += 1;
+        return answers === 1 ? {ok: true, layout: LAYOUT, document: 'doc-late', late: true} : {ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited (code 3)', tilesOff: true};
+      }});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(env.layouts).toHaveLength(2);
+      expect(env.pane.mode()).toBe('diff');
+      expect(env.pane.takeNotices()).toEqual(['✗ in-pane view turned off: the browser exited (code 3) · r still works']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('a resize whose new layout fails', () => {
+  it('says the layout failed, so a place kept for the resize lets go, and is no failure back at the width it drew at', async () => {
+    let calls = 0;
+    const env = setup({layout: async (request) => {
+      calls += 1;
+      return calls === 1 ? {ok: true, layout: LAYOUT, document: documentOf(request)} : {ok: false, state: 'error', reason: 'the browser exited (code 3)'};
+    }});
+    await ready(env);
+    const narrow = {...GEOM, innerCols: 120};
+    env.pane.rows('docs/page.md', narrow);
+    // On its way, not failed yet.
+    expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
+    await flush();
+    expect(JSON.stringify(env.pane.rows('docs/page.md', narrow))).toContain("couldn't lay out the page · the browser exited (code 3)");
+    expect(env.pane.layoutFailed('docs/page.md')).toBe(true);
+    expect(boxRows(env.pane.rows('docs/page.md', GEOM))).toHaveLength(150);
+    expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
+  });
+});
+
+describe('the state the pane keeps per file', () => {
+  it('keeps at most the drawn layout and the newest one per file over 100 reviews, and names only drawn tiles', async () => {
+    let epoch = 0;
+    const env = setup();
+    const pane = createRenderedPane({
+      backend: {layout: async (request) => ({ok: true, layout: LAYOUT, document: `doc-${request.source.fragment.assets.epoch}`}), tile: async () => ({ok: false, state: 'error', reason: 'unused'}), disabledReason: () => null},
+      registry: env.registry,
+      caps: CAPS,
+      env: {BRANCH_REVIEW_PANE: 'on'},
+      chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      // The text never changes; each review is a new epoch.
+      source: () => ({fragment: {...FRAGMENT, assets: {...FRAGMENT.assets, epoch}}, base: 'main'}),
+      fileForAlias: () => null,
+    });
+    pane.enter();
+    let most = 0;
+    for (; epoch < 100; epoch += 1) {
+      pane.rows('docs/page.md', GEOM);
+      most = Math.max(most, pane.stateSizes().layouts);
+      await flush();
+      pane.rows('docs/page.md', GEOM);
+      most = Math.max(most, pane.stateSizes().layouts);
+      pane.sweep(new Set(), new Set());
+    }
+    expect(most).toBeLessThanOrEqual(2);
+    expect(pane.stateSizes().layouts).toBeLessThanOrEqual(2);
+    // One page of 150 rows names 4 tiles of 40 rows.
+    expect(pane.stateSizes().tileMeta).toBeLessThanOrEqual(4);
+  });
+
+  it('aborts the layout a newer one of the file replaces', async () => {
+    const signals: AbortSignal[] = [];
+    let epoch = 0;
+    const env = setup();
+    const pane = createRenderedPane({
+      backend: {
+        layout: (_request, signal) => {
+          signals.push(signal);
+          return new Promise(() => undefined);
+        },
+        tile: async () => ({ok: false, state: 'error', reason: 'unused'}),
+        disabledReason: () => null,
+      },
+      registry: env.registry,
+      caps: CAPS,
+      env: {BRANCH_REVIEW_PANE: 'on'},
+      chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      source: () => ({fragment: {...FRAGMENT, assets: {...FRAGMENT.assets, epoch}}, base: 'main'}),
+      fileForAlias: () => null,
+    });
+    pane.enter();
+    pane.rows('docs/page.md', GEOM);
+    epoch = 1;
+    pane.rows('docs/page.md', GEOM);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(signals[1]!.aborted).toBe(false);
+    expect(pane.stateSizes().layouts).toBe(1);
+  });
+});
+
+describe('a resize while a page is drawn', () => {
+  it('shows the page\'s rows at the new size in the hold shade while it is laid out there, never the old tiles', async () => {
+    let answer: () => void = () => undefined;
+    let calls = 0;
+    const env = setup({layout: (request) => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve({ok: true, layout: LAYOUT, document: documentOf(request)});
+      return new Promise((resolve) => {
+        answer = () => resolve({ok: true, layout: LAYOUT, document: documentOf(request)});
+      });
+    }});
+    await ready(env);
+    const old = new Set(boxRows(env.pane.rows('docs/page.md', GEOM)).map((row) => row.boxes[0]!.imageKey));
+    // Narrower: 117 columns of sheet, so another geometry.
+    const narrow = {...GEOM, innerCols: 120};
+    const rows = env.pane.rows('docs/page.md', narrow);
+    const expected = Math.ceil((LAYOUT.heightCss * 1.25) / 20);
+    expect(rows).toHaveLength(1 + expected);
+    expect(boxRows(rows)).toHaveLength(0);
+    expect(JSON.stringify(rows)).not.toContain('page:');
+    for (const row of rows.slice(1)) expect(JSON.stringify(row)).toContain('░'.repeat(117));
+    expect(env.pane.ready(new Set(), new Set(['docs/page.md']))).toBe(false);
+    // The page still answers questions about the reader's place.
+    expect(env.pane.lineAtRow('docs/page.md', 3)).toBe(3);
+    answer();
+    await flush();
+    const after = boxRows(env.pane.rows('docs/page.md', narrow));
+    expect(after).toHaveLength(expected);
+    expect(after.some((row) => old.has(row.boxes[0]!.imageKey))).toBe(false);
+  });
+});
+
+describe('rows of a list whose items are shorter than a row and a half', () => {
+  // The owner's pane: 13 by 29 cells at dpr 1.75, rows 16.57 CSS px.
+  const OWNER_CAPS = {...CAPS, cellPx: {w: 13, h: 29}};
+  const item = (index: number) => ({top: index * 28, bottom: index * 28 + 24});
+  const LIST: PageLayout = {
+    heightCss: 112,
+    blocks: [
+      {id: 'b-list', top: 0, bottom: 108, lines: [1, 4]},
+      {id: 'b-one', ...item(0), lines: [1, 1]},
+      {id: 'b-two', ...item(1), lines: [2, 2], mark: 'modified'},
+      {id: 'b-three', ...item(2), lines: [3, 3]},
+      {id: 'b-four', ...item(3), lines: [4, 4]},
+    ],
+    removed: [],
+    links: [],
+    anchors: [],
+  };
+
+  it('copies with c the item each row mostly shows, and lands [ and ] on the changed one', async () => {
+    const {pane} = await ready(setup({caps: OWNER_CAPS, layout: async (request) => ({ok: true, layout: LIST, document: documentOf(request)})}));
+    expect(boxRows(pane.rows('docs/page.md', GEOM)).map((row) => row.lead?.map((part) => part.text).join(''))).toEqual(['   ', '   ', ' ▌ ', '   ', '   ', '   ', '   ']);
+    expect(pane.blockAt('docs/page.md', 2)).toEqual({id: 'b-two', lines: [2, 2]});
+    // Row 3 shows the end of the changed item, but mostly the next one.
+    expect(pane.blockAt('docs/page.md', 3)).toEqual({id: 'b-three', lines: [3, 3]});
+    expect(pane.blockAt('docs/page.md', 0)).toEqual({id: 'b-one', lines: [1, 1]});
+    expect(pane.changeStarts('docs/page.md')).toEqual([2]);
+  });
+});
+
+describe('the block a row shows, where blocks only graze it', () => {
+  // Rows of 16 CSS px at 10 by 20 cells and dpr 1.25: row 3 is 48 to 64, its center 56; row 5 is 80 to 96, its center 88.
+  const GRAZED: PageLayout = {
+    heightCss: 300,
+    blocks: [
+      // Holds row 3's center; a short block grazes the row's last 3 px.
+      {id: 'b-big', top: 40, bottom: 62, lines: [1, 3]},
+      {id: 'b-small', top: 61, bottom: 70, lines: [4, 4]},
+      // No block holds row 5's center: one overlaps its first 6 px, a short one its last 3.
+      {id: 'b-above', top: 70, bottom: 86, lines: [5, 6]},
+      {id: 'b-below', top: 93, bottom: 97, lines: [7, 7]},
+      {id: 'b-far', top: 200, bottom: 220, lines: [9, 9]},
+    ],
+    removed: [],
+    links: [],
+    anchors: [],
+  };
+
+  it('takes the block that holds the row\'s center over a shorter one that grazes it, and else the one that overlaps it most', async () => {
+    const {pane} = await ready(setup({layout: async (request) => ({ok: true, layout: GRAZED, document: documentOf(request)})}));
+    expect(pane.blockAt('docs/page.md', 3)).toEqual({id: 'b-big', lines: [1, 3]});
+    expect(pane.blockAt('docs/page.md', 5)).toEqual({id: 'b-above', lines: [5, 6]});
+  });
+});
+
+describe('a click on a link that wraps', () => {
+  // `plain words [a link that wraps](one) [second](two)` in a 400 px column,
+  // 16 CSS px a line at 10 by 20 cells and dpr 1.25: the first link runs
+  // from x 60 on line one to x 100 on line two, and the second follows it
+  // on line two. Chromium's box for the first link spans both whole lines.
+  function wrapped(): PageLayout {
+    const strings: string[] = [];
+    const s = (text: string) => (strings.includes(text) ? strings.indexOf(text) : strings.push(text) - 1);
+    const nodes = [
+      {name: '#document', parent: -1, attributes: [] as number[]},
+      {name: 'HTML', parent: 0, attributes: [], box: [0, 0, 400, 48]},
+      {name: 'BODY', parent: 1, attributes: [], box: [0, 0, 400, 48]},
+      {name: 'P', parent: 2, attributes: [s('data-block'), s('b-p'), s('data-lines'), s('1-1')], box: [0, 0, 400, 32]},
+      {name: '#text', parent: 3, attributes: [], box: [0, 0, 60, 16]},
+      {name: 'A', parent: 3, attributes: [s('href'), s('https://one.example/a')], box: [0, 0, 400, 32]},
+      {name: '#text', parent: 5, attributes: [], box: [0, 0, 400, 32]},
+      {name: 'A', parent: 3, attributes: [s('href'), s('https://two.example/b')], box: [110, 16, 90, 16]},
+      {name: '#text', parent: 7, attributes: [], box: [110, 16, 90, 16]},
+    ];
+    const laid = nodes.flatMap((node, index) => (node.box ? [{index, box: node.box}] : []));
+    const layoutIndexOf = (node: number) => laid.findIndex((each) => each.index === node);
+    return parseSnapshot({
+      strings,
+      documents: [{
+        nodes: {nodeName: nodes.map((node) => s(node.name)), parentIndex: nodes.map((node) => node.parent), attributes: nodes.map((node) => node.attributes)},
+        layout: {nodeIndex: laid.map((each) => each.index), bounds: laid.map((each) => each.box)},
+        textBoxes: {
+          layoutIndex: [layoutIndexOf(4), layoutIndexOf(6), layoutIndexOf(6), layoutIndexOf(8)],
+          bounds: [[0, 0, 60, 16], [60, 0, 340, 16], [0, 16, 100, 16], [110, 16, 90, 16]],
+        },
+      }],
+    }, 48);
+  }
+
+  // `[logo ![badge](b.png)](https://img.example/)`: the link's text, then
+  // an image in it 32 px tall, taller than the line its text sits on.
+  function imageLink(): PageLayout {
+    const strings: string[] = [];
+    const s = (text: string) => (strings.includes(text) ? strings.indexOf(text) : strings.push(text) - 1);
+    const nodes = [
+      {name: '#document', parent: -1, attributes: [] as number[]},
+      {name: 'HTML', parent: 0, attributes: [], box: [0, 0, 400, 48]},
+      {name: 'BODY', parent: 1, attributes: [], box: [0, 0, 400, 48]},
+      {name: 'P', parent: 2, attributes: [s('data-block'), s('b-p'), s('data-lines'), s('1-1')], box: [0, 0, 400, 32]},
+      {name: 'A', parent: 3, attributes: [s('href'), s('https://img.example/')], box: [0, 16, 72, 16]},
+      {name: '#text', parent: 4, attributes: [], box: [0, 16, 40, 16]},
+      {name: 'IMG', parent: 4, attributes: [s('src'), s('data:image/png;base64,AA==')], box: [40, 0, 32, 32]},
+    ];
+    const laid = nodes.flatMap((node, index) => (node.box ? [{index, box: node.box}] : []));
+    return parseSnapshot({
+      strings,
+      documents: [{
+        nodes: {nodeName: nodes.map((node) => s(node.name)), parentIndex: nodes.map((node) => node.parent), attributes: nodes.map((node) => node.attributes)},
+        layout: {nodeIndex: laid.map((each) => each.index), bounds: laid.map((each) => each.box)},
+        textBoxes: {layoutIndex: [laid.findIndex((each) => each.index === 5)], bounds: [[0, 16, 40, 16]]},
+      }],
+    }, 48);
+  }
+
+  it('keeps a box for an image in a link as well as its text, so a click on the image follows it', async () => {
+    expect(imageLink().links).toEqual([{href: 'https://img.example/', rects: [{left: 0, right: 40, top: 16, bottom: 32}, {left: 40, right: 72, top: 0, bottom: 32}]}]);
+    const {pane} = await ready(setup({layout: async (request) => ({ok: true, layout: imageLink(), document: documentOf(request)})}));
+    const leftPad = 3 + Math.floor((200 - 3 - 122) / 2);
+    const col = (css: number) => leftPad + Math.floor(css / 8);
+    // Row 0 shows only the image's top half.
+    expect(pane.hitTest('docs/page.md', 0, col(50))).toEqual({kind: 'external', url: 'https://img.example/'});
+    expect(pane.hitTest('docs/page.md', 1, col(20))).toEqual({kind: 'external', url: 'https://img.example/'});
+    expect(pane.hitTest('docs/page.md', 0, col(20))).toBeNull();
+  });
+
+  it('keeps one box per line of the link, and none over the text beside it', () => {
+    expect(wrapped().links).toEqual([
+      {href: 'https://one.example/a', rects: [{left: 60, right: 400, top: 0, bottom: 16}, {left: 0, right: 100, top: 16, bottom: 32}]},
+      {href: 'https://two.example/b', rects: [{left: 110, right: 200, top: 16, bottom: 32}]},
+    ]);
+  });
+
+  it('copies the link under the click, never the wrapped one beside it', async () => {
+    const {pane} = await ready(setup({layout: async (request) => ({ok: true, layout: wrapped(), document: documentOf(request)})}));
+    const leftPad = 3 + Math.floor((200 - 3 - 122) / 2);
+    const col = (css: number) => leftPad + Math.floor(css / 8);
+    // Line two: the second link, and the end of the first.
+    expect(pane.hitTest('docs/page.md', 1, col(150))).toEqual({kind: 'external', url: 'https://two.example/b'});
+    expect(pane.hitTest('docs/page.md', 1, col(50))).toEqual({kind: 'external', url: 'https://one.example/a'});
+    // Line one: the plain words before the link, and the link itself.
+    expect(pane.hitTest('docs/page.md', 0, col(30))).toBeNull();
+    expect(pane.hitTest('docs/page.md', 0, col(200))).toEqual({kind: 'external', url: 'https://one.example/a'});
+    // Past the end of line two, beside both links.
+    expect(pane.hitTest('docs/page.md', 1, col(300))).toBeNull();
+  });
+});
+
+describe('what a click on a web link copies', () => {
+  const layoutWith = (href: string): PageLayout => ({...LAYOUT, links: [{href, rects: [{left: 16, right: 300, top: 4 * ROW, bottom: 5 * ROW}]}]});
+  const clicked = async (href: string) => {
+    const {pane} = await ready(setup({layout: async (request) => ({ok: true, layout: layoutWith(href), document: documentOf(request)})}));
+    const leftPad = 3 + Math.floor((200 - 3 - 122) / 2);
+    return pane.hitTest('docs/page.md', 4, leftPad + 5);
+  };
+
+  it('refuses a link that holds a newline, an ESC, a BEL or a C1 control', async () => {
+    for (const href of ['https://example.com/a\nb', 'https://example.com/\u001b]52;c;Zm9v\u0007', 'https://example.com/\u009b2J', 'https://example.com/\u007f']) {
+      expect(await clicked(href)).toEqual({kind: 'refused', reason: 'this link holds control characters · not copied'});
+    }
+  });
+
+  it('copies the URL as parsed: a space percent-encoded, a plain one unchanged', async () => {
+    expect(await clicked('https://example.com/a b')).toEqual({kind: 'external', url: 'https://example.com/a%20b'});
+    expect(await clicked('https://example.com/docs?x=1#y')).toEqual({kind: 'external', url: 'https://example.com/docs?x=1#y'});
+    expect(await clicked('mailto:someone@example.com')).toEqual({kind: 'external', url: 'mailto:someone@example.com'});
+    expect(await clicked('https://')).toBeNull();
+    expect(await clicked('ftp://example.com/x')).toBeNull();
+  });
+});
+
+describe('tiles queued while the reader holds PgDn', () => {
+  it('cuts the tiles of the screen it stops on first, and drops the ones it went past', async () => {
+    // A 40-tile page, and a worker that cuts one tile at a time, the lowest
+    // priority number first, taking a moment for each.
+    const TALL: PageLayout = {heightCss: 1600 * ROW, blocks: [], removed: [], links: [], anchors: []};
+    type Job = {index: number; signal: AbortSignal; priority: number; resolve: (result: TileResult) => void};
+    const queue: Job[] = [];
+    const cut: number[] = [];
+    const aborted: number[] = [];
+    let running = false;
+    const pump = async () => {
+      if (running) return;
+      running = true;
+      while (queue.length > 0) {
+        queue.sort((left, right) => left.priority - right.priority);
+        const job = queue.shift()!;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        cut.push(job.index);
+        job.resolve({ok: true, png: pngHeaderOnly(1220, 800)});
+      }
+      running = false;
+    };
+    const env = setup();
+    const pane = createRenderedPane({
+      backend: {
+        layout: async (request) => ({ok: true, layout: TALL, document: documentOf(request)}),
+        tile: (request, signal, priority = 1) => new Promise((resolve, reject) => {
+          const job: Job = {index: request.index, signal, priority, resolve};
+          queue.push(job);
+          signal.addEventListener('abort', () => {
+            // A queued job is dropped; one being cut finishes, unheard.
+            const at = queue.indexOf(job);
+            if (at >= 0) {
+              queue.splice(at, 1);
+              aborted.push(request.index);
+            }
+            reject(new Error('aborted'));
+          }, {once: true});
+          void pump();
+        }),
+        prioritize: (signal, priority) => {
+          const job = queue.find((each) => each.signal === signal);
+          if (job) job.priority = priority;
+        },
+        disabledReason: () => null,
+      },
+      registry: env.registry,
+      caps: CAPS,
+      env: {BRANCH_REVIEW_PANE: 'on'},
+      chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      source: () => ({fragment: FRAGMENT, base: 'main'}),
+      fileForAlias: () => null,
+    });
+    pane.enter();
+    pane.rows('docs/page.md', GEOM);
+    await flush();
+    const rows = boxRows(pane.rows('docs/page.md', GEOM));
+    expect(new Set(rows.map((row) => row.boxes[0]!.imageKey)).size).toBe(40);
+    const live = new Set(rows.map((row) => row.boxes[0]!.imageKey));
+    const view = 30;
+    // As the app asks after each frame: the boxes on screen, one screen
+    // above and two below, and those on screen.
+    const at = (offset: number) => {
+      const window = new Map<string, PlanBoxRow['boxes'][number]>();
+      const visible = new Set<string>();
+      for (const [row, each] of rows.entries()) {
+        const box = each.boxes[0]!;
+        if (row >= offset - view && row < offset + 2 * view && !window.has(box.imageKey)) window.set(box.imageKey, box);
+        if (row >= offset && row < offset + view) visible.add(box.imageKey);
+      }
+      return {boxes: [...window.values()].map((box) => ({fileKey: 'docs/page.md', box})), visible};
+    };
+    const tileOf = (key: string) => Number(key.split(':').at(-1));
+    let final = at(0);
+    for (let offset = 0; offset <= 1500; offset += view) {
+      final = at(offset);
+      pane.want(final.boxes, final.visible);
+      pane.sweep(live, final.visible);
+    }
+    while (queue.length > 0 || running) await new Promise((resolve) => setTimeout(resolve, 10));
+    const onScreen = [...final.visible].map(tileOf).sort((left, right) => left - right);
+    const near = final.boxes.map(({box}) => tileOf(box.imageKey)).filter((index) => !onScreen.includes(index));
+    // The first tile was already being cut when the reader started; then the screen, then what is near it.
+    expect(cut[0]).toBe(0);
+    expect(cut.slice(1, 1 + onScreen.length).sort((left, right) => left - right)).toEqual(onScreen);
+    expect(cut.slice(1 + onScreen.length).sort((left, right) => left - right)).toEqual(near.sort((left, right) => left - right));
+    // Everything passed on the way was dropped, never cut.
+    expect(aborted.length).toBeGreaterThan(10);
+    for (const index of aborted) expect(cut).not.toContain(index);
   });
 });

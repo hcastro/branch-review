@@ -1,6 +1,6 @@
 import {spawn as nodeSpawn, type ChildProcess, type SpawnOptions} from 'node:child_process';
 import type {Readable, Writable} from 'node:stream';
-import type {LayoutBlock, LayoutBox, LayoutLink, PageLayout} from '../plan.js';
+import type {LayoutBlock, LayoutBox, LayoutLink, LayoutRect, PageLayout} from '../plan.js';
 import {createCdpPipe, type CdpPipe} from './cdp.js';
 import type {ChromeBinary} from './chrome.js';
 
@@ -52,10 +52,18 @@ export const CHROME_FLAGS = [
 const VIEWPORT_HEIGHT = 800;
 const DEFAULT_TIMEOUTS = {launch: 10_000, call: 3_000};
 const CLOSE_GRACE_MS = 1_000;
+// How long a pipe that ended waits for the browser's exit, whose code or
+// signal says better why.
+const EXIT_WAIT_MS = 250;
 
 type Snapshot = {
   strings: string[];
-  documents: Array<{nodes: {nodeName: number[]; parentIndex?: number[]; attributes: number[][]}; layout: {nodeIndex: number[]; bounds: number[][]}}>;
+  documents: Array<{
+    nodes: {nodeName: number[]; parentIndex?: number[]; attributes: number[][]};
+    layout: {nodeIndex: number[]; bounds: number[][]};
+    /** Each line box of text, by the layout index of its text node. */
+    textBoxes?: {layoutIndex: number[]; bounds: number[][]};
+  }>;
 };
 
 /**
@@ -66,7 +74,9 @@ type Snapshot = {
  * would pad a short page with blank rows. `viewHeight` stands in when the
  * snapshot has no root box. A list item's box ends where its first nested
  * list starts, so its mark covers its own text and never the items under
- * it, which carry marks of their own.
+ * it, which carry marks of their own. A link's boxes are those of the
+ * lines of text in it and of the images in it, so a link that wraps holds
+ * only what it draws, never the rest of the lines it runs over.
  */
 export function parseSnapshot(snapshot: Snapshot, viewHeight: number): PageLayout {
   const layout: PageLayout = {heightCss: viewHeight, blocks: [], removed: [], links: [], anchors: []};
@@ -78,6 +88,53 @@ export function parseSnapshot(snapshot: Snapshot, viewHeight: number): PageLayou
   for (const [at, node] of document.layout.nodeIndex.entries()) if (!boxes.has(node)) boxes.set(node, document.layout.bounds[at]!);
   // Our list items' blocks by node, for the lists nested in them, which come after them.
   const items = new Map<number, LayoutBlock>();
+  const parents = document.nodes.parentIndex ?? [];
+  const names = document.nodes.nodeName.map((nameIndex) => text(nameIndex).toUpperCase());
+  const attributeOf = (node: number, name: string) => {
+    const list = document.nodes.attributes[node] ?? [];
+    for (let at = 0; at + 1 < list.length; at += 2) if (text(list[at]) === name) return text(list[at + 1]);
+    return undefined;
+  };
+  // The links: every <a> with an href, except a heading's own anchor.
+  const linkNodes = new Map<number, LayoutLink>();
+  for (const [node, name] of names.entries()) {
+    const href = attributeOf(node, 'href');
+    if (name === 'A' && href && !(attributeOf(node, 'class') ?? '').split(/\s+/).includes('anchor')) linkNodes.set(node, {href, rects: []});
+  }
+  // The nearest link a node is inside, found once per node.
+  const linkAbove = new Map<number, number | null>();
+  const nearestLink = (start: number): number | null => {
+    const path: number[] = [];
+    let found: number | null = null;
+    for (let node = start; node >= 0; node = parents[node] ?? -1) {
+      const known = linkAbove.get(node);
+      if (known !== undefined) {
+        found = known;
+        break;
+      }
+      path.push(node);
+      if (linkNodes.has(node)) {
+        found = node;
+        break;
+      }
+    }
+    for (const node of path) linkAbove.set(node, found);
+    return found;
+  };
+  const rectOf = ([x = 0, y = 0, width = 0, height = 0]: number[]): LayoutRect => ({left: x, right: x + width, top: y, bottom: y + height});
+  const textBoxes = document.textBoxes;
+  if (textBoxes) {
+    for (const [at, layoutIndex] of textBoxes.layoutIndex.entries()) {
+      const node = document.layout.nodeIndex[layoutIndex];
+      const link = node === undefined ? null : nearestLink(node);
+      if (link !== null) linkNodes.get(link)!.rects.push(rectOf(textBoxes.bounds[at]!));
+    }
+  }
+  for (const [at, node] of document.layout.nodeIndex.entries()) {
+    if (names[node] !== 'IMG' && names[node] !== 'SVG') continue;
+    const link = nearestLink(parents[node] ?? -1);
+    if (link !== null) linkNodes.get(link)!.rects.push(rectOf(document.layout.bounds[at]!));
+  }
   for (const [node, nameIndex] of document.nodes.nodeName.entries()) {
     const bounds = boxes.get(node);
     if (!bounds) continue;
@@ -100,11 +157,9 @@ export function parseSnapshot(snapshot: Snapshot, viewHeight: number): PageLayou
     const item = items.get(document.nodes.parentIndex?.[node] ?? -1);
     if (item && (name === 'UL' || name === 'OL')) item.bottom = Math.max(item.top, Math.min(item.bottom, box.top));
     if (name === 'DETAILS' && classes.includes('br-removed')) layout.removed.push(box);
-    const href = attributes.get('href');
-    if (name === 'A' && href && !classes.includes('anchor')) {
-      const link: LayoutLink = {href, left: x, right: x + width, ...box};
-      layout.links.push(link);
-    }
+    const link = linkNodes.get(node);
+    // With no text or picture of its own laid out, the link's own box.
+    if (link) layout.links.push(link.rects.length > 0 ? link : {...link, rects: [{left: x, right: x + width, top: box.top, bottom: box.bottom}]});
     const anchor = attributes.get('id');
     if (anchor) layout.anchors.push({id: anchor, top: y});
   }
@@ -125,10 +180,13 @@ export function createBrowser({binary, userDataDir, spawn = nodeSpawn as Spawn, 
   // `used`: a document was loaded into the page since it was made.
   type Running = {child: ChildProcess; pipe: CdpPipe; session: string; frame: string; loaded: string | null; used: boolean; viewport: string | null};
   let running: Promise<Running> | null = null;
+  // The browser `running` stands for, from the moment it is spawned.
+  let runningChild: ChildProcess | null = null;
 
   const stop = () => {
     const current = running;
     running = null;
+    runningChild = null;
     void current?.then((each) => {
       // Asked to close first, so it ends its own work; killed if it doesn't
       // within a second, or at once when it no longer answers.
@@ -159,9 +217,33 @@ export function createBrowser({binary, userDataDir, spawn = nodeSpawn as Spawn, 
   const launch = async (budget: BrowserBudget): Promise<Running> => {
     const args = [binary.headless, '--remote-debugging-pipe', `--user-data-dir=${userDataDir}`, ...CHROME_FLAGS, ...extraArgs, 'about:blank'];
     const child = spawn(binary.path, args, {stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe']});
-    const pipe = createCdpPipe(child.stdio[4] as Readable, child.stdio[3] as Writable, {timeoutMs: timeouts.call});
+    runningChild = child;
+    // A pipe that ends is closed with the browser's exit, when that comes
+    // soon, so a crash says its signal or code.
+    let exited: string | null = null;
+    let waitingForExit: ReturnType<typeof setTimeout> | null = null;
+    const pipe = createCdpPipe(child.stdio[4] as Readable, child.stdio[3] as Writable, {
+      timeoutMs: timeouts.call,
+      onEnd: () => {
+        if (exited !== null) {
+          pipe.close(exited);
+          return;
+        }
+        waitingForExit ??= setTimeout(() => pipe.close(), EXIT_WAIT_MS);
+        waitingForExit.unref?.();
+      },
+    });
     child.once('error', () => pipe.close("the browser didn't start"));
-    child.once('exit', (code, signal) => pipe.close(`the browser exited (${signal ? `signal ${signal}` : `code ${code}`})`));
+    child.once('exit', (code, signal) => {
+      exited = `the browser exited (${signal ? `signal ${signal}` : `code ${code}`})`;
+      if (waitingForExit) clearTimeout(waitingForExit);
+      // A browser that died between jobs is no one's failure: the next job starts a new one.
+      if (runningChild === child) {
+        running = null;
+        runningChild = null;
+      }
+      pipe.close(exited);
+    });
     try {
       const {targetId} = await pipe.send<{targetId: string}>('Target.createTarget', {url: 'about:blank'}, {timeoutMs: allowed(timeouts.launch, budget)});
       const {sessionId} = await pipe.send<{sessionId: string}>('Target.attachToTarget', {targetId, flatten: true}, {timeoutMs: allowed(timeouts.call, budget)});

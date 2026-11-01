@@ -68,6 +68,37 @@ describe('the link and anchor report', () => {
     expect(html).not.toMatch(/data-br[a-z]{16}/);
   });
 
+  it('reports and draws 60,000 links to missing anchors on another page in time, counting as a small page does', async () => {
+    const guide = await renderMarkdown({path: 'docs/guide.md', source: '# Guide\n', groups: [], asset: skipped, link: outside});
+    const links = (repoPath: string): LinkAnswer => (repoPath === 'docs/guide.md' ? {kind: 'inReview', href: 'f-guide.html'} : outside());
+    const pageOf = (count: number) => renderMarkdown({
+      path: 'README.md',
+      source: `${Array.from({length: count}, (_, index) => `[l${index}](docs/guide.md#nope-${index})`).join(' ')}\n`,
+      groups: [],
+      asset: skipped,
+      link: links,
+    });
+    const reportOf = (readme: RenderedFragment) => {
+      const {findings, broken} = linkReport([source(readme, 'README.md'), source(guide, 'docs/guide.md')]);
+      const html = assembleFilePage({title: TITLE, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, rail: [], brokenRefs: broken.get('README.md') ?? []});
+      return {findings, broken: broken.get('README.md') ?? [], drawn: html.match(/class="br-broken" title="anchor not found"/g)?.length ?? 0};
+    };
+
+    const small = reportOf(await pageOf(3));
+    expect(small.findings).toEqual([0, 1, 2].map((index) => ({path: 'README.md', line: 1, target: `docs/guide.md#nope-${index}`, what: 'link', kind: 'badAnchor', reason: 'anchor not found'})));
+    expect(small.broken).toEqual([0, 1, 2]);
+    expect(small.drawn).toBe(3);
+
+    const readme = await pageOf(60_000);
+    const started = Date.now();
+    const large = reportOf(readme);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(large.findings).toHaveLength(60_000);
+    expect(large.findings.slice(0, 3)).toEqual(small.findings);
+    expect(large.broken).toEqual(Array.from({length: 60_000}, (_, index) => index));
+    expect(large.drawn).toBe(60_000);
+  });
+
   it('finds a link to a missing, untracked or ignored file and one whose case differs, and passes a folder or a tracked file', async () => {
     const repo = initRepo({'.gitignore': 'secret/\n', 'LICENSE': 'MIT\n', 'docs/setup.md': '# Setup\n'});
     git(repo, 'checkout', '-q', '-b', 'feature');
@@ -109,6 +140,24 @@ describe('the link and anchor report', () => {
     expect(readme.html).toContain('<a class="br-inert br-broken" title="case mismatch: Docs/Setup.md vs docs/setup.md">Setup</a>');
   });
 
+  it('finds a link to a folder the work tree deleted entirely, and passes one that still holds a file', async () => {
+    const repo = initRepo({'README.md': '# Project\n', 'legacy/a.md': 'a\n', 'legacy/b.md': 'b\n'});
+    const base = git(repo, 'rev-parse', 'main').trim();
+    const linkTo = async (gone: string[]) => {
+      for (const file of gone) fs.rmSync(path.join(repo, file), {force: true});
+      const sides: AssetSides = {base, after: {worktree: gone.map((file) => ({path: file, id: null, mode: null}))}, epoch: gone.length};
+      const lookups = pageLookups(createAssetResolver({cwd: repo}), sides, false);
+      const page = await renderMarkdown({path: 'README.md', source: 'See [legacy](legacy/).\n', groups: [], asset: skipped, link: lookups.linkTarget});
+      return {status: page.links[0]!.status, findings: linkReport([source(page, 'README.md')]).findings};
+    };
+
+    expect(await linkTo(['legacy/a.md'])).toEqual({status: 'outside', findings: []});
+    expect(await linkTo(['legacy/a.md', 'legacy/b.md'])).toEqual({
+      status: 'missing',
+      findings: [{path: 'README.md', line: 1, target: 'legacy/', what: 'link', kind: 'missing', reason: 'file not found'}],
+    });
+  });
+
   it('claims nothing of a link whose check runs past the budget, and has the page asked for again', async () => {
     const later = <T>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
     const slow = {
@@ -123,8 +172,8 @@ describe('the link and anchor report', () => {
     expect(page.html).not.toContain('br-inert');
     expect(page.differences).toEqual([]);
     expect(linkReport([source(page, 'README.md')]).findings).toEqual([]);
-    expect(uses).toEqual([{side: 'after', path: 'docs/gone.md', identity: LATE_IDENTITY}]);
-  }, 10_000);
+    expect(uses).toEqual([{kind: 'link', side: 'after', path: 'docs/gone.md', identity: LATE_IDENTITY}]);
+  });
 
   it('finds every missing file a link-heavy page names, from the trees alone when git is slow to say more', async () => {
     const repo = initRepo({'README.md': '# Project\n'});
@@ -157,6 +206,57 @@ describe('the link and anchor report', () => {
     expect(uses.some((use) => use.identity === LATE_IDENTITY)).toBe(true);
     expect(most).toBeLessThanOrEqual(6);
   }, 20_000);
+
+  describe('a held fragment checks its links again for each review', () => {
+    // README.md's fragment, asked for under the same key for each review:
+    // its own text never changes, only what its links name.
+    function asker(repo: string, handler = createRenderedHandler()) {
+      return async (assets: AssetSides) => {
+        const result = await handler.handle({
+          type: 'fragment', cwd: repo, key: 'readme-key', path: 'README.md', status: 'modified',
+          source: {kind: 'blob', id: git(repo, 'rev-parse', 'main:README.md').trim()}, groups: [], links: {}, assets,
+        }) as FragmentResult & {ok: true};
+        return {statuses: result.summary.links.map((link) => link.status), findings: linkReport([{path: 'README.md', status: 'modified', ...result.summary, images: result.summary.images ?? [], anchors: result.summary.anchors ?? []}]).findings.map((finding) => finding.kind)};
+      };
+    }
+
+    it('at a ref: a file the branch gains is no longer missing', async () => {
+      const repo = initRepo({'README.md': 'Run [the script](install.sh).\n'});
+      git(repo, 'checkout', '-q', '-b', 'feature');
+      writeBytes(repo, 'CHANGES.md', 'changed\n');
+      commitAll(repo, 'feature');
+      const ask = asker(repo);
+      expect(await ask({base: 'main...feature', after: {tree: 'feature'}, epoch: 0})).toEqual({statuses: ['missing'], findings: ['missing']});
+      writeBytes(repo, 'install.sh', 'echo hi\n');
+      commitAll(repo, 'script');
+      expect(await ask({base: 'main...feature', after: {tree: 'feature'}, epoch: 1})).toEqual({statuses: ['outside'], findings: []});
+    });
+
+    it('in the work tree: a new untracked file is untracked, and a deleted one is missing', async () => {
+      const repo = initRepo({'README.md': 'Run [the script](install.sh), read [the license](LICENSE).\n', 'LICENSE': 'MIT\n'});
+      const base = git(repo, 'rev-parse', 'main').trim();
+      const ask = asker(repo);
+      expect(await ask({base, after: {worktree: []}, epoch: 0})).toEqual({statuses: ['missing', 'outside'], findings: ['missing']});
+      writeBytes(repo, 'install.sh', 'echo hi\n');
+      expect(await ask({base, after: {worktree: []}, epoch: 1})).toEqual({statuses: ['untracked', 'outside'], findings: ['untracked']});
+      fs.rmSync(path.join(repo, 'LICENSE'));
+      expect(await ask({base, after: {worktree: [{path: 'LICENSE', id: null, mode: null}]}, epoch: 2})).toEqual({statuses: ['untracked', 'missing'], findings: ['untracked', 'missing']});
+    });
+
+    it('keeps the held fragment while every link answers the same', async () => {
+      const repo = initRepo({'README.md': 'Run [the script](install.sh).\n'});
+      const base = git(repo, 'rev-parse', 'main').trim();
+      let renders = 0;
+      const handler = createRenderedHandler({render: async (input) => {
+        renders += 1;
+        return renderMarkdown(input);
+      }});
+      const ask = asker(repo, handler);
+      await ask({base, after: {worktree: []}, epoch: 0});
+      await ask({base, after: {worktree: []}, epoch: 1});
+      expect(renders).toBe(1);
+    });
+  });
 
   it('makes a fragment whose link check ran out of time late, and the next ask claims what the trees say', async () => {
     const repo = initRepo({'README.md': '# Project\n'});

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {createLru} from '../../media/lru.js';
 import type {WorkerFailure} from '../../media/workerClient.js';
-import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
+import {createAssetResolver, LATE_IDENTITY, linkIdentity, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
 import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type PageResult, type RenderedWorkerRequest, type TileResult, type TileSource} from '../backend.js';
 import {imageBody, imageFacts} from '../image.js';
 import {renderMarkdown, type RenderInput, type RenderedFragment} from '../markdown.js';
@@ -37,6 +37,12 @@ const TILES_OFF = 'in-pane view turned off';
 // and sending the answer back.
 const BROWSER_MARGIN_MS = 1_000;
 const LAYOUT_CACHE_BYTES = 4 * 1024 * 1024;
+// The tile documents laid out, which tiles are cut from.
+const DRAWN_CACHE_BYTES = 16 * 1024 * 1024;
+const STALE = 'the page changed since it was laid out';
+// The files whose newest tile document is held past the budget: more
+// than a screen shows pages of at once.
+const NEWEST_FILES = 4;
 
 // A tile document, with the markdown its blocks came from when it has any.
 type DrawnDocument = TileDocument & {text?: string};
@@ -55,7 +61,7 @@ function heldBytes(held: Held) {
 export function summarize(body: PageBody, uses: readonly AssetUse[] = []): FragmentSummary {
   // Lookups finish in whatever order git answers them, so the signature
   // reads them sorted and once each: the same images, the same signature.
-  const named = [...new Set(uses.map((use) => JSON.stringify([use.side, use.path, use.identity])))].sort();
+  const named = [...new Set(uses.map((use) => JSON.stringify(use.kind === 'link' ? ['link', use.path, use.hash ?? null, use.identity] : [use.side, use.path, use.identity])))].sort();
   const assets = named.length === 0 ? '' : createHash('sha256').update(JSON.stringify(named)).digest('hex').slice(0, 20);
   const late = uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {};
   const empty: Pick<RenderedFragment, 'changes' | 'differences' | 'blocks' | 'headings' | 'links' | 'anchors' | 'images'> = {changes: {changed: 0, removed: 0}, differences: [], blocks: [], headings: [], links: [], anchors: [], images: []};
@@ -95,15 +101,32 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     return resolver;
   };
 
-  // A held fragment is current while every image it looked up would still
-  // get the same answer: the key covers the file's own text, not the
-  // images it embeds. One with a lookup that ran out of time never is.
+  // A held fragment is current while every image it looked up and every
+  // link it checked would still get the same answer: the key covers the
+  // file's own text, not the images it embeds nor the files its links
+  // name. One with a lookup that ran out of time never is. The links are
+  // asked again together, within one lookup budget; the resolver's answers
+  // for the review keep that cheap.
   const current = async (entry: Held, cwd: string, sides: AssetSides) => {
     const resolver = resolverFor(cwd);
+    if (entry.uses.some((use) => use.identity === LATE_IDENTITY)) return false;
     for (const use of entry.uses) {
-      if (use.identity === LATE_IDENTITY || await resolver.identity(sides, use.side, use.path) !== use.identity) return false;
+      if (use.kind === 'asset' && await resolver.identity(sides, use.side, use.path) !== use.identity) return false;
     }
-    return true;
+    const links = entry.uses.filter((use) => use.kind === 'link');
+    if (links.length === 0) return true;
+    const checks = Promise.all(links.map(async (use) => linkIdentity(await resolver.linkTarget(sides, use.path, use.hash).checked) === use.identity)).then((same) => same.every(Boolean));
+    if (lookupBudgetMs === undefined) return checks;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), lookupBudgetMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([checks, late]);
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   // `fresh`: rendered now, not taken from the cache.
@@ -164,14 +187,34 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
   };
 
   // The tile document for a source, named by everything it is drawn from,
-  // with the markdown it was drawn from.
-  const tileDocument = async (source: TileSource): Promise<DrawnDocument> => {
+  // with the markdown it was drawn from. `late`: a lookup it drew didn't
+  // answer in time, or answered with a failure of the moment.
+  const tileDocument = async (source: TileSource): Promise<{document: DrawnDocument; late: boolean}> => {
     const {fragment: request, scheme, bg, base, geometry, brokenRefs} = source;
-    const {body, text} = await fragment(request);
+    const {body, text, uses} = await fragment(request);
     const html = assembleTileDocument({file: {path: request.path, status: request.status, ...(request.oldPath ? {oldPath: request.oldPath} : {}), body}, scheme, bg, cssWidth: geometry.cssWidth, base, ...(brokenRefs ? {brokenRefs} : {})});
     const key = createHash('sha256').update(html).digest('hex').slice(0, 20);
-    return {key, html, cssWidth: geometry.cssWidth, dpr: geometry.dpr, scheme, ...(text !== undefined ? {text} : {})};
+    const late = uses.some((use) => use.identity === LATE_IDENTITY || use.identity.startsWith('retry:'));
+    return {document: {key, html, cssWidth: geometry.cssWidth, dpr: geometry.dpr, scheme, ...(text !== undefined ? {text} : {})}, late};
   };
+
+  // Laid-out documents by name, so each tile is cut from the very document
+  // its layout measured, never one built again (a late image that has since
+  // answered would move everything below it). Each file's newest is kept
+  // whatever its size, for the few files laid out last, so pages past the
+  // budget on screen together still draw and never evict each other.
+  const drawn = createLru<DrawnDocument>(DRAWN_CACHE_BYTES, (document) => document.html.length * 2);
+  const newest = new Map<string, DrawnDocument>();
+  const hold = (file: string, document: DrawnDocument) => {
+    drawn.set(document.key, document);
+    newest.delete(file);
+    newest.set(file, document);
+    for (const oldest of newest.keys()) {
+      if (newest.size <= NEWEST_FILES) break;
+      newest.delete(oldest);
+    }
+  };
+  const heldDocument = (key: string) => drawn.get(key) ?? [...newest.values()].find((document) => document.key === key);
 
   // Browser jobs take turns: they share Chromium's one page.
   let turn: Promise<unknown> = Promise.resolve();
@@ -182,17 +225,16 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
 
   // Runs a browser job, counting its failure toward turning tiles off.
   // `budget`: when the job must be done, its deadline less the margin.
-  function withBrowser<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser, document: DrawnDocument) => Promise<T>): Promise<T | LayoutResult | TileResult> {
+  function withBrowser<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser) => Promise<T>): Promise<T | LayoutResult | TileResult> {
     const run = turn.then(() => browserJob(source, budget, work));
     turn = run.catch(() => undefined);
     return run;
   }
 
-  async function browserJob<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser, document: DrawnDocument) => Promise<T>): Promise<T | LayoutResult | TileResult> {
+  async function browserJob<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser) => Promise<T>): Promise<T | LayoutResult | TileResult> {
     if (tilesOff) return {ok: false, state: 'unavailable', reason: tilesOff, tilesOff: true};
-    const document = await tileDocument(source);
     try {
-      return await work(browserFor(source.chrome), document);
+      return await work(browserFor(source.chrome));
     } catch (error) {
       const reason = oneLine(error);
       const at = now();
@@ -215,18 +257,25 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
       try {
         if (message.type === 'layout') {
           const budget = budgetFor('layout', startedAt);
-          return await withBrowser(message.source, budget, async (instance, document) => {
+          if (tilesOff) return {ok: false, state: 'unavailable', reason: tilesOff, tilesOff: true};
+          const {document, late} = await tileDocument(message.source);
+          hold(`${message.source.fragment.cwd}\0${message.source.fragment.path}`, document);
+          return await withBrowser(message.source, budget, async (instance) => {
             const name = `${document.key}@${document.dpr}`;
             const layout = layouts.get(name) ?? await instance.layout(document, budget);
             layouts.set(name, layout);
-            return {ok: true, layout, document: document.key, ...(document.text !== undefined ? {text: document.text} : {})};
+            return {ok: true, layout, document: document.key, ...(document.text !== undefined ? {text: document.text} : {}), ...(late ? {late: true as const} : {})};
           });
         }
         if (message.type === 'tile') {
           const {source, index, rows, mosaic} = message;
+          // Cut from the document its layout measured, or from none: one
+          // no longer held is laid out again, and no browser is asked.
+          const document = heldDocument(message.document);
+          if (!document) return {ok: false, state: 'error', reason: STALE, stale: true};
           const range = tileRange(index, rows, source.geometry);
           const budget = budgetFor('tile', startedAt);
-          return await withBrowser(source, budget, async (instance, document): Promise<TileResult> => {
+          return await withBrowser(source, budget, async (instance): Promise<TileResult> => {
             // A device pixel more than the tile, since Chromium rounds a
             // fractional clip down; the finisher cuts it to the exact size.
             const drawn = await instance.capture(document, {cssY: range.cssY, cssHeight: range.cssHeight + 1 / source.geometry.dpr}, budget);

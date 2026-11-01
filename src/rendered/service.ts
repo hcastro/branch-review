@@ -6,7 +6,8 @@ import {patchObjectIds} from '../media/classify.js';
 import type {Opener} from '../media/openExternal.js';
 import {findTool} from '../media/worker/tools.js';
 import type {ReviewFile, ReviewModel} from '../review/model.js';
-import {reviewAssetSides, reviewPaths, type AssetSides} from './assets.js';
+import {reviewAssetSides, reviewPaths, type AssetSides} from './sides.js';
+import {LEAVES_PANE} from './marks.js';
 import type {FragmentRequest, FragmentSummary, PageRequest, RenderedBackend} from './backend.js';
 import {changeGroups} from './changes.js';
 import {failedMarkdownPage, renderableKind, type RenderableKind} from './classify.js';
@@ -64,12 +65,7 @@ const MAX_REWRITES = 3;
 const LIVE_GAP_MS = 1_000;
 const NOTHING_TO_RENDER = 'nothing to render · no markdown, images or SVG on this branch';
 
-/**
- * The mark for "opens outside the pane". `↗` would read better, but
- * string-width, which Ink lays rows out with, counts it two cells while
- * terminals draw it in one, so every row holding it would end a cell short.
- */
-export const LEAVES_PANE = '⇗';
+export {LEAVES_PANE} from './marks.js';
 
 export type PageOutcome = {ok: true; key: string; url: string} | {ok: false; reason: string};
 
@@ -116,8 +112,10 @@ type Written = {ok: true; key: string} | {ok: false; reason: string};
 
 type Asking = {epoch: number; fileKey: string; priority: number; controller: AbortController; done: Promise<Answer | null>};
 
-export function createRenderedService({backend, site, surface, motion, animations = true, colors = {}, now = Date.now, setTimer = defaultTimer, pane: paneOptions}: {
+export function createRenderedService({backend, site, surface, motion, animations = true, colors = {}, now = Date.now, setTimer = defaultTimer, pane: paneOptions, live = false}: {
   backend: RenderedBackend;
+  /** Watch mode: the split follows edits to the page it shows. Off, it changes only on a press. */
+  live?: boolean;
   site: RenderedSite;
   /** Where pages open. Without one, the service only renders. */
   surface?: PageSurface;
@@ -139,6 +137,8 @@ export function createRenderedService({backend, site, surface, motion, animation
   let alsoSearch: {cwd: string; links: Record<string, LinkAnswer>; linkSignature: string; sides: () => AssetSides; done: Promise<void> | null} | null = null;
   let title: Omit<PageInput['title'], 'renderedAt'> | null = null;
   let epoch = 0;
+  // Counts the changes to `answers`, for what is read from all of them.
+  let answersChanged = 0;
   let started = false;
   let cancelTimer: (() => void) | null = null;
   let focused: string | null = null;
@@ -176,15 +176,31 @@ export function createRenderedService({backend, site, surface, motion, animation
   let trips = 0;
   // Files whose page opened this session: the next trip is a revisit.
   const visited = new Set<string>();
-  // The file page the split shows, where it opened it, and the blocks it
-  // had, for live refreshes. Null when the split shows something else.
-  let inSplit: {fileKey: string; key: string; at?: number; f?: number; blocks: Set<string>} | null = null;
+  // The file page the split shows, as a trip or a refresh cmux confirmed
+  // put it there: its page key, what the page shows apart from its rail
+  // (`content`), where it opened, and the blocks it had, for live
+  // refreshes. Null when the split shows something else. A refresh on its
+  // way changes it only once cmux says the split went. `seq` orders what
+  // set it: a trip, or a refresh by when it was sent.
+  type InSplit = {fileKey: string; key: string; content: string; at?: number; f?: number; blocks: Set<string>; seq: number};
+  let inSplit: InSplit | null = null;
+  let splitSeq = 0;
+  let seqs = 0;
+  // The refreshes sent and not answered yet: the split may show any of
+  // them by the time the next one asks cmux what it shows.
+  const sending = new Set<InSplit>();
+  // What each page written shows apart from its rail, by page key.
+  const contents = new Map<string, string>();
+  const setSplit = (next: InSplit | null) => {
+    inSplit = next;
+    splitSeq = next?.seq ?? (seqs += 1);
+  };
   let lastLive = -Infinity;
   let cancelLive: (() => void) | null = null;
   // Presses whose page is still on its way to the surface. A live refresh
   // waits for them: the press decides what the split shows, and a refresh
   // still due after it goes then.
-  let travelling = 0;
+  let traveling = 0;
   let liveAfterPress = false;
 
   const tripHash = (hash: Pick<PageHash, 'at' | 'f' | 'd' | 'g'>) => formatPageHash({...hash, m: animations, bg: colors.bg, fg: colors.fg, n: (trips += 1)});
@@ -237,7 +253,10 @@ export function createRenderedService({backend, site, surface, motion, animation
       return {failed: oneLine(result.reason)};
     }).then((answer) => {
       const known = answers.get(request.key);
-      if (!known || known.epoch <= askedAt) answers.set(request.key, {epoch: askedAt, answer});
+      if (!known || known.epoch <= askedAt) {
+        answers.set(request.key, {epoch: askedAt, answer});
+        answersChanged += 1;
+      }
       // The link report grew, and a page in the pane may draw a link broken now.
       pane?.sourcesChanged();
       return answer;
@@ -268,6 +287,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     if (known && known.epoch > askedAt) return;
     if (known && 'summary' in known.answer && JSON.stringify(known.answer.summary) === JSON.stringify(summary)) return;
     answers.set(key, {epoch: askedAt, answer: {summary}});
+    answersChanged += 1;
     pane?.sourcesChanged();
     stale = true;
     // A pass running, or waiting to start, writes them; else one starts.
@@ -328,13 +348,19 @@ export function createRenderedService({backend, site, surface, motion, animation
   // The link and anchor report over the review's markdown as rendered so
   // far: a page not rendered yet adds nothing, and its anchors are no one's
   // finding.
+  // Asked for on every r, R, page write and tile layout: read again only
+  // when the review or an answer changed since.
+  let reported: {at: string; value: ReturnType<typeof linkReport>} | null = null;
   function report() {
+    const at = `${epoch}:${answersChanged}`;
+    if (reported?.at === at) return reported.value;
     const sources: ReportSource[] = [...plan.values()].flatMap((planned) => {
       const summary = summaryOf(planned);
       if (planned.kind !== 'markdown' || summary?.kind !== 'rendered') return [];
       return [{path: planned.file.path, status: planned.file.status, links: summary.links, images: summary.images ?? [], anchors: summary.anchors ?? []}];
     });
-    return linkReport(sources);
+    reported = {at, value: linkReport(sources)};
+    return reported.value;
   }
 
   // What a page shows from the other pages' renders: its part of the link
@@ -370,16 +396,17 @@ export function createRenderedService({backend, site, surface, motion, animation
     const rail = railFor(planned);
     const extras = pageExtras(planned);
     const alsoFile = planned.also ? {also: {embeds: embedsOf(planned)}} : {};
-    const key = renderedPageKey({
+    const keyParts = {
       fragment: planned.request?.key ?? planned.fileKey,
       // A failed page and the page that renders once the failure passes
       // never share a name.
       body: failure !== undefined ? `failed:${failure}` : summary ? (summary.kind === 'failed' ? `failed:${summary.reason ?? ''}` : summary.kind) : body ? body.kind : 'unrendered',
       assets: summary?.assets ?? '',
-      rail,
       title: title!,
       extra: JSON.stringify([extras, alsoFile]),
-    });
+    };
+    const key = renderedPageKey({...keyParts, rail});
+    contents.set(key, renderedPageKey({...keyParts, rail: []}));
     const askedAt = epoch;
     // The page on disk, which the stable name already points at, is the one
     // this review wants: the name now stands for this review too.
@@ -620,6 +647,10 @@ export function createRenderedService({backend, site, surface, motion, animation
     return {ok: true, key, url: site.url(key)};
   }
 
+  // What a file's page shows apart from the rail, which another file's
+  // edit changes: the page key with the rail left out.
+  const contentOf = (key: string) => contents.get(key) ?? key;
+
   const blockIds = (planned: Planned) => {
     const answer = answerFor(planned);
     return new Set(answer && 'summary' in answer ? answer.summary.blocks.map((block) => block.id) : []);
@@ -634,15 +665,20 @@ export function createRenderedService({backend, site, surface, motion, animation
   // change tries again. A split that is gone ends live refreshes until the
   // next trip opens one.
   function refreshSplit() {
-    const shown = inSplit;
-    if (!shown || !surface?.refresh || disposed || cancelLive) return;
-    if (travelling > 0) {
+    const confirmed = inSplit;
+    if (!live || !confirmed || !surface?.refresh || disposed || cancelLive) return;
+    if (traveling > 0) {
       liveAfterPress = true;
       return;
     }
-    const planned = plan.get(shown.fileKey);
-    const key = current.get(shown.fileKey);
-    if (!planned || !key || key === shown.key || !pointedNow(planned)) return;
+    // Sent since the split was last confirmed: what it may show by now.
+    const sent = [...sending].filter((each) => each.seq > splitSeq);
+    const newest = sent.at(-1) ?? confirmed;
+    const planned = plan.get(confirmed.fileKey);
+    const key = current.get(confirmed.fileKey);
+    // Only a change to what the page shows moves the split: a page that
+    // differs in its rail alone, after another file changed, stays as it is.
+    if (!planned || !key || key === newest.key || contentOf(key) === newest.content || !pointedNow(planned)) return;
     const wait = lastLive + LIVE_GAP_MS - now();
     if (wait > 0) {
       cancelLive = setTimer(() => {
@@ -653,14 +689,28 @@ export function createRenderedService({backend, site, surface, motion, animation
     }
     lastLive = now();
     const blocks = blockIds(planned);
-    const fresh = [...blocks].filter((id) => !shown.blocks.has(id));
-    const place = {...(shown.at !== undefined ? {at: shown.at} : {}), ...(shown.f !== undefined ? {f: shown.f} : {})};
-    const next = {...shown, key, blocks};
-    inSplit = next;
-    void surface.refresh(site.url(key, tripHash({...place, d: 'none', g: fresh})), [`${shown.key}.html`, `${planned.alias}.html`]).then((went) => {
-      if (inSplit !== next) return;
-      if (went === 'skipped') inSplit = shown;
-      else if (!went) inSplit = null;
+    const place = {...(confirmed.at !== undefined ? {at: confirmed.at} : {}), ...(confirmed.f !== undefined ? {f: confirmed.f} : {})};
+    const next: InSplit = {...confirmed, key, content: contentOf(key), blocks, seq: (seqs += 1)};
+    // The blocks that pulse: those new since the page the split shows as
+    // the goto is sent. A refresh queued behind one still on its way finds
+    // that one landed by then, or not, and its blocks glow once.
+    const url = () => {
+      const shows = inSplit && inSplit.fileKey === confirmed.fileKey && inSplit.seq >= confirmed.seq ? inSplit : confirmed;
+      return site.url(key, tripHash({...place, d: 'none', g: [...blocks].filter((id) => !shows.blocks.has(id))}));
+    };
+    sending.add(next);
+    // The split may show the page confirmed or any refresh still on its
+    // way: one queued behind a slow goto finds the page that goto sent.
+    // A refresh that gives way, or one the split skips, leaves the next one
+    // comparing against the pages the split may show, never one it was
+    // only sent that was dropped.
+    const showing = [...new Set([confirmed, ...sent].map((each) => `${each.key}.html`)), `${planned.alias}.html`];
+    void surface.refresh(url, showing).then((went) => {
+      sending.delete(next);
+      // A trip, or a newer refresh cmux confirmed, came after this one.
+      if (next.seq <= splitSeq) return;
+      if (went === true) setSplit(next);
+      else if (went === false) setSplit(null);
     });
   }
 
@@ -679,7 +729,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     if (!place) return {kind: 'error', message: 'pages open only in the full app'};
     if (place.refusal) return {kind: 'error', message: place.refusal};
     const press = (presses += 1);
-    travelling += 1;
+    traveling += 1;
     motionAsked ??= motion ? motion() : Promise.resolve('off');
     const crossing = motionAsked.then((kind) => trip?.cross(kind));
     let ready = false;
@@ -704,8 +754,8 @@ export function createRenderedService({backend, site, surface, motion, animation
       return place.opensSplit?.() ? crossing.then(show) : show();
     });
     void shown.catch(() => null).then(() => {
-      travelling -= 1;
-      if (travelling > 0 || !liveAfterPress) return;
+      traveling -= 1;
+      if (traveling > 0 || !liveAfterPress) return;
       liveAfterPress = false;
       refreshSplit();
     });
@@ -798,6 +848,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         asking.delete(key);
       }
       for (const key of answers.keys()) if (!wanted.has(key)) answers.delete(key);
+      answersChanged += 1;
       for (const key of [...current.keys()]) {
         if (next.has(key)) continue;
         current.delete(key);
@@ -848,7 +899,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       };
       return travel(fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, write, trip, (where, key) => {
         visited.add(planned.fileKey);
-        inSplit = where === 'browser' ? null : {fileKey: planned.fileKey, key, ...place, blocks: blockIds(planned)};
+        setSplit(where === 'browser' ? null : {fileKey: planned.fileKey, key, content: contentOf(key), ...place, blocks: blockIds(planned), seq: (seqs += 1)});
       });
     },
 
@@ -859,7 +910,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       if (plan.size === 0) return {kind: 'info', message: NOTHING_TO_RENDER};
       // The split shows the overview now, which no file's refresh replaces.
       return travel('overview', null, writeOverview, trip, () => {
-        inSplit = null;
+        setSplit(null);
       });
     },
 
@@ -918,7 +969,7 @@ export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openO
  * the surface they open on. `colors` are the terminal's, as it answered
  * them at startup.
  */
-export function startRenderedService({tempDir, env, cwd, animations = true, opener, colors = {}, pane}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; colors?: {fg?: string; bg?: string}; pane?: {registry: ImageRegistry; caps: GraphicsCaps}}) {
+export function startRenderedService({tempDir, env, cwd, animations = true, opener, colors = {}, pane, live = false}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; colors?: {fg?: string; bg?: string}; pane?: {registry: ImageRegistry; caps: GraphicsCaps}; live?: boolean}) {
   const platform = process.platform;
   // Looked up the first time `v` asks, and fixed for the session.
   let chrome: ChromeBinary | null | undefined;
@@ -932,5 +983,6 @@ export function startRenderedService({tempDir, env, cwd, animations = true, open
     motion: () => resolveMotion({env, animations, run: runTool, platform}),
     animations,
     colors,
+    live,
   });
 }

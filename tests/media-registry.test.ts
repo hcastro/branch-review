@@ -255,6 +255,34 @@ describe('image registry budgets and pools', () => {
     expect(instance.fits(pngHeaderOnly(100, 50))).toBe(true);
   });
 
+  it('leaves media its own base64 budget however many page tiles are live, within the decoded one', () => {
+    // Media's budget fits three of these; page tiles are far larger to send.
+    const media = pngFixture(40, 40);
+    const tightBytes = 3 * Buffer.from(media).toString('base64').length + 10;
+    const run = (tiles: number) => {
+      const {instance} = pooled({maxBytes: tightBytes, maxDecoded: 192 * MB});
+      for (let index = 0; index < tiles; index += 1) instance.acquire(`page:${index}`, TILE, 131, 40, undefined, 'page');
+      const fits: boolean[] = [];
+      const keys = ['m-0', 'm-1', 'm-2', 'm-3'];
+      for (const key of keys) {
+        fits.push(instance.fits(media));
+        instance.acquire(key, media, 4, 2);
+      }
+      const before = instance.liveCount('media');
+      // Over its base64 budget with a fourth image: the media sweep trims off screen, never on.
+      instance.sweep(new Set(keys), new Set(['m-0', 'm-3']));
+      return {fits, before, after: instance.liveCount('media'), kept: keys.map((key) => instance.idFor(key) !== undefined), pageLive: instance.liveCount('page'), decoded: instance.decodedBytes()};
+    };
+    const alone = run(0);
+    expect(alone.fits).toEqual([true, true, true, false]);
+    expect(alone.before).toBe(4);
+    // Near the page pool's limits: ten tiles, about 79 MB decoded of its 96.
+    const beside = run(10);
+    expect(beside.pageLive).toBe(10);
+    expect(beside.decoded).toBeLessThanOrEqual(192 * MB);
+    expect({fits: beside.fits, before: beside.before, after: beside.after, kept: beside.kept}).toEqual({fits: alone.fits, before: alone.before, after: alone.after, kept: alone.kept});
+  });
+
   it('hands both pools ids from the one table, so no id names two images', () => {
     const {instance} = pooled();
     const ids = new Set<number>();

@@ -25,6 +25,9 @@ export type ShowResult =
   | {superseded: true};
 
 const CMUX_TIMEOUT_MS = 1500;
+// How long an open-split cmux was slow to answer may still run: one that
+// answers late is still the split, and later presses go to it.
+const OPEN_SPLIT_KILL_MS = 10_000;
 const HEADLESS = 'branch-review --render-out <dir> writes the pages';
 const IN_SPLIT = 'in the split →';
 const IN_BROWSER = 'opened in your browser';
@@ -69,7 +72,7 @@ function shownPageName(stdout: string): string | null {
   }
 }
 
-export function createSurface({env, run, findTool, opener, platform, inPane = false}: {
+export function createSurface({env, run, findTool, opener, platform, inPane = false, timeoutMs = CMUX_TIMEOUT_MS}: {
   env: NodeJS.ProcessEnv;
   run: RunTool;
   /** An absolute path for a program on PATH, outside the repo, or null. */
@@ -78,6 +81,8 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   platform: NodeJS.Platform;
   /** The diff pane draws pages too (`v`), which is the way to read one over SSH. */
   inPane?: boolean;
+  /** How long a cmux call has to answer before the page goes elsewhere (1500 ms). */
+  timeoutMs?: number;
 }) {
   const ssh = Boolean(env.SSH_CONNECTION);
   const workspace = env.CMUX_WORKSPACE_ID;
@@ -91,6 +96,9 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   // cmux said its browser is off: it hands every page to the default
   // browser, and no split takes room from the TUI.
   let browserOff = false;
+  // An open-split cmux didn't answer in time, still running: while it
+  // runs, a press opens the browser and starts no second one.
+  let lateSplit: Promise<void> | null = null;
   const stopped = new AbortController();
   let inFlight: Promise<unknown> | null = null;
   let newest = 0;
@@ -112,7 +120,7 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   // answer that names no page of ours, is a no. A failure cmux answers at
   // once is a split that is gone, as for a goto.
   async function splitShows(ref: string, showing: readonly string[]): Promise<'shows' | 'other' | 'gone'> {
-    const asked = await run(cmux!, ['browser', '--surface', ref, 'url'], {timeoutMs: CMUX_TIMEOUT_MS, env, signal: stopped.signal});
+    const asked = await run(cmux!, ['browser', '--surface', ref, 'url'], {timeoutMs, env, signal: stopped.signal});
     if (!asked.ok) return asked.timedOut ? 'other' : 'gone';
     const name = shownPageName(asked.stdout);
     return name !== null && showing.includes(name) ? 'shows' : 'other';
@@ -121,24 +129,30 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   // `reuseOnly`: a live refresh, which goes to the open split or nowhere;
   // with `showing`, only while the split shows one of those pages, and only
   // while nothing asked for since (`outrun`) is waiting for its turn.
-  async function place(url: string, reuseOnly: boolean, showing?: readonly string[], outrun = () => false): Promise<ShowResult | {skipped: true}> {
+  // `gone`: a refresh found no split to send. A refresh's `url` may be a
+  // function, called once, when the page is about to be sent: by then every
+  // call before it has ended, so it can name what the split shows.
+  async function place(target: string | (() => string), reuseOnly: boolean, showing?: readonly string[], outrun = () => false): Promise<ShowResult | {skipped: true} | {gone: true}> {
+    let resolved: string | undefined;
+    const href = () => (resolved ??= typeof target === 'string' ? target : target());
     if (refusal) return {refused: refusal};
-    if (stopped.signal.aborted || (reuseOnly && !split)) return {superseded: true};
-    if (!cmux) return inBrowser(url) ? {where: 'browser', message: IN_BROWSER} : {refused: `no browser opener found · ${HEADLESS}`};
+    if (stopped.signal.aborted) return {superseded: true};
+    if (reuseOnly && !split) return {gone: true};
+    if (!cmux) return inBrowser(href()) ? {where: 'browser', message: IN_BROWSER} : {refused: `no browser opener found · ${HEADLESS}`};
     if (split && showing) {
       const shown = await splitShows(split, showing);
       if (stopped.signal.aborted) return {superseded: true};
       // The next press opens a new split, once its crossing has ended.
       if (shown === 'gone') {
         split = null;
-        return {superseded: true};
+        return {gone: true};
       }
       if (shown === 'other') return {skipped: true};
     }
     // A press made while cmux said what the split shows goes next, not after a goto too.
     if (stopped.signal.aborted || outrun()) return {superseded: true};
     if (split) {
-      const went = await run(cmux, ['browser', '--surface', split, 'goto', url], {timeoutMs: CMUX_TIMEOUT_MS, env, signal: stopped.signal});
+      const went = await run(cmux, ['browser', '--surface', split, 'goto', href()], {timeoutMs, env, signal: stopped.signal});
       if (stopped.signal.aborted) return {superseded: true};
       if (went.ok) return {where: 'cmux-reuse', message: IN_SPLIT};
       // A goto cmux was slow to answer may still land, and a split that
@@ -146,10 +160,37 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
       if (went.timedOut) return {where: 'cmux-reuse', message: `${IN_SPLIT} · cmux was slow to answer`};
       // The split was closed: a new one opens, without comment.
       split = null;
-      if (reuseOnly) return {superseded: true};
+      if (reuseOnly) return {gone: true};
     }
-    const opened = await run(cmux, ['--json', 'browser', 'open-split', url, '--workspace', workspace!, '--focus', 'false'], {timeoutMs: CMUX_TIMEOUT_MS, env, signal: stopped.signal});
+    const url = href();
+    const slow = () => (inBrowser(url) ? {where: 'browser' as const, message: `cmux didn't answer · ${IN_BROWSER}`} : {refused: `cmux didn't answer · no browser opener found · ${HEADLESS}`});
+    if (lateSplit) return slow();
+    // cmux has `timeoutMs` to answer before the page opens in the browser;
+    // the call itself runs on, to its own kill, and a split it answers late
+    // is the one later presses go to.
+    const opening = run(cmux, ['--json', 'browser', 'open-split', url, '--workspace', workspace!, '--focus', 'false'], {timeoutMs: OPEN_SPLIT_KILL_MS, env, signal: stopped.signal});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const opened = await Promise.race([opening, new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+      timer.unref?.();
+    })]);
+    clearTimeout(timer);
     if (stopped.signal.aborted) return {superseded: true};
+    if (opened === null) {
+      const late: Promise<void> = opening.then((result) => {
+        if (lateSplit === late) lateSplit = null;
+        if (stopped.signal.aborted || !result.ok) return;
+        const answer = readSplit(result.stdout);
+        if (answer && 'ref' in answer) {
+          split = answer.ref;
+          browserOff = false;
+        } else if (answer) {
+          browserOff = true;
+        }
+      });
+      lateSplit = late;
+      return slow();
+    }
     const answer = opened.ok ? readSplit(opened.stdout) : null;
     if (answer && 'ref' in answer) {
       split = answer.ref;
@@ -161,15 +202,15 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
       browserOff = true;
       return {where: 'browser', message: `${IN_BROWSER} · cmux's browser is off`};
     }
-    return inBrowser(url) ? {where: 'browser', message: `cmux didn't answer · ${IN_BROWSER}`} : {refused: `cmux didn't answer · no browser opener found · ${HEADLESS}`};
+    return slow();
   }
 
   // One call is in flight at a time; of the pages asked for while it runs,
   // only the newest is placed after it. A refresh asked for while a press
   // waits or runs is dropped.
   async function queued(url: string, reuseOnly: false): Promise<ShowResult>;
-  async function queued(url: string, reuseOnly: true, showing?: readonly string[]): Promise<ShowResult | {skipped: true}>;
-  async function queued(url: string, reuseOnly: boolean, showing?: readonly string[]): Promise<ShowResult | {skipped: true}> {
+  async function queued(url: string | (() => string), reuseOnly: true, showing?: readonly string[]): Promise<ShowResult | {skipped: true} | {gone: true}>;
+  async function queued(url: string | (() => string), reuseOnly: boolean, showing?: readonly string[]): Promise<ShowResult | {skipped: true} | {gone: true}> {
     if (reuseOnly && pressing > 0) return {superseded: true};
     const ticket = (newest += 1);
     if (!reuseOnly) pressing += 1;
@@ -209,11 +250,16 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
      * when there is no split to send, or it has gone. With `showing`, the
      * page names the split may show (file names, never repo text), cmux is
      * asked first and `skipped` means the split shows something else or
-     * didn't say in time.
+     * didn't say in time. `superseded`: a press or a newer page came first,
+     * and the split shows what it showed. `url` may be a function, called
+     * only as the page is sent, after every call ahead of it has ended.
      */
-    refresh: async (url: string, showing?: readonly string[]): Promise<boolean | 'skipped'> => {
+    refresh: async (url: string | (() => string), showing?: readonly string[]): Promise<boolean | 'skipped' | 'superseded'> => {
       const result = await queued(url, true, showing);
-      return 'skipped' in result ? 'skipped' : 'where' in result;
+      if ('skipped' in result) return 'skipped';
+      if ('gone' in result) return false;
+      if ('superseded' in result) return 'superseded';
+      return 'where' in result;
     },
     /** Kills a cmux call still running, and opens nothing from now on. */
     dispose() {

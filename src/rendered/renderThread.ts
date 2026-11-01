@@ -20,10 +20,17 @@ import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown
  */
 export type RenderJob = {cwd: string; path: string; oldPath?: string; status: FileStatus; textUnchanged?: true; source: string; groups: ChangeGroup[]; links: Record<string, LinkAnswer>; assets: AssetSides; budgetMs: number};
 
-/** A render, and whether any of its lookups ran out of time: then it shows less than it will once they answer. */
-export type RenderThreadResult = {fragment: RenderedFragment; late?: true};
+/**
+ * A render, and whether any of its lookups ran out of time: then it shows
+ * less than it will once they answer. `settled`: a late render's lookups
+ * have all answered in the thread, so a render asked for again finds them
+ * at hand. It settles, too, when the thread stops or the deadline passes.
+ */
+export type RenderThreadResult = {fragment: RenderedFragment; late?: true; settled: Promise<void>};
 
-type Reply = RenderThreadResult | {error: string};
+// Each message names its job, so a late job's word that its lookups
+// settled never reads as the answer to the next one.
+type Reply = {id: number} & ({fragment: RenderedFragment; late?: true} | {error: string} | {settled: true});
 
 const THREAD_TAG = 'branch-review-render-thread';
 
@@ -39,6 +46,27 @@ function startWorker(modulePath: string) {
 
 export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
   let current: Promise<Worker> | null = null;
+  let jobs = 0;
+
+  // Settles when the thread says job `id`'s lookups have, or it stops, or
+  // the deadline passes.
+  const settledFor = (worker: Worker, id: number) => new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', done);
+      worker.off('error', done);
+      resolve();
+    };
+    const onMessage = (reply: Reply) => {
+      if (reply.id === id && 'settled' in reply) done();
+    };
+    const timer = setTimeout(done, deadlineMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', done);
+    worker.once('error', done);
+  });
 
   const start = () => {
     const worker = startWorker(fileURLToPath(import.meta.url));
@@ -66,6 +94,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
         current = null;
         throw error;
       }
+      const id = (jobs += 1);
       return new Promise<RenderThreadResult>((resolve, reject) => {
         const finish = () => {
           clearTimeout(timer);
@@ -74,9 +103,10 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
           worker.off('exit', onExit);
         };
         const onMessage = (reply: Reply) => {
+          if (reply.id !== id || 'settled' in reply) return;
           finish();
           if ('error' in reply) reject(new Error(reply.error));
-          else resolve(reply);
+          else resolve({fragment: reply.fragment, ...(reply.late ? {late: true as const} : {}), settled: reply.late ? settledFor(worker, id) : Promise.resolve()});
         };
         // A thread that crashed or ran out of memory is replaced for the next file.
         const onError = (error: Error) => {
@@ -93,7 +123,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
         worker.on('message', onMessage);
         worker.on('error', onError);
         worker.on('exit', onExit);
-        worker.postMessage(job);
+        worker.postMessage({...job, id});
       });
     },
     async close() {
@@ -107,7 +137,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
 if (!isMainThread && workerData === THREAD_TAG) {
   const port = parentPort!;
   const resolvers = new Map<string, AssetResolver>();
-  port.on('message', (job: RenderJob) => {
+  port.on('message', (job: RenderJob & {id: number}) => {
     let resolver = resolvers.get(job.cwd);
     if (!resolver) {
       resolver = createAssetResolver({cwd: job.cwd});
@@ -127,8 +157,13 @@ if (!isMainThread && workerData === THREAD_TAG) {
       // Own keys only: a link to `constructor` names no file in the review.
       link: (repoPath, hash) => (Object.hasOwn(job.links, repoPath) ? job.links[repoPath]! : lookups.linkTarget(repoPath, hash)),
     }).then(
-      (fragment) => port.postMessage({fragment, ...(uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {})} satisfies Reply),
-      (error: unknown) => port.postMessage({error: error instanceof Error ? error.message : String(error)} satisfies Reply),
+      (fragment) => {
+        const late = uses.some((use) => use.identity === LATE_IDENTITY);
+        port.postMessage({id: job.id, fragment, ...(late ? {late: true as const} : {})} satisfies Reply);
+        // What ran out of time still answers here, into the resolver's caches.
+        if (late) void lookups.settled().then(() => port.postMessage({id: job.id, settled: true} satisfies Reply));
+      },
+      (error: unknown) => port.postMessage({id: job.id, error: error instanceof Error ? error.message : String(error)} satisfies Reply),
     );
   });
   port.postMessage('ready');

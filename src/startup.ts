@@ -240,9 +240,12 @@ export async function runCli(io: CliIo) {
     return;
   }
 
-  // Loaded while the terminal answers, so it adds nothing to startup: the
-  // service is small, and its renderer loads only in its own worker. A
-  // module that fails to load leaves the app as it is without the view.
+  // Loaded while the terminal answers, so it adds nothing to startup. This
+  // loads the service, its planning (change groups, page keys, the link
+  // report and the page shell) and the pane, none of which import the
+  // markdown parser: unified, remark, rehype, gemoji, yaml and the code
+  // grammars load only in the rendered worker. A module that fails to load
+  // leaves the app as it is without the view.
   const loadingRendered = import('./rendered/service.js').catch(() => null);
 
   // Asks the terminal what it can draw once the UI is sure to mount. Raw
@@ -290,7 +293,7 @@ export async function runCli(io: CliIo) {
   const rendered = renderedModule?.startRenderedService({tempDir: () => {
     sweepOnce();
     return tempDir.get();
-  }, env, cwd, animations: options.animations, opener, colors: {...(caps.fg ? {fg: caps.fg} : {}), ...(caps.bg ? {bg: caps.bg} : {})}, ...(pane ? {pane} : {})});
+  }, env, cwd, animations: options.animations, opener, colors: {...(caps.fg ? {fg: caps.fg} : {}), ...(caps.bg ? {bg: caps.bg} : {})}, ...(pane ? {pane} : {}), live: options.watch});
   proc.on('exit', () => rendered?.dispose());
   proc.on('exit', tempDir.remove);
   const media = started?.media;

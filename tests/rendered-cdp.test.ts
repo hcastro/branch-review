@@ -11,7 +11,9 @@ import {createRenderedHandler} from '../src/rendered/worker/handler.js';
 import {BROWSER_JOB_DEADLINES_MS, type FragmentRequest, type LayoutResult, type TileResult, type TileSource} from '../src/rendered/backend.js';
 import type {PageLayout} from '../src/rendered/plan.js';
 import {tileGeometry} from '../src/rendered/tileGeometry.js';
-import {cleanupTempDirs, makeTempDir, writeExecutable} from './core-helpers.js';
+import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, writeExecutable} from './core-helpers.js';
+import {renderMarkdown} from '../src/rendered/markdown.js';
+import {pngFixture} from './media-helpers.js';
 
 // The DevTools protocol over a pipe, against a fake peer on fds 3 and 4
 // that answers the way Chromium does: framing, events, refusals and
@@ -139,6 +141,13 @@ describe('the browser', () => {
     expect(named('Fetch.enable')[0]!.params).toEqual({patterns: [{urlPattern: '*'}]});
     expect(named('Page.setDocumentContent')[0]!.params).toEqual({frameId: 'F1', html: DOC.html});
     expect(named('Page.navigate')).toEqual([]);
+    // Scripts are off and every request is caught before the first document loads.
+    const order = methods.map((entry) => entry.method);
+    const firstDocument = order.indexOf('Page.setDocumentContent');
+    expect(order.indexOf('Emulation.setScriptExecutionDisabled')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('Fetch.enable')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('Emulation.setScriptExecutionDisabled')).toBeLessThan(firstDocument);
+    expect(order.indexOf('Fetch.enable')).toBeLessThan(firstDocument);
     // The one remote request the page made is failed, as if a client blocked it.
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(logged(log).filter((entry) => entry.method === 'Fetch.failRequest').map((entry) => entry.params)).toEqual([{requestId: 'R1', errorReason: 'BlockedByClient'}]);
@@ -148,7 +157,7 @@ describe('the browser', () => {
       heightCss: 600,
       blocks: [{id: 'b-1', top: 80, bottom: 128, lines: [3, 4], mark: 'added'}],
       removed: [{top: 200, bottom: 222}],
-      links: [{href: 'f-123.html#user-content-x', left: 40, right: 100, top: 80, bottom: 100}],
+      links: [{href: 'f-123.html#user-content-x', rects: [{left: 40, right: 100, top: 80, bottom: 100}]}],
       anchors: [{id: 'user-content-intro', top: 20}],
     });
     browser.close();
@@ -207,6 +216,25 @@ describe('the browser', () => {
     await expect(browser.layout(DOC)).rejects.toThrow(/browser/);
     expect(spawned).toHaveLength(2);
     browser.close();
+  });
+
+  it('starts a new browser for the next job when the last one exited between jobs, and charges no job for it', async () => {
+    const {browser, spawned} = fakeChrome('exitafter:DOMSnapshot.captureSnapshot');
+    await browser.layout(DOC);
+    const first = spawned[0]!;
+    await new Promise((resolve) => (first.exitCode !== null || first.signalCode !== null ? resolve(null) : first.once('exit', resolve)));
+    await expect(browser.layout(DOC)).resolves.toMatchObject({heightCss: 600});
+    expect(spawned).toHaveLength(2);
+    browser.close();
+  });
+
+  it('names the exit code or the signal of a browser that dies during a job', async () => {
+    const crashed = fakeChrome('crash:DOMSnapshot.captureSnapshot');
+    await expect(crashed.browser.layout(DOC)).rejects.toThrow('the browser exited (code 3)');
+    crashed.browser.close();
+    const killed = fakeChrome('kill:DOMSnapshot.captureSnapshot');
+    await expect(killed.browser.layout(DOC)).rejects.toThrow('the browser exited (signal SIGKILL)');
+    killed.browser.close();
   });
 
   it('kills a browser that stops answering, so the next job starts clean', async () => {
@@ -269,6 +297,13 @@ describe('the tile jobs', () => {
     return {factory, documents, clips, made: () => made};
   }
 
+  // The name of the document a layout of `tileSource` drew, which a tile job cuts from.
+  const laidOut = async (handler: ReturnType<typeof createRenderedHandler>, tileSource: TileSource) => {
+    const laid = await handler.handle({type: 'layout', source: tileSource}) as LayoutResult;
+    if (!laid.ok) throw new Error(laid.reason);
+    return laid.document;
+  };
+
   const solid = (width: number, height: number, color: {r: number; g: number; b: number}) => sharp({create: {width, height, channels: 4, background: {...color, alpha: 1}}}).png().toBuffer().then((buffer) => new Uint8Array(buffer));
 
   it('lays out the tile document of the fragment at the sheet width and scale, with the markdown it was drawn from', async () => {
@@ -321,7 +356,8 @@ describe('the tile jobs', () => {
       return {before, after: Date.now()};
     };
     const layout = await sent({type: 'layout', source: source(dir)});
-    const tile = await sent({type: 'tile', source: source(dir), index: 0, rows: 100, mosaic: false});
+    const document = await laidOut(handler, source(dir));
+    const tile = await sent({type: 'tile', source: source(dir), document, index: 0, rows: 100, mosaic: false});
     expect(budgets[0]).toBeGreaterThanOrEqual(layout.before + BROWSER_JOB_DEADLINES_MS.layout - 1_000);
     expect(budgets[0]).toBeLessThanOrEqual(layout.after + BROWSER_JOB_DEADLINES_MS.layout - 1_000);
     expect(budgets[1]).toBeGreaterThanOrEqual(tile.before + BROWSER_JOB_DEADLINES_MS.tile - 1_000);
@@ -333,7 +369,9 @@ describe('the tile jobs', () => {
     const dir = makeTempDir('branch-review-tiles-');
     const {log} = fakeChrome('hang:Target.createTarget');
     const binary = path.join(path.dirname(log), 'chrome-headless-shell');
-    const handler = createRenderedHandler({browser: (chrome) => createBrowser({
+    // The page is laid out by a browser that answers, then cut by one that hangs as it starts.
+    const answering = fakeBrowser(() => solid(10, 10, {r: 0, g: 0, b: 0}));
+    const handler = createRenderedHandler({browser: (chrome) => (chrome.path !== binary ? answering.factory() : createBrowser({
       binary: chrome,
       userDataDir: path.join(dir, 'chrome'),
       spawn: (command, args, options) => {
@@ -341,9 +379,10 @@ describe('the tile jobs', () => {
         children.push(child);
         return child;
       },
-    })});
+    }))});
+    const document = await laidOut(handler, source(dir));
     const started = Date.now();
-    const result = await handler.handle({type: 'tile', source: {...source(dir), chrome: {path: binary, headless: '--headless'}}, index: 0, rows: 100, mosaic: false}) as TileResult;
+    const result = await handler.handle({type: 'tile', source: {...source(dir), chrome: {path: binary, headless: '--headless'}}, document, index: 0, rows: 100, mosaic: false}) as TileResult;
     expect(result).toMatchObject({ok: false, state: 'error'});
     expect(Date.now() - started).toBeLessThan(BROWSER_JOB_DEADLINES_MS.tile);
     handler.dispose();
@@ -353,7 +392,7 @@ describe('the tile jobs', () => {
     const dir = makeTempDir('branch-review-tiles-');
     const fake = fakeBrowser(() => solid(1703, 1159, {r: 20, g: 30, b: 40}));
     const handler = createRenderedHandler({browser: fake.factory});
-    const result = await handler.handle({type: 'tile', source: source(dir), index: 1, rows: 100, mosaic: false}) as TileResult;
+    const result = await handler.handle({type: 'tile', source: source(dir), document: await laidOut(handler, source(dir)), index: 1, rows: 100, mosaic: false}) as TileResult;
     expect(result.ok).toBe(true);
     const meta = await sharp(Buffer.from((result as {png: Uint8Array}).png)).metadata();
     expect([meta.width, meta.height]).toEqual([1703, 1160]);
@@ -373,7 +412,7 @@ describe('the tile jobs', () => {
     const png = new Uint8Array(await sharp(raw, {raw: {width: 1703, height: 1160, channels: 4}}).png().toBuffer());
     const fake = fakeBrowser(async () => png);
     const handler = createRenderedHandler({browser: fake.factory});
-    const result = await handler.handle({type: 'tile', source: source(dir), index: 0, rows: 100, mosaic: true}) as {ok: true; mosaic: Uint8Array};
+    const result = await handler.handle({type: 'tile', source: source(dir), document: await laidOut(handler, source(dir)), index: 0, rows: 100, mosaic: true}) as {ok: true; mosaic: Uint8Array};
     expect(result.mosaic).toHaveLength(131 * 40 * 3);
     expect([...result.mosaic.subarray(0, 3)]).toEqual([200, 0, 0]);
     const last = (131 * 40 - 1) * 3;
@@ -386,8 +425,99 @@ describe('the tile jobs', () => {
     const noise = Buffer.from(Array.from({length: 1703 * 1160 * 3}, () => Math.floor(Math.random() * 256)));
     const png = new Uint8Array(await sharp(noise, {raw: {width: 1703, height: 1160, channels: 3}}).png({compressionLevel: 0}).toBuffer());
     const handler = createRenderedHandler({browser: fakeBrowser(async () => png).factory});
-    const result = await handler.handle({type: 'tile', source: source(dir), index: 0, rows: 100, mosaic: false}) as TileResult;
+    const result = await handler.handle({type: 'tile', source: source(dir), document: await laidOut(handler, source(dir)), index: 0, rows: 100, mosaic: false}) as TileResult;
     expect(result).toMatchObject({ok: false, tooLarge: true});
+    handler.dispose();
+  });
+
+  it('cuts each tile from the document its layout measured, though an image that was late then has since answered', async () => {
+    const repo = initRepo({'page.md': '# Title\n\n![Logo](logo.png)\n\nText under the image.\n'});
+    fs.writeFileSync(path.join(repo, 'logo.png'), pngFixture(3, 2, [200, 40, 40, 255]));
+    commitAll(repo, 'logo');
+    const tileSource: TileSource = {...source(repo), fragment: {...source(repo).fragment, cwd: repo, source: {kind: 'worktree', path: 'page.md'}}};
+    fs.writeFileSync(path.join(repo, 'page.md'), '# Title\n\n![Logo](logo.png)\n\nText under the image.\n');
+    const fake = fakeBrowser(() => solid(1703, 1160, {r: 0, g: 0, b: 0}));
+    // No time for a lookup: the layout's image, asked before git read a tree, is late.
+    const handler = createRenderedHandler({browser: fake.factory, lookupBudgetMs: 0});
+    const laid = await handler.handle({type: 'layout', source: tileSource}) as Extract<LayoutResult, {ok: true}>;
+    expect(laid.ok).toBe(true);
+    expect(fake.documents[0]!.html).toContain('took too long to read');
+    // By the tile job git has answered, so a render now would embed the image.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const tile = await handler.handle({type: 'tile', source: tileSource, document: laid.document, index: 0, rows: 100, mosaic: false}) as TileResult;
+    expect(tile.ok).toBe(true);
+    expect(fake.documents.at(-1)!.key).toBe(laid.document);
+    expect(fake.documents.at(-1)!.html).toContain('took too long to read');
+    // The layout said it drew something late, so the pane asks again.
+    expect(laid.late).toBe(true);
+    handler.dispose();
+  });
+
+  it('says a layout drew something late when an image it shows failed to read for a reason of the moment', async () => {
+    const repo = initRepo({'page.md': '# Title\n\n![Logo](logo.png)\n'});
+    fs.writeFileSync(path.join(repo, 'logo.png'), pngFixture(3, 2, [200, 40, 40, 255]));
+    const id = git(repo, 'hash-object', 'logo.png').trim();
+    // An agent is rewriting the image: its bytes aren't the ones the review named.
+    fs.writeFileSync(path.join(repo, 'logo.png'), pngFixture(3, 2, [40, 40, 200, 255]));
+    const base = source(repo, '# Title\n\n![Logo](logo.png)\n');
+    const tileSource: TileSource = {...base, fragment: {...base.fragment, assets: {base: null, after: {worktree: [{path: 'logo.png', id, mode: 'regular'}]}, epoch: 0}}};
+    const fake = fakeBrowser(() => solid(10, 10, {r: 0, g: 0, b: 0}));
+    const handler = createRenderedHandler({browser: fake.factory});
+    const laid = await handler.handle({type: 'layout', source: tileSource}) as Extract<LayoutResult, {ok: true}>;
+    expect(fake.documents[0]!.html).toContain("doesn't match git");
+    // A read that may work a moment later: the pane asks for the layout again.
+    expect(laid.late).toBe(true);
+    handler.dispose();
+  });
+
+  it('holds the newest document of each of several pages too large for the budget, so their tiles never evict each other', async () => {
+    const dir = makeTempDir('branch-review-tiles-');
+    // Each page's tile document is past half the 16 MB budget.
+    const handler = createRenderedHandler({
+      browser: fakeBrowser(() => solid(1703, 1160, {r: 0, g: 0, b: 0})).factory,
+      render: async (input) => ({...(await renderMarkdown(input)), html: `<p>${input.source} ${'x'.repeat(9_000_000)}</p>`}),
+    });
+    const sourceOf = (name: string, key = `frag-${name}`): TileSource => {
+      const base = source(dir);
+      fs.writeFileSync(path.join(dir, name), `# ${name}\n`);
+      return {...base, fragment: {...base.fragment, key, path: name, source: {kind: 'worktree', path: name}}};
+    };
+    const tile = (tileSource: TileSource, document: string) => handler.handle({type: 'tile', source: tileSource, document, index: 0, rows: 100, mosaic: false});
+    const one = sourceOf('one.md');
+    const two = sourceOf('two.md');
+    const first = await laidOut(handler, one);
+    const second = await laidOut(handler, two);
+    // Both files on screen: each one's tiles are cut from its own document.
+    expect(await tile(one, first)).toMatchObject({ok: true});
+    expect(await tile(two, second)).toMatchObject({ok: true});
+    // A file laid out anew keeps only its newest document.
+    const edited = sourceOf('one.md', 'frag-one-edited');
+    fs.writeFileSync(path.join(dir, 'one.md'), '# one, edited\n');
+    const newer = await laidOut(handler, edited);
+    expect(newer).not.toBe(first);
+    expect(await tile(one, first)).toMatchObject({ok: false, stale: true});
+    expect(await tile(edited, newer)).toMatchObject({ok: true});
+    expect(await tile(two, second)).toMatchObject({ok: true});
+    // Held for the four files laid out last, no more: the fifth lets the oldest go.
+    for (const name of ['three.md', 'four.md']) await laidOut(handler, sourceOf(name));
+    expect(await tile(two, second)).toMatchObject({ok: true});
+    await laidOut(handler, sourceOf('five.md'));
+    expect(await tile(two, second)).toMatchObject({ok: false, stale: true});
+    expect(await tile(edited, newer)).toMatchObject({ok: true});
+    handler.dispose();
+  });
+
+  it('answers a tile of a document it doesn\'t hold as stale at once, asking no browser and counting no failure', async () => {
+    const dir = makeTempDir('branch-review-tiles-');
+    const fake = fakeBrowser(() => solid(1703, 1160, {r: 0, g: 0, b: 0}));
+    const handler = createRenderedHandler({browser: fake.factory});
+    for (let at = 0; at < 4; at += 1) {
+      expect(await handler.handle({type: 'tile', source: source(dir), document: 'not-laid-out', index: 0, rows: 100, mosaic: false})).toEqual({ok: false, state: 'error', reason: 'the page changed since it was laid out', stale: true});
+    }
+    expect(fake.made()).toBe(0);
+    // Four stale answers turned nothing off: a page laid out now is cut.
+    const document = await laidOut(handler, source(dir));
+    expect(await handler.handle({type: 'tile', source: source(dir), document, index: 0, rows: 100, mosaic: false})).toMatchObject({ok: true});
     handler.dispose();
   });
 
@@ -400,7 +530,8 @@ describe('the tile jobs', () => {
       throw new Error('the browser exited (code 3)');
     });
     const handler = createRenderedHandler({browser: fake.factory, now: () => now});
-    const tile = () => handler.handle({type: 'tile', source: source(dir), index: 0, rows: 100, mosaic: false}) as Promise<TileResult>;
+    const document = await laidOut(handler, source(dir));
+    const tile = () => handler.handle({type: 'tile', source: source(dir), document, index: 0, rows: 100, mosaic: false}) as Promise<TileResult>;
     expect(await tile()).toMatchObject({ok: false, reason: 'the browser exited (code 3)'});
     now += 61_000;
     // A failure a minute later starts the count again.

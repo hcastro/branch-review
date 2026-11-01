@@ -82,7 +82,7 @@ The following settings change how the page arrives:
 
 ### Live updates in watch mode
 
-In watch mode inside cmux, when the file you last opened with `r` changes, the split goes to its new page within a second, at the place you scrolled the split to. The new page doesn't develop. The blocks that are new since the last page glow once instead. The split gets at most one update a second, and an update never takes the place of a page you just opened with `r`. After you close the split, the updates stop until the next `r` opens one. The page in a browser tab, and the overview, don't update.
+In watch mode inside cmux, when the file you last opened with `r` changes, or an edit to another file changes what its page shows, such as a link that no longer resolves, the split goes to its new page within a second, at the place you scrolled the split to. The new page doesn't develop. The blocks that are new since the last page glow once instead. The split gets at most one update a second, and an update never takes the place of a page you just opened with `r`. After you close the split, the updates stop until the next `r` opens one. The page in a browser tab, and the overview, don't update.
 
 Before each update, `branch-review` asks cmux which page the split shows. The split updates only while it shows that file's page. After you go to another page with `{`, `}` or a link, the split stays where you went, and updates to the file resume once you go back to its page. When cmux doesn't answer within 1.5 seconds, that update is skipped. To follow the page you moved to, press `r` on its file in the review.
 
@@ -98,7 +98,7 @@ The in-pane view needs the following:
 
 - A terminal that draws Kitty images, such as Ghostty, cmux, or Kitty. Other terminals keep the diff, and `v` on a markdown file does nothing new.
 - A terminal that reports its cell size in pixels. Each tile is cut to fill its cells exactly, so the terminal never scales it. Ghostty, cmux, and Kitty report it.
-- A headless Chromium on disk. `branch-review` never installs one. It uses `BRANCH_REVIEW_CHROME` when that names a program, else the newest `chrome-headless-shell` that Playwright or Puppeteer installed, else Google Chrome, or on Linux `chromium` or `google-chrome` on your `PATH`. A program inside the repo under review is never used.
+- A headless Chromium on disk. `branch-review` never installs one. When `BRANCH_REVIEW_CHROME` is set, it's used only when it's an absolute path to a program outside the repo. A `BRANCH_REVIEW_CHROME` that can't be used turns the in-pane view off, and `branch-review` looks for no other Chromium. With it unset, `branch-review` uses the newest `chrome-headless-shell` that Playwright or Puppeteer installed, else Google Chrome on macOS. On Linux it then takes the first of `chrome-headless-shell`, `chromium`, `chromium-browser`, and `google-chrome` on your `PATH`. A program inside the repo under review is never used.
 
 To read the page of the markdown file in view, press `v`, or click **Diff** to go back. The page takes the pane's width up to the width GitHub lays a file out at, centered in the pane, and its text is the same height as the terminal's. The diff's text dissolves, the page's colors arrive as shade characters, and an accent line sweeps down the pane with the sharp page above it. The page opens on the block that was at the top of the diff. Press `v` again, and the diff is back in one frame, at the line the page showed at the top.
 
@@ -113,9 +113,10 @@ While the page is in the pane, the following keys change:
 | `v` | Go back to the diff |
 | `[` / `]` | Scroll to the previous or next change |
 | `c` | Copy the markdown source of the block at the top of the pane, as the page shows it, even when the file changed on disk since |
+| `p` / `b` | Copy the diff or the prompt of the change the block at the top of the pane shows. On a block the branch didn't change, nothing is copied, and the footer says to press `v` for the diff. |
 | `r` | Open the page in the split or your browser, at the block at the top of the pane |
 
-`j`, `k`, `g`, `G`, and the mouse wheel scroll the page. Clicking a link on the page follows it in the review: a heading on the page scrolls there, and a link to another file of the review opens that file. A web or email address is copied to the clipboard and never opened, because it's the repo's. The footer reads `◆ rendered · local` while the page is on screen.
+`j`, `k`, `g`, `G`, and the mouse wheel scroll the page. Clicking a link on the page follows it in the review: a heading on the page scrolls there, and a link to another file of the review opens that file. A web or email address is copied to the clipboard and never opened, because it's the repo's. A link that holds control characters isn't copied, and the footer says so. The footer reads `◆ rendered · local` while the page is on screen.
 
 Each page is laid out and cut into tiles by the headless Chromium, in the session's temp directory, with scripts and every network request off. The page loads as a document, never as a file or a URL, and every host resolves to nothing. The tiles go to the terminal as images before any row of the pane shows them, and at most ten of them are kept in the terminal at a time. When the tiles on screen aren't in the terminal yet, the pane holds on the page's colors, and after a moment the footer reads `developing`.
 
@@ -129,7 +130,7 @@ The footer names the following problems:
 
 | Message | What it means |
 | --- | --- |
-| `the in-pane view needs Chrome` | No headless Chromium was found. Set `BRANCH_REVIEW_CHROME` to one, or install `chrome-headless-shell`. `r` still opens the page. |
+| `the in-pane view needs Chrome` | No headless Chromium was found, or `BRANCH_REVIEW_CHROME` names one that can't be used. Set `BRANCH_REVIEW_CHROME` to the absolute path of one, or install `chrome-headless-shell`. `r` still opens the page. |
 | `the terminal didn't report its cell size` | The terminal didn't answer the cell size query, so a tile would be scaled and blurred. `r` still opens the page. |
 | `in-pane view turned off` | Chromium failed three times in a minute, so the pane goes back to the diff for the session. `r` still works. |
 | `rendered view turned off` | The rendered view's worker failed three times in a minute. The pane goes back to the diff, and `r` and `R` stop working for the session. |

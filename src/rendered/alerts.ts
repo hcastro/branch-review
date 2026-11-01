@@ -3,7 +3,7 @@ import type {Blockquote, Paragraph, Root, Text} from 'mdast';
 export const ALERT_TYPES = ['note', 'tip', 'important', 'warning', 'caution'] as const;
 export type AlertType = typeof ALERT_TYPES[number];
 
-const MARKER = /^\[!(note|tip|important|warning|caution)\][ \t]*(?:\n|$)/i;
+const MARKER = /^\[!(note|tip|important|warning|caution)\][ \t]*(?:\r?\n|$)/i;
 
 /**
  * GitHub's alerts: a top-level blockquote whose first line is only

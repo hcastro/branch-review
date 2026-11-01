@@ -54,6 +54,23 @@ describe('renderMarkdown fixtures', () => {
     await snapshot('alerts', html);
   });
 
+  it('renders each alert in a CRLF file as it does in an LF file', async () => {
+    const renderSource = async (source: string) => (await renderMarkdown({
+      path: 'docs/crlf.md',
+      source,
+      groups: [],
+      asset: async (): Promise<AssetAnswer> => ({kind: 'skipped'}),
+      link: (): LinkAnswer => ({kind: 'outside'}),
+    })).html.replace(/ data-(?:block|lines)="[^"]*"/g, '');
+    for (const type of ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION']) {
+      const lf = `> [!${type}]\n> The body, on its own line.\n`;
+      const lfHtml = await renderSource(lf);
+      expect(lfHtml).toContain(`<div class="markdown-alert markdown-alert-${type.toLowerCase()}">`);
+      const crlfHtml = await renderSource(lf.replaceAll('\n', '\r\n'));
+      expect(crlfHtml.replaceAll('\r', '')).toBe(lfHtml);
+    }
+  });
+
   it('renders task lists with disabled checkboxes', async () => {
     const {html} = await render('tasks');
     expect(html).toContain('<ul class="contains-task-list">');
@@ -101,6 +118,21 @@ describe('renderMarkdown fixtures', () => {
     expect(html).toMatch(/^<table><thead><tr><th>title<\/th><th>tags<\/th><th>owner<\/th><\/tr><\/thead><tbody><tr><td><div>Rendered view<\/div><\/td><td><table><tbody><tr><td><div>docs<\/div><\/td><td><div>review<\/div><\/td><\/tr><\/tbody><\/table><\/td><td><table><thead><tr><th>name<\/th><th>team<\/th><\/tr><\/thead>/);
     expect(html).toContain('Body after frontmatter</h1>');
     await snapshot('frontmatter', html);
+  });
+
+  it('shows cyclic or very deep frontmatter as its source, and renders the rest of the document', async () => {
+    const renderSource = async (source: string) => (await renderMarkdown({path: 'docs/meta.md', source, groups: [], asset: async (): Promise<AssetAnswer> => ({kind: 'skipped'}), link: (): LinkAnswer => ({kind: 'outside'})})).html.replace(/ data-(?:block|lines)="[^"]*"/g, '');
+    const cyclic = await renderSource('---\na: &x [*x]\n---\n\n# Body after it\n');
+    expect(cyclic).toContain('<pre><code>a: &#x26;x [*x]</code></pre>');
+    expect(cyclic).toContain('Body after it');
+    const deep = `${'['.repeat(40)}1${']'.repeat(40)}`;
+    const nested = await renderSource(`---\na: ${deep}\n---\n\nText.\n`);
+    expect(nested).toContain(`<pre><code>a: ${deep}</code></pre>`);
+    expect(nested).toContain('Text.');
+    // Within the limit, nested values are still nested tables.
+    const shallow = await renderSource('---\na: [[[1]]]\n---\n\nText.\n');
+    expect(shallow).not.toContain('<pre>');
+    expect(shallow.match(/<table>/g)).toHaveLength(4);
   });
 
   it('keeps the raw HTML GitHub allows: alignment, details, kbd, sub, sup and named anchors', async () => {

@@ -39,8 +39,10 @@ import {createLoneEscapeGuard} from '../media/replyGuard.js';
 import {placeholderRun} from '../media/kitty.js';
 import {formatBytes, formatLabel} from '../media/layout.js';
 import type {MediaService, WantedBox} from '../media/service.js';
-import {LEAVES_PANE, type RenderedPages, type RenderedService, type Trip} from '../rendered/service.js';
+import {LEAVES_PANE} from '../rendered/marks.js';
+import type {RenderedPages, RenderedService, Trip} from '../rendered/service.js';
 import {anchorLine} from '../rendered/anchor.js';
+import {isMarkdownName} from '../rendered/classify.js';
 import {beamFrame, pressFrame} from '../rendered/beam.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 import {createCrossingClock, type CrossingClock} from './crossing.js';
@@ -129,6 +131,12 @@ export const RENDERED_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r render
 // back to the diff.
 const DIFF_ACTION: FileAction = {id: 'rendered.diff', label: 'Diff'};
 export const PANE_OFFER_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'v here', 'j/k scroll', '[/] block', 't tree'];
+// An image's or an SVG's own hints, with `r` before `t tree`, its last.
+function withRenderedHint(items: readonly string[]) {
+  const tree = items.indexOf('t tree');
+  const at = tree < 0 ? items.length : tree;
+  return [...items.slice(0, at), `r rendered ${LEAVES_PANE}`, ...items.slice(at)];
+}
 export const PANE_KEY_HINT_ITEMS = ['q quit', 'v diff', '[/] change', 'j/k scroll', 'c copy block', `r open ${LEAVES_PANE}`, 't tree'];
 const PANE_REST = '◆ rendered · local';
 const PANE_DEVELOPING = 'developing';
@@ -1857,6 +1865,63 @@ function topPageRow(rows: readonly DiffRow[], offset: number, viewRows: number, 
   return null;
 }
 
+// The new-side lines a hunk changed: each added line, and for each run of
+// removed lines the line that follows where they were. Context lines, which
+// git prints three of around each change, are none of them. `tails`: a
+// removed run also touches the line before it, so a block that lost its
+// last lines, at the end of the file too, counts the change.
+function changedNewLines(block: ReviewBlock, tails = false): number[] {
+  const lines = block.rawDiff.split('\n');
+  const header = lines.findIndex((line) => line.startsWith('@@'));
+  // A hunk that adds nothing names the line before the one its removal
+  // came out ahead of.
+  let line = block.newLines === 0 ? block.newStart + 1 : block.newStart;
+  let removing = false;
+  const changed: number[] = [];
+  for (const text of lines.slice(header + 1)) {
+    if (text.startsWith('+')) {
+      changed.push(line);
+      line += 1;
+      removing = false;
+    } else if (text.startsWith('-')) {
+      if (!removing) {
+        changed.push(line);
+        if (tails && line > 1) changed.push(line - 1);
+      }
+      removing = true;
+    } else if (text.startsWith('\\')) {
+      // `\ No newline at end of file`
+    } else {
+      line += 1;
+      removing = false;
+    }
+  }
+  return changed;
+}
+
+// The hunk of `blocks` that changed the most lines within source lines
+// `first` to `last`, the first of those on a tie; none when no hunk changed
+// a line there, though its context lines may run over them. A block the
+// page marked changed whose lines no hunk added to or removed ahead of has
+// lost its last lines: a removed run then counts for the line before it
+// too. Only a marked block looks there, so an unchanged block that ends
+// where a removed one began still has nothing to copy.
+function hunkForLines(blocks: readonly ReviewBlock[], [first, last]: readonly [number, number], marked = false): ReviewBlock | undefined {
+  const most = (tails: boolean) => {
+    let best: ReviewBlock | undefined;
+    let count = 0;
+    for (const block of blocks) {
+      const inside = changedNewLines(block, tails).filter((line) => line >= first && line <= last).length;
+      if (inside > count) {
+        count = inside;
+        best = block;
+      }
+    }
+    return best;
+  };
+  return most(false) ?? (marked ? most(true) : undefined);
+}
+
 // The `#rrggbb` the terminal answered, as numbers, for the crossing's mosaic.
 function hexRgb(hex: string | undefined): Rgb {
   const value = /^#([0-9a-f]{6})$/i.exec(hex ?? '')?.[1] ?? '111318';
@@ -2535,6 +2600,8 @@ function AppContent({
   // A view that only follows focus, as a stub can, opens no pages.
   const pages = rendered?.open ? rendered as RenderedPages : undefined;
   const activeRenderable = Boolean(pages && activeFileKey && pages.renderable(activeFileKey));
+  // A renderable file is markdown, or an image or SVG whose media hints stay.
+  const activeIsMarkdown = Boolean(activeFile && isMarkdownName(activeFile.path));
   const [crossing] = useState(createCrossingClock);
   useEffect(() => () => crossing.dispose(), [crossing]);
   // The in-pane crossing's clock. The footer reads only whether it is
@@ -2560,7 +2627,11 @@ function AppContent({
   const paneFilesRef = useRef<ReadonlySet<string>>(new Set());
   // Where the pane is to open, or the diff to come back to, once the rows
   // for it are built: the source line the other view had at the top.
-  const pendingPaneAnchor = useRef<{fileKey: string; line: number | null; fraction: number} | null>(null);
+  // `within`: how far down its block the top row was; `keep`: a resize,
+  // which holds the view where it is until the new page rows exist.
+  const pendingPaneAnchor = useRef<{fileKey: string; line: number | null; fraction: number; within?: number; keep?: true} | null>(null);
+  // What the pane showed at the last commit, for keeping the reader's place when a resize lays the page out anew.
+  const paneViewRef = useRef<{width: number; rows: readonly DiffRow[]; offset: number; viewRows: number; fileKey: string; inPane: boolean} | null>(null);
   const pendingDiffAnchor = useRef<{fileKey: string; line: number | null} | null>(null);
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
@@ -2760,6 +2831,17 @@ function AppContent({
   // at the line the page showed at the top. The rows decide, not the pane:
   // a layout can land between a render and this effect, before any row
   // holds it.
+  // A resize that changes the pane's width lays the page out anew, at
+  // another height: the block at the top, and how far into it, is kept
+  // from the page drawn before, to come back to once the new rows exist.
+  useEffect(() => {
+    const before = paneViewRef.current;
+    if (!before || before.width === wrapWidth || !before.inPane || !pane || pendingPaneAnchor.current) return;
+    const pageRow = topPageRow(before.rows, before.offset, before.viewRows, before.fileKey);
+    const place = pageRow === null ? null : pane.placeAt(before.fileKey, pageRow);
+    if (place) pendingPaneAnchor.current = {fileKey: before.fileKey, line: place.line, fraction: 0, within: place.within, keep: true};
+  }, [pane, wrapWidth]);
+
   useEffect(() => {
     const toPage = pendingPaneAnchor.current;
     if (toPage && paneOn && pane) {
@@ -2767,11 +2849,11 @@ function AppContent({
       if (start < 0) return;
       const drawn = allDiffRows.some((row) => row.pane?.fileKey === toPage.fileKey && row.pane.pageRow !== undefined);
       if (!drawn && !pane.layoutFailed(toPage.fileKey)) {
-        setDiffOffset(Math.min(start, scrollCeiling));
+        if (!toPage.keep) setDiffOffset(Math.min(start, scrollCeiling));
         return;
       }
       pendingPaneAnchor.current = null;
-      const pageRow = toPage.line === null ? 0 : pane.rowForLine(toPage.fileKey, toPage.line) ?? 0;
+      const pageRow = toPage.line === null ? 0 : pane.rowForLine(toPage.fileKey, toPage.line, toPage.within) ?? 0;
       setDiffOffset(clamp(start + 1 + pageRow - Math.round(toPage.fraction * visibleDiffRows), start, scrollCeiling));
       return;
     }
@@ -2782,6 +2864,10 @@ function AppContent({
       if (row !== null) setDiffOffset(clamp(row, 0, scrollCeiling));
     }
   }, [allDiffRows, pane, paneOn, panePlanVersion, scrollCeiling, visibleDiffRows]);
+
+  useEffect(() => {
+    paneViewRef.current = {width: wrapWidth, rows: allDiffRows, offset: diffOffset, viewRows: visibleDiffRows, fileKey: activeFileKey, inPane: Boolean(paneOn && activeFileKey && pane?.covers(activeFileKey))};
+  });
 
   useEffect(() => {
     setTreeOffset((current) => {
@@ -3108,6 +3194,10 @@ function AppContent({
       if (start >= 0) scrollDiffTo(clamp(start + 1 + target.row, 0, scrollCeiling));
       return;
     }
+    if (target.kind === 'refused') {
+      showToast(target.reason, undefined, 'error');
+      return;
+    }
     try {
       const result = await (copyWriter ?? writeClipboard)(target.url);
       if (result.ok) showToast('Copied link', truncateEnd(toDisplayText(target.url), 60));
@@ -3314,6 +3404,24 @@ function AppContent({
 
     showToast(result.toast, result.hint, result.ok ? 'success' : 'error');
   }, [activeFile, copyWriter, focusedBlock, readFileContent, resolveAbsolutePath, review, showToast]);
+
+  // `p` and `b` on the page: the diff or the prompt of the change the block
+  // at the top shows, the review hunk that changed the most of the block's
+  // source lines (for a run of removed lines, the line they were removed
+  // before, and for a marked block that lost its last lines, the line they
+  // were removed after). A block whose lines a hunk only shows as context
+  // has nothing to copy.
+  const copyPageChange = useCallback((commandId: 'copy.blockDiff' | 'copy.blockPrompt') => {
+    if (!pane || !activeFile) return;
+    const pageRow = topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey);
+    const shown = pageRow === null ? null : pane.blockAt(activeFileKey, pageRow);
+    const hunk = shown && pageRow !== null ? hunkForLines(activeFile.blocks, shown.lines, pane.markAt(activeFileKey, pageRow) !== null) : undefined;
+    if (!hunk) {
+      showToast('no change here · v shows the diff', undefined, 'info');
+      return;
+    }
+    void runCopyCommand(commandId, activeFile, hunk);
+  }, [activeFile, activeFileKey, allDiffRows, diffOffset, pane, runCopyCommand, showToast, visibleDiffRows]);
 
   const copyFileTree = useCallback(async () => {
     // A name that is not UTF-8 is shown as an escaped stand-in that names no
@@ -3950,6 +4058,11 @@ function AppContent({
       return;
     }
 
+    if ((input === 'p' || input === 'b') && activeInPane) {
+      copyPageChange(input === 'p' ? 'copy.blockDiff' : 'copy.blockPrompt');
+      return;
+    }
+
     // Compare views for a modified image: 1 side by side, 2 flip (and 2
     // again swaps the side), 3 difference. Nothing on any other file.
     const compareMode = COMPARE_KEYS[input];
@@ -4037,7 +4150,7 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneOfferedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable ? RENDERED_KEY_HINT_ITEMS : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneOfferedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable && activeIsMarkdown ? RENDERED_KEY_HINT_ITEMS : activeRenderable ? withRenderedHint(mediaHintItems(media, activeMediaRef)) : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
   // A block preview is rough on purpose; while one is on screen the footer
   // says why the picture is not drawn properly.
   const footerRight = activeInPane

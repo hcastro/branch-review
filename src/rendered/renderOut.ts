@@ -73,6 +73,8 @@ type Options = {
   sleep?: (ms: number) => Promise<void>;
   /** How long one page's lookups may take on each of its renders (LOOKUP_BUDGET_MS). */
   lookupBudgetMs?: number;
+  /** How long the search for markdown that shows a changed image may take (2 seconds). */
+  embeddersMs?: number;
 };
 
 // One file to write a page for: the review's markdown and images, then the
@@ -90,7 +92,7 @@ type Planned = {
 const OVERVIEW_FILE = 'overview.html';
 const LINKS_FILE = 'links.json';
 
-export async function renderToDirectory({cwd, range, review, outDir, outLabel, now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), lookupBudgetMs = LOOKUP_BUDGET_MS}: Options): Promise<RenderOutReport> {
+export async function renderToDirectory({cwd, range, review, outDir, outLabel, now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), lookupBudgetMs = LOOKUP_BUDGET_MS, embeddersMs}: Options): Promise<RenderOutReport> {
   // A markdown file whose review entry failed is listed too, as a page or a
   // card, so no failure goes missing from the run.
   const files = review.files.flatMap((file): Array<{file: ReviewFile; kind: RenderableKind; failure?: string}> => {
@@ -127,34 +129,44 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
   const reader = createSourceReader({sleep});
   // The images on every page, under the same rule as the TUI's pages.
   const assets = reviewAssetSides(review, range, 0);
-  const resolver = createAssetResolver({cwd});
-  const renderOnce = async (each: Planned): Promise<{body: PageBody; late?: true}> => {
-    if (each.failure !== undefined) return {body: {kind: 'failed', reason: oneLine(each.failure), source: ''}};
+  const resolver = createAssetResolver({cwd, ...(embeddersMs === undefined ? {} : {embeddersMs})});
+  // `settled`: every lookup the render started has answered.
+  const renderOnce = async (each: Planned): Promise<{body: PageBody; late?: true; settled: Promise<void>}> => {
+    if (each.failure !== undefined) return {body: {kind: 'failed', reason: oneLine(each.failure), source: ''}, settled: Promise.resolve()};
     if (each.kind !== 'markdown') {
       const uses: AssetUse[] = [];
-      const {asset, baseAsset} = pageLookups(resolver, assets, false, uses, {budgetMs: lookupBudgetMs});
-      const body: PageBody = {kind: 'image', image: await imageBody({format: each.kind, path: each.file.path, ...(each.file.oldPath ? {oldPath: each.file.oldPath} : {}), status: each.file.status, asset, baseAsset})};
-      return {body, ...(uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {})};
+      const lookups = pageLookups(resolver, assets, false, uses, {budgetMs: lookupBudgetMs});
+      const body: PageBody = {kind: 'image', image: await imageBody({format: each.kind, path: each.file.path, ...(each.file.oldPath ? {oldPath: each.file.oldPath} : {}), status: each.file.status, asset: lookups.asset, baseAsset: lookups.baseAsset})};
+      return {body, ...(uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {}), settled: lookups.settled()};
     }
     const {file, groups} = each;
     let ranLate = false;
+    let settled = Promise.resolve();
     const render = async (source: string) => {
       const result = await thread.render({cwd, path: file.path, ...(file.oldPath ? {oldPath: file.oldPath} : {}), status: file.status, ...(each.also ? {textUnchanged: true as const} : {}), source, groups, links, assets, budgetMs: lookupBudgetMs});
       ranLate = Boolean(result.late);
+      settled = result.settled;
       return result.fragment;
     };
     const body = await pageBody(() => reader.read(cwd, each.source!), render);
-    return {body, ...(ranLate ? {late: true as const} : {})};
+    return {body, ...(ranLate ? {late: true as const} : {}), settled};
   };
   // A render whose lookups ran out of time (the first read of a tree, a
   // busy machine) shows less than the page will once git answers, so it
-  // renders once more, when what the first one asked for is at hand, as
-  // the TUI's service asks again. Whatever is still late stays unclaimed.
+  // renders once more, when what the first one asked for is at hand (or a
+  // render's deadline has passed), as the TUI's service asks again.
+  // Whatever is still late stays unclaimed.
   const renderOne = async (each: Planned): Promise<PageBody> => {
     const first = await renderOnce(each);
-    const settled = first.late ? await renderOnce(each) : first;
-    if (settled.late) late.add(each);
-    return settled.body;
+    if (!first.late) return first.body;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([first.settled, new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, RENDER_DEADLINE_MS);
+    })]);
+    clearTimeout(timer);
+    const again = await renderOnce(each);
+    if (again.late) late.add(each);
+    return again.body;
   };
   const alsoPlanned: Planned[] = [];
   const alsoBodies: PageBody[] = [];

@@ -21,7 +21,10 @@ export type PageLayout = {
 
 export type LayoutBox = {top: number; bottom: number};
 export type LayoutBlock = LayoutBox & {id: string; lines?: readonly [number, number]; mark?: 'added' | 'modified'};
-export type LayoutLink = LayoutBox & {href: string; left: number; right: number};
+/** A box on the page, in CSS pixels from its top-left. */
+export type LayoutRect = {left: number; right: number; top: number; bottom: number};
+/** A link and the boxes it draws: one per line its text runs over, and its images. */
+export type LayoutLink = {href: string; rects: LayoutRect[]};
 
 export type PaneMark = 'added' | 'modified' | 'removed';
 
@@ -40,17 +43,44 @@ export function rowAt(geometry: PageGeometry, css: number) {
 }
 
 /**
+ * The pane rows a box stands for: those whose vertical centers it holds,
+ * or, for a box that holds no row's center, the one row it overlaps most
+ * (the earlier on a tie). A box that only grazes a row leaves it to what
+ * the row mostly shows. Empty for an empty box.
+ */
+export function rowsOf(box: LayoutBox, geometry: PageGeometry, rows: number): readonly [number, number] | null {
+  if (box.bottom <= box.top || rows <= 0) return null;
+  const height = geometry.cellPx.h / geometry.dpr;
+  // Row r's center is (r + 0.5) * height: the first at or below the top,
+  // the last above the bottom.
+  const first = Math.max(0, Math.ceil(box.top / height - 0.5 - 1e-9));
+  const last = Math.min(rows - 1, Math.ceil(box.bottom / height - 0.5 - 1e-9) - 1);
+  if (first <= last) return [first, last];
+  let best = -1;
+  let most = 0;
+  for (let row = Math.max(0, Math.floor(box.top / height)); row <= Math.min(rows - 1, Math.floor(box.bottom / height)); row += 1) {
+    const overlap = Math.min(box.bottom, (row + 1) * height) - Math.max(box.top, row * height);
+    if (overlap > most + 1e-9) {
+      most = overlap;
+      best = row;
+    }
+  }
+  return best < 0 ? null : [best, best];
+}
+
+/**
  * Each pane row's mark: the change a marked block or a removed marker
- * crossing it shows. A row two blocks cross shows the stronger: modified
- * over added, and either over a removed marker beside it.
+ * shows there, by rowsOf: a block marks the rows it mostly fills, never a
+ * row of an unchanged neighbor it grazes. A row two of them claim shows
+ * the stronger: modified over added, and either over a removed marker.
  */
 export function rowMarks(layout: PageLayout, geometry: PageGeometry, rows: number): Array<PaneMark | null> {
   const marks: Array<PaneMark | null> = Array(rows).fill(null);
   const rank: Record<PaneMark, number> = {removed: 1, added: 2, modified: 3};
   const put = (box: LayoutBox, mark: PaneMark) => {
-    if (box.bottom <= box.top) return;
-    const last = Math.min(rows - 1, rowAt(geometry, box.bottom - 1e-3));
-    for (let row = rowAt(geometry, box.top); row <= last; row += 1) {
+    const span = rowsOf(box, geometry, rows);
+    if (!span) return;
+    for (let row = span[0]; row <= span[1]; row += 1) {
       const known = marks[row];
       if (!known || rank[mark] > rank[known]) marks[row] = mark;
     }

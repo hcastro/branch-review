@@ -9,18 +9,23 @@ import type {FragmentRequest, LayoutResult, RenderedBackend, TileRequest, TileRe
 import {createRenderedPane, PANE_NEEDS_CHROME, type RenderedPane} from '../src/rendered/pane.js';
 import type {PageLayout} from '../src/rendered/plan.js';
 import {
+  binaryMediaFile,
   BLOCKS_CAPS,
   buildFixture,
   decodePlaceholders,
   emitMousePressAt,
   expectTransmitBeforeUse,
+  fakeMediaService,
   flush,
   frameLines,
   KITTY_CAPS,
   markdownFile,
+  multiBlockFile,
   parseApc,
   recordingWriter,
   renderSized,
+  sideInfo,
+  svgMediaFile,
   type FixtureFile,
   type TimelineEntry,
 } from './ui-fixtures.js';
@@ -55,13 +60,17 @@ function layoutOf(rows: number): PageLayout {
       {id: 'b-more', top: 60 * ROW, bottom: 61 * ROW, lines: [7, 7], mark: 'modified'},
     ],
     removed: [],
-    links: [{href: 'https://example.com/docs', left: 0, right: 400, top: 7 * ROW, bottom: 8 * ROW}],
+    links: [{href: 'https://example.com/docs', rects: [{left: 0, right: 400, top: 7 * ROW, bottom: 8 * ROW}]}],
     anchors: [],
   };
 }
 
-function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutDelay = 0, chrome = true, tile, animations = false, size = SIZE, readFile}: {
+function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides}: {
+  // With media previews, the sides they read by id.
+  mediaSides?: NonNullable<Parameters<typeof fakeMediaService>[0]>['sides'];
   layout?: PageLayout;
+  // The layout at the sheet width asked for, as text wraps taller in a narrower sheet.
+  layoutFor?: (cssWidth: number) => PageLayout;
   // What reading a file from disk gives now, when it isn't the text the page was laid out from.
   readFile?: (path: string) => string | null;
   // How long the layout takes, as on a cold Chromium start.
@@ -88,7 +97,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
   const backend: Pick<RenderedBackend, 'layout' | 'tile' | 'disabledReason'> = {
     layout: async (request): Promise<LayoutResult> => {
       const text = sources[request.source.fragment.path];
-      const answer: LayoutResult = {ok: true, layout: layout ?? layoutOf(rows), document: `doc-${request.source.fragment.key}`, ...(text === undefined ? {} : {text})};
+      const answer: LayoutResult = {ok: true, layout: layoutFor?.(request.source.geometry.cssWidth) ?? layout ?? layoutOf(rows), document: `doc-${request.source.fragment.key}`, ...(text === undefined ? {} : {text})};
       return layoutDelay ? new Promise((resolve) => setTimeout(() => resolve(answer), layoutDelay)) : answer;
     },
     tile: async (request) => {
@@ -112,6 +121,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
     fileForAlias: () => null,
   });
   const writes: string[] = [];
+  const media = mediaSides ? fakeMediaService({caps: caps as typeof CAPS, sides: mediaSides, review: fixture.review}).service : undefined;
   const element = (dimensions: {columns: number; rows: number}) => (
     <App
       base="development"
@@ -125,6 +135,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
       graphics={caps}
       animations={animations}
       rendered={{focus: () => undefined, pane}}
+      {...(media ? {media} : {})}
     />
   );
   const instance = renderSized(element(size), size, timeline);
@@ -292,7 +303,7 @@ describe('the page in the pane', () => {
   });
 
   it('scrolls to the heading a link on the page names when it is clicked', async () => {
-    const layout = {...layoutOf(150), links: [{href: '#more', left: 0, right: 400, top: 7 * ROW, bottom: 8 * ROW}], anchors: [{id: 'user-content-more', top: 60 * ROW}]};
+    const layout = {...layoutOf(150), links: [{href: '#more', rects: [{left: 0, right: 400, top: 7 * ROW, bottom: 8 * ROW}]}], anchors: [{id: 'user-content-more', top: 60 * ROW}]};
     const {instance, writes} = setup({layout});
     await settle();
     await press(instance, 'v');
@@ -347,6 +358,269 @@ describe('the page in the pane', () => {
       instance.unmount();
     });
   }
+
+  it('keeps the file and the block at the top when a resize lays the page out anew', async () => {
+    // Each line's block is two page rows at the first width, three at the narrower one.
+    let wide = 0;
+    const layoutFor = (cssWidth: number): PageLayout => {
+      wide = Math.max(wide, cssWidth);
+      const each = cssWidth < wide ? 3 : 2;
+      return {heightCss: 80 * each * ROW, blocks: Array.from({length: 80}, (_, index) => ({id: `b-${index}`, top: each * index * ROW, bottom: (each * index + each) * ROW, lines: [index + 1, index + 1] as const})), removed: [], links: [], anchors: []};
+    };
+    const {instance, pane, resize} = setup({files: [LONG, CODE], layoutFor, layoutDelay: 300});
+    await settle();
+    await press(instance, 'v');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await settle();
+    // The label row, then 19 page rows down.
+    await press(instance, 'j'.repeat(20));
+    let frame = instance.lastFrame();
+    expect(decodePlaceholders(frame).find((cell) => cell.line === topRow(frame).index)?.row).toBe(19);
+    const line = pane.lineAtRow('docs/long.md', 19);
+    expect(line).toBe(10);
+    // Narrower: another sheet width, so the page is laid out again, in 300 ms.
+    resize({columns: 100, rows: 30});
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await settle();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await settle();
+    frame = instance.lastFrame();
+    // At 100 columns the header shortens the path.
+    expect(text(frame)).toContain('long.md');
+    expect(text(frame)).toContain('file 1/2');
+    const top = decodePlaceholders(frame).find((cell) => cell.line === topRow(frame).index)?.row;
+    // Line 10's block, at three rows a line, half way in: rows 27 to 29.
+    expect(top).toBeGreaterThanOrEqual(27);
+    expect(pane.lineAtRow('docs/long.md', top!)).toBe(line);
+    instance.unmount();
+  });
+
+  // A page of three changes, each a hunk of the file's diff, and an unchanged block between the first two.
+  const THREE = multiBlockFile('docs/three.md', [3, 20, 40], 2);
+  const THREE_LAYOUT: PageLayout = {
+    heightCss: 80 * ROW,
+    blocks: [
+      {id: 'b-title', top: 0, bottom: 2 * ROW, lines: [1, 1]},
+      {id: 'b-h0', top: 4 * ROW, bottom: 6 * ROW, lines: [3, 4], mark: 'added'},
+      {id: 'b-same', top: 20 * ROW, bottom: 22 * ROW, lines: [10, 12]},
+      {id: 'b-h1', top: 40 * ROW, bottom: 42 * ROW, lines: [20, 21], mark: 'added'},
+      {id: 'b-h2', top: 60 * ROW, bottom: 62 * ROW, lines: [40, 41], mark: 'added'},
+    ],
+    removed: [],
+    links: [],
+    anchors: [],
+  };
+
+  it('copies with p the diff of the change at the top, and nothing on a block that didn\'t change', async () => {
+    const {instance, writes} = setup({files: [THREE, CODE], layout: THREE_LAYOUT});
+    await settle();
+    await press(instance, 'v');
+    await press(instance, ']]]');
+    await press(instance, 'p');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain('docs/three.md-h2-0');
+    expect(writes[0]).not.toContain('docs/three.md-h1-0');
+    await press(instance, 'b');
+    expect(writes).toHaveLength(2);
+    expect(writes[1]).toContain('docs/three.md-h2-0');
+    expect(writes[1]).not.toContain('docs/three.md-h0-0');
+    instance.unmount();
+
+    const again = setup({files: [THREE, CODE], layout: THREE_LAYOUT});
+    await settle();
+    await press(again.instance, 'v');
+    // The label row, then down to the unchanged block's first row.
+    await press(again.instance, 'j'.repeat(21));
+    await press(again.instance, 'p');
+    await press(again.instance, 'b');
+    expect(again.writes).toEqual([]);
+    expect(text(again.instance.lastFrame())).toContain('no change here · v shows the diff');
+    again.instance.unmount();
+  });
+
+  // Hunks as git prints them by default, with three lines of context
+  // around each change: line 10 added, line 25 added, and three lines
+  // removed ahead of line 37.
+  function contextFile(): FixtureFile {
+    const path = 'docs/context.md';
+    const raw: string[] = [];
+    const rendered: string[] = [];
+    const gutterOf = (line: number) => ` ${String(line).padStart(3)} ⋮ ${String(line).padStart(3)} │`;
+    const added = (oldStart: number, newStart: number, at: number) => {
+      raw.push(`@@ -${oldStart},6 +${newStart},7 @@`);
+      rendered.push(`• ${path}:${newStart}: `);
+      for (let line = newStart; line < newStart + 7; line += 1) {
+        const body = line === at ? `line${line}-added` : `line${line}`;
+        raw.push(`${line === at ? '+' : ' '}${body}`);
+        rendered.push(`${gutterOf(line)}${body}`);
+      }
+    };
+    added(7, 7, 10);
+    added(21, 22, 25);
+    raw.push('@@ -33,6 +34,3 @@');
+    rendered.push(`• ${path}:34: `);
+    for (const line of [34, 35, 36]) {
+      raw.push(` line${line}`);
+      rendered.push(`${gutterOf(line)}line${line}`);
+    }
+    for (const gone of [1, 2, 3]) {
+      raw.push(`-gone${gone}`);
+      rendered.push(` ${String(35 + gone).padStart(3)} ⋮     │gone${gone}`);
+    }
+    return {path, rawDiff: raw.join('\n'), rendered};
+  }
+  const contextLayout = (lines: [number, number], mark?: 'modified'): PageLayout => ({
+    heightCss: 80 * ROW,
+    blocks: [
+      {id: 'b-title', top: 0, bottom: 2 * ROW, lines: [1, 1]},
+      {id: 'b-first', top: 4 * ROW, bottom: 6 * ROW, lines: [7, 10], mark: 'modified'},
+      {id: 'b-top', top: 20 * ROW, bottom: 30 * ROW, lines, ...(mark ? {mark} : {})},
+    ],
+    removed: [],
+    links: [],
+    anchors: [],
+  });
+  // `p` with the pane's top row on the block at lines `lines`.
+  // `file`: another diff of the page. The pane opens where the diff's first
+  // line is drawn, which for a file whose first hunk starts inside the block
+  // is that block, so `g` takes it to the top first.
+  const copiedAt = async (lines: [number, number], mark?: 'modified', file?: FixtureFile) => {
+    const {instance, writes} = setup({files: [file ?? contextFile(), CODE], layout: contextLayout(lines, mark)});
+    await settle();
+    await press(instance, 'v');
+    if (file) await press(instance, 'g');
+    await press(instance, 'j'.repeat(21));
+    await press(instance, 'p');
+    const frame = text(instance.lastFrame());
+    instance.unmount();
+    return {writes, frame};
+  };
+
+  it('copies with p the hunk that changed the block\'s lines, not one whose context lines only run over them', async () => {
+    // Lines 12 to 30: hunk 1's last context lines, and hunk 2's change at line 25.
+    const spanning = await copiedAt([12, 30], 'modified');
+    expect(spanning.writes).toHaveLength(1);
+    expect(spanning.writes[0]).toContain('line25-added');
+    expect(spanning.writes[0]).not.toContain('line10-added');
+    // Lines 12 and 13 are only hunk 1's context: nothing changed there.
+    const context = await copiedAt([12, 13]);
+    expect(context.writes).toEqual([]);
+    expect(context.frame).toContain('no change here · v shows the diff');
+    // Lines removed ahead of line 37, after three lines of context.
+    const removed = await copiedAt([37, 40], 'modified');
+    expect(removed.writes).toHaveLength(1);
+    expect(removed.writes[0]).toContain('gone2');
+  });
+
+  // A file whose hunks are given line by line, as git prints them: each
+  // line a mark (' ', '+' or '-') and its text.
+  function hunksFile(path: string, hunks: Array<{oldStart: number; newStart: number; lines: string[]}>): FixtureFile {
+    const raw: string[] = [];
+    const rendered: string[] = [];
+    for (const {oldStart, newStart, lines} of hunks) {
+      const olds = lines.filter((line) => !line.startsWith('+')).length;
+      const news = lines.filter((line) => !line.startsWith('-')).length;
+      raw.push(`@@ -${oldStart},${olds} +${newStart},${news} @@`);
+      rendered.push(`• ${path}:${newStart}: `);
+      let before = oldStart;
+      let after = newStart;
+      for (const line of lines) {
+        const body = line.slice(1);
+        raw.push(line);
+        const left = line.startsWith('+') ? '   ' : String(before).padStart(3);
+        const right = line.startsWith('-') ? '   ' : String(after).padStart(3);
+        rendered.push(` ${left} ⋮ ${right} │${body}`);
+        if (!line.startsWith('+')) before += 1;
+        if (!line.startsWith('-')) after += 1;
+      }
+    }
+    return {path, rawDiff: raw.join('\n'), rendered};
+  }
+  // A change far down the file, on no block the tests below put at the top,
+  // so each file has two hunks as the pane tests above do.
+  const far = (oldStart: number, newStart: number) => ({oldStart, newStart, lines: [' far1', '+far-added', ' far2']});
+
+  it('copies with p the hunk that changed the most of a block\'s lines, where two hunks change it', async () => {
+    // Lines 3 to 20: hunk 1 adds line 4, hunk 2 adds lines 15 and 16.
+    const file = hunksFile('docs/context.md', [
+      {oldStart: 1, newStart: 1, lines: [' l1', ' l2', ' l3', '+one-added4', ' l5', ' l6', ' l7']},
+      {oldStart: 11, newStart: 12, lines: [' l12', ' l13', ' l14', '+two-added15', '+two-added16', ' l17', ' l18', ' l19']},
+    ]);
+    const spanning = await copiedAt([3, 20], 'modified', file);
+    expect(spanning.writes).toHaveLength(1);
+    expect(spanning.writes[0]).toContain('two-added15');
+    expect(spanning.writes[0]).not.toContain('one-added4');
+  });
+
+  it('copies with p the hunk that removed a modified block\'s last line, and nothing on an unchanged block a removal comes after', async () => {
+    // Lines 9 to 11 keep their text; the line after them, `gone12`, is removed.
+    const tail = hunksFile('docs/context.md', [
+      {oldStart: 9, newStart: 9, lines: [' line9', ' line10', ' line11', '-gone12', ' line12', ' line13', ' line14']},
+      far(60, 59),
+    ]);
+    const lost = await copiedAt([9, 11], 'modified', tail);
+    expect(lost.writes).toHaveLength(1);
+    expect(lost.writes[0]).toContain('gone12');
+    expect(lost.frame).not.toContain('no change here');
+
+    // A paragraph and the blank line ahead of it are removed right after an
+    // unchanged paragraph at line 9: that paragraph has nothing to copy.
+    const neighbor = hunksFile('docs/context.md', [
+      {oldStart: 6, newStart: 6, lines: [' line6', ' ', ' # Notes', ' Para one.', '-', '-Gone para.', ' ', ' Next para.', ' line12']},
+      far(60, 58),
+    ]);
+    const unchanged = await copiedAt([9, 9], undefined, neighbor);
+    expect(unchanged.writes).toEqual([]);
+    expect(unchanged.frame).toContain('no change here · v shows the diff');
+  });
+
+  it('copies with p the hunk that cut a modified paragraph\'s last line, mid-file and at the end of the file', async () => {
+    // `para four` removed from the paragraph at lines 3 to 5, before a blank line.
+    const middle = hunksFile('docs/context.md', [
+      {oldStart: 3, newStart: 3, lines: [' para one', ' para two', ' para three', '-para four', ' ', ' Next para.']},
+      far(60, 59),
+    ]);
+    const cut = await copiedAt([3, 5], 'modified', middle);
+    expect(cut.writes).toHaveLength(1);
+    expect(cut.writes[0]).toContain('-para four');
+    // The file's last paragraph goes from two lines to one, at line 24.
+    const end = hunksFile('docs/context.md', [
+      {oldStart: 1, newStart: 1, lines: [' l1', '+early-added', ' l2', ' l3', ' l4']},
+      {oldStart: 21, newStart: 22, lines: [' Intro.', ' ', ' last one', '-last two']},
+    ]);
+    const atEnd = await copiedAt([24, 24], 'modified', end);
+    expect(atEnd.writes).toHaveLength(1);
+    expect(atEnd.writes[0]).toContain('-last two');
+    expect(atEnd.writes[0]).not.toContain('early-added');
+  });
+
+  it('keeps v for the text view on a PNG and the source view on an SVG, and the pane stays on the diff', async () => {
+    const files = [PAGE, binaryMediaFile('docs/logo.png', 'added', ['0000000', '97fa3ee']), svgMediaFile('docs/flow.svg')];
+    const {instance, pane} = setup({files, mediaSides: {'97fa3ee': sideInfo({width: 200, height: 100, bytes: 232_000}), '35ecfd6': sideInfo({format: 'svg', width: 200, height: 100, bytes: 1_200, hasAlpha: true})}});
+    await settle();
+    const goTo = async (path: string) => {
+      for (let step = 0; step < 4 && !frameLines(instance.lastFrame()).some((line) => line.includes(path) && line.includes('Copy path')); step += 1) await press(instance, '\u001B[B');
+      expect(frameLines(instance.lastFrame()).some((line) => line.includes(path) && line.includes('Copy path'))).toBe(true);
+    };
+    await goTo('docs/logo.png');
+    expect(text(instance.lastFrame())).not.toMatch(/format\s+PNG/);
+    await press(instance, 'v');
+    // The image's details in place of its picture.
+    expect(text(instance.lastFrame())).toMatch(/format\s+PNG/);
+    expect(pane.mode()).toBe('diff');
+    await press(instance, 'v');
+    expect(text(instance.lastFrame())).not.toMatch(/format\s+PNG/);
+    expect(pane.mode()).toBe('diff');
+    await goTo('docs/flow.svg');
+    expect(text(instance.lastFrame())).toContain('picture · rendered from the SVG source');
+    await press(instance, 'v');
+    // Its source alone, unfolded, with no picture.
+    expect(text(instance.lastFrame())).not.toContain('picture · rendered from the SVG source');
+    expect(text(instance.lastFrame())).not.toContain('lines folded');
+    expect(pane.mode()).toBe('diff');
+    expect(text(instance.lastFrame())).not.toContain('rendered here');
+    instance.unmount();
+  });
 
   it('copies the markdown of the block at the top with c', async () => {
     const {instance, writes} = setup();
@@ -424,6 +698,21 @@ describe('the page in the pane', () => {
     await settle();
     expect(writes.at(-1)).toBe('https://example.com/docs');
     expect(text(instance.lastFrame())).toContain('Copied link');
+    instance.unmount();
+  });
+
+  it('copies nothing for a link that holds control characters, and says why', async () => {
+    const layout = {...layoutOf(150), links: [{href: 'https://example.com/a\u001b]52;c;Zm9v\u0007', rects: [{left: 0, right: 400, top: 7 * ROW, bottom: 8 * ROW}]}]};
+    const {instance, writes} = setup({layout});
+    await settle();
+    await press(instance, 'v');
+    const lines = frameLines(instance.lastFrame());
+    const top = lines.findIndex((line) => stripAnsi(line).includes('rendered here')) + 1;
+    const diffLeft = stripAnsi(lines[top]!).indexOf('││') + 1;
+    await emitMousePressAt(diffLeft + 2 + 3 + 10, top + 1 + 7);
+    await settle();
+    expect(writes).toEqual([]);
+    expect(text(instance.lastFrame())).toContain('this link holds control characters · not copied');
     instance.unmount();
   });
 });

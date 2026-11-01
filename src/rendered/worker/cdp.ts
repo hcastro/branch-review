@@ -34,7 +34,11 @@ export type CdpPipe = {
   closed: Promise<string>;
 };
 
-export function createCdpPipe(readable: Readable, writable: Writable, {timeoutMs = DEFAULT_TIMEOUT_MS}: {timeoutMs?: number} = {}): CdpPipe {
+/**
+ * `onEnd`: called instead of closing when the peer's side of the pipe ends,
+ * for an owner that can say better why (the peer's exit), and closes it.
+ */
+export function createCdpPipe(readable: Readable, writable: Writable, {timeoutMs = DEFAULT_TIMEOUT_MS, onEnd}: {timeoutMs?: number; onEnd?: () => void} = {}): CdpPipe {
   let buffer = '';
   let next = 0;
   let ended: string | null = null;
@@ -92,8 +96,13 @@ export function createCdpPipe(readable: Readable, writable: Writable, {timeoutMs
     }
     if (buffer.length > MAX_MESSAGE_CHARS) close('the browser sent a message too large to read');
   });
-  readable.on('end', () => close());
-  readable.on('error', () => close());
+  const end = () => {
+    if (ended !== null) return;
+    if (onEnd) onEnd();
+    else close();
+  };
+  readable.on('end', end);
+  readable.on('error', end);
   writable.on('error', () => close());
 
   return {

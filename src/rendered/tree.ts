@@ -24,6 +24,8 @@ export type TreeIndex = {
   linkAbove(repoPath: string): {path: string; mode: string} | undefined;
   /** Whether `repoPath` is a folder the tree holds files in. */
   hasFolder(repoPath: string): boolean;
+  /** Whether any file the tree holds under folder `repoPath` passes `test`; stops at the first. */
+  someUnder(repoPath: string, test: (file: string) => boolean): boolean;
 };
 
 // A session sees few trees: the base, the branch, and a branch tip that
@@ -33,6 +35,7 @@ const MAX_TREES = 4;
 export function treeIndex(entries: ReadonlyMap<string, TreeEntry>): TreeIndex {
   let folded: Map<string, string> | null = null;
   let folders: Set<string> | null = null;
+  let sorted: string[] | null = null;
   return {
     get: (repoPath) => entries.get(repoPath),
     caseMatch(repoPath) {
@@ -61,6 +64,20 @@ export function treeIndex(entries: ReadonlyMap<string, TreeEntry>): TreeIndex {
         }
       }
       return folders.has(repoPath);
+    },
+    someUnder(repoPath, test) {
+      // Sorted once, so each folder's files are one run found by halving.
+      sorted ??= [...entries.keys()].sort();
+      const prefix = `${repoPath}/`;
+      let low = 0;
+      let high = sorted.length;
+      while (low < high) {
+        const middle = (low + high) >> 1;
+        if (sorted[middle]! < prefix) low = middle + 1;
+        else high = middle;
+      }
+      for (let at = low; at < sorted.length && sorted[at]!.startsWith(prefix); at += 1) if (test(sorted[at]!)) return true;
+      return false;
     },
   };
 }

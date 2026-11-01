@@ -49,7 +49,7 @@ describe.skipIf(!CHROME)('tiles in a real Chromium', () => {
     expect(layout.heightCss).toBeGreaterThan(1000);
     expect(layout.links.some((link) => link.href === 'https://example.com/docs')).toBe(true);
     const rows = pageRows(geometry, layout.heightCss);
-    const tile = await handler.handle({type: 'tile', source: tileSource, index: 0, rows, mosaic: true}) as TileResult;
+    const tile = await handler.handle({type: 'tile', source: tileSource, document: (laid as Extract<LayoutResult, {ok: true}>).document, index: 0, rows, mosaic: true}) as TileResult;
     expect(tile.ok).toBe(true);
     const {png, mosaic} = tile as Extract<TileResult, {ok: true}>;
     const meta = await sharp(Buffer.from(png)).metadata();
@@ -125,7 +125,7 @@ describe.skipIf(!CHROME)('several tile documents in a real Chromium', () => {
     const seen: Array<{height: number; corner: string}> = [];
     for (const source of documents) {
       const laid = await shared.handle({type: 'layout', source}) as Extract<LayoutResult, {ok: true}>;
-      const tile = await shared.handle({type: 'tile', source, index: 0, rows: pageRows(source.geometry, laid.layout.heightCss), mosaic: false}) as Extract<TileResult, {ok: true}>;
+      const tile = await shared.handle({type: 'tile', source, document: laid.document, index: 0, rows: pageRows(source.geometry, laid.layout.heightCss), mosaic: false}) as Extract<TileResult, {ok: true}>;
       expect(tile.ok).toBe(true);
       seen.push({height: laid.layout.heightCss, corner: await pixel(tile.png, 2, 2)});
     }
@@ -139,6 +139,28 @@ describe.skipIf(!CHROME)('several tile documents in a real Chromium', () => {
       expect(seen[index]!.height, `document ${index}`).toBe(laid.layout.heightCss);
     }
   }, 120_000);
+
+  it('gives a link that wraps one box per line, so a click beside it on either line finds the right link or none', async () => {
+    const dir = makeTempDir('branch-review-tiles-chrome-');
+    const sheet = tileGeometry(51, {w: 10, h: 20}, 1)!;
+    expect(sheet.cssWidth).toBe(480);
+    const text = 'Some plain words come first, then [a long link whose text runs on past the end of the first line](https://one.example/a) and [second](https://two.example/b) after it.\n';
+    const handler = handlerIn(dir, 'chrome');
+    const laid = await handler.handle({type: 'layout', source: {...sourceOf(dir, 'links.md', text), geometry: sheet}}) as Extract<LayoutResult, {ok: true}>;
+    handler.dispose();
+    const [wrapping, second] = laid.layout.links;
+    expect(wrapping!.href).toBe('https://one.example/a');
+    expect(second!.href).toBe('https://two.example/b');
+    expect(wrapping!.rects.length).toBeGreaterThanOrEqual(2);
+    const inside = (rects: ReadonlyArray<{left: number; right: number; top: number; bottom: number}>, x: number, y: number) => rects.some((rect) => x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom);
+    // The second link's middle is in no box of the wrapped one.
+    const target = second!.rects[0]!;
+    expect(inside(wrapping!.rects, (target.left + target.right) / 2, (target.top + target.bottom) / 2)).toBe(false);
+    // Nor is the plain text before the wrapped link on its first line.
+    const first = wrapping!.rects[0]!;
+    expect(first.left).toBeGreaterThan(40);
+    expect(inside(wrapping!.rects, first.left / 2, (first.top + first.bottom) / 2)).toBe(false);
+  }, 60_000);
 
   it('makes a short page as tall as its text, not the browser\'s window', async () => {
     const dir = makeTempDir('branch-review-tiles-chrome-');

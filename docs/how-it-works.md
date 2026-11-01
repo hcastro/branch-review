@@ -69,7 +69,7 @@ On `q`, `Esc`, `Control+C`, `SIGTERM`, a closed window, or a crash, `branch-revi
 
 ## What branch-review touches
 
-`branch-review` never writes to the repo it reviews. It leaves the index, the working tree, refs, the stash, config, and hooks alone. Working-tree diffs read a private copy of the index with Git's optional locks off, so a stat-dirty file never makes Git rewrite `.git/index` or a submodule's index. Git runs with `GIT_OPTIONAL_LOCKS=0` and `GIT_TERMINAL_PROMPT=0`.
+`branch-review` never writes to the repo it reviews, except for pages you ask `--render-out` to write into a directory there. It leaves the index, the working tree, refs, the stash, config, and hooks alone. Working-tree diffs read a private copy of the index with Git's optional locks off, so a stat-dirty file never makes Git rewrite `.git/index` or a submodule's index. Git runs with `GIT_OPTIONAL_LOCKS=0` and `GIT_TERMINAL_PROMPT=0`.
 
 A few things happen the same way they do for `git status` or `git diff`:
 
@@ -77,6 +77,6 @@ A few things happen the same way they do for `git status` or `git diff`:
 - In a split-index repo, Git refreshes the shared index file's modification time on every read. Its content stays the same.
 - A partial clone might fetch missing objects on demand, and Git writes what it fetches into `.git/objects` as new pack files. Git is never allowed to prompt, so a fetch that needs credentials shows up as an error on that file.
 
-Outside the repo, `branch-review` writes temp files under the system temp directory, or under `BRANCH_REVIEW_TMPDIR` when it's set. These hold the private index copy, the refresh process's files, and one private directory for media. Images and videos opened in a viewer are temp copies.
+Outside the repo, `branch-review` writes temp files under the system temp directory, or under `BRANCH_REVIEW_TMPDIR` when it's set. These hold the private index copy, the refresh process's files, and one private directory for the session. That directory holds the media files, the rendered pages, the rendered worker's files, and the in-pane view's Chromium profile, and it's removed when `branch-review` exits. Images and videos opened in a viewer are temp copies.
 
 `branch-review` removes its temp files when it exits, and a refresh that's stopped, or whose parent quits or crashes, stops its `git` and `delta` and removes its temp directory. The next start removes media directories left by a session that crashed.

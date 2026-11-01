@@ -108,19 +108,26 @@ export const BROWSER_JOB_DEADLINES_MS = {layout: 15_000, tile: 8_000} as const;
 // A browser failure says whether it was the one that turned the in-pane
 // view off for the session; a tile whose PNG came out too large asks to be
 // cut in shorter tiles.
-type TileFailure = WorkerFailure & {tilesOff?: true; tooLarge?: true};
+// A tile asked of a document the worker no longer holds is `stale`: the
+// page is laid out again, and no browser was asked.
+type TileFailure = WorkerFailure & {tilesOff?: true; tooLarge?: true; stale?: true};
 
 export type LayoutRequest = {source: TileSource};
 /**
  * `document`: the name of the tile document laid out, which changes with
  * anything it draws, an embedded image included. `text`: the markdown its
  * blocks came from, which `c` copies a block of, so a copy is what the page
- * shows however the file changed on disk since.
+ * shows however the file changed on disk since. `late`: an image or link
+ * the page shows didn't answer in time, so laying it out again later can
+ * draw more.
  */
-export type LayoutResult = {ok: true; layout: PageLayout; document: string; text?: string} | TileFailure;
+export type LayoutResult = {ok: true; layout: PageLayout; document: string; text?: string; late?: true} | TileFailure;
 
-/** Tile `index` of a page `rows` rows tall, with each cell's mean color when `mosaic`. */
-export type TileRequest = {source: TileSource; index: number; rows: number; mosaic: boolean};
+/**
+ * Tile `index` of a page `rows` rows tall, cut from `document`, the tile
+ * document a layout answered, with each cell's mean color when `mosaic`.
+ */
+export type TileRequest = {source: TileSource; document: string; index: number; rows: number; mosaic: boolean};
 export type TileResult = {ok: true; png: Uint8Array; mosaic?: Uint8Array} | TileFailure;
 
 export interface RenderedBackend {

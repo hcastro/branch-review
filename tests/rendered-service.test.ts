@@ -511,14 +511,15 @@ const CRASHING_WORKER = fileURLToPath(new URL('./fixtures/crashing-rendered-work
 // The service with a surface that records what it was asked to show and a
 // motion the test picks. `cross` records the crossing the TUI was asked to
 // play, which ends a turn of the event loop later, as a real one ends
-// 320 ms after it starts.
+// 320 ms after it starts. `live`: watch mode, on here unless a test says.
 function openingService(backend: RenderedBackend, {
   surface = recordingSurface(),
   motion = 'full' as const,
   site,
   colors,
   animations,
-}: {surface?: ReturnType<typeof recordingSurface>; motion?: 'full' | 'reduced' | 'off'; site?: ReturnType<typeof createRenderedSite>; colors?: {fg?: string; bg?: string}; animations?: boolean} = {}) {
+  live = true,
+}: {surface?: ReturnType<typeof recordingSurface>; motion?: 'full' | 'reduced' | 'off'; site?: ReturnType<typeof createRenderedSite>; colors?: {fg?: string; bg?: string}; animations?: boolean; live?: boolean} = {}) {
   const clock = fakeTimers();
   const session = makeTempDir('branch-review-open-');
   const usedSite = site ?? createRenderedSite({tempDir: () => session, now: clock.now});
@@ -535,6 +536,7 @@ function openingService(backend: RenderedBackend, {
     },
     ...(colors ? {colors} : {}),
     ...(animations !== undefined ? {animations} : {}),
+    live,
   });
   const events: string[] = [];
   const trip = {
@@ -547,7 +549,7 @@ function openingService(backend: RenderedBackend, {
   return {service, clock, surface, trip, events, dir: path.join(session, 'rendered'), motionAsked: () => motionAsked};
 }
 
-function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true as boolean | 'skipped', opensSplit = undefined as (() => boolean) | undefined} = {}) {
+function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true as boolean | 'skipped' | 'superseded', opensSplit = undefined as (() => boolean) | undefined} = {}) {
   const shown: string[] = [];
   const refreshed: string[] = [];
   // The page names each refresh said the split may show.
@@ -567,8 +569,9 @@ function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal
       return answer;
     },
     // A live refresh sends the split it opened to `url`; false once it can't.
-    async refresh(url: string, names?: readonly string[]) {
-      refreshed.push(url);
+    // Nothing is ever in flight here, so a `url` to work out is sent at once.
+    async refresh(url: string | (() => string), names?: readonly string[]) {
+      refreshed.push(typeof url === 'string' ? url : url());
       showing.push(names);
       return refreshes;
     },
@@ -1221,6 +1224,111 @@ describe('the trip\'s hash', () => {
     expect(surface.refreshed).toEqual([]);
   });
 
+  it('sends no live refresh without watch mode', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const {service, clock, surface, trip} = openingService(backend, {live: false});
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    // A review refreshed without watch mode: a background pass rewrites the page, and the split stays.
+    ids = ['b-0000000a-0', 'b-0000000b-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited again.\n')]), CTX);
+    await clock.advance(5_000);
+    expect(surface.refreshed).toEqual([]);
+  });
+
+  it('sends no live refresh when only the rail of the page shown changed, after another file did', async () => {
+    // README.md's render is slow: the guide's page opens while README.md is
+    // still pending on its rail, and is written again once it answers.
+    const slow = deferred<FragmentResult>();
+    const {backend} = scriptedBackend((request) => (request.path === 'README.md' ? slow.promise : {ok: true, summary: summary({blocks: blocks('b-0000000a-0')})}));
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n'), edited('README.md', 'A.\n', 'B.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    const opened = new URL(surface.shown[0]!).pathname;
+    slow.resolve({ok: true, summary: summary({changes: {changed: 3, removed: 0}})});
+    await clock.advance(5_000);
+    const now = await service.page('docs/guide.md');
+    // The guide's page is another page now, its rail no longer pending; the guide didn't change.
+    expect(now.ok && new URL(now.url).pathname).not.toBe(opened);
+    expect(surface.refreshed).toEqual([]);
+  });
+
+  it('refreshes the split when an edit to another file breaks a link the page shows', async () => {
+    let guideAnchors = ['user-content-setup'];
+    const {backend} = scriptedBackend((request) => (request.path === 'README.md'
+      ? {ok: true, summary: summary({blocks: blocks('b-0000000a-0'), links: [{href: 'docs/guide.md#setup', status: 'ok', line: 1, ref: {path: 'docs/guide.md', anchor: 'setup', index: 0}}], anchors: []})}
+      : {ok: true, summary: summary({blocks: blocks('b-0000000b-0'), anchors: guideAnchors})}));
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('README.md', 'A.\n', 'B.\n'), edited('docs/guide.md', '# Setup\n', '# Setup\n\nMore.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'README.md'}, trip);
+    const opened = new URL(surface.shown[0]!).pathname;
+    // The guide's heading is renamed: README.md's link to it is broken now.
+    guideAnchors = ['user-content-installation'];
+    service.setReview(review([edited('README.md', 'A.\n', 'B.\n'), edited('docs/guide.md', '# Setup\n', '# Installation\n\nMore.\n')]), CTX);
+    await clock.advance(5_000);
+    const now = await service.page('README.md');
+    expect(now.ok && new URL(now.url).pathname).not.toBe(opened);
+    expect(surface.refreshed).toHaveLength(1);
+    expect(new URL(surface.refreshed[0]!).pathname).toBe(now.ok && new URL(now.url).pathname);
+  });
+
+  it('keeps refreshing the split after a refresh gave way to a newer one while cmux was slow to say what it shows', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    // cmux with an open split: it shows the page it was last sent, and the
+    // first time it is asked which, it takes its time to say.
+    let showing = '';
+    let firstUrl: Deferred<void> | null = deferred<void>();
+    const gotos: string[] = [];
+    const run: RunTool = async (_command, args) => {
+      if (args.includes('open-split')) {
+        showing = args[args.indexOf('open-split') + 1]!;
+        return {ok: true, stdout: JSON.stringify({created_split: true, surface_ref: 'surface:9'})};
+      }
+      if (args.at(-2) === 'goto') {
+        showing = args.at(-1)!;
+        gotos.push(showing);
+        return {ok: true, stdout: ''};
+      }
+      if (args.at(-1) === 'url') {
+        if (firstUrl) {
+          const wait = firstUrl;
+          firstUrl = null;
+          await wait.promise;
+        }
+        return {ok: true, stdout: `${showing}\n`};
+      }
+      return {ok: false, timedOut: false, reason: 'exit 1'};
+    };
+    const surface = createSurface({env: {CMUX_WORKSPACE_ID: 'workspace:3'}, run, findTool: () => '/fake/bin/cmux', opener: () => undefined, platform: 'darwin'});
+    const {service, clock, trip} = openingService(backend, {surface: surface as unknown as ReturnType<typeof recordingSurface>});
+    const edit = async (next: string, block: string) => {
+      ids = ['b-0000000a-0', block];
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(1_100);
+    };
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    const wait = firstUrl!;
+    // The first refresh waits on cmux; a second edit's refresh comes in behind it.
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    await edit('One, edited three times.\n', 'b-0000000c-0');
+    wait.resolve();
+    for (let turn = 0; turn < 20; turn += 1) await clock.advance(0);
+    expect(gotos).toHaveLength(1);
+    expect(gotos[0]).toContain('g=b-0000000c-0&');
+    // A later edit still goes: the split is compared with the page it shows.
+    await edit('One, edited four times.\n', 'b-0000000d-0');
+    for (let turn = 0; turn < 20; turn += 1) await clock.advance(0);
+    expect(gotos).toHaveLength(2);
+    expect(gotos[1]).toContain('g=b-0000000d-0');
+  });
+
   it('names the pages the split may show for a live refresh, and tries again after one the split skipped', async () => {
     let ids = ['b-0000000a-0'];
     const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
@@ -1252,6 +1360,178 @@ describe('the trip\'s hash', () => {
     expect(surface.showing[1]).toEqual(surface.showing[0]);
   });
 });
+
+describe('live refreshes behind a goto cmux is slow to finish', () => {
+  const blocks = (...ids: string[]) => ids.map((id, index) => ({id, kind: 'p', lines: [index * 2 + 1, index * 2 + 1] as const}));
+  // cmux with an open split, whose first goto takes its time: the page it
+  // sends lands once the goto ends.
+  // `movedTo`: where the reader takes the split as the slow goto ends.
+  function slowGotoCmux(movedTo?: string) {
+    let showing = '';
+    let firstGoto: Deferred<void> | null = deferred<void>();
+    const held = firstGoto;
+    const gotos: string[] = [];
+    const run: RunTool = async (_command, args) => {
+      if (args.includes('open-split')) {
+        showing = args[args.indexOf('open-split') + 1]!;
+        return {ok: true, stdout: JSON.stringify({created_split: true, surface_ref: 'surface:9'})};
+      }
+      if (args.at(-2) === 'goto') {
+        if (firstGoto) {
+          const wait = firstGoto;
+          firstGoto = null;
+          await wait.promise;
+          showing = args.at(-1)!;
+          gotos.push(showing);
+          if (movedTo) showing = movedTo;
+          return {ok: true, stdout: ''};
+        }
+        showing = args.at(-1)!;
+        gotos.push(showing);
+        return {ok: true, stdout: ''};
+      }
+      if (args.at(-1) === 'url') return {ok: true, stdout: `${showing}\n`};
+      return {ok: false, timedOut: false, reason: 'exit 1'};
+    };
+    const surface = createSurface({env: {CMUX_WORKSPACE_ID: 'workspace:3'}, run, findTool: () => '/fake/bin/cmux', opener: () => undefined, platform: 'darwin'});
+    return {surface, gotos, release: () => held.resolve()};
+  }
+
+  async function editing(movedTo?: string) {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const cmux = slowGotoCmux(movedTo);
+    const {service, clock, trip} = openingService(backend, {surface: cmux.surface as unknown as ReturnType<typeof recordingSurface>});
+    const settle = async () => {
+      for (let turn = 0; turn < 40; turn += 1) await clock.advance(0);
+    };
+    const edit = async (next: string, block: string) => {
+      ids = ['b-0000000a-0', block];
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(1_100);
+    };
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    return {...cmux, clock, edit, settle};
+  }
+
+  it('sends the newest edit after the refresh whose goto was slow lands', async () => {
+    const {gotos, release, edit, settle, clock} = await editing();
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    // The first refresh's goto is held; a second edit's refresh queues behind it.
+    await edit('One, edited three times.\n', 'b-0000000c-0');
+    release();
+    await settle();
+    await clock.advance(3_000);
+    await settle();
+    expect(gotos.map((url) => /g=([^&]*)/.exec(url)?.[1])).toEqual(['b-0000000b-0', 'b-0000000c-0']);
+  });
+
+  it('keeps the split on the newest edit as more edits come in behind the slow goto', async () => {
+    const {gotos, release, edit, settle} = await editing();
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    await edit('One, edited three times.\n', 'b-0000000c-0');
+    release();
+    await settle();
+    await edit('One, edited four times.\n', 'b-0000000d-0');
+    await settle();
+    expect(gotos.map((url) => /g=([^&]*)/.exec(url)?.[1])).toEqual(['b-0000000b-0', 'b-0000000c-0', 'b-0000000d-0']);
+  });
+
+  // Edits that keep each block they add: the page grows by one block an edit.
+  async function growing() {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const cmux = slowGotoCmux();
+    const {service, clock, trip} = openingService(backend, {surface: cmux.surface as unknown as ReturnType<typeof recordingSurface>});
+    const settle = async () => {
+      for (let turn = 0; turn < 40; turn += 1) await clock.advance(0);
+    };
+    const edit = async (next: string, ...more: string[]) => {
+      ids = ['b-0000000a-0', ...more];
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(1_100);
+    };
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    return {...cmux, clock, edit, settle};
+  }
+
+  it('pulses only the blocks new since the slow goto\'s page when the edit behind it keeps that page\'s blocks', async () => {
+    const {gotos, release, edit, settle, clock} = await growing();
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    // The second edit keeps b and adds c; its refresh queues behind the held goto.
+    await edit('One, edited three times.\n', 'b-0000000b-0', 'b-0000000c-0');
+    release();
+    await settle();
+    await clock.advance(3_000);
+    await settle();
+    expect(gotos.map((url) => /g=([^&]*)/.exec(url)?.[1])).toEqual(['b-0000000b-0', 'b-0000000c-0']);
+  });
+
+  it('still pulses every block new since the page the split shows when the refresh ahead of it was skipped', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    // cmux with an open split, whose first answer to which page it shows
+    // takes its time and names a page of none of ours, while the split shows
+    // the page the trip sent by the time it is asked again.
+    let showing = '';
+    let firstUrl: Deferred<void> | null = deferred<void>();
+    const held = firstUrl;
+    const gotos: string[] = [];
+    const run: RunTool = async (_command, args) => {
+      if (args.includes('open-split')) {
+        showing = args[args.indexOf('open-split') + 1]!;
+        return {ok: true, stdout: JSON.stringify({created_split: true, surface_ref: 'surface:9'})};
+      }
+      if (args.at(-2) === 'goto') {
+        showing = args.at(-1)!;
+        gotos.push(showing);
+        return {ok: true, stdout: ''};
+      }
+      if (args.at(-1) === 'url') {
+        if (firstUrl) {
+          firstUrl = null;
+          await held.promise;
+          return {ok: true, stdout: 'file:///elsewhere/notes.html\n'};
+        }
+        return {ok: true, stdout: `${showing}\n`};
+      }
+      return {ok: false, timedOut: false, reason: 'exit 1'};
+    };
+    const surface = createSurface({env: {CMUX_WORKSPACE_ID: 'workspace:3'}, run, findTool: () => '/fake/bin/cmux', opener: () => undefined, platform: 'darwin'});
+    const {service, clock, trip} = openingService(backend, {surface: surface as unknown as ReturnType<typeof recordingSurface>});
+    const edit = async (next: string, ...more: string[]) => {
+      ids = ['b-0000000a-0', ...more];
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(1_100);
+    };
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    // The first refresh (b) is held while cmux says what the split shows; the
+    // second (b and c) waits behind it, then the first is skipped.
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    await edit('One, edited three times.\n', 'b-0000000b-0', 'b-0000000c-0');
+    held.resolve();
+    for (let turn = 0; turn < 40; turn += 1) await clock.advance(0);
+    expect(gotos.map((url) => /g=([^&]*)/.exec(url)?.[1])).toEqual(['b-0000000b-0,b-0000000c-0']);
+  });
+
+  it('still skips the refresh when the reader moved the split to another page as the slow goto ended', async () => {
+    const {gotos, release, edit, settle} = await editing('file:///elsewhere/notes.html');
+    await edit('One, edited twice.\n', 'b-0000000b-0');
+    await edit('One, edited three times.\n', 'b-0000000c-0');
+    // The goto lands, and the reader follows a link inside the split: the
+    // split shows a page that is none of ours, and the refresh behind is skipped.
+    release();
+    await settle();
+    expect(gotos).toHaveLength(1);
+  });
+});
+
 
 describe('the order of the beam and the split', () => {
   async function pressWith(opensSplit: boolean) {

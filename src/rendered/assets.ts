@@ -10,18 +10,18 @@ import {
   objectFormatOperation,
   readWorktreeBytes,
   runOperationAsync,
-  type DiffRange,
   type ObjectFormat,
   type TreeEntry,
 } from '../git.js';
-import {patchObjectIds} from '../media/classify.js';
 import {createLru} from '../media/lru.js';
 import {isFormat, magicFormat, sniffImage} from '../media/worker/sniff.js';
-import type {ReviewModel} from '../review/model.js';
 import {isMarkdownName} from './classify.js';
 import {anchorTarget, markdownAnchors, type AssetAnswer, type LinkAnswer, type RefusedReason} from './markdown.js';
 import {RENDER_LIMIT} from './source.js';
 import {createTreeReader, type RunOperation, type TreeIndex} from './tree.js';
+import type {AssetSide, AssetSides, WorktreeChange} from './sides.js';
+
+export {reviewAssetSides, reviewPaths, type AssetSide, type AssetSides, type WorktreeChange} from './sides.js';
 
 // The asset rule: which images a page inlines. An image is inlined only when
 // its path stays inside the repo, it is a regular file (never a symlink or a
@@ -66,84 +66,6 @@ const UNREADABLE = {
   mismatch: "doesn't match git: changed since the review read it, or by a git filter",
   late: 'took too long to read',
 } as const;
-
-/**
- * A file the work tree review changed, from its patch: the id of its new
- * content and its mode, null when it's gone, or `unreadable` when the
- * review couldn't read its diff. A pure rename names no id; its content is
- * what `from` holds at the base. `untracked`: not part of a push yet.
- */
-export type WorktreeChange = {
-  path: string;
-  id: string | null;
-  mode: 'regular' | 'symlink' | 'submodule' | 'unreadable' | null;
-  from?: string;
-  untracked?: true;
-};
-
-/**
- * The two sides of a review, as the asset rule reads them. `base` is a ref
- * (`main...feature` names their merge base, as the diff does). The after
- * side is a ref, or the work tree: there a file the review changed reads
- * from disk under the id its diff named, and every other file is as `base`
- * holds it, which is what the diff found on disk. `epoch` names the review,
- * so answers about the work tree are asked again for the next one.
- */
-export type AssetSides = {base: string | null; after: {tree: string} | {worktree: WorktreeChange[]}; epoch: number};
-
-export type AssetSide = 'base' | 'after';
-
-// The mode git printed for a patch's new side, when it is a link.
-const LINK_AFTER = /^(?:new file mode|new mode|index [0-9a-f]+\.\.[0-9a-f]+) (120000|160000)$/m;
-// Where a patch's header ends: its first hunk, or its binary content.
-const PATCH_BODY = /^(?:@@ |GIT binary patch$|Binary files )/m;
-
-/**
- * Every path the review's files go by, a moved file's old one included:
- * none of them is a file the review left alone.
- */
-export function reviewPaths(files: ReadonlyArray<Pick<ReviewModel['files'][number], 'path' | 'oldPath'>>): Set<string> {
-  return new Set(files.flatMap((file) => (file.oldPath ? [file.path, file.oldPath] : [file.path])));
-}
-
-/** The asset sides of a review. Pure: reads only the patches. */
-export function reviewAssetSides(review: Pick<ReviewModel, 'files'>, range: Pick<DiffRange, 'diffArg' | 'branch' | 'includeWorktree'>, epoch: number): AssetSides {
-  if (!range.includeWorktree) return {base: range.diffArg, after: {tree: range.branch}, epoch};
-  const changes: WorktreeChange[] = [];
-  for (const file of review.files) {
-    // A name that isn't UTF-8 names no file a link can reach.
-    if (file.pathError) continue;
-    if (file.oldPath) changes.push({path: file.oldPath, id: null, mode: null});
-    if (file.status === 'deleted') {
-      changes.push({path: file.path, id: null, mode: null});
-      continue;
-    }
-    // A diff that failed to load, for a file nobody can read, has no patch.
-    const start = file.rawDiff.lastIndexOf('diff --git ');
-    if (start < 0) {
-      changes.push({path: file.path, id: null, mode: 'unreadable'});
-      continue;
-    }
-    // A file that changed type prints two patches; the last is its new side.
-    // Its id and mode are in the header, so the hunks are never searched.
-    const patch = file.rawDiff.slice(start);
-    const body = patch.search(PATCH_BODY);
-    const header = body < 0 ? patch : patch.slice(0, body);
-    const id = patchObjectIds(header)?.after ?? null;
-    const link = LINK_AFTER.exec(header)?.[1];
-    if (link) changes.push({path: file.path, id, mode: link === '160000' ? 'submodule' : 'symlink'});
-    else {
-      changes.push({
-        path: file.path,
-        id,
-        mode: 'regular',
-        ...(id === null && file.oldPath ? {from: file.oldPath} : {}),
-        ...(file.status === 'untracked' ? {untracked: true as const} : {}),
-      });
-    }
-  }
-  return {base: range.diffArg, after: {worktree: changes}, epoch};
-}
 
 // Where an image's bytes are, or why there are none.
 type Located =
@@ -212,7 +134,7 @@ function sameContent(left: Located, right: Located) {
   return left.kind === 'refused' && right.kind === 'refused' && left.reason === right.reason && left.hint === right.hint;
 }
 
-export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string; run?: RunOperation}) {
+export function createAssetResolver({cwd, run = runOperationAsync, embeddersMs = EMBEDDERS_MS}: {cwd: string; run?: RunOperation; embeddersMs?: number}) {
   const trees = createTreeReader({cwd, run});
   const verified = createLru<Verified>(CACHE_BYTES, (entry) => entry.bytes.byteLength);
   const limit = createLimiter(MAX_READS);
@@ -375,8 +297,9 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
     : located.kind === 'file' ? `file:${located.id}${located.untracked ? ':untracked' : ''}` : `no:${located.reason}:${located.hint ?? ''}`);
 
   // A read that failed for a reason of the moment, such as a file nobody
-  // may read or a git that failed, is tried again next time.
-  const passing = (answer: AssetAnswer) => answer.kind === 'refused' && answer.reason === 'unreadable' && (answer.hint === UNREADABLE.file || answer.hint === UNREADABLE.git);
+  // may read, a git that failed, or a file caught mid-rewrite, is tried
+  // again next time.
+  const passing = (answer: AssetAnswer) => answer.kind === 'refused' && answer.reason === 'unreadable' && (answer.hint === UNREADABLE.file || answer.hint === UNREADABLE.git || answer.hint === UNREADABLE.mismatch);
 
   // The anchors of a markdown blob, read once. Null when it can't be read
   // as text within the render limit: nothing to check it against.
@@ -429,8 +352,11 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
       const base = sides.base === null ? null : await trees.tree(sides.base, sides.epoch);
       const gone = new Set(changes.filter((each) => each.mode === null).map((each) => each.path));
       const under = (each: WorktreeChange) => each.mode !== null && each.path.startsWith(`${repoPath}/`);
+      // A folder only the base holds is on disk while a file of it is: the
+      // work tree may have deleted every one.
+      const folderStays = () => !base?.get(repoPath) && base?.hasFolder(repoPath) ? base.someUnder(repoPath, (file) => !gone.has(file)) : true;
       // Unchanged by the review: on disk as the base holds it.
-      if (found(base) || base?.linkAbove(repoPath) || changes.some(under)) return intoFile(base?.get(repoPath), repoPath, hash);
+      if (changes.some(under) || ((found(base) || base?.linkAbove(repoPath)) && folderStays())) return intoFile(base?.get(repoPath), repoPath, hash);
       const lower = repoPath.toLowerCase();
       const match = changes.find((each) => each.mode !== null && each.path.toLowerCase() === lower)?.path ?? base?.caseMatch(repoPath);
       if (match && !gone.has(match)) return {known: {kind: 'caseMismatch', hint: caseHint(repoPath, match)}};
@@ -445,8 +371,9 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
      * didn't change is on the after side as the after ref holds it, or, in
      * a work tree review, as the base holds it, which is what the diff
      * found on disk. One bounded `git grep` finds them; a search that fails
-     * or runs past its time finds none. Each one is only a candidate: its
-     * render tells whether it shows a changed image.
+     * or runs past its time (`embeddersMs`, 2 seconds by default) finds
+     * none. Each one is only a candidate: its render tells whether it shows
+     * a changed image.
      */
     async embedders(sides: AssetSides, names: readonly string[], skip: ReadonlySet<string>): Promise<Array<{path: string; oid: string}>> {
       const ref = 'tree' in sides.after ? sides.after.tree : sides.base;
@@ -456,7 +383,7 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
       try {
         const oid = await trees.treeOid(ref, sides.epoch);
         const index = await trees.tree(ref, sides.epoch);
-        const found = await run(grepTreeFilesOperation(cwd, oid, [...new Set(names)]), {signal: AbortSignal.timeout(EMBEDDERS_MS)});
+        const found = await run(grepTreeFilesOperation(cwd, oid, [...new Set(names)]), {signal: AbortSignal.timeout(embeddersMs)});
         return found.filter((file) => isMarkdownName(file) && !skip.has(file) && !gone.has(file)).flatMap((file) => {
           const entry = index.get(file);
           return entry && (entry.mode === '100644' || entry.mode === '100755') ? [{path: file, oid: entry.oid}] : [];
@@ -524,9 +451,14 @@ export type AssetResolver = ReturnType<typeof createAssetResolver>;
 
 /**
  * An image a render looked up, and what its answer depended on; or a link
- * it couldn't check in time, under LATE_IDENTITY.
+ * it checked, with the answer it gave as its identity (LATE_IDENTITY when
+ * the check ran out of time), so a held fragment can ask each link again.
  */
-export type AssetUse = {side: AssetSide; path: string; identity: string};
+export type AssetUse = {kind: 'asset'; side: AssetSide; path: string; identity: string}
+  | {kind: 'link'; side: 'after'; path: string; hash?: string; identity: string};
+
+/** The identity of a link check's answer: the same answer, the same identity. */
+export const linkIdentity = (answer: LinkAnswer) => JSON.stringify(answer);
 
 /** The identity of a lookup that ran out of time: no image has it, so a page that used it renders again. */
 export const LATE_IDENTITY = 'late';
@@ -542,7 +474,9 @@ export const LATE_IDENTITY = 'late';
  */
 export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted: boolean, uses: AssetUse[] = [], {budgetMs}: {budgetMs?: number} = {}) {
   const ends = budgetMs === undefined ? null : Date.now() + budgetMs;
-  const inTime = <T>(work: Promise<T>, late: T) => (ends === null ? work : new Promise<T>((resolve) => {
+  // Every lookup started, answered in time or not, for `settled`.
+  const started: Array<Promise<unknown>> = [];
+  const inTime = <T>(work: Promise<T>, late: T) => (started.push(work), ends === null ? work : new Promise<T>((resolve) => {
     const timer = setTimeout(() => resolve(late), Math.max(0, ends - Date.now()));
     timer.unref?.();
     void work.then((value) => {
@@ -554,7 +488,7 @@ export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted:
   // late card renders again next time.
   const lookup = (side: AssetSide) => async (repoPath: string) => {
     const {answer, identity} = await inTime(resolver.answer(sides, side, repoPath), {answer: unreadable(UNREADABLE.late), identity: LATE_IDENTITY});
-    uses.push({side, path: repoPath, identity});
+    uses.push({kind: 'asset', side, path: repoPath, identity});
     return answer;
   };
   return {
@@ -562,18 +496,26 @@ export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted:
     baseAsset: lookup('base'),
     // Out of time, a link says what the trees alone tell of it, or, before
     // they answer, nothing at all: no claim without an answer. Either way
-    // the page renders again for git's word.
+    // the page renders again for git's word. Every answer is recorded, so a
+    // held fragment asks it again for the next review.
     async linkTarget(repoPath: string, hash?: string): Promise<LinkAnswer> {
       const {known, checked} = resolver.linkTarget(sides, repoPath, hash);
       const answer = await inTime<LinkAnswer | null>(checked, null);
+      uses.push({kind: 'link', side: 'after', path: repoPath, ...(hash === undefined ? {} : {hash}), identity: answer ? linkIdentity(answer) : LATE_IDENTITY});
       if (answer) return answer;
-      uses.push({side: 'after', path: repoPath, identity: LATE_IDENTITY});
       return (await inTime<LinkAnswer | null>(known, null)) ?? {kind: 'unchecked'};
     },
     async assetChanged(repoPath: string, basePath = repoPath) {
       const {changed, base, after} = await inTime(resolver.compare(sides, repoPath, basePath), {changed: false, base: LATE_IDENTITY, after: LATE_IDENTITY});
-      uses.push({side: 'base', path: basePath, identity: base}, {side: 'after', path: repoPath, identity: after});
+      uses.push({kind: 'asset', side: 'base', path: basePath, identity: base}, {kind: 'asset', side: 'after', path: repoPath, identity: after});
       return changed;
+    },
+    /**
+     * Settles once every lookup started so far has, the late ones
+     * included: their answers are then at hand to a render that asks again.
+     */
+    settled: async () => {
+      await Promise.allSettled(started);
     },
   };
 }

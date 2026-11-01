@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {renderToDirectory} from '../src/rendered/renderOut.js';
 import {prepareStartup} from '../src/startup.js';
-import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, snapshotTree, writeExecutable, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, snapshotTree, withEnvAsync, writeExecutable, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
 
 // Each test builds a real repo and runs the CLI in a child, git and delta
@@ -584,11 +584,40 @@ describe('--render-out over the whole branch', () => {
     const out = makeTempDir('branch-review-out-');
     // No time at all for a lookup: every first render, before git has read
     // a tree or an image, runs out of it.
-    const report = await renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0});
+    // The search for "also looks different" is not what this test times: it has all the time it needs.
+    const report = await renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0, embeddersMs: 60_000});
     expect(report.also.map((page) => [page.path, page.embeds])).toEqual([['README.md', ['docs/hero.png']]]);
     expect(report.findings).toEqual([{path: 'docs/guide.md', line: 3, target: 'notes.md', what: 'link', kind: 'missing', reason: 'file not found'}]);
     const links = JSON.parse(fs.readFileSync(path.join(out, 'links.json'), 'utf8')) as Links;
     expect(links.links).toEqual([{path: 'docs/guide.md', line: 3, href: 'notes.md', status: 'missing'}]);
+  });
+
+  it('waits for a late render\'s lookups before rendering it again, however slowly git answers', async () => {
+    const repo = heroRepo({'docs/guide.md': '# Guide\n\nSee [the notes](notes.md).\n'});
+    const {cwd, range, review} = await prepareStartup({cwd: repo, options: {requestedBranch: 'feature', requestedBase: 'main', watch: false, watchPoll: false, animations: false}, width: 100});
+    const out = makeTempDir('branch-review-out-');
+    // A git that takes a second to say whether a file is untracked: past
+    // the first render's budget, and still at work when it ends.
+    const bin = makeTempDir('branch-review-slow-git-');
+    const realGit = spawnSync('/usr/bin/which', ['git'], {encoding: 'utf8'}).stdout.trim();
+    writeExecutable(path.join(bin, 'git'), ['#!/bin/sh', 'case "$*" in *ls-files*--others*) sleep 1 ;; esac', `exec '${realGit}' "$@"`, ''].join('\n'));
+    const report = await withEnvAsync({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0, embeddersMs: 60_000}));
+    expect(report.findings).toEqual([{path: 'docs/guide.md', line: 3, target: 'notes.md', what: 'link', kind: 'missing', reason: 'file not found'}]);
+    expect(report.pages.find((page) => page.path === 'docs/guide.md')).not.toHaveProperty('late');
+  });
+
+  it('waits no longer than a render\'s deadline for lookups that never answer, and keeps the page late', async () => {
+    const repo = heroRepo({'docs/guide.md': '# Guide\n\nSee [the notes](notes.md).\n'});
+    const {cwd, range, review} = await prepareStartup({cwd: repo, options: {requestedBranch: 'feature', requestedBase: 'main', watch: false, watchPoll: false, animations: false}, width: 100});
+    const out = makeTempDir('branch-review-out-');
+    const bin = makeTempDir('branch-review-stuck-git-');
+    const realGit = spawnSync('/usr/bin/which', ['git'], {encoding: 'utf8'}).stdout.trim();
+    writeExecutable(path.join(bin, 'git'), ['#!/bin/sh', 'case "$*" in *ls-files*--others*) sleep 15 ;; esac', `exec '${realGit}' "$@"`, ''].join('\n'));
+    const started = Date.now();
+    const report = await withEnvAsync({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0, embeddersMs: 60_000}));
+    // One render's deadline of waiting, 5 seconds, not the 15 git takes.
+    expect(Date.now() - started).toBeLessThan(12_000);
+    expect(report.pages.find((page) => page.path === 'docs/guide.md')).toMatchObject({late: true});
   });
 
   it('finds markdown that still shows a moved image by its old name', () => {

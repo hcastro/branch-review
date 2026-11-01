@@ -1,14 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import {spawnSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
+import {spawn, spawnSync} from 'node:child_process';
+import {createRequire} from 'node:module';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 import {afterEach, describe, expect, it} from 'vitest';
 import {createWorkerBackend} from '../src/media/workerClient.js';
 import type {MediaBackend} from '../src/media/backend.js';
 import type {SideRef} from '../src/media/types.js';
-import type {FragmentRequest, RenderedBackend} from '../src/rendered/backend.js';
+import type {FragmentRequest, RenderedBackend, TileSource} from '../src/rendered/backend.js';
+import {tileGeometry} from '../src/rendered/tileGeometry.js';
 import {createRenderedBackend} from '../src/rendered/workerClient.js';
-import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, writeFiles} from './core-helpers.js';
+import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
 
 // The rendered worker is supervised the way the media worker is, with its
 // own deadlines and its own three strikes: one worker turning off leaves the
@@ -59,7 +61,7 @@ function fragmentOf(cwd: string, file: string, overrides: Partial<FragmentReques
 const mediaSide = (file: string): SideRef => ({side: 'after', source: 'blob', path: file, abbrevId: 'abcdef1', key: `blob|${file}|abcdef1`});
 const inspectOf = (cwd: string, file: string) => ({cwd, side: mediaSide(file), kind: 'raster' as const, format: 'png' as const});
 
-type LogEntry = {event: 'start' | 'job'; pid: number; tmpdir?: string; type?: string; path?: string};
+type LogEntry = {event: 'start' | 'job'; at: number; pid: number; tmpdir?: string; type?: string; path?: string};
 function renderedLog(tempDir: string): LogEntry[] {
   const file = path.join(tempDir, 'rendered-scripted.log');
   if (!fs.existsSync(file)) return [];
@@ -96,6 +98,90 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     // The media worker never saw a strike and still answers.
     expect(await media.inspect(inspectOf(cwd, 'answer.png'), never)).toEqual({ok: false, state: 'error', reason: 'answered answer.png'});
     expect(media.disabledReason?.()).toBeNull();
+  });
+
+  it('sends a tile to the worker only once the layout ahead of it answered, and a fragment at once', async () => {
+    const cwd = initRepo();
+    const tempDir = sessionDir();
+    const rendered = renderedFor(tempDir, {modulePath: SCRIPTED_RENDERED});
+    const sourceOf = (file: string): TileSource => ({fragment: fragmentOf(cwd, file), scheme: 'dark', bg: '#101418', base: 'main', geometry: tileGeometry(220, {w: 13, h: 29})!, chrome: {path: '/fake/chrome', headless: '--headless'}});
+    const sent = Date.now();
+    const layout = rendered.layout!({source: sourceOf('delay-800-page.md')}, never);
+    const tile = rendered.tile!({source: sourceOf('answer-page.md'), document: 'doc-delay-800-page.md', index: 0, rows: 40, mosaic: false}, never, 0);
+    const fragment = rendered.fragment(fragmentOf(cwd, 'answer-other.md'), never);
+    expect(await fragment).toMatchObject({ok: true});
+    expect(await layout).toMatchObject({ok: true, document: 'doc-delay-800-page.md'});
+    expect(await tile).toMatchObject({ok: true});
+    const jobs = renderedLog(tempDir).filter((entry) => entry.event === 'job');
+    const arrived = (type: string) => jobs.find((entry) => entry.type === type)!.at;
+    // The fragment went alongside the layout; the tile waited out the layout's 800 ms.
+    expect(arrived('fragment') - sent).toBeLessThan(700);
+    expect(arrived('tile') - arrived('layout')).toBeGreaterThanOrEqual(750);
+  });
+
+  it('sends a tile once the layout ahead of it ran out of time', async () => {
+    const cwd = initRepo();
+    const tempDir = sessionDir();
+    const rendered = renderedFor(tempDir, {modulePath: SCRIPTED_RENDERED, deadlinesMs: {layout: 500}, backoffMs: [50, 50, 50]});
+    const sourceOf = (file: string): TileSource => ({fragment: fragmentOf(cwd, file), scheme: 'dark', bg: '#101418', base: 'main', geometry: tileGeometry(220, {w: 13, h: 29})!, chrome: {path: '/fake/chrome', headless: '--headless'}});
+    const layout = rendered.layout!({source: sourceOf('hang-page.md')}, never);
+    const tile = rendered.tile!({source: sourceOf('answer-page.md'), document: 'doc-hang-page.md', index: 0, rows: 40, mosaic: false}, never, 0);
+    expect(await layout).toMatchObject({ok: false, reason: 'timed out'});
+    expect(await tile).toMatchObject({ok: true});
+    const jobs = renderedLog(tempDir).filter((entry) => entry.event === 'job');
+    const arrived = (type: string) => jobs.find((entry) => entry.type === type)!.at;
+    expect(arrived('tile') - arrived('layout')).toBeGreaterThanOrEqual(450);
+  });
+
+  it('ends its own process group, the browser in it included, when the UI process dies', async () => {
+    const cwd = initRepo({'page.md': '# Title\n\nA paragraph.\n'});
+    const tempDir = sessionDir();
+    // A fake Chromium that records its pid, lays out, hangs on the tile, and
+    // outlives its pipe: only the worker's group kill ends it.
+    const bin = makeTempDir('branch-review-orphan-chrome-');
+    const chromePid = path.join(bin, 'chrome.pid');
+    const peer = fileURLToPath(new URL('./fake-cdp-peer.mjs', import.meta.url));
+    const chrome = writeExecutable(path.join(bin, 'chrome-headless-shell'), `#!/bin/sh\necho $$ > '${chromePid}'\nFAKE_CDP_STAY=1 FAKE_CDP_MODE='hang:Page.captureScreenshot' exec '${process.execPath}' '${peer}' "$@"\n`);
+    const probe = fileURLToPath(new URL('./fixtures/orphaned-rendered-worker-probe.ts', import.meta.url));
+    const tsx = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
+    const parent = spawn(process.execPath, ['--import', tsx, probe, tempDir, cwd, chrome], {cwd, stdio: ['ignore', 'pipe', 'pipe']});
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const recorded: number[] = [parent.pid!];
+    try {
+      let output = '';
+      parent.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      await waitFor(() => /worker \d+/.test(output) && /laid true/.test(output), 20_000);
+      const workerPid = Number(/worker (\d+)/.exec(output)![1]);
+      recorded.push(workerPid);
+      await waitFor(() => fs.existsSync(chromePid) && fs.readFileSync(chromePid, 'utf8').trim() !== '', 20_000);
+      const browserPid = Number(fs.readFileSync(chromePid, 'utf8').trim());
+      recorded.push(browserPid);
+      // The tile is with the browser, which hangs on it.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(alive(workerPid)).toBe(true);
+      expect(alive(browserPid)).toBe(true);
+
+      process.kill(parent.pid!, 'SIGKILL');
+      await waitFor(() => !alive(workerPid) && !alive(browserPid), 5_000);
+    } finally {
+      // Only the pids this test recorded.
+      for (const pid of recorded) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // Already gone.
+        }
+      }
+    }
   });
 
   it('keeps rendering after the media worker turned itself off', async () => {

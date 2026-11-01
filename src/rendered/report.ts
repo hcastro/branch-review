@@ -1,5 +1,6 @@
 import type {FileStatus} from '../git.js';
-import {anchorTarget, imageFinding, linkReason, type LinkStatus, type PageImageUse, type PageLink, type RefusedReason} from './markdown.js';
+import type {LinkStatus, PageImageUse, PageLink, RefusedReason} from './markdown.js';
+import {anchorTarget, imageFinding, linkReason} from './words.js';
 
 // The link and anchor report: what on the review's pages won't resolve once
 // they are on GitHub. Each page's render says how its links and images
@@ -42,7 +43,9 @@ export function linkReport(pages: readonly ReportSource[]): {findings: Finding[]
       const known = ref ? anchors.get(ref.path) : undefined;
       if (!ref || !known || anchorTarget(known, ref.anchor) !== null) continue;
       own.push({path: page.path, line: link.line, target: link.href, what: 'link', kind: 'badAnchor', reason: linkReason('badAnchor')});
-      broken.set(page.path, [...(broken.get(page.path) ?? []), ref.index]);
+      const refs = broken.get(page.path);
+      if (refs) refs.push(ref.index);
+      else broken.set(page.path, [ref.index]);
     }
     for (const image of page.images) {
       if (image.status === 'embed' || image.status === 'skipped') continue;

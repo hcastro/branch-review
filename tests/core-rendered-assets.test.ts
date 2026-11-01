@@ -241,8 +241,8 @@ describe('lookups that must never reach git or the network', () => {
     expect(fragment.html).toContain('image not inlined · took too long to read · a.png');
     expect(fragment.html).toContain('Title');
     // Held under no identity the resolver gives, so the page renders again next time.
-    expect(uses).toEqual([{side: 'after', path: 'a.png', identity: 'late'}]);
-  }, 10_000);
+    expect(uses).toEqual([{kind: 'asset', side: 'after', path: 'a.png', identity: 'late'}]);
+  });
 
   it('inlines a page\'s images while its link checks run past the budget, which leaves those links unchecked', async () => {
     const embed: AssetAnswer = {kind: 'embed', mime: 'image/png', dataUrl: dataUrl('image/png', RED), oid: 'abc123'};
@@ -259,7 +259,7 @@ describe('lookups that must never reach git or the network', () => {
     expect(fragment.html).toContain(`src="${embed.dataUrl}"`);
     expect(fragment.html).not.toContain('took too long to read');
     expect(fragment.links.map((link) => link.status)).toEqual(['unchecked', 'unchecked']);
-  }, 10_000);
+  });
 });
 
 describe('the asset rule in the work tree', () => {
@@ -435,6 +435,36 @@ describe('the asset rule in the work tree', () => {
   });
 });
 
+describe('the patch header of a work tree file', () => {
+  const hashOf = (repo: string, file: string) => git(repo, 'hash-object', file).trim();
+  it('reads the ids of an SVG whose own text holds a patch header line', async () => {
+    const repo = initRepo();
+    const header = (name: string) => `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">\n<!--\ndiff --git a/x b/x\n${name}\n-->\n<rect width="20" height="10"/></svg>\n`;
+    writeBytes(repo, 'logo.svg', SVG);
+    commitAll(repo, 'logo');
+    writeBytes(repo, 'logo.svg', header('edited'));
+    writeBytes(repo, 'new.svg', header('added'));
+    git(repo, 'add', '-N', 'new.svg');
+    const patchOf = (file: string) => git(repo, 'diff', 'main', '--', file);
+    const files = [
+      {path: 'logo.svg', status: 'modified', rawDiff: patchOf('logo.svg')},
+      {path: 'new.svg', status: 'added', rawDiff: patchOf('new.svg')},
+    ] as ReviewFile[];
+    // The patch's own lines carry the header text past their first column.
+    for (const file of files) expect(file.rawDiff).toContain('+diff --git a/x b/x');
+    const sides = reviewAssetSides({files}, {diffArg: blobId(repo, 'main'), branch: 'HEAD', includeWorktree: true}, 0);
+    const changes = 'worktree' in sides.after ? sides.after.worktree : [];
+    expect(changes.map((change) => [change.path, change.mode])).toEqual([['logo.svg', 'regular'], ['new.svg', 'regular']]);
+    expect(hashOf(repo, 'logo.svg').startsWith(changes[0]!.id ?? '-')).toBe(true);
+    expect(hashOf(repo, 'new.svg').startsWith(changes[1]!.id ?? '-')).toBe(true);
+    const resolver = createAssetResolver({cwd: repo});
+    for (const name of ['logo.svg', 'new.svg']) {
+      expect((await resolver.answer(sides, 'after', name)).answer).toMatchObject({kind: 'embed', mime: 'image/svg+xml', oid: hashOf(repo, name)});
+      expect((await resolver.compare(sides, name)).changed).toBe(true);
+    }
+  });
+});
+
 describe('the search for markdown that shows a changed image', () => {
   // `main` holds markdown that shows the hero, a text file that only names
   // it, and a page the review changed; `feature` changes the hero and adds
@@ -505,7 +535,7 @@ describe('the search for markdown that shows a changed image', () => {
     expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
     const failing: RunOperation = (operation, scope) => (scope?.signal ? Promise.reject(new Error('git failed')) : runOperationAsync(operation));
     expect(await createAssetResolver({cwd: repo, run: failing}).embedders(refSides(), ['hero.png'], new Set())).toEqual([]);
-  }, 10_000);
+  });
 
   it('answers the worker\'s embedders job from the search', async () => {
     const repo = heroRepo();
@@ -714,6 +744,26 @@ describe('fragments in the rendered worker', () => {
     expect(page.ok && page.html).not.toContain("can't read the file");
   });
 
+  it('reads again an image it read mid-rewrite, once the file matches the id the next review names', async () => {
+    const repo = initRepo({'README.md': '# Project\n\n![Logo](logo.png)\n'});
+    writeBytes(repo, 'logo.png', BLUE);
+    const id = git(repo, 'hash-object', 'logo.png').trim();
+    const handler = createRenderedHandler();
+    const pageOf = async (epoch: number) => await handler.handle({
+      type: 'page', key: 'p', title, file: {path: 'README.md', status: 'modified'}, rail: [],
+      content: {fragment: {cwd: repo, key: 'logo', path: 'README.md', status: 'modified', source: {kind: 'blob', id: blobId(repo, 'HEAD:README.md')}, groups: [], links: {}, assets: {base: blobId(repo, 'main'), after: {worktree: [{path: 'logo.png', id, mode: 'regular'}]}, epoch}}},
+    }) as PageResult;
+
+    // An agent is rewriting the file: its bytes aren't the ones the review named.
+    writeBytes(repo, 'logo.png', RED);
+    const first = await pageOf(0);
+    expect(first.ok && first.html).toContain("doesn't match git");
+    writeBytes(repo, 'logo.png', BLUE);
+    const page = await pageOf(1);
+    expect(page.ok && page.html).toContain(dataUrl('image/png', BLUE));
+    expect(page.ok && page.html).not.toContain("doesn't match git");
+  });
+
   it('names the same images the same way, whatever order their lookups finish in', async () => {
     const names = Array.from({length: 10}, (_, index) => `img/${index}.png`);
     const source = names.map((name) => `![${name}](${name})`).join('\n\n');
@@ -749,7 +799,7 @@ describe('fragments in the rendered worker', () => {
     const fragment = await renderMarkdown({path: 'README.md', source: after, groups: changeGroups(diffFile(before, after)), ...pageLookups(slow, refSides(), false, uses, {budgetMs: 10}), link: () => ({kind: 'outside'})});
     expect(uses.map((use) => use.identity)).toContain(LATE_IDENTITY);
     expect(summarize({kind: 'rendered', fragment}, uses)).toMatchObject({late: true});
-    expect(summarize({kind: 'rendered', fragment}, [{side: 'after', path: 'logo.png', identity: 'blob:abc1234'}])).not.toHaveProperty('late');
+    expect(summarize({kind: 'rendered', fragment}, [{kind: 'asset', side: 'after', path: 'logo.png', identity: 'blob:abc1234'}])).not.toHaveProperty('late');
   });
 
   it('says when a page rendered its fragment again rather than use the one held', async () => {

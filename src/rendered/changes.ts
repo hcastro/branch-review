@@ -234,12 +234,18 @@ export function markBlocks(after: MarkSide, base: MarkSide, groups: readonly Cha
   const goneGroup = new Map(groups.flatMap((group) => (gone.get(group.id) ?? []).map((index) => [index, group] as const)));
 
   const removals: Removal[] = [];
+  // What each block of a run looks like, read once, not once per pair.
+  const baseLikeness = new Map<number, BlockLikeness>();
+  const afterLikeness = new Map<number, BlockLikeness>();
+  const numbering = new Map<string, number>();
   for (const region of regions) {
     const last = region.at(-1)!;
+    for (const index of region.flatMap((group) => gone.get(group.id) ?? [])) if (!baseLikeness.has(index)) baseLikeness.set(index, blockLikeness(base.blocks[index]!, numbering));
+    for (const index of region.flatMap((group) => fresh.get(group.id) ?? [])) if (!afterLikeness.has(index)) afterLikeness.set(index, blockLikeness(after.blocks[index]!, numbering));
     const ops = align(
       region.flatMap((group) => gone.get(group.id) ?? []),
       region.flatMap((group) => fresh.get(group.id) ?? []),
-      (baseIndex, afterIndex) => pairScore(base.blocks[baseIndex]!, after.blocks[afterIndex]!),
+      (baseIndex, afterIndex) => pairScore(base.blocks[baseIndex]!, after.blocks[afterIndex]!, baseLikeness.get(baseIndex)!, afterLikeness.get(afterIndex)!),
     );
     // Removed blocks go before the next block of the run, the way the diff
     // prints `-` lines before `+` lines; with none left, after the run.
@@ -337,19 +343,80 @@ function family(block: MarkableBlock) {
   return block.footnote ? `footnote ${tag}` : tag;
 }
 
-// An image, and a link's destination: neither is part of a block's wording.
-const IMAGE = /!\[[^\]]*\]\([^)]*\)/g;
-const IMAGE_SOURCE = /!\[[^\]]*\]\(\s*<?([^)>\s]*)/g;
-const LINK_DESTINATION = /\]\([^)]*\)/g;
+// An image, `![alt](src)`, and a link's destination, `](dest)`: neither is
+// part of a block's wording. Read in one pass each, as the regular
+// expressions /!\[[^\]]*\]\([^)]*\)/g, /\]\([^)]*\)/g and
+// /!\[[^\]]*\]\(\s*<?([^)>\s]*)/g match, without their cost on a block of
+// `![` and no `]`, which a regular expression scans to the end from every
+// start. Each takes the first `]` after `![` and the first `)` after `(`,
+// so a start that fails makes every start before that `]` fail too, and
+// one with no closer left ends the search.
+
+// The text with each image as one space.
+function withoutImages(text: string): string {
+  let out = '';
+  let from = 0;
+  for (let at = text.indexOf('![', from); at >= 0; at = text.indexOf('![', from)) {
+    const close = text.indexOf(']', at + 2);
+    if (close < 0) break;
+    if (text[close + 1] !== '(') {
+      out += text.slice(from, close + 1);
+      from = close + 1;
+      continue;
+    }
+    const end = text.indexOf(')', close + 2);
+    if (end < 0) break;
+    out += `${text.slice(from, at)} `;
+    from = end + 1;
+  }
+  return out + text.slice(from);
+}
+
+// The text with each link destination cut down to the `]` before it.
+function withoutDestinations(text: string): string {
+  let out = '';
+  let from = 0;
+  for (let at = text.indexOf('](', from); at >= 0; at = text.indexOf('](', from)) {
+    const end = text.indexOf(')', at + 2);
+    if (end < 0) break;
+    out += `${text.slice(from, at)}]`;
+    from = end + 1;
+  }
+  return out + text.slice(from);
+}
+
+const SPACE = /\s/;
+
+// Each image's source as written, without a `<` before it.
+function imageSources(text: string): string[] {
+  const sources: string[] = [];
+  let from = 0;
+  for (let at = text.indexOf('![', from); at >= 0; at = text.indexOf('![', from)) {
+    const close = text.indexOf(']', at + 2);
+    if (close < 0) break;
+    if (text[close + 1] !== '(') {
+      from = close + 1;
+      continue;
+    }
+    let start = close + 2;
+    while (start < text.length && SPACE.test(text[start]!)) start += 1;
+    if (text[start] === '<') start += 1;
+    let end = start;
+    while (end < text.length && text[end] !== ')' && text[end] !== '>' && !SPACE.test(text[end]!)) end += 1;
+    sources.push(text.slice(start, end));
+    from = end;
+  }
+  return sources;
+}
 
 // What a block shows, for telling an edit from new text: the letter pairs
 // of its words, so `Theme` and `Theming` are close and unrelated sentences
 // are far apart. A block that is only images shows its images, so it
 // compares by their sources.
-function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>; words: string[]} {
-  const prose = text.replace(IMAGE, ' ').replace(LINK_DESTINATION, ']').toLowerCase();
+export function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>; words: string[]} {
+  const prose = withoutDestinations(withoutImages(text)).toLowerCase();
   const words = prose.match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (words.length === 0) return {kind: 'images', parts: new Set([...text.matchAll(IMAGE_SOURCE)].map((match) => match[1]!)), words};
+  if (words.length === 0) return {kind: 'images', parts: new Set(imageSources(text)), words};
   const parts = new Set<string>();
   for (const word of words) {
     const letters = [...word];
@@ -357,6 +424,51 @@ function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>; 
     for (let at = 0; at + 1 < letters.length; at += 1) parts.add(letters[at]! + letters[at + 1]!);
   }
   return {kind: 'words', parts, words};
+}
+
+// A block as pairing reads it: its trimmed text, its row key, its
+// likeness and the set of its words.
+// `codes`: its parts as numbers, sorted, from one numbering for the whole
+// pairing, so two blocks' shared parts are counted in one merge.
+type BlockLikeness = {text: string; rowKey: string; likeness: ReturnType<typeof likeness>; wordSet: ReadonlySet<string>; codes: Int32Array};
+
+function blockLikeness(block: MarkableBlock, numbering: Map<string, number>): BlockLikeness {
+  const look = likeness(block.text);
+  const codes = Int32Array.from(look.parts, (part) => {
+    let code = numbering.get(part);
+    if (code === undefined) {
+      code = numbering.size;
+      numbering.set(part, code);
+    }
+    return code;
+  }).sort();
+  return {text: block.text.trim(), rowKey: block.tag === 'tr' ? rowKey(block.text) : '', likeness: look, wordSet: new Set(look.words), codes};
+}
+
+// How many parts two blocks share.
+function sharedParts(left: Int32Array, right: Int32Array) {
+  let shared = 0;
+  for (let at = 0, other = 0; at < left.length && other < right.length;) {
+    if (left[at] === right[other]) {
+      shared += 1;
+      at += 1;
+      other += 1;
+    } else if (left[at]! < right[other]!) {
+      at += 1;
+    } else {
+      other += 1;
+    }
+  }
+  return shared;
+}
+
+// Whether the shorter wording can run inside the longer at all: its first
+// and last words are among the longer's. Most pairs of a rewrite fail here,
+// before holds() reads them word by word.
+function mayHold(left: BlockLikeness, right: BlockLikeness) {
+  const [short, long] = left.likeness.words.length <= right.likeness.words.length ? [left, right] : [right, left];
+  const words = short.likeness.words;
+  return words.length > 0 && long.wordSet.has(words[0]!) && long.wordSet.has(words.at(-1)!);
 }
 
 // Below this share of parts in common, two blocks are different text, not
@@ -401,17 +513,17 @@ function rowKey(text: string) {
 // whose old wording runs whole and in order inside the new one pair ahead
 // of blocks that only share letters with it: `A nested tip` was extended
 // into `A nested tip that changed`, not into `A new nested tip`.
-function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
+function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock, baseLook: BlockLikeness, afterLook: BlockLikeness) {
   if (family(baseBlock) !== family(afterBlock)) return null;
-  if (baseBlock.text.trim() === afterBlock.text.trim()) return 3;
-  const left = likeness(baseBlock.text);
-  const right = likeness(afterBlock.text);
+  if (baseLook.text === afterLook.text) return 3;
+  const left = baseLook.likeness;
+  const right = afterLook.likeness;
   if (left.kind !== right.kind) return null;
-  const shared = [...left.parts].filter((part) => right.parts.has(part)).length;
+  const shared = sharedParts(baseLook.codes, afterLook.codes);
   const total = left.parts.size + right.parts.size;
   const similarity = total === 0 ? 1 : (2 * shared) / total;
-  const held = left.kind === 'words' && holds(left.words, right.words);
-  if (baseBlock.tag === 'tr' && rowKey(baseBlock.text) !== '' && rowKey(baseBlock.text) === rowKey(afterBlock.text)) return 2 + similarity / 2;
+  const held = left.kind === 'words' && mayHold(baseLook, afterLook) && holds(left.words, right.words);
+  if (baseBlock.tag === 'tr' && baseLook.rowKey !== '' && baseLook.rowKey === afterLook.rowKey) return 2 + similarity / 2;
   if (baseBlock.tag !== 'tr' && held) return 2 + similarity / 2;
   if (similarity >= MIN_LIKENESS) return 1 + similarity;
   return held ? 1 + MIN_LIKENESS : null;

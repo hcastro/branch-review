@@ -127,15 +127,38 @@ const LAYOUT: PageLayout = {
 describe('rendered rows', () => {
   const geometry = tileGeometry(220, OWNER)!;
 
-  it('marks the rows a changed block or a removed marker crosses, and no others', () => {
+  it('marks the rows whose centers a changed block or a removed marker holds, and no others', () => {
     const marks = rowMarks(LAYOUT, geometry, pageRows(geometry, LAYOUT.heightCss));
-    const at = (css: number) => Math.floor((css * 1.75) / 29);
-    expect(marks.slice(at(50), at(100) + 1).every((mark) => mark === 'added')).toBe(true);
-    expect(marks[at(50) - 1]).toBeNull();
-    expect(marks[at(100) + 1]).toBeNull();
-    expect(marks[at(410)]).toBe('removed');
-    expect(marks[at(1010)]).toBe('modified');
-    expect(marks.filter((mark) => mark !== null)).toHaveLength((at(100) - at(50) + 1) + (at(420) - at(400) + 1) + (at(1020) - at(1000) + 1));
+    // Rows are 29 / 1.75 CSS px: [50, 100) holds the centers of rows 3 to 5
+    // (row 6 only grazes it), [400, 420) row 24's, [1000, 1020) rows 60 and 61.
+    const marked = marks.flatMap((mark, row) => (mark ? [[row, mark]] : []));
+    expect(marked).toEqual([[3, 'added'], [4, 'added'], [5, 'added'], [24, 'removed'], [60, 'modified'], [61, 'modified']]);
+  });
+
+  it('marks only the rows a changed list item mostly fills, never a row of an unchanged neighbor it grazes', () => {
+    // 24 px items 4 px apart, at 13 by 29 cells and dpr 1.75: rows are
+    // 16.57 CSS px, centered at 8.3, 24.9, 41.4, 58.0, 74.6, 91.1.
+    const item = (index: number) => ({top: index * 28, bottom: index * 28 + 24});
+    const list: PageLayout = {
+      heightCss: 112,
+      blocks: [
+        {id: 'b-list', top: 0, bottom: 108, lines: [1, 4]},
+        {id: 'b-one', ...item(0), lines: [1, 1]},
+        {id: 'b-two', ...item(1), lines: [2, 2], mark: 'modified'},
+        {id: 'b-three', ...item(2), lines: [3, 3]},
+        {id: 'b-four', ...item(3), lines: [4, 4]},
+      ],
+      removed: [],
+      links: [],
+      anchors: [],
+    };
+    const marks = rowMarks(list, geometry, pageRows(geometry, list.heightCss));
+    expect(marks).toEqual([null, null, 'modified', null, null, null, null]);
+    // A 10 px box between two rows' centers marks the one it overlaps most.
+    const thin: PageLayout = {...list, blocks: [{id: 'b-thin', top: 26, bottom: 36, lines: [2, 2], mark: 'added'}]};
+    expect(rowMarks(thin, geometry, 7)).toEqual([null, 'added', null, null, null, null, null]);
+    const removed: PageLayout = {...list, blocks: [], removed: [{top: 26, bottom: 36}]};
+    expect(rowMarks(removed, geometry, 7).filter(Boolean)).toHaveLength(1);
   });
 
   it('gives a row two marks cross the stronger: modified over added, either over a removed marker', () => {

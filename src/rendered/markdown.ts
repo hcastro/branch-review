@@ -10,6 +10,7 @@ import rehypeStringify from 'rehype-stringify';
 import GithubSlugger from 'github-slugger';
 import {nameToEmoji} from 'gemoji';
 import {parse as parseYaml} from 'yaml';
+import {normalizeIdentifier} from 'micromark-util-normalize-identifier';
 import type {Element, ElementContent, Parents, Root, RootContent} from 'hast';
 import type {Nodes as MdastNodes, Root as MdastRoot, Yaml} from 'mdast';
 import type {FileStatus} from '../git.js';
@@ -17,6 +18,9 @@ import {remarkAlerts, type AlertType} from './alerts.js';
 import {createBlockIds, privateAttribute} from './blockIds.js';
 import {baseText, markBlocks, type ChangeGroup, type MarkableBlock} from './changes.js';
 import {readPageHash} from './hash.js';
+import {anchorTarget, LINK_TEXT, linkReason, pageTop, REFUSED_TEXT, refusedCard, withPrefix} from './words.js';
+
+export {anchorTarget, imageFinding, LINK_TEXT, linkReason, refusedCard} from './words.js';
 import {octicon, type OcticonName} from './octicons.js';
 import {rawSource, type RawSource} from './raw.js';
 
@@ -322,11 +326,14 @@ function parser(stampProperty: string) {
  * renders as one, and the number each footnote reference shows on the
  * whole page, by its target.
  */
-type Side = {blocks: Candidate[]; lines: string[]; definitions: string[]; footnoteLabels: string[]; footnoteNumbers: Map<string, string>};
+type Side = {blocks: Candidate[]; lines: string[]; definitions: Map<string, string[]>; footnoteLabels: Map<string, string>; footnoteNumbers: Map<string, string>};
 
 function emptySide(): Side {
-  return {blocks: [], lines: [], definitions: [], footnoteLabels: [], footnoteNumbers: new Map()};
+  return {blocks: [], lines: [], definitions: new Map(), footnoteLabels: new Map(), footnoteNumbers: new Map()};
 }
+
+// A label as CommonMark matches it: case folded, runs of white space as one.
+const labelKey = (label: string) => normalizeIdentifier(label).toLowerCase().toUpperCase();
 
 async function baseSide(processor: ReturnType<typeof parser>, source: string, groups: ChangeGroup[]): Promise<Side> {
   const text = baseText(source, groups);
@@ -378,17 +385,24 @@ function countGitLines(tree: Positioned, text: string) {
   visit(tree);
 }
 
+// Each link definition by its label, every one in file order (the first
+// wins, as on the page), and each footnote's label by its normalized form.
 function sideContext(mdast: MdastRoot, hast: Root, source: string): Pick<Side, 'definitions' | 'footnoteLabels' | 'footnoteNumbers'> {
-  const definitions: string[] = [];
-  const footnoteLabels: string[] = [];
+  const definitions = new Map<string, string[]>();
+  const footnoteLabels = new Map<string, string>();
   const visit = (node: MdastNodes, nested: boolean) => {
     if (node.type === 'definition' && node.position?.start.offset !== undefined && node.position.end.offset !== undefined) {
       const text = source.slice(node.position.start.offset, node.position.end.offset);
       // A definition inside a quote or a list item keeps that container's
-      // marks on its later lines; at the top of a file it needs none.
-      definitions.push(nested ? text.split('\n').map((line, index) => (index === 0 ? line : line.replace(/^[ \t>]*/, ''))).join('\n') : text);
+      // marks on its later lines; at the top of a file it needs none. Keyed
+      // by the label as written, as a reference names it (`identifier`):
+      // `label` is decoded, so `R&amp;D` there is `R&D`.
+      const key = labelKey(node.identifier);
+      definitions.set(key, [...(definitions.get(key) ?? []), nested ? text.split('\n').map((line, index) => (index === 0 ? line : line.replace(/^[ \t>]*/, ''))).join('\n') : text]);
     } else if (node.type === 'footnoteDefinition') {
-      footnoteLabels.push(node.label ?? node.identifier);
+      // The label as written, which a view's context defines it by again.
+      const label = writtenFootnoteLabel(node, source) ?? node.label ?? node.identifier;
+      if (!footnoteLabels.has(labelKey(node.identifier))) footnoteLabels.set(labelKey(node.identifier), label);
     }
     if ('children' in node) for (const child of node.children) visit(child, node.type !== 'root');
   };
@@ -401,6 +415,15 @@ function sideContext(mdast: MdastRoot, hast: Root, source: string): Pick<Side, '
     }
   });
   return {definitions, footnoteLabels, footnoteNumbers};
+}
+
+// A footnote definition's label as the source writes it, between its `[^`
+// and the first `]`, or null when its position isn't known.
+function writtenFootnoteLabel(node: {position?: {start: {offset?: number}}}, source: string): string | null {
+  const start = node.position?.start.offset;
+  if (start === undefined || !source.startsWith('[^', start)) return null;
+  const close = source.indexOf(']', start + 2);
+  return close < 0 ? null : source.slice(start + 2, close);
 }
 
 // A footnote reference's target, the same before and after the sanitizer
@@ -780,7 +803,7 @@ async function resolveLinks(tree: Root, options: TreeOptions, tally: Tally, refP
   return {links, anchors};
 }
 
-const withPrefix = (anchor: string) => (anchor.startsWith('user-content-') ? anchor : `user-content-${anchor}`);
+
 
 // Every id on the page a link can point at: those its headings, footnotes
 // and HTML carry once the sanitizer gave them their prefix, by `id` or by
@@ -796,24 +819,6 @@ function pageAnchors(tree: Root): string[] {
   return [...ids].sort();
 }
 
-// An empty fragment, or `top` in any case, opens a page at its top, as the
-// HTML standard says, whatever ids the page has.
-const pageTop = (fragment: string) => fragment === '' || fragment.toLowerCase() === 'top';
-
-/**
- * Where a link's fragment lands on a page with `ids` (`anchors`), as GitHub
- * finds it: the `user-content-` id it names, else that id in lowercase,
- * which GitHub's page script also tries; `top` for the top of the page; or
- * null when it lands nowhere. One rule for a link into the same page,
- * another rendered page, and a markdown file outside the review.
- */
-export function anchorTarget(ids: ReadonlySet<string>, fragment: string): string | 'top' | null {
-  const id = withPrefix(fragment);
-  if (ids.has(id)) return id;
-  if (ids.has(id.toLowerCase())) return id.toLowerCase();
-  return pageTop(fragment) ? 'top' : null;
-}
-
 /**
  * The ids a link can point at on the page `source` renders to, as that
  * page's own render lists them in `anchors`, for a markdown file the
@@ -826,22 +831,6 @@ export async function markdownAnchors(source: string): Promise<string[]> {
   const tree = unified().use(rehypeSanitize, sanitizeSchema(stamp.property)).runSync(hast) as Root;
   addHeadingAnchors(tree, stamp.property);
   return pageAnchors(tree);
-}
-
-/** What a link that opens no page says of itself. */
-export const LINK_TEXT: Record<Exclude<LinkStatus, 'ok'>, string> = {
-  outside: 'not part of this review',
-  unchecked: 'not checked in time',
-  missing: 'file not found',
-  badAnchor: 'anchor not found',
-  untracked: 'file is untracked',
-  ignored: 'ignored by git',
-  caseMismatch: 'case mismatch',
-};
-
-/** The words for a link that won't resolve on GitHub: its reason, and for a case mismatch the names it confused. */
-export function linkReason(status: Exclude<LinkStatus, 'ok' | 'outside' | 'unchecked'>, hint?: string) {
-  return status === 'caseMismatch' && hint ? `${LINK_TEXT.caseMismatch}: ${hint}` : LINK_TEXT[status];
 }
 
 // No page to open for it: the link stays readable, inert, and says why. One
@@ -864,49 +853,6 @@ function makeInert(node: Element, answer: Exclude<LinkAnswer, {kind: 'inReview'}
 // never asked for.
 function tripHashLike(fragment: string) {
   return Object.keys(readPageHash(fragment)).length > 0;
-}
-
-const REFUSED_TEXT: Record<Extract<AssetAnswer, {kind: 'refused'}>['reason'], string> = {
-  remote: 'not loaded (offline)',
-  untracked: "won't render on GitHub: file is untracked",
-  ignored: "won't render on GitHub: ignored by git",
-  caseMismatch: "won't render on GitHub: case mismatch",
-  missing: "won't render on GitHub: file not found",
-  symlink: "won't render on GitHub: symlink · not followed",
-  outside: "won't render on GitHub: outside the repo",
-  lfs: "won't render on GitHub: LFS object · not fetched",
-  submodule: "won't render on GitHub: submodule · not rendered",
-  notImage: "won't render on GitHub: not an image",
-  tooLarge: 'image not inlined · page limit',
-  pageLimit: 'image not inlined · page limit',
-  unreadable: 'image not inlined',
-};
-
-const GITHUB_REFUSAL = "won't render on GitHub: ";
-
-/**
- * What the card in place of an image says, and whether it is soft: an
- * image GitHub can show that this page leaves out, in amber, rather than
- * one GitHub won't show either, in red.
- */
-export function refusedCard(reason: RefusedReason, hint?: string): {text: string; soft: boolean} {
-  const soft = reason === 'tooLarge' || reason === 'pageLimit' || reason === 'unreadable';
-  const text = !hint ? REFUSED_TEXT[reason]
-    : reason === 'caseMismatch' ? `${REFUSED_TEXT.caseMismatch}: ${hint}`
-      : reason === 'unreadable' ? `${REFUSED_TEXT.unreadable} · ${hint}` : REFUSED_TEXT[reason];
-  return {text, soft};
-}
-
-/**
- * What an image card says after `won't render on GitHub:`, for an image
- * GitHub won't show either, or null for one only this page leaves out
- * (remote, too large, unreadable).
- */
-export function imageFinding(reason: RefusedReason, hint?: string): string | null {
-  const text = REFUSED_TEXT[reason];
-  if (!text.startsWith(GITHUB_REFUSAL)) return null;
-  const said = text.slice(GITHUB_REFUSAL.length);
-  return reason === 'caseMismatch' && hint ? `${said}: ${hint}` : said;
 }
 
 // The first URL of a `srcset`, which is all a markdown `<picture>` uses.
@@ -1217,18 +1163,48 @@ const FRONTMATTER_FENCE = /^---\s*$/;
  * references. `except` names footnotes the source defines itself.
  */
 async function renderAlone(side: Side, source: string, first: number, options: TreeOptions, tally: Tally, except = new Set<string>()): Promise<Root> {
-  const labels = side.footnoteLabels.filter((label) => !except.has(label)).map((label) => `[^${label}]: .`);
+  // Only what the source can refer to: every bracketed run in it, read as
+  // a label, so the context grows with the block, never with the file.
+  const named = bracketedLabels(source);
+  const exceptKeys = new Set([...except].map(labelKey));
+  const labels = [...named].flatMap((key) => {
+    const label = key.startsWith('^') ? side.footnoteLabels.get(key.slice(1)) : undefined;
+    return label !== undefined && !exceptKeys.has(key.slice(1)) ? [`[^${label}]: .`] : [];
+  });
+  const definitions = [...named].flatMap((key) => side.definitions.get(key) ?? []);
   // A footnote definition takes the indented lines after it, as a list item
   // does, so a comment, which renders as nothing, closes the labels.
-  const context = [...labels, ...(labels.length > 0 ? ['<!-- -->'] : []), ...side.definitions];
+  const context = [...labels, ...(labels.length > 0 ? ['<!-- -->'] : []), ...definitions];
   const frontmatter = first === 1 && FRONTMATTER_FENCE.test(side.lines[0] ?? '');
   const tree = (await renderTree(context.length > 0 && !frontmatter ? `${context.join('\n\n')}\n\n${source}` : source, options, tally)).tree;
   walk(tree, (node) => {
+    // The page owns every id and name: a view of a block that has one would
+    // repeat it, and a link to it could land in the view. Links keep their
+    // targets.
+    delete node.properties.id;
+    delete node.properties.name;
     if (node.tagName !== 'a' || node.properties.dataFootnoteRef === undefined || typeof node.properties.href !== 'string') return;
     const number = side.footnoteNumbers.get(footnoteTarget(node.properties.href));
     if (number !== undefined) node.children = [{type: 'text', value: number}];
   });
   return tree;
+}
+
+// The labels a source may refer to: the text of each bracketed run, as in
+// `[label]`, `[text][label]` and `[label][]`, normalized; a footnote's
+// `[^label]` as `^` and its normalized label. A run that names no
+// definition costs nothing. Runs are read without nesting, as labels are.
+function bracketedLabels(source: string): Set<string> {
+  const keys = new Set<string>();
+  for (let open = source.indexOf('['); open >= 0; open = source.indexOf('[', open + 1)) {
+    const close = source.indexOf(']', open + 1);
+    if (close < 0) break;
+    const inner = source.slice(open + 1, close);
+    // A label holds no unescaped bracket and at most 999 characters.
+    if (inner.includes('[') || inner.length > 999 || inner.trim() === '') continue;
+    keys.add(inner.startsWith('^') ? `^${labelKey(inner.slice(1))}` : labelKey(inner));
+  }
+  return keys;
 }
 
 // Whether two renders show the same thing.
@@ -1317,9 +1293,10 @@ function frontmatterTable(state: {patch(from: Yaml, to: Element): void}, node: Y
   } catch {
     value = undefined;
   }
-  const result = value === undefined
-    ? element('pre', [element('code', [{type: 'text', value: node.value}])])
-    : valueTable(value);
+  // A value that refers to itself, or nests past what a page can show,
+  // shows as its source, as a value that doesn't parse does.
+  const table = value === undefined ? null : valueTable(value, new WeakSet(), 0);
+  const result = table ?? element('pre', [element('code', [{type: 'text', value: node.value}])]);
   state.patch(node, result);
   return result;
 }
@@ -1328,19 +1305,45 @@ function element(tagName: string, children: ElementContent[], properties: Elemen
   return {type: 'element', tagName, properties, children};
 }
 
-function valueTable(value: unknown): Element {
-  if (Array.isArray(value)) return element('table', [element('tbody', [element('tr', value.map((item) => element('td', [cell(item)])))])]);
+// Frontmatter tables nest at most this deep.
+const MAX_FRONTMATTER_DEPTH = 32;
+
+// The table for a value, or null for one that contains itself (`path`
+// holds the objects above it) or nests past MAX_FRONTMATTER_DEPTH.
+function valueTable(value: unknown, path: WeakSet<object>, depth: number): Element | null {
+  if (depth >= MAX_FRONTMATTER_DEPTH) return null;
+  const cells = (items: readonly unknown[]) => {
+    const out: Element[] = [];
+    for (const item of items) {
+      const inner = cell(item, path, depth + 1);
+      if (!inner) return null;
+      out.push(element('td', [inner]));
+    }
+    return out;
+  };
   if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>);
-    return element('table', [
-      element('thead', [element('tr', entries.map(([key]) => element('th', [{type: 'text', value: key}])))]),
-      element('tbody', [element('tr', entries.map(([, item]) => element('td', [cell(item)])))]),
-    ]);
+    if (path.has(value)) return null;
+    path.add(value);
+    try {
+      if (Array.isArray(value)) {
+        const row = cells(value);
+        return row && element('table', [element('tbody', [element('tr', row)])]);
+      }
+      const entries = Object.entries(value as Record<string, unknown>);
+      const row = cells(entries.map(([, item]) => item));
+      return row && element('table', [
+        element('thead', [element('tr', entries.map(([key]) => element('th', [{type: 'text', value: key}])))]),
+        element('tbody', [element('tr', row)]),
+      ]);
+    } finally {
+      path.delete(value);
+    }
   }
-  return element('table', [element('tbody', [element('tr', [element('td', [cell(value)])])])]);
+  const row = cells([value]);
+  return row && element('table', [element('tbody', [element('tr', row)])]);
 }
 
-function cell(value: unknown): Element {
-  if (value && typeof value === 'object') return valueTable(value);
+function cell(value: unknown, path: WeakSet<object>, depth: number): Element | null {
+  if (value && typeof value === 'object') return valueTable(value, path, depth);
   return element('div', [{type: 'text', value: value === null || value === undefined ? '' : String(value)}]);
 }

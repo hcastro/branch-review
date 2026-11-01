@@ -42,6 +42,30 @@ describe('createCrossingClock', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('starts over on a second press: the first settles, and the second plays its full 320 ms', async () => {
+    const {clock} = listening();
+    let first = false;
+    let second = false;
+    void clock.start('full').then(() => {
+      first = true;
+    });
+    await vi.advanceTimersByTimeAsync(120);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 120});
+    void clock.start('full').then(() => {
+      second = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first).toBe(true);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 0});
+    await vi.advanceTimersByTimeAsync(280);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 280});
+    expect(second).toBe(false);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(second).toBe(true);
+    expect(clock.snapshot()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('plays a reduced crossing for 120 ms', async () => {
     const {clock} = listening();
     let settled = false;

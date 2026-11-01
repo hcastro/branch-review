@@ -1,5 +1,6 @@
+import fs from 'node:fs';
 import {afterEach, describe, expect, it} from 'vitest';
-import {changeGroups} from '../src/rendered/changes.js';
+import {changeGroups, likeness} from '../src/rendered/changes.js';
 import {renderMarkdown, type RenderInput} from '../src/rendered/markdown.js';
 import {cleanupTempDirs} from './core-helpers.js';
 import {diffFile} from './rendered-helpers.js';
@@ -13,8 +14,8 @@ const lookups: Pick<RenderInput, 'asset' | 'link'> = {
 
 // What the page marks for `before` -> `after`: each marked block as its tag,
 // mark and text, and each removed marker as its label.
-async function marksFor(before: string, after: string) {
-  const file = diffFile(before, after);
+async function marksFor(before: string, after: string, extraArgs: readonly string[] = []) {
+  const file = diffFile(before, after, 'doc.md', extraArgs);
   const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
   const doc = new DOMParserLite(fragment.html);
   return {
@@ -85,6 +86,27 @@ describe('changeGroups', () => {
     ]);
   });
 
+  // Hunks with no context, as `git diff -U0` or a user's diff.context=0
+  // prints them: a side with no lines names the line before the hunk.
+  const BEFORE = '# Title\n\nFirst.\n\nSecond.\n\nThird.\n';
+  const WITHOUT_SECOND = '# Title\n\nFirst.\n\nThird.\n';
+
+  it('reads a pure removal mid-file from a hunk with no context', () => {
+    const file = diffFile(BEFORE, WITHOUT_SECOND, 'doc.md', ['-U0']);
+    expect(file.rawDiff).toContain('@@ -5,2 +4,0 @@');
+    expect(changeGroups(file)).toEqual([
+      {id: 'g0', kind: 'removed', after: null, base: [5, 6], anchorLine: 5, removedLines: ['Second.', '']},
+    ]);
+  });
+
+  it('reads a pure addition mid-file from a hunk with no context', () => {
+    const file = diffFile(WITHOUT_SECOND, BEFORE, 'doc.md', ['-U0']);
+    expect(file.rawDiff).toContain('@@ -4,0 +5,2 @@');
+    expect(changeGroups(file)).toEqual([
+      {id: 'g0', kind: 'added', after: [5, 6], base: null, anchorLine: 5, removedLines: []},
+    ]);
+  });
+
   it('returns no groups for new and deleted files, which get a banner instead of bars', () => {
     expect(changeGroups(diffFile(null, '# New\n'))).toEqual([]);
     expect(changeGroups(diffFile('# Old\n', null))).toEqual([]);
@@ -92,7 +114,84 @@ describe('changeGroups', () => {
   });
 });
 
+describe('likeness', () => {
+  // The regular expressions the scanners stand in for.
+  const reference = (text: string) => {
+    const prose = text.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\]\([^)]*\)/g, ']').toLowerCase();
+    const words = prose.match(/[\p{L}\p{N}]+/gu) ?? [];
+    return {words, sources: [...text.matchAll(/!\[[^\]]*\]\(\s*<?([^)>\s]*)/g)].map((match) => match[1]!)};
+  };
+
+  it('reads images and link destinations as the regular expressions do', () => {
+    const cases = [
+      'Plain words, no images.',
+      '![logo](logo.png) and ![](  <spaced.png> "title") and [a link](https://x.y/z) end',
+      '![a](b) ![c] (d) ![e](f',
+      '![unclosed [nested](x) ![x](y)',
+      '![a\nb](c\nd) [l](m) ](n) ](',
+      '![](\t<x>)',
+      '![only](one.png)',
+      '![a](b) ![c](<d e>)',
+    ];
+    let seed = 3;
+    const pick = (from: string) => from[(seed = (seed * 1103515245 + 12345) % 2147483648) % from.length]!;
+    for (let at = 0; at < 500; at += 1) cases.push(Array.from({length: 30}, () => pick('![]()<> \tab')).join(''));
+    for (const text of cases) {
+      const found = likeness(text);
+      const expected = reference(text);
+      expect(found.words, JSON.stringify(text)).toEqual(expected.words);
+      if (found.kind === 'images') expect([...found.parts], JSON.stringify(text)).toEqual([...new Set(expected.sources)]);
+    }
+  });
+
+  it('reads a block of 160 KB of `![` and no `]` in time', () => {
+    const text = '!['.repeat(80 * 1024);
+    const started = performance.now();
+    likeness(text);
+    likeness(`${text}](x`);
+    expect(performance.now() - started).toBeLessThan(100);
+  });
+});
+
 describe('change marks on the page', () => {
+  it('marks a pure removal and a pure addition from hunks with no context as it does with context', async () => {
+    const before = '# Title\n\nFirst.\n\nSecond.\n\nThird.\n';
+    const after = '# Title\n\nFirst.\n\nThird.\n';
+    for (const args of [[], ['-U0']]) {
+      const removal = await marksFor(before, after, args);
+      expect(removal.marked, args.join(' ')).toEqual([]);
+      expect(removal.removed).toEqual(['− 1 paragraph removed · show']);
+      // The marker sits before the block that now follows the removed text.
+      expect(removal.html.indexOf('paragraph removed')).toBeLessThan(removal.html.indexOf('Third.'));
+      expect(removal.html.indexOf('paragraph removed')).toBeGreaterThan(removal.html.indexOf('First.'));
+      const addition = await marksFor(after, before, args);
+      expect(addition.marked, args.join(' ')).toEqual([{tag: 'p', mark: 'added', text: 'Second.'}]);
+      expect(addition.removed).toEqual([]);
+    }
+  });
+
+  it('gives the page alone the ids its views show: one footnote reference id, whatever cites it', async () => {
+    const {html} = await marksFor('Text[^1].\n\n[^1]: The note.\n', 'Text[^1], edited.\n\n[^1]: The note.\n');
+    expect(beforeViews(html)).toHaveLength(1);
+    expect(html.match(/id="user-content-fnref-1"/g)).toHaveLength(1);
+    // The view keeps its link to the footnote.
+    expect(html.match(/href="#user-content-fn-1"/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('keeps every id unique on each fixture page with every line of words edited', async () => {
+    const dir = new URL('./fixtures/rendered/', import.meta.url);
+    const names = fs.readdirSync(dir).filter((name) => name.endsWith('.md'));
+    expect(names.length).toBeGreaterThan(5);
+    for (const name of names) {
+      const before = fs.readFileSync(new URL(name, dir), 'utf8');
+      const after = before.split('\n').map((line) => (/^(?:[A-Za-z#]|- |\[\^)/.test(line) ? `${line} edited` : line)).join('\n');
+      const {html} = await marksFor(before, after);
+      const ids = [...html.matchAll(/\sid="([^"]*)"/g)].map((match) => match[1]!);
+      const repeated = ids.filter((id, at) => ids.indexOf(id) !== at);
+      expect(repeated, name).toEqual([]);
+    }
+  });
+
   it('counts lines as git does when a lone carriage return sits in the file', async () => {
     // The parser would end a line at the carriage return; git ends one only
     // at a newline, and the marks follow git's numbering.
@@ -343,12 +442,62 @@ describe('change marks on the page', () => {
     let seed = 7;
     const letter = () => String.fromCharCode(97 + ((seed = (seed * 1103515245 + 12345) % 2147483648) % 26));
     const words = Array.from({length: 3000}, () => Array.from({length: 6}, letter).join(''));
-    const before = `# T\n\n${'aa '.repeat(40_000)}bb\n`;
-    const after = `# T\n\n${words.join(' ')} ${'aa '.repeat(80_000)}cc\n`;
+    // The new one holds the old one's first and last words, so the search
+    // runs: `bb` turns up before the run, never after it.
+    const before = `# T\n\n${'aa '.repeat(50_000)}bb\n`;
+    const after = `# T\n\n${words.join(' ')} bb ${'aa '.repeat(100_000)}cc\n`;
+    // Only the pairing is timed: the diff git prints for the fixture is not.
+    const file = diffFile(before, after);
     const started = Date.now();
-    const {marked} = await marksFor(before, after);
+    const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(new DOMParserLite(fragment.html).marked()).toHaveLength(1);
+  });
+
+  it('resolves in a view a reference or a footnote whose label holds an entity or a backslash escape', async () => {
+    const defs = '[R&amp;D]: https://example.com/rd\n\n[a\\*b]: https://example.com/ab\n\n[^x&amp;y]: The note.\n';
+    const before = `# T\n\nSee [the lab][R&amp;D] and [the star][a\\*b] and a note[^x&amp;y], first.\n\n${defs}`;
+    const after = `# T\n\nSee [the lab][R&amp;D] and [the star][a\\*b] and a note[^x&amp;y], second.\n\n${defs}`;
+    const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(diffFile(before, after)), ...lookups});
+    const views = beforeBodies(fragment.html);
+    expect(views).toHaveLength(1);
+    expect(views[0]).toContain('<a href="https://example.com/rd" rel="nofollow noopener noreferrer">the lab</a>');
+    expect(views[0]).toContain('<a href="https://example.com/ab" rel="nofollow noopener noreferrer">the star</a>');
+    // The footnote reference, with the number the page gives it.
+    expect(views[0]).toMatch(/data-footnote-ref[^>]*>1<\/a>/);
+  });
+
+  it('renders 400 edited paragraphs that each cite one of 400 definitions in time, each view with its own link', async () => {
+    const count = 400;
+    const definitions = Array.from({length: count}, (_, index) => `[ref ${index}]: https://example.com/${index}`).join('\n');
+    const paragraphs = (word: string) => Array.from({length: count}, (_, index) => `Paragraph ${index} ${word} cites [the page][Ref  ${index}] and a note[^n${index % 3}].`).join('\n\n');
+    const notes = '[^n0]: Zero.\n\n[^n1]: One.\n\n[^n2]: Two.\n';
+    const before = `# T\n\n${paragraphs('first')}\n\n${definitions}\n\n${notes}`;
+    const after = `# T\n\n${paragraphs('second')}\n\n${definitions}\n\n${notes}`;
+    const file = diffFile(before, after);
+    const started = Date.now();
+    const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
     expect(Date.now() - started).toBeLessThan(3_000);
-    expect(marked).toHaveLength(1);
+    const views = beforeBodies(fragment.html);
+    expect(views).toHaveLength(count);
+    // Each view resolves its own reference, by its label in any case and spacing, and its footnote's number.
+    for (const index of [0, 1, 199, 399]) {
+      expect(views[index]).toContain(`<a href="https://example.com/${index}" rel="nofollow noopener noreferrer">the page</a>`);
+      expect(views[index]).toContain(`>${(index % 3) + 1}</a>`);
+    }
+  });
+
+  it('pairs 490 rewritten paragraphs of one region in time', async () => {
+    let seed = 11;
+    const word = () => Array.from({length: 5}, () => String.fromCharCode(97 + ((seed = (seed * 1103515245 + 12345) % 2147483648) % 26))).join('');
+    const paragraphs = () => Array.from({length: 490}, () => Array.from({length: 100}, word).join(' ')).join('\n\n');
+    const before = `# T\n\n${paragraphs()}\n`;
+    const after = `# T\n\n${paragraphs()}\n`;
+    const file = diffFile(before, after);
+    const started = Date.now();
+    const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(new DOMParserLite(fragment.html).marked()).toHaveLength(490);
   });
 
   it('pairs an edited table row with its old self by its first cell, and marks the new row after it as added', async () => {
