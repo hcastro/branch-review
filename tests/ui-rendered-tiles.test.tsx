@@ -81,8 +81,8 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PREVIEW: 'on'}
   layoutError?: string;
   // A file's own layout answer, when it isn't the one every file gets.
   layoutOf?: (path: string) => Promise<LayoutResult> | undefined;
-  // Why the rendered worker turned off, when it did.
-  disabled?: string | null;
+  // Why the rendered worker turned off, when it did, or a getter for when it turns off mid-test.
+  disabled?: string | null | (() => string | null);
   files?: FixtureFile[];
   env?: NodeJS.ProcessEnv;
   caps?: typeof CAPS | typeof BLOCKS_CAPS;
@@ -120,7 +120,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PREVIEW: 'on'}
       const height = Math.min(geometry.tileRows, request.rows - request.index * geometry.tileRows) * geometry.cellPx.h;
       return {ok: true, png: pngHeaderOnly(geometry.sheetCols * geometry.cellPx.w, height)};
     },
-    disabledReason: () => disabled,
+    disabledReason: () => (typeof disabled === 'function' ? disabled() : disabled),
   };
   const markdown = new Set(files.filter((file) => file.path.endsWith('.md')).map((file) => fileKey({path: file.path})));
   const fragment = (path: string): FragmentRequest => ({cwd: '/repo', key: `frag-${path.replace(/\W/g, '')}`, path, status: 'modified', source: {kind: 'blob', id: 'abcdef1'}, groups: [], links: {}, assets: {base: null, after: {tree: 'HEAD'}, epoch: 0}});
@@ -990,6 +990,65 @@ describe('when the page in the pane fails', () => {
     await until(() => topLine(cold.instance.lastFrame()) === was);
     expect(topLine(cold.instance.lastFrame())).toBe(was);
     cold.instance.unmount();
+  });
+
+  // Every frame from the last that showed the page on: the diff, at `line`.
+  const backAt = (frames: readonly string[], line: string) => {
+    let last = -1;
+    for (const [index, frame] of frames.entries()) if (text(frame).includes('Preview · [ ]')) last = index;
+    expect(last).toBeGreaterThanOrEqual(0);
+    expect(frames.length).toBeGreaterThan(last + 1);
+    for (const frame of frames.slice(last + 1)) {
+      expect(decodePlaceholders(frame)).toEqual([]);
+      expect(topLine(frame)).toBe(line);
+    }
+  };
+
+  it('goes back to the diff where it was when the first tile fails before the commit at the reader\'s line has run its effects', async () => {
+    // The tile job holds the event loop 20 ms as it is asked, as a loaded
+    // CI runner does. React's scheduler runs the next commit's effects in
+    // the same turn only within a 5 ms slice, so it yields, and the failure
+    // lands while the commit that put the page at the reader's line still
+    // has its effects to run.
+    const {instance} = setup({files: [LONG, CODE], layout: LONG_LAYOUT, tile: async () => {
+      const end = Date.now() + 20;
+      while (Date.now() < end) {
+        // Busy, as a loaded machine is.
+      }
+      return {ok: false, state: 'error', reason: 'timed out'};
+    }});
+    await settle();
+    await press(instance, 'j'.repeat(20));
+    const before = topLine(instance.lastFrame());
+    expect(before).toContain('│Line 16');
+    const from = instance.frames.length;
+    await press(instance, 'v');
+    expect(text(instance.lastFrame())).toContain('✗ Preview isn\'t available: timed out · r opens it in the browser');
+    backAt(instance.frames.slice(from), before);
+    instance.unmount();
+  });
+
+  it('goes back to the diff where it was when the worker turns off between the page\'s first frame and its effects', async () => {
+    // The worker gives up as the frame that first draws the page is
+    // written: the effects of that commit find it gone, in the same pass
+    // that puts the page at the reader's line.
+    let gone: string | null = null;
+    const {instance} = setup({files: [LONG, CODE], layout: LONG_LAYOUT, disabled: () => gone, tile: () => new Promise(() => undefined)});
+    await settle();
+    await press(instance, 'j'.repeat(20));
+    const before = topLine(instance.lastFrame());
+    expect(before).toContain('│Line 16');
+    const write = instance.stdout.write;
+    instance.stdout.write = (frame: string) => {
+      if (!gone && frame.includes('░')) gone = 'the worker exited 3 times in a minute';
+      return write(frame);
+    };
+    const from = instance.frames.length;
+    await press(instance, 'v');
+    expect(gone).not.toBeNull();
+    expect(text(instance.lastFrame())).toContain('✗ the worker exited 3 times in a minute');
+    backAt(instance.frames.slice(from), before);
+    instance.unmount();
   });
 
   it('goes back to the diff when the tiles on screen still haven\'t come after 5 s', async () => {

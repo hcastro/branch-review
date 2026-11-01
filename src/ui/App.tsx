@@ -2697,6 +2697,9 @@ function AppContent({
   const pendingPaneAnchor = useRef<{fileKey: string; line: number | null; fraction: number; within?: number; keep?: true} | null>(null);
   // What the pane showed at the last commit, for keeping the reader's place when a resize lays the page out anew.
   const paneViewRef = useRef<{width: number; rows: readonly DiffRow[]; offset: number; viewRows: number; fileKey: string; inPane: boolean} | null>(null);
+  // Where the place-keeping effect below just put the page, which the
+  // snapshot of the view after it records before a commit draws it.
+  const paneLandingRef = useRef<{fileKey: string; offset: number} | null>(null);
   const pendingDiffAnchor = useRef<{fileKey: string; line: number | null} | null>(null);
   // The diff comes back in the frame that drops the page's rows, already at
   // the reader's line: set while rendering, React renders again before it
@@ -2962,7 +2965,9 @@ function AppContent({
       }
       pendingPaneAnchor.current = null;
       const pageRow = toPage.line === null ? 0 : pane.rowForLine(toPage.fileKey, toPage.line, toPage.within) ?? 0;
-      setDiffOffset(clamp(start + 1 + pageRow - Math.round(toPage.fraction * visibleDiffRows), start, scrollCeiling));
+      const offset = clamp(start + 1 + pageRow - Math.round(toPage.fraction * visibleDiffRows), start, scrollCeiling);
+      paneLandingRef.current = {fileKey: toPage.fileKey, offset};
+      setDiffOffset(offset);
       return;
     }
     const toDiff = pendingDiffAnchor.current;
@@ -2973,8 +2978,19 @@ function AppContent({
     }
   }, [allDiffRows, pane, paneClock, paneOn, panePlanVersion, scrollCeiling, visibleDiffRows]);
 
+  // The reader's place, from what this commit drew. The rows say whether it
+  // showed the page, not the pane: on a busy machine these effects can run
+  // after a failure landed, while this commit still showed the page. A page
+  // the effect above just put at the reader's line is there, though the
+  // commit that draws it is still to come: a failure before it comes back
+  // from that line.
   useEffect(() => {
-    paneViewRef.current = {width: wrapWidth, rows: allDiffRows, offset: diffOffset, viewRows: visibleDiffRows, fileKey: activeFileKey, inPane: Boolean(activeFileKey && pane?.shows(activeFileKey))};
+    const landing = paneLandingRef.current;
+    paneLandingRef.current = null;
+    const fileKey = landing?.fileKey ?? activeFileKey;
+    const section = fileKey ? sections.find((each) => each.key === fileKey) : undefined;
+    const inPane = section !== undefined && allDiffRows[section.startLine]?.pane?.fileKey === fileKey;
+    paneViewRef.current = {width: wrapWidth, rows: allDiffRows, offset: landing?.offset ?? diffOffset, viewRows: visibleDiffRows, fileKey, inPane};
   });
 
   useEffect(() => {
