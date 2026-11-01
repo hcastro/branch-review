@@ -48,7 +48,7 @@
     "build": "tsup",
     "dev": "tsx src/cli.tsx",
     "pretest": "node scripts/inline-assets.mjs --check",
-    "test": "vitest run",
+    "test": "vitest run --testTimeout 30000",
     "typecheck": "tsc --noEmit",
     "prepare": "node scripts/inline-assets.mjs && tsup"
   },

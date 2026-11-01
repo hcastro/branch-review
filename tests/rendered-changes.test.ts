@@ -496,7 +496,10 @@ describe('change marks on the page', () => {
     const file = diffFile(before, after);
     const started = Date.now();
     const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
-    expect(Date.now() - started).toBeLessThan(3_000);
+    // Quadratic pairing took 10.9 s here; the linear one takes about 1.5 s on
+    // a laptop and 3 s on a CI runner, so 6 s catches the regression without
+    // tripping on a slow machine.
+    expect(Date.now() - started).toBeLessThan(6_000);
     expect(new DOMParserLite(fragment.html).marked()).toHaveLength(490);
   });
 

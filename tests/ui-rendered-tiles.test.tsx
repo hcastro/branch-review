@@ -165,6 +165,14 @@ const settle = (times = 8) => flush(times);
 const raw = (frame: string | undefined) => (frame ?? '').split('\n');
 const text = (frame: string | undefined) => frameLines(frame).map((line) => stripAnsi(line)).join('\n');
 // Each key on its own, as a person types them: Ink reads one write as one input.
+// The diff comes back first and the scroll to the reader's line lands one
+// update later, so a loaded CI runner can show the frame in between. Waits
+// for the frame the check is about, then the check runs as before.
+async function until(check: () => boolean, ms = 5_000) {
+  const deadline = Date.now() + ms;
+  while (!check() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+}
+
 async function press(instance: ReturnType<typeof setup>['instance'], keys: string, times = 8) {
   for (const key of keys.startsWith('\u001B') ? [keys] : [...keys]) {
     instance.stdin.write(key);
@@ -964,6 +972,7 @@ describe('when the page in the pane fails', () => {
     const shown = text(instance.lastFrame());
     expect(shown).toContain('✗ Preview isn\'t available: timed out · r opens it in the browser');
     expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    await until(() => topLine(instance.lastFrame()) === before);
     expect(topLine(instance.lastFrame())).toBe(before);
     instance.unmount();
 
@@ -978,6 +987,7 @@ describe('when the page in the pane fails', () => {
     await settle();
     expect(text(cold.instance.lastFrame())).toContain('✗ Preview isn\'t available: the browser exited (code 3) · r opens it in the browser');
     expect(text(cold.instance.lastFrame())).not.toContain('laying out the page');
+    await until(() => topLine(cold.instance.lastFrame()) === was);
     expect(topLine(cold.instance.lastFrame())).toBe(was);
     cold.instance.unmount();
   });
