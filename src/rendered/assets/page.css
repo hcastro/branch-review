@@ -683,7 +683,28 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 .markdown-body [data-mark="modified"]::before { background: var(--br-modified); }
 /* A quote's or alert's left border moves its padding box in by 0.25em. */
 .markdown-body :is(blockquote, .markdown-alert)[data-mark]::before { left: calc(var(--br-bar-x) - 0.25em); }
-.markdown-body li[data-mark]::before { left: calc(-2em + var(--br-bar-x)); }
+/* An item's bar, tint and removed marker reach back past its list's indent
+   to the margin, which each list nested in an item indents 2em more, and
+   the footnotes' list 16 px. */
+.markdown-body li { --br-indent: 2em; }
+.markdown-body li li { --br-indent: 4em; }
+.markdown-body li li li { --br-indent: 6em; }
+.markdown-body li li li li { --br-indent: 8em; }
+.markdown-body .footnotes li { --br-indent: var(--base-size-16); }
+.markdown-body li[data-mark]::before { left: calc(var(--br-bar-x) - var(--br-indent)); }
+/* A list nested in a changed item covers the item's bar, tint and glow with
+   the page's background, from the margin's column across, so they mark the
+   item's own text and never the items under it, which carry their own
+   marks. The list is a stacking context, so its cover sits under its own
+   text and its items' bars and over everything the item drew. */
+.markdown-body li[data-mark] > :is(ul, ol) { position: relative; z-index: 0; }
+.markdown-body li[data-mark] > :is(ul, ol)::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 0 calc(var(--br-bar-x) - var(--br-indent));
+  z-index: -1;
+  background: var(--br-bg);
+}
 /* A rule is a quarter em high and clips what it holds, and GitHub makes its
    ::before a table, which no top and bottom stretch: its bar is a block that
    stands out above and below it. */
@@ -745,7 +766,7 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
   transform-origin: 0 50%;
   pointer-events: none;
 }
-.markdown-body li > .br-tint { left: calc(-2em + var(--br-bar-x)); }
+.markdown-body li > .br-tint { left: calc(var(--br-bar-x) - var(--br-indent)); }
 .markdown-body :is(blockquote, .markdown-alert) > .br-tint { left: calc(var(--br-bar-x) - 0.25em); }
 .markdown-body .br-tint-added { background: var(--br-tint-added); }
 .markdown-body .br-tint-modified { background: var(--br-tint-modified); }
@@ -821,7 +842,7 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 /* Not a list item to the browser, so an ordered list's numbers skip it. */
 .markdown-body li.br-removed-item { display: block; list-style: none; }
 .markdown-body li.br-removed-item details.br-removed { margin: 4px 0; }
-.markdown-body li.br-removed-item details.br-removed::before { left: calc(-2em + var(--br-bar-x)); }
+.markdown-body li.br-removed-item details.br-removed::before { left: calc(var(--br-bar-x) - var(--br-indent)); }
 .markdown-body tr.br-removed-row > td { background: var(--br-removed-soft); }
 .markdown-body tr.br-removed-row details.br-removed { margin: 0; }
 /* The row's tint is the summary's background; a second one under the text

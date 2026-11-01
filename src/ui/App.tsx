@@ -44,6 +44,10 @@ import {anchorLine} from '../rendered/anchor.js';
 import {beamFrame, pressFrame} from '../rendered/beam.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 import {createCrossingClock, type CrossingClock} from './crossing.js';
+import {createPaneClock, type PaneClock} from './paneCrossing.js';
+import {addRenderedRows, renderPaneRow} from './renderedRows.js';
+import {crossingLine, crossingPlays, glowTone, type Rgb} from '../rendered/transition.js';
+import type {LinkTarget, RenderedPane} from '../rendered/pane.js';
 
 /**
  * Adds media rows to the wrapped sections, before blocks are folded, and may
@@ -121,6 +125,14 @@ type FileAction = {readonly id: string; readonly label: string};
 // to drop when the header narrows.
 const RENDERED_ACTION: FileAction = {id: 'rendered.open', label: `Rendered ${LEAVES_PANE}`};
 export const RENDERED_KEY_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'j/k scroll', '[/] block', 't tree'];
+// While the pane shows a markdown file's page (`v`), its first button goes
+// back to the diff.
+const DIFF_ACTION: FileAction = {id: 'rendered.diff', label: 'Diff'};
+export const PANE_OFFER_HINT_ITEMS = ['q quit', '↑/↓ jump file', `r rendered ${LEAVES_PANE}`, 'R all', 'v here', 'j/k scroll', '[/] block', 't tree'];
+export const PANE_KEY_HINT_ITEMS = ['q quit', 'v diff', '[/] change', 'j/k scroll', 'c copy block', `r open ${LEAVES_PANE}`, 't tree'];
+const PANE_REST = '◆ rendered · local';
+const PANE_DEVELOPING = 'developing';
+const PANE_METRICS = 'rendered here · [ ] between changes · c copies a block';
 const FILE_ACTIONS: readonly FileAction[] = [
   {id: 'copy.path', label: 'Copy path'},
   {id: 'copy.fileDiff', label: 'Copy diff'},
@@ -634,6 +646,7 @@ function copyActionHint(actionId: string) {
   if (actionId === 'media.open') return 'opens the image in the default viewer';
   if (actionId === 'media.play') return 'plays the video in the default player';
   if (actionId === 'media.quickLook') return 'shows the video in Quick Look';
+  if (actionId === 'rendered.diff') return 'back to the diff · v';
   return null;
 }
 
@@ -1816,6 +1829,40 @@ function topSourceLine(rows: readonly DiffRow[], offset: number, viewRows: numbe
   return {};
 }
 
+// The first diff row of `fileKey` that shows source line `line` or a later
+// one, counting each hunk's body lines as topSourceLine does; the file's
+// first row when none does. For going back from the page to the diff.
+function diffRowForSourceLine(rows: readonly DiffRow[], fileKey: string, line: number | null): number | null {
+  const ordinals = new Map<number, number>();
+  let first: number | null = null;
+  for (const [index, row] of rows.entries()) {
+    if (!row.target || reviewFileKey(row.target.file) !== fileKey) continue;
+    first ??= row.headerLine ?? index;
+    if (line === null || row.source === undefined || row.headerLine === null) continue;
+    const ordinal = ordinals.get(row.headerLine) ?? 0;
+    ordinals.set(row.headerLine, ordinal + 1);
+    const at = anchorLine(row.target.file, row.target.block, ordinal);
+    if (at !== null && at >= line) return row.headerLine === index - ordinal - 1 && ordinal === 0 ? row.headerLine : index;
+  }
+  return first;
+}
+
+// The page row at the top of the pane for `fileKey`, when the pane shows
+// that file's page there.
+function topPageRow(rows: readonly DiffRow[], offset: number, viewRows: number, fileKey: string): number | null {
+  for (let index = offset; index < Math.min(rows.length, offset + viewRows); index += 1) {
+    const info = rows[index]?.pane;
+    if (info?.fileKey === fileKey && info.pageRow !== undefined) return info.pageRow;
+  }
+  return null;
+}
+
+// The `#rrggbb` the terminal answered, as numbers, for the crossing's mosaic.
+function hexRgb(hex: string | undefined): Rgb {
+  const value = /^#([0-9a-f]{6})$/i.exec(hex ?? '')?.[1] ?? '111318';
+  return [parseInt(value.slice(0, 2), 16), parseInt(value.slice(2, 4), 16), parseInt(value.slice(4, 6), 16)];
+}
+
 type TerminalSize = {columns: number; rows: number};
 
 function readTerminalSize(stdout: NodeJS.WriteStream | undefined): TerminalSize {
@@ -1960,6 +2007,11 @@ type DiffPaneBodyProps = {
   // columns on the file row, when it is drawn.
   crossing: CrossingClock;
   renderedSpan: {start: number; end: number} | null;
+  // The page in the pane, and its crossing's clock, while it is offered.
+  pane?: RenderedPane;
+  paneClock: PaneClock;
+  // The terminal's background and color depth, for the crossing's mosaic.
+  paneColors: {bg: Rgb; depth: 2 | 3};
 };
 
 const LOADING_LABEL = 'loading preview…';
@@ -2134,6 +2186,9 @@ function DiffPaneBody({
   media,
   crossing,
   renderedSpan,
+  pane,
+  paneClock,
+  paneColors,
 }: DiffPaneBodyProps) {
   const inner = Math.max(1, paneWidth - 4);
   // Only this pane reads the crossing's clock, so its 40 ms ticks redraw
@@ -2142,6 +2197,28 @@ function DiffPaneBody({
   const beamAccent = palette.beam();
   const beam = (line: string, row: number) => (crossingFrame?.motion === 'full' ? beamFrame(line, row, crossingFrame.t, inner, beamAccent) ?? line : line);
   const pressedRow = crossingFrame ? pressFrame(fileRow, renderedSpan, crossingFrame.t, crossingFrame.motion, beamAccent) : null;
+  // The in-pane crossing's frame, while `v` plays one.
+  const paneFrame = useSyncExternalStore(paneClock.subscribe, paneClock.snapshot);
+  const glow = paneFrame ? glowTone(paneFrame.t) : null;
+  // A row as the page draws it, and the mean colors of its tile row per
+  // cell, for the crossing's mosaic.
+  const drawPaneRow = (row: DiffRow) => {
+    const info = row.pane!;
+    const state = info.box && pane ? pane.boxState(info.box) : null;
+    return renderPaneRow(info, state, inner, glow);
+  };
+  const mosaicOf = (row: DiffRow | undefined): Array<Rgb | null> | null => {
+    const info = row?.pane;
+    const colors = info?.box && pane ? pane.mosaic(info.box) : null;
+    if (!info?.box || !colors) return null;
+    const cells: Array<Rgb | null> = Array(inner).fill(null);
+    const at = (info.boxRow ?? 0) * info.box.cols;
+    for (let col = 0; col < info.box.cols && info.box.leftPad + col < inner; col += 1) {
+      const offset = (at + col) * 3;
+      if (offset + 2 < colors.length) cells[info.box.leftPad + col] = [colors[offset]!, colors[offset + 1]!, colors[offset + 2]!];
+    }
+    return cells;
+  };
   const rows: string[] = [
     frameTopBorder(paneWidth, borderAnsi),
     frameLine(pressedRow ?? applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
@@ -2163,6 +2240,19 @@ function DiffPaneBody({
     // With the focused block's header scrolled off the top, the top row's
     // pane border turns heavy, so the block that block keys act on stays marked.
     const marksFocus = index === 0 && focusedBlockLineIndex !== null && focusedBlockLineIndex < diffOffset;
+    if (paneFrame) {
+      // The in-pane crossing: the diff's rows dissolve as the page arrives
+      // in their place.
+      const drawn = row?.pane ? drawPaneRow(row) : visibleLine;
+      const departing = paneFrame.departing[index] ?? '';
+      const line = crossingLine(paneFrame.t, index, departing, {drawn, mosaic: mosaicOf(row)}, {width: inner, rows: visibleDiffLines.length, link: paneFrame.link, accent: beamAccent ?? '', bg: paneColors.bg, depth: paneColors.depth});
+      rows.push(frameLine(line, inner, borderAnsi));
+      continue;
+    }
+    if (row?.pane) {
+      rows.push(frameLine(row.pane.box ? drawPaneRow(row) : visibleLine, inner, borderAnsi));
+      continue;
+    }
     if (row?.kind === 'media') {
       // Media rows hold no code: no selection highlight and no arrival wash,
       // which would put color codes between placeholder cells.
@@ -2271,6 +2361,12 @@ function AppContent({
   const mediaPlanVersion = mediaOn ? media!.planVersion() : 0;
   // Boxes are sized to the viewport once it holds still, like the wrap width.
   const mediaViewportRows = useSettledValue(mediaOn ? visibleDiffRows : 0, WRAP_SETTLE_MS);
+  // The page in the pane (`v`), when it is offered here: a Kitty terminal
+  // with BRANCH_REVIEW_PANE=on. Without it nothing below changes a row.
+  const pane = rendered?.pane?.offered() ? rendered.pane : undefined;
+  const paneVersion = useSyncExternalStore(pane ? pane.subscribe : noUpdates, pane ? pane.getVersion : noVersion);
+  const panePlanVersion = pane ? pane.planVersion() : 0;
+  const paneOn = pane?.mode() === 'rendered';
   const mediaSections = useMemo(
     () => {
       if (addMediaRows) return addMediaRows(wrappedSections, {innerWidth: wrapWidth, viewportRows: visibleDiffRows});
@@ -2320,9 +2416,14 @@ function AppContent({
     const ids: ReadonlySet<string> = folded.length > 0 ? new Set([...userCollapsedBlockIds, ...folded]) : userCollapsedBlockIds;
     return {collapsedBlockIds: ids, foldedLineCounts: counts.size > 0 ? counts : undefined};
   }, [svgFolds, svgSources, userCollapsedBlockIds]);
+  // The pane's plan version stands for the layouts the page rows are built from.
+  const paneSections = useMemo(
+    () => (paneOn ? addRenderedRows(mediaSections, pane, {innerWidth: wrapWidth, viewportRows: visibleDiffRows}) : mediaSections),
+    [mediaSections, pane, paneOn, panePlanVersion, visibleDiffRows, wrapWidth],
+  );
   const sections = useMemo(
-    () => applyCollapsedBlocks(mediaSections, collapsedBlockIds),
-    [collapsedBlockIds, mediaSections],
+    () => applyCollapsedBlocks(paneSections, collapsedBlockIds),
+    [collapsedBlockIds, paneSections],
   );
 
   const files = useMemo(() => sections.map((section) => ({path: section.path, key: section.key})), [sections]);
@@ -2334,6 +2435,7 @@ function AppContent({
   const allDiffRows = useMemo(() => buildDiffRows(sections), [sections]);
   // The rows that draw part of a picture, so scrolling never walks every row.
   const boxRowIndexes = useMemo(() => allDiffRows.flatMap((row, index) => (row.media?.boxes ? [index] : [])), [allDiffRows]);
+  const paneBoxRowIndexes = useMemo(() => allDiffRows.flatMap((row, index) => (row.pane?.box ? [index] : [])), [allDiffRows]);
   // Counts rebuilds of the rendered sections, so a render failure in the diff
   // pane is retried after every refresh.
   const sectionsRevisionRef = useRef(0);
@@ -2435,6 +2537,31 @@ function AppContent({
   const activeRenderable = Boolean(pages && activeFileKey && pages.renderable(activeFileKey));
   const [crossing] = useState(createCrossingClock);
   useEffect(() => () => crossing.dispose(), [crossing]);
+  // The in-pane crossing's clock. The footer reads only whether it is
+  // developing, so its ticks redraw the diff pane alone.
+  const [paneClock] = useState(createPaneClock);
+  useEffect(() => () => paneClock.stop(), [paneClock]);
+  const paneDeveloping = useSyncExternalStore(paneClock.subscribe, () => paneClock.snapshot()?.developing ?? false);
+  // How much `v` moves: asked once, ahead of the first press, the way the
+  // trip to a split asks; full until the answer is in.
+  const [paneMotion, setPaneMotion] = useState<'full' | 'reduced' | 'off'>(animations ? 'full' : 'off');
+  useEffect(() => {
+    if (!pane || !animations || !rendered?.crossingMotion) return;
+    let live = true;
+    void rendered.crossingMotion().then((motion) => {
+      if (live) setPaneMotion(motion);
+    });
+    return () => {
+      live = false;
+    };
+  }, [animations, pane, rendered]);
+  const paneVisibleRef = useRef<ReadonlySet<string>>(new Set());
+  // The files with a page row on screen, which the crossing waits for too.
+  const paneFilesRef = useRef<ReadonlySet<string>>(new Set());
+  // Where the pane is to open, or the diff to come back to, once the rows
+  // for it are built: the source line the other view had at the top.
+  const pendingPaneAnchor = useRef<{fileKey: string; line: number | null; fraction: number} | null>(null);
+  const pendingDiffAnchor = useRef<{fileKey: string; line: number | null} | null>(null);
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
     [allDiffRows],
@@ -2466,15 +2593,21 @@ function AppContent({
     : activeMediaRef?.kind === 'video'
       ? media!.platform === 'darwin' ? VIDEO_FILE_ACTIONS : VIDEO_FILE_ACTIONS_ELSEWHERE
       : FILE_ACTIONS;
+  // The pane shows the active file's page: its first button goes back.
+  const activeInPane = Boolean(paneOn && activeFileKey && pane!.covers(activeFileKey));
+  const paneOfferedHere = Boolean(pane && !paneOn && activeFileKey && pane.covers(activeFileKey));
+  const headerActions = activeInPane
+    ? [DIFF_ACTION, ...(activeRenderable ? [RENDERED_ACTION] : []), ...FILE_ACTIONS]
+    : activeRenderable ? [RENDERED_ACTION, ...fileActionsHere] : fileActionsHere;
   const diffHeader = buildDiffHeader({
     path: activeFilePath,
     status: activeFile?.status,
     showActions: Boolean(review) && sections.length > 0,
-    actions: activeRenderable ? [RENDERED_ACTION, ...fileActionsHere] : fileActionsHere,
+    actions: headerActions,
     hoveredAction: fileHover,
     copiedAction: fileCopied,
     metricsCore: activeSection
-      ? `${activeMediaMetrics ?? formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${ANSI_RESET}`
+      ? `${activeMediaMetrics ?? formatMetrics(activeSection.metrics)}  ${ANSI_GRAY}file ${activeSectionIndex + 1}/${sections.length}${activeInPane ? ` · ${PANE_METRICS}` : ''}${ANSI_RESET}`
       : `${ANSI_GRAY}No changes to review${ANSI_RESET}`,
     width: diffContentWidth,
   });
@@ -2579,6 +2712,7 @@ function AppContent({
 
   const visibleRows = rows.slice(treeOffset, treeOffset + visibleTreeRows);
   const visibleDiffLines = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows);
+  const paneColors = useMemo(() => ({bg: hexRgb(graphics?.bg), depth: (graphics?.colorDepth ?? 3) as 2 | 3}), [graphics?.bg, graphics?.colorDepth]);
 
   useEffect(() => {
     const snapshot = viewSnapshotRef.current;
@@ -2620,6 +2754,35 @@ function AppContent({
     setDiffOffset((current) => clamp(current, 0, scrollCeiling));
   }, [scrollCeiling]);
 
+  // Place-keeping across `v`, after the remap above: the page opens with the
+  // block the diff showed at the top at the same height, once its page rows
+  // are among the rows built (until then, at its label); the diff comes back
+  // at the line the page showed at the top. The rows decide, not the pane:
+  // a layout can land between a render and this effect, before any row
+  // holds it.
+  useEffect(() => {
+    const toPage = pendingPaneAnchor.current;
+    if (toPage && paneOn && pane) {
+      const start = allDiffRows.findIndex((row) => row.pane?.fileKey === toPage.fileKey);
+      if (start < 0) return;
+      const drawn = allDiffRows.some((row) => row.pane?.fileKey === toPage.fileKey && row.pane.pageRow !== undefined);
+      if (!drawn && !pane.layoutFailed(toPage.fileKey)) {
+        setDiffOffset(Math.min(start, scrollCeiling));
+        return;
+      }
+      pendingPaneAnchor.current = null;
+      const pageRow = toPage.line === null ? 0 : pane.rowForLine(toPage.fileKey, toPage.line) ?? 0;
+      setDiffOffset(clamp(start + 1 + pageRow - Math.round(toPage.fraction * visibleDiffRows), start, scrollCeiling));
+      return;
+    }
+    const toDiff = pendingDiffAnchor.current;
+    if (toDiff && !paneOn) {
+      pendingDiffAnchor.current = null;
+      const row = diffRowForSourceLine(allDiffRows, toDiff.fileKey, toDiff.line);
+      if (row !== null) setDiffOffset(clamp(row, 0, scrollCeiling));
+    }
+  }, [allDiffRows, pane, paneOn, panePlanVersion, scrollCeiling, visibleDiffRows]);
+
   useEffect(() => {
     setTreeOffset((current) => {
       const clamped = clamp(current, 0, maxTreeOffset);
@@ -2630,6 +2793,8 @@ function AppContent({
   // Every scroll except [ and ] hands focus back to the block at the top.
   const scrollDiffTo = useCallback((offset: number | ((current: number) => number)) => {
     setBlockFocus(null);
+    pendingPaneAnchor.current = null;
+    pendingDiffAnchor.current = null;
     setDiffOffset(offset);
   }, []);
 
@@ -2786,6 +2951,45 @@ function AppContent({
     media.sweep(live, visible);
   }, [allDiffRows, boxRowIndexes, diffOffset, media, mediaOn, mediaVersion, visibleDiffRows]);
 
+  // The same for the page in the pane, from its own pool of ids: rows name
+  // a tile's id only once the tile was sent, so this runs before any frame
+  // can draw one. Leaving the page frees every tile.
+  useEffect(() => {
+    if (!pane) return;
+    const visibleEnd = diffOffset + visibleDiffRows;
+    const nearStart = diffOffset - visibleDiffRows;
+    const nearEnd = diffOffset + 2 * visibleDiffRows;
+    const wanted: Array<{fileKey: string; box: NonNullable<NonNullable<DiffRow['pane']>['box']>}> = [];
+    const seen = new Set<string>();
+    const live = new Set<string>();
+    const visible = new Set<string>();
+    for (const index of paneBoxRowIndexes) {
+      const info = allDiffRows[index]!.pane!;
+      const key = info.box!.imageKey;
+      live.add(key);
+      if (index >= diffOffset && index < visibleEnd) visible.add(key);
+      if (index >= nearStart && index < nearEnd && !seen.has(key)) {
+        seen.add(key);
+        wanted.push({fileKey: info.fileKey, box: info.box!});
+      }
+    }
+    const files = new Set<string>();
+    for (let index = diffOffset; index < Math.min(visibleEnd, allDiffRows.length); index += 1) {
+      const info = allDiffRows[index]!.pane;
+      if (info) files.add(info.fileKey);
+    }
+    paneVisibleRef.current = visible;
+    paneFilesRef.current = files;
+    pane.want(wanted, visible);
+    pane.sweep(live, visible);
+  }, [allDiffRows, diffOffset, pane, paneBoxRowIndexes, paneVersion, visibleDiffRows]);
+
+  // The pane's notices, such as Chromium giving up, in the footer.
+  useEffect(() => {
+    const notices = pane?.takeNotices() ?? [];
+    if (notices.length > 0) showToast(notices.at(-1)!, undefined, 'info');
+  }, [pane, paneVersion, showToast]);
+
   // Failures that end every preview are said once, in the footer.
   useEffect(() => {
     const notices = media?.takeNotices() ?? [];
@@ -2809,13 +3013,109 @@ function AppContent({
       cross: (motion) => crossing.start(motion),
       waiting: (message) => showToast(message, undefined, 'info'),
     };
+    // On the page in the pane, the line the page shows at the top.
+    const pageRow = pane?.mode() === 'rendered' ? topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey) : null;
+    const pageLine = pageRow === null ? null : pane!.lineAtRow(activeFileKey, pageRow);
     const opening = target === 'overview'
       ? pages.openOverview(trip)
-      : pages.open({fileKey: activeFileKey, ...topSourceLine(allDiffRows, diffOffset, visibleDiffRows, activeFileKey)}, trip);
+      : pages.open({fileKey: activeFileKey, ...(pageLine === null ? topSourceLine(allDiffRows, diffOffset, visibleDiffRows, activeFileKey) : {line: pageLine})}, trip);
     void opening.then((outcome) => {
       if (outcome) showToast(outcome.message, undefined, outcome.kind);
     });
-  }, [activeFileKey, allDiffRows, crossing, diffOffset, pages, showToast, visibleDiffRows]);
+  }, [activeFileKey, allDiffRows, crossing, diffOffset, pages, pane, showToast, visibleDiffRows]);
+
+  // `v` on a markdown file: the page in the pane, with its crossing, or
+  // back to the diff in one frame. What the pane can't do is said in the
+  // footer, and the diff stays.
+  const togglePane = useCallback(() => {
+    if (!pane) return;
+    if (pane.mode() === 'rendered') {
+      const pageRow = topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey);
+      paneClock.stop();
+      pendingPaneAnchor.current = null;
+      pendingDiffAnchor.current = {fileKey: activeFileKey, line: pageRow === null ? null : pane.lineAtRow(activeFileKey, pageRow)};
+      pane.leave();
+      return;
+    }
+    const entered = pane.enter();
+    if (!entered.ok) {
+      showToast(entered.message, undefined, 'info');
+      return;
+    }
+    const top = topSourceLine(allDiffRows, diffOffset, visibleDiffRows, activeFileKey);
+    pendingPaneAnchor.current = {fileKey: activeFileKey, line: top.line ?? null, fraction: top.fraction ?? 0};
+    pendingDiffAnchor.current = null;
+    if (!crossingPlays(paneMotion, palette.enabled)) return;
+    // What each screen row showed, to dissolve: text rows only, never a
+    // picture's placeholder cells.
+    const departing = allDiffLines.slice(diffOffset, diffOffset + visibleDiffRows).map((line, index) => (allDiffRows[diffOffset + index]?.kind === 'media' ? '' : line));
+    void paneClock.start({link: pane.slow ? 'slow' : 'local', departing, ready: () => pane.ready(paneVisibleRef.current, paneFilesRef.current)});
+  }, [activeFileKey, allDiffLines, allDiffRows, diffOffset, pane, paneClock, paneMotion, showToast, visibleDiffRows]);
+
+  // `[` and `]` on the page: the next or previous row where a change starts.
+  const hopPageChange = useCallback((direction: 1 | -1) => {
+    if (!pane) return;
+    const starts = new Set(pane.changeStarts(activeFileKey));
+    const rows = paneBoxRowIndexes.filter((index) => {
+      const info = allDiffRows[index]!.pane!;
+      return info.fileKey === activeFileKey && starts.has(info.pageRow!);
+    });
+    const target = direction > 0 ? rows.find((index) => index > diffOffset) : [...rows].reverse().find((index) => index < diffOffset);
+    if (target === undefined) {
+      showToast(direction > 0 ? 'no more changes below' : 'no more changes above', undefined, 'info');
+      return;
+    }
+    scrollDiffTo(clamp(target, 0, scrollCeiling));
+  }, [activeFileKey, allDiffRows, diffOffset, pane, paneBoxRowIndexes, scrollCeiling, scrollDiffTo, showToast]);
+
+  // `c` on the page: the markdown source of the block at the top, as the
+  // page shows it, never read again from a file that may have changed.
+  const copyPageBlock = useCallback(async () => {
+    if (!pane || !activeFile) return;
+    const pageRow = topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey);
+    const block = pageRow === null ? null : pane.blockSource(activeFileKey, pageRow);
+    if (!block) {
+      showToast('no block to copy here', undefined, 'info');
+      return;
+    }
+    if (block === 'unread') {
+      showToast('Copy action unavailable.', "the page's source can't be read", 'error');
+      return;
+    }
+    try {
+      const result = await (copyWriter ?? writeClipboard)(block.text);
+      if (result.ok) {
+        const {lines} = block;
+        showToast('Copied block', `${lines} ${lines === 1 ? 'line' : 'lines'}`);
+      } else {
+        showToast(result.message, result.hint, 'error');
+      }
+    } catch (error) {
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
+    }
+  }, [activeFile, activeFileKey, allDiffRows, copyWriter, diffOffset, pane, showToast, visibleDiffRows]);
+
+  // A click on a link on the page: a heading on it scrolls there, another
+  // page of the review opens in the pane, and a web address is copied,
+  // never opened, since it is the repo's.
+  const followPageLink = useCallback(async (target: LinkTarget, fileKey: string) => {
+    if (target.kind === 'file') {
+      jumpToFile(target.fileKey);
+      return;
+    }
+    if (target.kind === 'anchor') {
+      const start = allDiffRows.findIndex((row) => row.pane?.fileKey === fileKey);
+      if (start >= 0) scrollDiffTo(clamp(start + 1 + target.row, 0, scrollCeiling));
+      return;
+    }
+    try {
+      const result = await (copyWriter ?? writeClipboard)(target.url);
+      if (result.ok) showToast('Copied link', truncateEnd(toDisplayText(target.url), 60));
+      else showToast(result.message, result.hint, 'error');
+    } catch (error) {
+      showToast('Clipboard write failed.', error instanceof Error ? error.message : undefined, 'error');
+    }
+  }, [allDiffRows, copyWriter, jumpToFile, scrollCeiling, scrollDiffTo, showToast]);
 
   const openMediaFile = useCallback(async (ref: MediaRef, how: 'open' | 'quickLook') => {
     if (!media) return;
@@ -3491,6 +3791,8 @@ function AppContent({
         const actionId = spanAt(relativeY === 1 ? header.fileSpans : header.metricsSpans, relativeX - 2);
         if (actionId === RENDERED_ACTION.id) {
           openRendered('file');
+        } else if (actionId === DIFF_ACTION.id) {
+          togglePane();
         } else if (actionId === 'media.open' || actionId === 'media.play' || actionId === 'media.quickLook') {
           if (activeMediaRef) void openMediaFile(activeMediaRef, actionId === 'media.quickLook' ? 'quickLook' : 'open');
         } else if (actionId) {
@@ -3501,6 +3803,11 @@ function AppContent({
 
       const diffLineIndex = diffOffset + relativeY - 3;
       const row = allDiffRows[diffLineIndex];
+      if (row?.pane && diffLineIndex < diffOffset + visibleDiffRows) {
+        const target = row.pane.box && pane ? pane.hitTest(row.pane.fileKey, row.pane.pageRow!, relativeX - 2) : null;
+        if (target) void followPageLink(target, row.pane.fileKey);
+        return;
+      }
       if (row?.kind === 'media' && media && diffLineIndex < diffOffset + visibleDiffRows) {
         // A tab picks its compare view; in flip mode the picture swaps sides.
         const mode = COMPARE_SPANS[spanAt(row.media?.spans ?? [], relativeX - 2) ?? ''];
@@ -3532,6 +3839,9 @@ function AppContent({
     visibleDiffRows,
     openMediaFile,
     openRendered,
+    togglePane,
+    followPageLink,
+    pane,
     allDiffRows,
     blockHeaderSpans,
     clearTreeTooltip,
@@ -3610,7 +3920,8 @@ function AppContent({
     }
 
     if (input === ']' || input === '[') {
-      moveBlockFocus(input === ']' ? 1 : -1);
+      if (activeInPane) hopPageChange(input === ']' ? 1 : -1);
+      else moveBlockFocus(input === ']' ? 1 : -1);
       return;
     }
 
@@ -3624,6 +3935,18 @@ function AppContent({
     // whatever the terminal can draw.
     if (input === 'r' || input === 'R') {
       openRendered(input === 'R' ? 'overview' : 'file');
+      return;
+    }
+
+    // The page in the pane, on a markdown file, where it is offered. On an
+    // SVG or an image, `v` keeps its media meaning below.
+    if (input === 'v' && (activeInPane || paneOfferedHere)) {
+      togglePane();
+      return;
+    }
+
+    if (input === 'c' && activeInPane) {
+      void copyPageBlock();
       return;
     }
 
@@ -3689,7 +4012,7 @@ function AppContent({
   // to the top bar instead.
   const tooltipOverImage = Boolean(treeTooltip && media?.caps.protocol === 'kitty' && tooltipCoversKittyRows(treeTooltip, leftWidth, (screenRow) => {
     const line = diffOffset + screenRow - DIFF_FIRST_SCREEN_ROW;
-    return line >= diffOffset && line < diffOffset + visibleDiffRows && Boolean(allDiffRows[line]?.media?.boxes);
+    return line >= diffOffset && line < diffOffset + visibleDiffRows && Boolean(allDiffRows[line]?.media?.boxes || allDiffRows[line]?.pane?.box);
   }));
   const shownInfoTip = infoTip ?? (tooltipOverImage ? treeTooltip!.text : null);
 
@@ -3714,10 +4037,12 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeRenderable ? RENDERED_KEY_HINT_ITEMS : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneOfferedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable ? RENDERED_KEY_HINT_ITEMS : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
   // A block preview is rough on purpose; while one is on screen the footer
   // says why the picture is not drawn properly.
-  const footerRight = activeMediaRef && media?.caps.protocol === 'blocks' ? 'no image support detected' : `${displayBase}...${displayBranch}`;
+  const footerRight = activeInPane
+    ? paneDeveloping ? PANE_DEVELOPING : PANE_REST
+    : activeMediaRef && media?.caps.protocol === 'blocks' ? 'no image support detected' : `${displayBase}...${displayBranch}`;
   const footerLine = composeBar(
     [footerStatus],
     {text: footerRight, style: ANSI_GRAY},
@@ -3834,6 +4159,9 @@ function AppContent({
               media={mediaOn ? media : undefined}
               crossing={crossing}
               renderedSpan={renderedSpan}
+              {...(pane ? {pane} : {})}
+              paneClock={paneClock}
+              paneColors={paneColors}
             />
           </DiffErrorBoundary>
         </DiffPane>

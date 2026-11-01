@@ -69,20 +69,22 @@ function shownPageName(stdout: string): string | null {
   }
 }
 
-export function createSurface({env, run, findTool, opener, platform}: {
+export function createSurface({env, run, findTool, opener, platform, inPane = false}: {
   env: NodeJS.ProcessEnv;
   run: RunTool;
   /** An absolute path for a program on PATH, outside the repo, or null. */
   findTool: (name: string) => string | null;
   opener: Opener;
   platform: NodeJS.Platform;
+  /** The diff pane draws pages too (`v`), which is the way to read one over SSH. */
+  inPane?: boolean;
 }) {
   const ssh = Boolean(env.SSH_CONNECTION);
   const workspace = env.CMUX_WORKSPACE_ID;
   const cmux = !ssh && workspace ? findTool('cmux') : null;
   // On macOS the first `open` on PATH inside cmux is its own wrapper.
   const browser = ssh ? null : platform === 'darwin' ? '/usr/bin/open' : platform === 'linux' || platform === 'freebsd' || platform === 'openbsd' ? findTool('xdg-open') : null;
-  const refusal = ssh ? `open isn't available over SSH · ${HEADLESS}` : !cmux && !browser ? `no browser opener found · ${HEADLESS}` : null;
+  const refusal = ssh ? `open isn't available over SSH · ${inPane ? 'v draws it here' : HEADLESS}` : !cmux && !browser ? `no browser opener found · ${HEADLESS}` : null;
   const kind: SurfaceKind = refusal ? 'none' : cmux ? 'cmux' : 'browser';
 
   let split: string | null = null;

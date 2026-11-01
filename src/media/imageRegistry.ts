@@ -7,17 +7,43 @@ import {deleteImage, frameGap, placeVirtual, startLoop, transmitFrame, transmitP
 // is a new key and a new id, so placeholder cells can never show another
 // image's pixels. A released id sits in quarantine before it is handed out
 // again, long enough for every frame that still drew it to be replaced.
+//
+// Two pools share the one table of ids: media previews, and a rendered
+// page's tiles in the diff pane. Each pool is swept on its own, by the rows
+// that name its keys, so neither frees the other's images. The terminal
+// keeps images decoded, four bytes a pixel (Ghostty allows 320 MB a
+// screen), so besides the base64 sent, every image counts by its decoded
+// size against one budget for both pools. That budget holds only while a
+// page tile is live or asked for: media previews alone keep the budgets
+// they had before the pane existed, so they are the same when it is idle.
 
 const MAX_ID = 255;
 const DEFAULT_MAX_LIVE = 64;
 const DEFAULT_MAX_BYTES = 96 * 1024 * 1024;
 const DEFAULT_QUARANTINE_MS = 2_000;
+const MB = 1024 * 1024;
+const DEFAULT_MAX_DECODED = 192 * MB;
+// A page's tiles are large (a 131 by 40 cell tile is about 8 MB decoded),
+// and only the ones near the viewport are needed.
+const PAGE_MAX_LIVE = 10;
+const PAGE_MAX_DECODED = 96 * MB;
 
-type Entry = {id: number; base64Bytes: number};
+export type ImagePool = 'media' | 'page';
+
+type Entry = {id: number; base64Bytes: number; decodedBytes: number; pool: ImagePool};
 
 const base64Size = (png: Uint8Array) => Math.ceil(png.byteLength / 3) * 4;
 // What an image costs the terminal: its first frame and every other one.
 const imageSize = (png: Uint8Array, animation?: Animation) => base64Size(png) + (animation?.frames ?? []).reduce((sum, frame) => sum + base64Size(frame.png), 0);
+
+// A PNG's pixels times four, from its header: what the terminal keeps once
+// it decodes it. Bytes that aren't a PNG count as their own size.
+function pngDecoded(png: Uint8Array) {
+  if (png.byteLength < 24 || png[12] !== 0x49 || png[13] !== 0x48 || png[14] !== 0x44 || png[15] !== 0x52) return png.byteLength;
+  const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  return view.getUint32(16) * view.getUint32(20) * 4;
+}
+const decodedSize = (png: Uint8Array, animation?: Animation) => pngDecoded(png) + (animation?.frames ?? []).reduce((sum, frame) => sum + pngDecoded(frame.png), 0);
 
 export type ImageRegistry = {
   /**
@@ -27,26 +53,30 @@ export type ImageRegistry = {
    * quarantine. An animation's frames and loop go out in the same write,
    * and the terminal runs it from there.
    */
-  acquire(imageKey: string, png: Uint8Array, cols: number, rows: number, animation?: Animation): number | null;
+  acquire(imageKey: string, png: Uint8Array, cols: number, rows: number, animation?: Animation, pool?: ImagePool): number | null;
   idFor(imageKey: string): number | undefined;
   /** Marks a key drawn this render, for least-recently-used eviction. */
   touch(imageKey: string): void;
   /** Deletes the key's image and quarantines its id. */
   release(imageKey: string): void;
   /**
-   * After a commit: releases keys no row references any more, then, over
-   * budget, the least recently used keys not on screen.
+   * After a commit: releases the pool's keys no row references any more,
+   * then, over the pool's budget or (while the pane draws) the decoded budget, its least recently
+   * used keys not on screen. The media pool when none is named.
    */
-  sweep(live: ReadonlySet<string>, visible: ReadonlySet<string>): void;
+  sweep(live: ReadonlySet<string>, visible: ReadonlySet<string>, pool?: ImagePool): void;
   /** Deletes for every live id, for the exit write; forgets them all. */
   restoreSequence(): string;
-  liveCount(): number;
+  /** Live images in a pool, or in both. */
+  liveCount(pool?: ImagePool): number;
+  /** What the live images take decoded, in a pool or in both. */
+  decodedBytes(pool?: ImagePool): number;
   /**
    * Whether one more image of this PNG's size (and its animation's frames)
-   * stays within both budgets, the image count and the bytes sent, so a
-   * sweep would not evict it again.
+   * stays within the pool's budgets and, while the pane draws, the decoded
+   * budget, so a sweep would not evict it again.
    */
-  fits(png: Uint8Array, animation?: Animation): boolean;
+  fits(png: Uint8Array, animation?: Animation, pool?: ImagePool): boolean;
   /**
    * After `acquire` found no free id: how long until the first id leaves
    * quarantine. With every id live, none is due yet, so the full quarantine,
@@ -62,19 +92,30 @@ export function createImageRegistry({
   maxBytes = DEFAULT_MAX_BYTES,
   quarantineMs = DEFAULT_QUARANTINE_MS,
   random = Math.random,
+  maxDecoded = DEFAULT_MAX_DECODED,
+  page = {},
 }: {
   write: (sequence: string) => void;
   now?: () => number;
+  // The media pool's image count and base64 budget.
   maxLive?: number;
   maxBytes?: number;
   quarantineMs?: number;
   random?: () => number;
+  // Both pools' decoded bytes together.
+  maxDecoded?: number;
+  page?: {maxLive?: number; maxDecoded?: number};
 }): ImageRegistry {
+  const pageMaxLive = page.maxLive ?? PAGE_MAX_LIVE;
+  const pageMaxDecoded = page.maxDecoded ?? PAGE_MAX_DECODED;
   // In use order, least recent first.
   const entries = new Map<string, Entry>();
   const liveIds = new Set<number>();
   const releasedAt = new Map<number, number>();
+  // The media pool's base64, and each pool's decoded bytes.
   let liveBytes = 0;
+  const decoded: Record<ImagePool, number> = {media: 0, page: 0};
+  const counts: Record<ImagePool, number> = {media: 0, page: 0};
   // A random start only staggers where a session's ids begin. It does not
   // keep two sessions drawing on one terminal apart: each knows only its own
   // ids, so sooner or later one writes over or deletes the other's. Under
@@ -100,7 +141,9 @@ export function createImageRegistry({
     if (!entry) return null;
     entries.delete(imageKey);
     liveIds.delete(entry.id);
-    liveBytes -= entry.base64Bytes;
+    if (entry.pool === 'media') liveBytes -= entry.base64Bytes;
+    decoded[entry.pool] -= entry.decodedBytes;
+    counts[entry.pool] -= 1;
     return entry;
   };
 
@@ -118,8 +161,19 @@ export function createImageRegistry({
     entries.set(imageKey, entry);
   };
 
+  const totalDecoded = () => decoded.media + decoded.page;
+  // Whether a pool is within its own budgets and the decoded one, with
+  // `extra` more of each.
+  const within = (pool: ImagePool, extra: {count: number; base64: number; decoded: number}) => {
+    const shared = pool === 'page' || counts.page > 0;
+    if (shared && totalDecoded() + extra.decoded > maxDecoded) return false;
+    if (pool === 'page') return counts.page + extra.count <= pageMaxLive && decoded.page + extra.decoded <= pageMaxDecoded;
+    return counts.media + extra.count <= maxLive && liveBytes + extra.base64 <= maxBytes;
+  };
+  const NONE = {count: 0, base64: 0, decoded: 0};
+
   return {
-    acquire(imageKey, png, cols, rows, animation) {
+    acquire(imageKey, png, cols, rows, animation, pool = 'media') {
       const existing = entries.get(imageKey);
       if (existing) {
         touch(imageKey);
@@ -135,20 +189,24 @@ export function createImageRegistry({
       write(transmitPng(id, png) + placeVirtual(id, cols, rows) + frames);
       releasedAt.delete(id);
       const base64Bytes = imageSize(png, animation);
-      entries.set(imageKey, {id, base64Bytes});
+      const decodedBytes = decodedSize(png, animation);
+      entries.set(imageKey, {id, base64Bytes, decodedBytes, pool});
       liveIds.add(id);
-      liveBytes += base64Bytes;
+      if (pool === 'media') liveBytes += base64Bytes;
+      decoded[pool] += decodedBytes;
+      counts[pool] += 1;
       return id;
     },
     idFor: (imageKey) => entries.get(imageKey)?.id,
     touch,
     release,
-    sweep(live, visible) {
-      for (const imageKey of [...entries.keys()]) {
+    sweep(live, visible, pool = 'media') {
+      const own = () => [...entries].filter(([, entry]) => entry.pool === pool).map(([imageKey]) => imageKey);
+      for (const imageKey of own()) {
         if (!live.has(imageKey)) release(imageKey);
       }
-      for (const imageKey of [...entries.keys()]) {
-        if (entries.size <= maxLive && liveBytes <= maxBytes) break;
+      for (const imageKey of own()) {
+        if (within(pool, NONE)) break;
         if (!visible.has(imageKey)) release(imageKey);
       }
     },
@@ -160,8 +218,9 @@ export function createImageRegistry({
       }
       return sequence;
     },
-    liveCount: () => entries.size,
-    fits: (png, animation) => entries.size < maxLive && liveBytes + imageSize(png, animation) <= maxBytes,
+    liveCount: (pool) => (pool ? counts[pool] : entries.size),
+    decodedBytes: (pool) => (pool ? decoded[pool] : totalDecoded()),
+    fits: (png, animation, pool = 'media') => within(pool, {count: 1, base64: imageSize(png, animation), decoded: decodedSize(png, animation)}),
     nextFreeIn() {
       const at = now();
       let soonest = quarantineMs;

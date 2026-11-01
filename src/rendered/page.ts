@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import path from 'node:path';
 import type {FileStatus} from '../git.js';
 import {HEAD_SCRIPT, HEAD_SCRIPT_HASH, PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from './assets.generated.js';
@@ -186,6 +187,71 @@ export function assembleFilePage(input: PageInput): string {
     '</main>',
     '</div>',
     ...documentFoot(!image ? FILE_KEYS : compares ? IMAGE_KEYS : SINGLE_IMAGE_KEYS),
+  ].join('\n');
+}
+
+// The in-pane view's tile document: the article alone, laid out at the
+// sheet's width in the terminal's own background, so a tile's letterbox and
+// the pane around it are one surface. The pane draws the change marks as
+// gutter text and has no pointer on the page, so the page draws no bars, nor
+// the cover a nested list puts over its item's bar, and leaves out the before
+// chip, and the room the chip keeps; a removed block's
+// marker stays, folded, and names where to open it, so the gutter has a row
+// to mark. The chip hides with an important rule because the page places it
+// in list items and table cells with rules more specific than the tile's.
+// Chromium loads it with scripts off, and it has none.
+const TILE_CSS = [
+  'html, body { min-height: 0; height: auto; background: var(--br-tile-bg); }',
+  'html { width: var(--br-tile-width); scroll-padding-top: 0; }',
+  ':root { --br-chip-room: 0px; --br-row-chip-room: 0px; }',
+  '.br-tile .markdown-body { max-width: none; margin: 0; padding: 16px 16px 24px; background: transparent; }',
+  '.br-tile .markdown-body :is([data-mark], details.br-removed)::before, .br-tile .markdown-body tr[data-mark] > :first-child::before { content: none; }',
+  '.br-tile details.br-before { display: none !important; }',
+  '.br-tile .markdown-body li[data-mark] > :is(ul, ol)::before { content: none; }',
+  '.br-tile details.br-removed > summary { list-style: none; cursor: default; }',
+  '.br-tile .br-banners, .br-tile .br-body { padding: 16px 16px 0; }',
+].join('\n');
+const TILE_FALLBACK_BG = {dark: '#111318', light: '#ffffff'} as const;
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+const REMOVED_SUMMARY = /(<details class="br-removed"><summary>[^<]*) · show<\/summary>/g;
+
+const cspHash = (text: string) => `'sha256-${createHash('sha256').update(text).digest('base64')}'`;
+
+/** `brokenRefs`: as on the file's page, the links drawn broken. */
+export type TileDocumentInput = {file: PageFile; scheme: 'dark' | 'light'; bg: string; cssWidth: number; base?: string; brokenRefs?: readonly number[]};
+
+export function assembleTileDocument({file, scheme, bg, cssWidth, base = 'the base branch', brokenRefs = []}: TileDocumentInput): string {
+  const background = HEX_COLOR.test(bg) ? bg.toLowerCase() : TILE_FALLBACK_BG[scheme];
+  const tile = `:root { --br-tile-bg: ${background}; --br-tile-width: ${Number.isFinite(cssWidth) ? cssWidth : 980}px; }\n${TILE_CSS}`;
+  const policy = [
+    "default-src 'none'",
+    'img-src data:',
+    `style-src '${PAGE_CSS_HASH}' ${cspHash(tile)}`,
+    "script-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-src 'none'",
+    "connect-src 'none'",
+  ].join('; ');
+  const content = file.body.kind === 'image' ? '' : body(file, brokenRefs).replace(REMOVED_SUMMARY, '$1 · r shows it in the split</summary>');
+  return [
+    '<!doctype html>',
+    `<html lang="en" data-theme="${scheme}" class="br-tile">`,
+    '<head>',
+    `<meta http-equiv="Content-Security-Policy" content="${policy}">`,
+    '<meta charset="utf-8">',
+    `<meta name="color-scheme" content="${scheme}">`,
+    `<title>${escapeHtml(path.posix.basename(file.path))}</title>`,
+    `<style>${PAGE_CSS}</style>`,
+    `<style>${tile}</style>`,
+    '</head>',
+    '<body>',
+    banners(file, {repo: '', base, branch: '', worktree: false, renderedAt: 0}),
+    // The raw source rides only in a file page, for its first frame.
+    content.replace(/<template class="br-raw-source">[\s\S]*?<\/template>/, ''),
+    '</body>',
+    '</html>',
+    '',
   ].join('\n');
 }
 

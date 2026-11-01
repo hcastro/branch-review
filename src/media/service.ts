@@ -3,7 +3,7 @@ import type {ReviewFile, ReviewModel} from '../review/model.js';
 import type {Animation, JobFailure, MediaBackend, RenderRequest, RenderResult, VideoRequest} from './backend.js';
 import {blockRows} from './blocks.js';
 import {classifyMedia} from './classify.js';
-import {createImageRegistry} from './imageRegistry.js';
+import {createImageRegistry, type ImageRegistry} from './imageRegistry.js';
 import {staleReason, type BoxSpec, type DrawnFacts} from './layout.js';
 import {createLru} from './lru.js';
 import {escapeHiddenCharacters} from '../controlChars.js';
@@ -64,6 +64,10 @@ export type MediaServiceOptions = {
   animations?: boolean;
   now?: () => number;
   registry?: {maxLive?: number; maxBytes?: number; quarantineMs?: number; random?: () => number};
+  // The terminal's image ids, when another view draws images too (the
+  // in-pane rendered view): one table, so no id names two images. Its
+  // writes go where that registry was told; `sink` is then unused for them.
+  imageRegistry?: ImageRegistry;
   // Messages for the footer from before the service existed.
   notices?: readonly string[];
 };
@@ -73,11 +77,11 @@ export type MediaService = ReturnType<typeof createMediaService>;
 // What the row builder reads from the service.
 export type MediaRowInput = Pick<MediaService, 'caps' | 'refFor' | 'sideState' | 'viewState' | 'drawnFacts' | 'watching'> & Partial<Pick<MediaService, 'animates'>>;
 
-export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, animations = false, now = Date.now, registry: registryOptions = {}, notices: startupNotices = []}: MediaServiceOptions) {
+export function createMediaService({caps, backend, sink, tempDir, opener, env, platform, watching = true, animations = false, now = Date.now, registry: registryOptions = {}, imageRegistry, notices: startupNotices = []}: MediaServiceOptions) {
   // Kitty terminals that run animations themselves loop an animated GIF or
   // WebP; everywhere else it shows its first frame.
   const animates = caps.protocol === 'kitty' && caps.animation && animations;
-  const registry = createImageRegistry({write: (sequence) => sink.write(sequence), now, ...registryOptions});
+  const registry = imageRegistry ?? createImageRegistry({write: (sequence) => sink.write(sequence), now, ...registryOptions});
   const listeners = new Set<() => void>();
   let context: MediaContext | null = null;
   let refs = new Map<string, MediaRef>();

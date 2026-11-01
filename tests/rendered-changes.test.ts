@@ -325,6 +325,18 @@ describe('change marks on the page', () => {
     expect(cut.removed).toEqual([]);
   });
 
+  it('pairs an item with the new item that keeps its words in order, ahead of one that only shares their letters', async () => {
+    const before = '# Guide\n\n- Tips\n  - A nested tip\n- Last\n';
+    const after = '# Guide\n\n- Tips\n  - A nested tip that changed\n  - A new nested tip\n- Last\n';
+    const {marked, removed, html} = await marksFor(before, after);
+    expect(marked).toEqual([
+      {tag: 'li', mark: 'modified', text: 'A nested tip that changed'},
+      {tag: 'li', mark: 'added', text: 'A new nested tip'},
+    ]);
+    expect(beforeViews(html)).toEqual(['A nested tip']);
+    expect(removed).toEqual([]);
+  });
+
   it('pairs a long paragraph against its old self in time, however its words repeat', async () => {
     // The old wording, long runs of one word, nearly turns up in the new
     // one again and again, which a word-by-word search pays for at every start.

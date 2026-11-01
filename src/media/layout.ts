@@ -81,6 +81,9 @@ export type PlanBoxRow = {
   boxRow: number;
   // A click on the row swaps the side flip mode shows.
   swap?: boolean;
+  // Text drawn before the boxes, in their left padding: a rendered page's
+  // gutter of change marks.
+  lead?: TextPart[];
 };
 
 export type PlanRow = PlanTextRow | PlanBoxRow;

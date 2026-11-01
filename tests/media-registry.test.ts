@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import {createImageRegistry} from '../src/media/imageRegistry.js';
-import {parseApc, pngFixture} from './media-helpers.js';
+import {parseApc, pngFixture, pngHeaderOnly} from './media-helpers.js';
 
 // Terminal image ids: which image key each id names, when it is sent, and
 // when it is deleted. One id names one key for its whole life, and a deleted
@@ -142,5 +142,126 @@ describe('image registry', () => {
     expect(b).not.toBe(a);
     expect(instance.liveCount()).toBe(0);
     expect(instance.restoreSequence()).toBe('');
+  });
+});
+
+// Ghostty counts what an image takes decoded, four bytes a pixel, against
+// 320 MB a screen. The registry keeps every image within 192 MB decoded,
+// and a rendered page's tiles in a pool of their own: at most 10 live and
+// 96 MB decoded, swept apart from the media pool, from the same 255 ids.
+describe('image registry budgets and pools', () => {
+  const MB = 1024 * 1024;
+  // A tile of 1703 by 1160 pixels decodes to about 7.9 MB.
+  const TILE = pngHeaderOnly(1703, 1160);
+  const TILE_DECODED = 1703 * 1160 * 4;
+
+  function pooled(options: Parameters<typeof createImageRegistry>[0] extends infer O ? Omit<O, 'write'> : never = {}) {
+    const writes: string[] = [];
+    let now = 1_000;
+    const instance = createImageRegistry({write: (seq) => writes.push(seq), now: () => now, random: () => 0, ...options});
+    return {instance, commands: () => parseApc(writes), advance: (ms: number) => {
+      now += ms;
+    }};
+  }
+
+  it('counts each image by its decoded size, every frame of an animation too', () => {
+    const {instance} = pooled();
+    instance.acquire('still', pngHeaderOnly(100, 50), 1, 1);
+    expect(instance.decodedBytes()).toBe(100 * 50 * 4);
+    const frame = pngHeaderOnly(100, 50);
+    instance.acquire('moving', pngHeaderOnly(100, 50), 1, 1, {frames: [{png: frame, delayMs: 50}, {png: frame, delayMs: 50}], firstDelayMs: 50});
+    expect(instance.decodedBytes()).toBe(100 * 50 * 4 * 4);
+    instance.release('moving');
+    expect(instance.decodedBytes()).toBe(100 * 50 * 4);
+  });
+
+  it('keeps the page pool to 10 live tiles off screen, and never sweeps the other pool', () => {
+    const {instance} = pooled();
+    const media = instance.acquire('media-a', PNG, 1, 1)!;
+    const keys = Array.from({length: 14}, (_, index) => `page:${index}`);
+    for (const key of keys) instance.acquire(key, pngHeaderOnly(10, 10), 1, 1, undefined, 'page');
+    expect(instance.liveCount('page')).toBe(14);
+    // The page sweep names only its own keys: the media image stays.
+    instance.sweep(new Set(keys), new Set(keys.slice(10)), 'page');
+    expect(instance.liveCount('page')).toBe(10);
+    expect(instance.idFor('media-a')).toBe(media);
+    // The least recently used went first, never one on screen.
+    expect(keys.slice(0, 4).map((key) => instance.idFor(key))).toEqual([undefined, undefined, undefined, undefined]);
+    expect(keys.slice(10).every((key) => instance.idFor(key) !== undefined)).toBe(true);
+    // And the media sweep leaves the page tiles alone.
+    instance.sweep(new Set(['media-a']), new Set(['media-a']));
+    expect(instance.liveCount('page')).toBe(10);
+    expect(instance.liveCount('media')).toBe(1);
+  });
+
+  it('keeps the page pool within 96 MB decoded, and says a tile that would pass it does not fit', () => {
+    // The count cap set high, so the decoded budget is the one that binds.
+    const {instance} = pooled({page: {maxLive: 50}});
+    const keys = Array.from({length: 14}, (_, index) => `page:${index}`);
+    let sent = 0;
+    for (const key of keys) {
+      if (!instance.fits(TILE, undefined, 'page')) break;
+      instance.acquire(key, TILE, 131, 40, undefined, 'page');
+      sent += 1;
+    }
+    expect(sent).toBe(Math.floor((96 * MB) / TILE_DECODED));
+    expect(instance.decodedBytes('page')).toBeLessThanOrEqual(96 * MB);
+    // Off screen, a tile that does not fit is never sent: no sweep then
+    // evicts it, so no next want sends it again.
+    instance.sweep(new Set(keys), new Set(), 'page');
+    expect(instance.liveCount('page')).toBe(sent);
+  });
+
+  it('keeps every image within 192 MB decoded across both pools', () => {
+    const {instance} = pooled({maxDecoded: 192 * MB, maxBytes: 1024 * MB});
+    const big = pngHeaderOnly(4096, 4096);
+    // 64 MB decoded each: two media images and one page tile come to 192.
+    instance.acquire('media-1', big, 1, 1);
+    instance.acquire('media-2', big, 1, 1);
+    expect(instance.fits(big, undefined, 'page')).toBe(true);
+    instance.acquire('page-1', pngHeaderOnly(4096, 4096), 1, 1, undefined, 'page');
+    expect(instance.decodedBytes()).toBe(3 * 64 * MB);
+    // Full: one more pixel of either pool does not fit.
+    expect(instance.fits(pngHeaderOnly(16, 16), undefined, 'page')).toBe(false);
+    expect(instance.fits(pngHeaderOnly(16, 16))).toBe(false);
+    // Over the global budget, a sweep trims its own pool's images off screen.
+    instance.acquire('page-2', pngHeaderOnly(4096, 1024), 1, 1, undefined, 'page');
+    instance.sweep(new Set(['page-1', 'page-2']), new Set(['page-2']), 'page');
+    expect(instance.idFor('page-1')).toBeUndefined();
+    expect(instance.decodedBytes()).toBeLessThanOrEqual(192 * MB);
+    expect(instance.idFor('media-1')).toBeDefined();
+  });
+
+  it('leaves media previews as they were while no page tile is live, however much they take decoded', () => {
+    const {instance} = pooled({maxDecoded: 192 * MB});
+    // A long animated GIF: small to send, 458 MB decoded, past the shared budget alone.
+    const frame = pngHeaderOnly(800, 500);
+    const gif = {frames: Array.from({length: 299}, () => ({png: frame, delayMs: 40})), firstDelayMs: 40};
+    instance.acquire('gif', pngHeaderOnly(800, 500), 80, 25, gif);
+    instance.acquire('small', pngHeaderOnly(100, 50), 10, 5);
+    expect(instance.decodedBytes()).toBeGreaterThan(192 * MB);
+    expect(instance.fits(pngHeaderOnly(100, 50))).toBe(true);
+    // Neither sweep evicts: the GIF on screen, then off it.
+    instance.sweep(new Set(['gif', 'small']), new Set(['gif']));
+    instance.sweep(new Set(['gif', 'small']), new Set());
+    expect([instance.idFor('gif'), instance.idFor('small')].every((id) => id !== undefined)).toBe(true);
+    // Once the pane draws a tile, the shared budget holds for both pools.
+    instance.acquire('page-1', pngHeaderOnly(10, 10), 1, 1, undefined, 'page');
+    expect(instance.fits(pngHeaderOnly(100, 50))).toBe(false);
+    instance.sweep(new Set(['gif', 'small']), new Set(['gif']));
+    expect(instance.idFor('small')).toBeUndefined();
+    // And when the last tile goes, media is as before again.
+    instance.release('page-1');
+    expect(instance.fits(pngHeaderOnly(100, 50))).toBe(true);
+  });
+
+  it('hands both pools ids from the one table, so no id names two images', () => {
+    const {instance} = pooled();
+    const ids = new Set<number>();
+    for (let index = 0; index < 5; index += 1) ids.add(instance.acquire(`media-${index}`, PNG, 1, 1)!);
+    for (let index = 0; index < 5; index += 1) ids.add(instance.acquire(`page-${index}`, PNG, 1, 1, undefined, 'page')!);
+    expect(ids.size).toBe(10);
+    // The restore at exit deletes both pools' images.
+    expect(parseApc([instance.restoreSequence()])).toHaveLength(10);
   });
 });

@@ -1,6 +1,6 @@
 # Rendered markdown pages
 
-This document describes how `branch-review` renders the branch's changed markdown, image, and SVG files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, how a page arrives, the `--render-out` option, what a page shows and its keys, image pages, pages that also look different, the links and images that won't resolve on GitHub, which images a page includes, how close a page is to github.com, and the JSON reports. For the other options, see the [Options](../README.md#options) section of the README.
+This document describes how `branch-review` renders the branch's changed markdown, image, and SVG files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, how a page arrives, reading a page in the diff pane, the `--render-out` option, what a page shows and its keys, image pages, pages that also look different, the links and images that won't resolve on GitHub, which images a page includes, how close a page is to github.com, and the JSON reports. For the other options, see the [Options](../README.md#options) section of the README.
 
 ## Open a page from the review
 
@@ -13,7 +13,7 @@ Where the page opens depends on where you run `branch-review`:
 | In a cmux workspace | A browser split to the right of the review. The split doesn't take the keyboard, and each later press sends the same split to the new page. |
 | In cmux, with its browser turned off in its settings | Your default browser. cmux opens it there itself. |
 | In another terminal on macOS or Linux | A new tab in your default browser, on each press. On Linux, `xdg-open` on your `PATH` opens it. |
-| Over SSH | Nothing opens. |
+| Over SSH | Nothing opens. With the in-pane view turned on, press `v` to read the page in the diff pane. |
 
 After each press the footer says where the page went, such as `⇗ setup.md · in the split →`. The first page of a session adds `nothing left this machine`. When the file in view has no page, `r` opens the review's first page and names it, such as `⇗ docs/setup.md · first rendered file · in the split →`. When the branch changed no markdown, image, or SVG file, the footer reads `nothing to render · no markdown, images or SVG on this branch`.
 
@@ -26,7 +26,7 @@ The footer names the following problems:
 | `cmux didn't answer · opened in your browser` | cmux didn't place the page within 1.5 seconds, so your default browser opened it. If a split from an earlier press was closed, the next press opens a new one without a message. |
 | `in the split → · cmux was slow to answer` | cmux took more than 1.5 seconds to send the split to the page. The page may land a moment late, and the next press uses the same split. |
 | `opened in your browser · cmux's browser is off` | cmux's browser is turned off in its settings. Each press opens the page in your default browser. |
-| `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. |
+| `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. With the in-pane view turned on, the message names `v`, which draws the page in the diff pane. |
 | `no browser opener found` | On Linux, no `xdg-open` is on your `PATH`. |
 | `rendered view turned off` | The renderer failed three times in a minute, so `r` and `R` stay off for the session. Image previews keep working. |
 | `can't write the page: disk full` | The session's temp directory is full. |
@@ -85,6 +85,58 @@ The following settings change how the page arrives:
 In watch mode inside cmux, when the file you last opened with `r` changes, the split goes to its new page within a second, at the place you scrolled the split to. The new page doesn't develop. The blocks that are new since the last page glow once instead. The split gets at most one update a second, and an update never takes the place of a page you just opened with `r`. After you close the split, the updates stop until the next `r` opens one. The page in a browser tab, and the overview, don't update.
 
 Before each update, `branch-review` asks cmux which page the split shows. The split updates only while it shows that file's page. After you go to another page with `{`, `}` or a link, the split stays where you went, and updates to the file resume once you go back to its page. When cmux doesn't answer within 1.5 seconds, that update is skipped. To follow the page you moved to, press `r` on its file in the review.
+
+## Read a page in the diff pane
+
+The in-pane view draws a markdown file's rendered page inside the diff pane, in place of its diff. It's turned off by default. To turn it on, set `BRANCH_REVIEW_PANE=on` before you start `branch-review`:
+
+```sh
+BRANCH_REVIEW_PANE=on branch-review
+```
+
+The in-pane view needs the following:
+
+- A terminal that draws Kitty images, such as Ghostty, cmux, or Kitty. Other terminals keep the diff, and `v` on a markdown file does nothing new.
+- A terminal that reports its cell size in pixels. Each tile is cut to fill its cells exactly, so the terminal never scales it. Ghostty, cmux, and Kitty report it.
+- A headless Chromium on disk. `branch-review` never installs one. It uses `BRANCH_REVIEW_CHROME` when that names a program, else the newest `chrome-headless-shell` that Playwright or Puppeteer installed, else Google Chrome, or on Linux `chromium` or `google-chrome` on your `PATH`. A program inside the repo under review is never used.
+
+To read the page of the markdown file in view, press `v`, or click **Diff** to go back. The page takes the pane's width up to the width GitHub lays a file out at, centered in the pane, and its text is the same height as the terminal's. The diff's text dissolves, the page's colors arrive as shade characters, and an accent line sweeps down the pane with the sharp page above it. The page opens on the block that was at the top of the diff. Press `v` again, and the diff is back in one frame, at the line the page showed at the top.
+
+The page stays on while you move to another markdown file with `↑`, `↓`, or the tree. Other files keep their diff, and `v` on an image or an SVG keeps its own meaning.
+
+The bars in the margin are text in the pane, beside the page: green for an added block, amber for a changed one, and a dotted red line where the branch removed content. A removed block's marker reads `r shows it in the split`, because the pane has no click to open it.
+
+While the page is in the pane, the following keys change:
+
+| Key | Action |
+| --- | --- |
+| `v` | Go back to the diff |
+| `[` / `]` | Scroll to the previous or next change |
+| `c` | Copy the markdown source of the block at the top of the pane, as the page shows it, even when the file changed on disk since |
+| `r` | Open the page in the split or your browser, at the block at the top of the pane |
+
+`j`, `k`, `g`, `G`, and the mouse wheel scroll the page. Clicking a link on the page follows it in the review: a heading on the page scrolls there, and a link to another file of the review opens that file. A web or email address is copied to the clipboard and never opened, because it's the repo's. The footer reads `◆ rendered · local` while the page is on screen.
+
+Each page is laid out and cut into tiles by the headless Chromium, in the session's temp directory, with scripts and every network request off. The page loads as a document, never as a file or a URL, and every host resolves to nothing. The tiles go to the terminal as images before any row of the pane shows them, and at most ten of them are kept in the terminal at a time. When the tiles on screen aren't in the terminal yet, the pane holds on the page's colors, and after a moment the footer reads `developing`.
+
+The following settings change the in-pane view:
+
+- `--no-animations`, **Reduce motion** in macOS, and `BRANCH_REVIEW_MOTION` turn its motion off. The page then replaces the diff at once.
+- Over SSH and inside tmux, the pane sends fewer frames, skips the page's colors, and sends tiles ahead only one below the screen.
+- `BRANCH_REVIEW_PANE_DPR` draws the page at a fixed scale, such as `2`, in place of the one that makes its text as tall as the terminal's. It's there to compare the two by eye.
+
+The footer names the following problems:
+
+| Message | What it means |
+| --- | --- |
+| `the in-pane view needs Chrome` | No headless Chromium was found. Set `BRANCH_REVIEW_CHROME` to one, or install `chrome-headless-shell`. `r` still opens the page. |
+| `the terminal didn't report its cell size` | The terminal didn't answer the cell size query, so a tile would be scaled and blurred. `r` still opens the page. |
+| `in-pane view turned off` | Chromium failed three times in a minute, so the pane goes back to the diff for the session. `r` still works. |
+| `rendered view turned off` | The rendered view's worker failed three times in a minute. The pane goes back to the diff, and `r` and `R` stop working for the session. |
+| `couldn't lay out the page` | Chromium couldn't lay out this file's page. The row under the file's name says why. To try again, press `v` twice. |
+| `couldn't draw this part of the page` | Chromium couldn't cut the tile for these rows, or the tile came out too large to send. To try again, press `v` twice. |
+| `the pane is too narrow for the page` | The pane is too narrow to read a page in. Make the window or the diff pane wider. |
+| `the page is too long to draw here` | The page is taller than the 10,000 rows the pane draws, as a page whose HTML sets a huge height can be. The pane draws the top of it, and `r` opens all of it. |
 
 ## Write the pages
 

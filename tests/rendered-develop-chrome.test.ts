@@ -679,6 +679,74 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
     expect(await evaluate<number>(left('.br-rail-findings li'))).toBe(await evaluate<number>(left('.br-rail-title')));
   }, 30_000);
 
+  it('draws every bar in the margin with the rest: a nested list item\'s and a footnote\'s too', async () => {
+    const before = '# Bars\n\nA paragraph.\n\n- Top item\n  - Nested item\n    - Deeper item\n\nText with a note.[^1]\n\n[^1]: The note.\n';
+    const after = before.replace('A paragraph.', 'A paragraph, edited.').replace('Deeper item', 'Deeper item, edited').replace('The note.', 'The note, edited.');
+    const fragment = await renderMarkdown({path: 'docs/bars.md', source: after, groups: changeGroups(diffFile(before, after, 'docs/bars.md')), asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const title: PageInput['title'] = {repo: 'branch-review-cli', base: 'main', branch: 'feature/rich-view', worktree: false, renderedAt: 0};
+    fs.writeFileSync(path.join(pageDir, 'bars.html'), assembleFilePage({title, file: {path: 'docs/bars.md', status: 'modified', body: {kind: 'rendered', fragment}}, rail: []}));
+    for (const width of [VIEW.width, 400]) {
+      await page('Emulation.setDeviceMetricsOverride', {width, height: VIEW.height, deviceScaleFactor: 1, mobile: false});
+      try {
+        await load('m=0&n=901', urlOf('bars.html'));
+        const bars = await evaluate<Array<{tag: string; text: string; x: number}>>(`[...document.querySelectorAll('.markdown-body [data-mark]')]
+          .filter((block) => block.tagName !== 'TR' && getComputedStyle(block, '::before').content !== 'none')
+          .map((block) => ({tag: block.tagName, text: block.textContent.trim().slice(0, 24), x: Math.round(block.getBoundingClientRect().left + parseFloat(getComputedStyle(block, '::before').left))}))`);
+        // The edited paragraph, the item two lists deep, and the footnote.
+        expect(bars.map((bar) => bar.text.split(',')[0]), `${width}`).toEqual(['A paragraph', 'Deeper item', 'The note']);
+        expect([...new Set(bars.map((bar) => bar.x))], JSON.stringify(bars)).toHaveLength(1);
+      } finally {
+        await page('Emulation.setDeviceMetricsOverride', {...VIEW, deviceScaleFactor: 1, mobile: false});
+      }
+    }
+  }, 30_000);
+
+  it('ends a changed item\'s bar and tint where its nested list starts, in both themes', async () => {
+    const before = '# Roadmap\n\n- [ ] Tables\n  - [ ] Alignment\n  - [ ] Wide tables\n- [ ] Other\n\nEnd.\n';
+    const after = '# Roadmap\n\n- [x] Tables\n  - [x] Alignment\n  - [ ] Wide tables\n    - [ ] Horizontal scroll\n- [ ] Other\n\nEnd.\n';
+    const fragment = await renderMarkdown({path: 'docs/roadmap.md', source: after, groups: changeGroups(diffFile(before, after, 'docs/roadmap.md')), asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const title: PageInput['title'] = {repo: 'branch-review-cli', base: 'main', branch: 'feature/rich-view', worktree: false, renderedAt: 0};
+    fs.writeFileSync(path.join(pageDir, 'roadmap.html'), assembleFilePage({title, file: {path: 'docs/roadmap.md', status: 'modified', body: {kind: 'rendered', fragment}}, rail: []}));
+    // An item of the page, never one in a before view.
+    const item = `(text) => [...document.querySelectorAll('.markdown-body li')].find((li) => !li.closest('.br-before-body') && li.querySelector('input').nextSibling.textContent.trim().startsWith(text))`;
+    const at = async (x: number, y: number) => [...(await shot({x, y, width: 1, height: 1})).subarray(0, 3)];
+    const near = (left: number[], right: number[]) => left.every((value, index) => Math.abs(value - right[index]!) <= 2);
+    const rgb = (css: string) => css.match(/\d+/g)!.slice(0, 3).map(Number);
+    for (const theme of ['light', 'dark']) {
+      await load('m=0&n=902', urlOf('roadmap.html'));
+      await evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(theme)}; scrollTo(0, 0)`);
+      await frames();
+      // The bar's column, the item's right edge, and the middle of each item's own first line.
+      const look = await evaluate<{x: number; right: number; rows: Record<string, number>; modified: string; added: string}>(`(() => {
+        const item = ${item};
+        const parent = item('Tables');
+        const box = parent.getBoundingClientRect();
+        const line = (li) => { const r = li.querySelector('input').getBoundingClientRect(); return Math.round(r.top + r.height / 2); };
+        return {
+          x: Math.round(box.left + parseFloat(getComputedStyle(parent, '::before').left)) + 1,
+          right: Math.round(box.right) - 4,
+          rows: Object.fromEntries(['Tables', 'Alignment', 'Wide tables', 'Horizontal scroll', 'Other'].map((text) => [text, line(item(text))])),
+          modified: getComputedStyle(parent, '::before').backgroundColor,
+          added: getComputedStyle(item('Horizontal scroll'), '::before').backgroundColor,
+        };
+      })()`);
+      const [modified, added] = [rgb(look.modified), rgb(look.added)];
+      // An unchanged item's row shows the page itself in the bar's column.
+      const page = await at(look.x, look.rows['Other']!);
+      expect(near(page, modified) || near(page, added), theme).toBe(false);
+      const column = async (text: string) => at(look.x, look.rows[text]!);
+      expect(near(await column('Tables'), modified), `${theme} Tables`).toBe(true);
+      expect(near(await column('Alignment'), modified), `${theme} Alignment`).toBe(true);
+      expect(near(await column('Wide tables'), page), `${theme} Wide tables`).toBe(true);
+      expect(near(await column('Horizontal scroll'), added), `${theme} Horizontal scroll`).toBe(true);
+      // The develop's tint over the item, at full width, stops there too.
+      await evaluate(`(() => { const tint = document.createElement('span'); tint.className = 'br-tint br-tint-modified'; tint.style.transform = 'none'; (${item})('Tables').prepend(tint); })()`);
+      await frames();
+      expect(near(await at(look.right, look.rows['Tables']!), page), `${theme} tint on the item`).toBe(false);
+      expect(near(await at(look.right, look.rows['Wide tables']!), page), `${theme} tint under the item`).toBe(true);
+    }
+  }, 30_000);
+
   it('keeps a strip with every chip on a 400 px screen, in both themes', async () => {
     const narrow = {width: 400, height: 760};
     // The longest chips a page has: a difference, and links and images that won't resolve.

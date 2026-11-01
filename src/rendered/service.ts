@@ -1,3 +1,4 @@
+import os from 'node:os';
 import path from 'node:path';
 import {escapeHiddenCharacters} from '../controlChars.js';
 import {fileKey, type DiffRange} from '../git.js';
@@ -16,10 +17,14 @@ import {resolveMotion, type Motion} from './motion.js';
 import {assembleOverview, railLabel, type OverviewEntry, type PageBody, type PageInput, type RailEntry} from './page.js';
 import {appearances, findingNotes, linkReport, type ReportSource} from './report.js';
 import {runTool} from './run.js';
+import {createRenderedPane, type RenderedPane} from './pane.js';
 import {createRenderedSite, type RenderedSite} from './site.js';
 import {oneLine, sourceSpec} from './source.js';
 import {createSurface, type ShowResult, type Surface} from './surface.js';
 import {createRenderedBackend} from './workerClient.js';
+import {findChrome, type ChromeBinary} from './worker/chrome.js';
+import type {ImageRegistry} from '../media/imageRegistry.js';
+import type {GraphicsCaps} from '../media/types.js';
 
 // The UI side of the rendered view. It holds what names and labels the
 // pages (keys, counts, failures), never their HTML: the worker renders,
@@ -111,7 +116,7 @@ type Written = {ok: true; key: string} | {ok: false; reason: string};
 
 type Asking = {epoch: number; fileKey: string; priority: number; controller: AbortController; done: Promise<Answer | null>};
 
-export function createRenderedService({backend, site, surface, motion, animations = true, colors = {}, now = Date.now, setTimer = defaultTimer}: {
+export function createRenderedService({backend, site, surface, motion, animations = true, colors = {}, now = Date.now, setTimer = defaultTimer, pane: paneOptions}: {
   backend: RenderedBackend;
   site: RenderedSite;
   /** Where pages open. Without one, the service only renders. */
@@ -124,6 +129,8 @@ export function createRenderedService({backend, site, surface, motion, animation
   colors?: {fg?: string; bg?: string};
   now?: () => number;
   setTimer?: SetTimer;
+  /** The in-pane view, in a terminal that draws Kitty images: the image registry it shares with media, and how to find Chromium. */
+  pane?: {registry: ImageRegistry; caps: GraphicsCaps; env: NodeJS.ProcessEnv; chrome: () => ChromeBinary | null};
 }) {
   let plan = new Map<string, Planned>();
   // Markdown outside the review that shows an image the review changed, by
@@ -231,6 +238,8 @@ export function createRenderedService({backend, site, surface, motion, animation
     }).then((answer) => {
       const known = answers.get(request.key);
       if (!known || known.epoch <= askedAt) answers.set(request.key, {epoch: askedAt, answer});
+      // The link report grew, and a page in the pane may draw a link broken now.
+      pane?.sourcesChanged();
       return answer;
     }, () => null).finally(() => {
       if (asking.get(request.key)?.controller === controller) asking.delete(request.key);
@@ -259,6 +268,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     if (known && known.epoch > askedAt) return;
     if (known && 'summary' in known.answer && JSON.stringify(known.answer.summary) === JSON.stringify(summary)) return;
     answers.set(key, {epoch: askedAt, answer: {summary}});
+    pane?.sourcesChanged();
     stale = true;
     // A pass running, or waiting to start, writes them; else one starts.
     if (askedAt === epoch && background?.epoch !== epoch && !cancelTimer) void prerender();
@@ -713,7 +723,24 @@ export function createRenderedService({backend, site, surface, motion, animation
     return {kind: 'info', message: parts.join(' · ')};
   }
 
+  // The page the pane draws for a review file: its markdown fragment, with
+  // the links its file page draws broken.
+  const pane: RenderedPane | null = paneOptions ? createRenderedPane({
+    backend,
+    ...paneOptions,
+    source: (fileKey) => {
+      const planned = plan.get(fileKey);
+      if (planned?.kind !== 'markdown' || !planned.request || !title) return null;
+      const brokenRefs = report().broken.get(planned.file.path) ?? [];
+      return {fragment: fragmentRequest(planned), base: title.base, ...(brokenRefs.length > 0 ? {brokenRefs} : {})};
+    },
+    fileForAlias: (alias) => [...plan.values()].find((planned) => planned.alias === alias)?.fileKey ?? null,
+  }) : null;
+
   return {
+    /** The in-pane view, when the terminal can draw it. */
+    pane,
+
     /**
      * Takes a new review: plans its markdown pages and drops work for files
      * that left it. Called while rendering, so it only starts work.
@@ -783,6 +810,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     /** The active file changed: it and its neighbors render first. */
     focus(fileKey: string) {
       focused = fileKey;
+      pane?.focus(fileKey);
       for (const running of asking.values()) {
         const planned = running.epoch === epoch ? plan.get(running.fileKey) : undefined;
         if (planned) raise(running, priorityOf(planned));
@@ -835,6 +863,12 @@ export function createRenderedService({backend, site, surface, motion, animation
       });
     },
 
+    /** How much the TUI moves on a trip, asked once for the session. */
+    crossingMotion(): Promise<Motion> {
+      motionAsked ??= motion ? motion() : Promise.resolve('off');
+      return motionAsked;
+    },
+
     /** The Rendered button's hint: where its page opens, or why it can't. */
     openHint() {
       if (!surface) return null;
@@ -865,6 +899,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       disposed = true;
       cancelTimer?.();
       cancelLive?.();
+      pane?.dispose();
       surface?.dispose?.();
       for (const running of asking.values()) running.controller.abort();
       asking.clear();
@@ -876,19 +911,24 @@ export function createRenderedService({backend, site, surface, motion, animation
 export type RenderedService = ReturnType<typeof createRenderedService>;
 
 /** What the TUI uses to open pages and hear the service's notices. */
-export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'>;
+export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openOverview' | 'openHint' | 'subscribe' | 'getVersion' | 'takeNotices'> & Partial<Pick<RenderedService, 'pane' | 'crossingMotion'>>;
 
 /**
  * The service the CLI runs: its own worker, pages in the session dir, and
  * the surface they open on. `colors` are the terminal's, as it answered
  * them at startup.
  */
-export function startRenderedService({tempDir, env, cwd, animations = true, opener, colors = {}}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; colors?: {fg?: string; bg?: string}}) {
+export function startRenderedService({tempDir, env, cwd, animations = true, opener, colors = {}, pane}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; colors?: {fg?: string; bg?: string}; pane?: {registry: ImageRegistry; caps: GraphicsCaps}}) {
   const platform = process.platform;
+  // Looked up the first time `v` asks, and fixed for the session.
+  let chrome: ChromeBinary | null | undefined;
+  const findBrowser = () => (chrome === undefined ? (chrome = findChrome({env, home: os.homedir(), platform, findTool: (name) => findTool(name, env, cwd), repoRoot: cwd})) : chrome);
+  const inPane = Boolean(pane && env.BRANCH_REVIEW_PANE === 'on' && pane.caps.protocol === 'kitty');
   return createRenderedService({
     backend: createRenderedBackend({tempDir, env, cwd}),
     site: createRenderedSite({tempDir}),
-    surface: createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform}),
+    surface: createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform, inPane}),
+    ...(pane ? {pane: {...pane, env, chrome: findBrowser}} : {}),
     motion: () => resolveMotion({env, animations, run: runTool, platform}),
     animations,
     colors,

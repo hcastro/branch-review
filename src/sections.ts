@@ -35,6 +35,20 @@ export type SectionRow = {
   label?: string;
   lineNumber?: number;
   media?: MediaRowInfo;
+  // A row of a rendered page in the pane (`v`); kind 'media', since it too
+  // holds no code.
+  pane?: PaneRowInfo;
+};
+
+// What a row of a rendered page shows: one row of a tile, with the gutter's
+// change mark before it, or a text row (the page's label, or why it isn't
+// drawn yet) with no box. `pageRow` counts the page's rows from its top.
+export type PaneRowInfo = {
+  fileKey: string;
+  pageRow?: number;
+  box?: BoxSpec;
+  boxRow?: number;
+  lead?: readonly TextPart[];
 };
 
 // What a media row shows. A box row names the boxes it crosses (two in a side
@@ -74,7 +88,7 @@ export const BLOCK_ACTION_LABELS = {
 } as const;
 
 import {cellWidth, graphemes, toDisplayText, truncateStart} from './ui/text.js';
-import type {BoxSpec} from './media/layout.js';
+import type {BoxSpec, TextPart} from './media/layout.js';
 import type {MediaSpan} from './media/types.js';
 import {palette} from './ui/palette.js';
 

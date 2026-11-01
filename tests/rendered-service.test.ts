@@ -6,14 +6,15 @@ import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it} from 'vitest';
 import type {DiffRange} from '../src/git.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
-import type {EmbeddersRequest, FragmentRequest, FragmentResult, FragmentSummary, PageRequest, PageResult, RenderedBackend} from '../src/rendered/backend.js';
+import type {EmbeddersRequest, FragmentRequest, FragmentResult, FragmentSummary, LayoutRequest, PageRequest, PageResult, RenderedBackend} from '../src/rendered/backend.js';
 import {createRenderedService} from '../src/rendered/service.js';
 import type {RunTool} from '../src/rendered/run.js';
 import {createSurface, type Surface} from '../src/rendered/surface.js';
 import {createRenderedSite} from '../src/rendered/site.js';
 import {createRenderedBackend} from '../src/rendered/workerClient.js';
 import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
-import {pngFixture} from './media-helpers.js';
+import {KITTY_CAPS, pngFixture} from './media-helpers.js';
+import {createImageRegistry} from '../src/media/imageRegistry.js';
 import {diffFile} from './rendered-helpers.js';
 
 // The rendered service on its own, over a scripted backend and a fake
@@ -1481,5 +1482,116 @@ describe('the whole branch', () => {
     expect(html).toContain('<h2 class="br-group-title">Won\'t render on GitHub</h2>');
     expect(html).toContain(`href="${readme.rail.find((entry) => entry.current)!.href}#at=L2&#x26;d=short"`);
     expect(html).toContain('<a class="br-findings" href="#br-findings" data-short="✗ 3">2 broken links · 1 image won\'t render</a>');
+  });
+});
+
+// The in-pane view rides on the service: it draws the review's markdown
+// pages from the same fragments the pages get, and a link to another page
+// of the review names that page's file.
+describe('the rendered service with the in-pane view', () => {
+  it('lays out the review\'s markdown from its fragment, and nothing else', async () => {
+    const {backend} = scriptedBackend();
+    const layouts: Array<{source: {fragment: FragmentRequest; base: string}}> = [];
+    const withPane: RenderedBackend = {...backend, layout: async (request) => {
+      layouts.push(request);
+      return {ok: true, layout: {heightCss: 100, blocks: [], removed: [], links: [], anchors: []}, document: 'doc-1'};
+    }, tile: async () => ({ok: false, state: 'error', reason: 'unused'})};
+    const session = makeTempDir('branch-review-media-service-');
+    const writes: string[] = [];
+    const service = createRenderedService({
+      backend: withPane,
+      site: createRenderedSite({tempDir: () => session}),
+      pane: {
+        registry: createImageRegistry({write: (sequence) => writes.push(sequence)}),
+        caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
+        env: {BRANCH_REVIEW_PANE: 'on'},
+        chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      },
+    });
+    const image = {...edited('docs/hero.png'), rawDiff: 'diff --git a/docs/hero.png b/docs/hero.png\nindex 1111111..2222222 100644\nBinary files a/docs/hero.png and b/docs/hero.png differ', blocks: []};
+    service.setReview(review([edited('docs/guide.md'), edited('README.md'), image]), CTX);
+    const pane = service.pane!;
+    expect(pane.offered()).toBe(true);
+    expect(pane.covers('docs/guide.md')).toBe(true);
+    expect(pane.covers('docs/hero.png')).toBe(false);
+    expect(pane.covers('src/app.ts')).toBe(false);
+    pane.enter();
+    pane.rows('docs/guide.md', {innerCols: 200, viewportRows: 30});
+    expect(layouts).toHaveLength(1);
+    expect(layouts[0]!.source.fragment).toMatchObject({path: 'docs/guide.md', cwd: '/repo/project'});
+    expect(layouts[0]!.source.base).toBe('main');
+    service.dispose();
+  });
+
+  it('draws the links its file page draws broken, once the report finds them', async () => {
+    const guideLinks = [{href: 'README.md#nope', status: 'ok' as const, line: 4, ref: {path: 'README.md', anchor: 'user-content-nope', index: 0}}];
+    const {backend} = scriptedBackend((request) => ({ok: true, summary: summary(request.path === 'README.md' ? {links: [], anchors: ['user-content-readme']} : {links: guideLinks, anchors: []})}));
+    const layouts: LayoutRequest[] = [];
+    const withPane: RenderedBackend = {...backend, layout: async (request) => {
+      layouts.push(request);
+      return {ok: true, layout: {heightCss: 100, blocks: [], removed: [], links: [], anchors: []}, document: 'doc-1'};
+    }, tile: async () => ({ok: false, state: 'error', reason: 'unused'})};
+    const clock = fakeTimers();
+    const session = makeTempDir('branch-review-media-service-');
+    const service = createRenderedService({
+      backend: withPane,
+      site: createRenderedSite({tempDir: () => session, now: clock.now}),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      pane: {
+        registry: createImageRegistry({write: () => undefined}),
+        caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
+        env: {BRANCH_REVIEW_PANE: 'on'},
+        chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      },
+    });
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    const pane = service.pane!;
+    pane.enter();
+    pane.rows('docs/guide.md', {innerCols: 200, viewportRows: 30});
+    pane.rows('README.md', {innerCols: 200, viewportRows: 30});
+    const sourceOf = (file: string) => layouts.find((request) => request.source.fragment.path === file)!.source;
+    expect(sourceOf('docs/guide.md').brokenRefs).toEqual([0]);
+    expect(sourceOf('README.md').brokenRefs).toBeUndefined();
+    service.dispose();
+  });
+
+  it('plans a page in the pane again when the report finds a broken link after it was laid out', async () => {
+    const guideLinks = [{href: 'README.md#nope', status: 'ok' as const, line: 4, ref: {path: 'README.md', anchor: 'user-content-nope', index: 0}}];
+    const {backend} = scriptedBackend((request) => ({ok: true, summary: summary(request.path === 'README.md' ? {links: [], anchors: ['user-content-readme']} : {links: guideLinks, anchors: []})}));
+    const layouts: LayoutRequest[] = [];
+    const withPane: RenderedBackend = {...backend, layout: async (request) => {
+      layouts.push(request);
+      return {ok: true, layout: {heightCss: 100, blocks: [], removed: [], links: [], anchors: []}, document: `doc-${layouts.length}`};
+    }, tile: async () => ({ok: false, state: 'error', reason: 'unused'})};
+    const clock = fakeTimers();
+    const session = makeTempDir('branch-review-media-service-');
+    const service = createRenderedService({
+      backend: withPane,
+      site: createRenderedSite({tempDir: () => session, now: clock.now}),
+      now: clock.now,
+      setTimer: clock.setTimer,
+      pane: {
+        registry: createImageRegistry({write: () => undefined}),
+        caps: {...KITTY_CAPS, bg: '#101418', scheme: 'dark'},
+        env: {BRANCH_REVIEW_PANE: 'on'},
+        chrome: () => ({path: '/fake/chrome-headless-shell', headless: '--headless'}),
+      },
+    });
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    const pane = service.pane!;
+    // `v` before the prerender's fragments land: the page has no broken link yet.
+    pane.enter();
+    pane.rows('docs/guide.md', {innerCols: 200, viewportRows: 30});
+    expect(layouts.map((request) => request.source.brokenRefs)).toEqual([undefined]);
+    await clock.advance(0);
+    const planned = pane.planVersion();
+    await clock.advance(2_000);
+    // Nothing else asks for the rows again: the pane says its plan changed.
+    expect(pane.planVersion()).toBeGreaterThan(planned);
+    pane.rows('docs/guide.md', {innerCols: 200, viewportRows: 30});
+    expect(layouts.map((request) => request.source.brokenRefs)).toEqual([undefined, [0]]);
+    service.dispose();
   });
 });

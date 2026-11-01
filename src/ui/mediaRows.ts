@@ -28,7 +28,8 @@ const TONES: Record<Tone, string> = {
 };
 const RESET = palette.sgr.reset;
 
-function styled(parts: PlanTextRow['pieces'][number]['parts']) {
+/** Text parts in their tones' colors, with control characters shown. */
+export function styledParts(parts: PlanTextRow['pieces'][number]['parts']) {
   return parts.map((part) => {
     const text = toDisplayText(part.text);
     const tone = TONES[part.tone];
@@ -42,10 +43,10 @@ export function styledPlanRow(row: PlanTextRow, width: number) {
   for (const piece of row.pieces) {
     const used = visibleWidth(out);
     out += used < piece.at ? ' '.repeat(piece.at - used) : out ? ' ' : '';
-    out += styled(piece.parts);
+    out += styledParts(piece.parts);
   }
   if (row.right) {
-    const right = styled(row.right);
+    const right = styledParts(row.right);
     const used = visibleWidth(out);
     if (used + 2 + visibleWidth(right) <= width) out += ' '.repeat(width - used - visibleWidth(right)) + right;
   }

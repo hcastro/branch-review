@@ -1,29 +1,55 @@
 import {createHash} from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 import {createLru} from '../../media/lru.js';
 import type {WorkerFailure} from '../../media/workerClient.js';
 import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
-import type {EmbeddersResult, FragmentRequest, FragmentResult, FragmentSummary, PageResult, RenderedWorkerRequest} from '../backend.js';
+import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type PageResult, type RenderedWorkerRequest, type TileResult, type TileSource} from '../backend.js';
 import {imageBody, imageFacts} from '../image.js';
 import {renderMarkdown, type RenderInput, type RenderedFragment} from '../markdown.js';
-import {assembleFilePage, type PageBody} from '../page.js';
+import type {PageLayout} from '../plan.js';
+import {assembleFilePage, assembleTileDocument, type PageBody} from '../page.js';
 import {createSourceReader, oneLine, pageBody} from '../source.js';
+import {MAX_TILE_PNG_BYTES, tileRange} from '../tileGeometry.js';
+import {createBrowser, type Browser, type BrowserBudget, type TileDocument} from './browser.js';
+import type {ChromeBinary} from './chrome.js';
+import {createTileFinisher} from './mosaic.js';
 
 // The rendered worker's jobs, with no process of its own, so tests can run
 // them in place. Repo text and images are read, rendered and assembled here;
 // the UI gets back counts and finished pages. Fragments are held by key, so
 // writing a page or a new rail costs no second render. An image's fragment
 // is its two sides, inlined.
+//
+// The in-pane view's jobs lay out and cut a page's tile document in a
+// headless Chromium, started on the first one and closed a minute after the
+// last. Its failures are counted here, apart from the worker's own: three
+// in a minute turn the in-pane view off, and the pages keep rendering. A
+// browser job ends a margin before its deadline, so a browser that hangs,
+// even on a cold start, fails as a browser failure and the worker lives.
 
 const FRAGMENT_CACHE_BYTES = 32 * 1024 * 1024;
+const BROWSER_IDLE_MS = 60_000;
+const BROWSER_FAILURE_WINDOW_MS = 60_000;
+const BROWSER_MAX_FAILURES = 3;
+const TILES_OFF = 'in-pane view turned off';
+// What a browser job leaves of its deadline for cutting the tile to size
+// and sending the answer back.
+const BROWSER_MARGIN_MS = 1_000;
+const LAYOUT_CACHE_BYTES = 4 * 1024 * 1024;
 
-type Held = {body: PageBody; summary: FragmentSummary; uses: AssetUse[]};
+// A tile document, with the markdown its blocks came from when it has any.
+type DrawnDocument = TileDocument & {text?: string};
+
+// `text`: the markdown a rendered body came from.
+type Held = {body: PageBody; summary: FragmentSummary; uses: AssetUse[]; text?: string};
 
 // JavaScript strings take two bytes a character.
 function heldBytes(held: Held) {
   const body = held.body;
   const image = body.kind === 'image' ? [body.image.before, body.image.after].reduce((sum, side) => sum + (side?.kind === 'shown' ? side.dataUrl.length : 0), 0) : 0;
   const text = body.kind === 'rendered' ? body.fragment.html + (body.fragment.raw?.text ?? '') : body.kind === 'tooLarge' ? body.head : body.kind === 'failed' ? body.source : '';
-  return (text.length + image) * 2 + 1024;
+  return (text.length + (held.text?.length ?? 0) + image) * 2 + 1024;
 }
 
 export function summarize(body: PageBody, uses: readonly AssetUse[] = []): FragmentSummary {
@@ -47,9 +73,15 @@ type HandlerOptions = {
   // How long a page's image lookups may take, for a process whose jobs
   // have a deadline (pageLookups).
   lookupBudgetMs?: number;
+  // The browser the in-pane view draws with, for a binary.
+  browser?: (binary: ChromeBinary) => Browser;
+  now?: () => number;
 };
 
-export function createRenderedHandler({render = renderMarkdown, sleep, lookupBudgetMs}: HandlerOptions = {}) {
+// Chromium's profile goes in the session dir, removed at exit.
+const defaultBrowser = (binary: ChromeBinary) => createBrowser({binary, userDataDir: path.join(process.env.BRANCH_REVIEW_MEDIA_TMP ?? os.tmpdir(), 'chrome')});
+
+export function createRenderedHandler({render = renderMarkdown, sleep, lookupBudgetMs, browser: makeBrowser = defaultBrowser, now = Date.now}: HandlerOptions = {}) {
   const sources = createSourceReader(sleep ? {sleep} : {});
   const resolvers = new Map<string, AssetResolver>();
   const held = createLru<Held>(FRAGMENT_CACHE_BYTES, heldBytes);
@@ -82,6 +114,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     const uses: AssetUse[] = [];
     const budget = lookupBudgetMs === undefined ? {} : {budgetMs: lookupBudgetMs};
     let body: PageBody;
+    let text: string | undefined;
     if (request.kind) {
       // Both sides as images, whatever the file's status says the page shows.
       const {asset, baseAsset} = pageLookups(resolverFor(request.cwd), request.assets, false, uses, budget);
@@ -93,19 +126,116 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
       const unchanged = request.textUnchanged ? {textUnchanged: true as const} : {};
       body = await pageBody(
         () => sources.read(request.cwd, request.source),
-        (source) => render({path: request.path, ...(request.oldPath ? {basePath: request.oldPath} : {}), status: request.status, ...unchanged, source, groups: request.groups, ...lookups, link}),
+        (source) => {
+          text = source;
+          return render({path: request.path, ...(request.oldPath ? {basePath: request.oldPath} : {}), status: request.status, ...unchanged, source, groups: request.groups, ...lookups, link});
+        },
       );
     }
-    const entry: Held = {body, summary: summarize(body, uses), uses};
+    const entry: Held = {body, summary: summarize(body, uses), uses, ...(body.kind === 'rendered' && text !== undefined ? {text} : {})};
     // A failure can depend on the moment (a file mid-write), so it is
     // rendered again next time rather than held.
     if (body.kind !== 'failed') held.set(request.key, entry);
     return {...entry, fresh: true};
   }
 
+  let browser: {binary: string; instance: Browser} | null = null;
+  let idle: ReturnType<typeof setTimeout> | null = null;
+  let browserFailures: number[] = [];
+  let tilesOff: string | null = null;
+  const finishTile = createTileFinisher();
+
+  const closeBrowser = () => {
+    if (idle) clearTimeout(idle);
+    idle = null;
+    browser?.instance.close();
+    browser = null;
+  };
+
+  const browserFor = (binary: ChromeBinary) => {
+    if (browser?.binary !== binary.path) {
+      closeBrowser();
+      browser = {binary: binary.path, instance: makeBrowser(binary)};
+    }
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(closeBrowser, BROWSER_IDLE_MS);
+    idle.unref?.();
+    return browser.instance;
+  };
+
+  // The tile document for a source, named by everything it is drawn from,
+  // with the markdown it was drawn from.
+  const tileDocument = async (source: TileSource): Promise<DrawnDocument> => {
+    const {fragment: request, scheme, bg, base, geometry, brokenRefs} = source;
+    const {body, text} = await fragment(request);
+    const html = assembleTileDocument({file: {path: request.path, status: request.status, ...(request.oldPath ? {oldPath: request.oldPath} : {}), body}, scheme, bg, cssWidth: geometry.cssWidth, base, ...(brokenRefs ? {brokenRefs} : {})});
+    const key = createHash('sha256').update(html).digest('hex').slice(0, 20);
+    return {key, html, cssWidth: geometry.cssWidth, dpr: geometry.dpr, scheme, ...(text !== undefined ? {text} : {})};
+  };
+
+  // Browser jobs take turns: they share Chromium's one page.
+  let turn: Promise<unknown> = Promise.resolve();
+
+  // Layouts by the document and scale they were laid out at, so asking
+  // again for a page that didn't change asks the browser nothing.
+  const layouts = createLru<PageLayout>(LAYOUT_CACHE_BYTES, (layout) => JSON.stringify(layout).length * 2);
+
+  // Runs a browser job, counting its failure toward turning tiles off.
+  // `budget`: when the job must be done, its deadline less the margin.
+  function withBrowser<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser, document: DrawnDocument) => Promise<T>): Promise<T | LayoutResult | TileResult> {
+    const run = turn.then(() => browserJob(source, budget, work));
+    turn = run.catch(() => undefined);
+    return run;
+  }
+
+  async function browserJob<T extends LayoutResult | TileResult>(source: TileSource, budget: BrowserBudget, work: (browser: Browser, document: DrawnDocument) => Promise<T>): Promise<T | LayoutResult | TileResult> {
+    if (tilesOff) return {ok: false, state: 'unavailable', reason: tilesOff, tilesOff: true};
+    const document = await tileDocument(source);
+    try {
+      return await work(browserFor(source.chrome), document);
+    } catch (error) {
+      const reason = oneLine(error);
+      const at = now();
+      browserFailures = [...browserFailures.filter((when) => at - when < BROWSER_FAILURE_WINDOW_MS), at];
+      if (browserFailures.length < BROWSER_MAX_FAILURES) return {ok: false, state: 'error', reason};
+      // The failure that turns tiles off says so, so the pane goes back to
+      // the diff now, not on some later job that may never come.
+      tilesOff = `${TILES_OFF}: ${reason}`;
+      closeBrowser();
+      return {ok: false, state: 'unavailable', reason: tilesOff, tilesOff: true};
+    }
+  }
+
+  const budgetFor = (type: keyof typeof BROWSER_JOB_DEADLINES_MS, startedAt: number): BrowserBudget => ({deadline: startedAt + BROWSER_JOB_DEADLINES_MS[type] - BROWSER_MARGIN_MS});
+
   return {
-    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | PageResult | EmbeddersResult> {
+    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | PageResult | EmbeddersResult | LayoutResult | TileResult> {
+      // The job's deadline started when it was sent, a moment before this.
+      const startedAt = Date.now();
       try {
+        if (message.type === 'layout') {
+          const budget = budgetFor('layout', startedAt);
+          return await withBrowser(message.source, budget, async (instance, document) => {
+            const name = `${document.key}@${document.dpr}`;
+            const layout = layouts.get(name) ?? await instance.layout(document, budget);
+            layouts.set(name, layout);
+            return {ok: true, layout, document: document.key, ...(document.text !== undefined ? {text: document.text} : {})};
+          });
+        }
+        if (message.type === 'tile') {
+          const {source, index, rows, mosaic} = message;
+          const range = tileRange(index, rows, source.geometry);
+          const budget = budgetFor('tile', startedAt);
+          return await withBrowser(source, budget, async (instance, document): Promise<TileResult> => {
+            // A device pixel more than the tile, since Chromium rounds a
+            // fractional clip down; the finisher cuts it to the exact size.
+            const drawn = await instance.capture(document, {cssY: range.cssY, cssHeight: range.cssHeight + 1 / source.geometry.dpr}, budget);
+            const cells = mosaic ? {cols: source.geometry.sheetCols, rows: range.rows} : undefined;
+            const finished = await finishTile(drawn, {width: range.width, height: range.height, bg: source.bg, ...(cells ? {cells} : {})});
+            if (finished.png.byteLength > MAX_TILE_PNG_BYTES) return {ok: false, state: 'error', reason: 'tile too large', tooLarge: true};
+            return {ok: true, ...finished};
+          });
+        }
         if (message.type === 'fragment') {
           const {type: _type, ...request} = message;
           return {ok: true, summary: (await fragment(request)).summary};
@@ -121,5 +251,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
         return {ok: false, state: 'error', reason: oneLine(error)} satisfies WorkerFailure;
       }
     },
+    /** Closes the browser, for a worker that is going away. */
+    dispose: closeBrowser,
   };
 }

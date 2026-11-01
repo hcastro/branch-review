@@ -54,6 +54,9 @@ export type ForkedWorkerSpec<Type extends string> = {
   maxInFlight: number;
   // Job types that may run only this many at a time.
   perTypeLimit?: Partial<Record<Type, number>>;
+  // Job types that count as one toward their limit, by a shared name: the
+  // rendered worker's layout and tile jobs take turns with one browser.
+  limitGroups?: Partial<Record<Type, string>>;
 };
 
 export type ForkedWorkerOptions<Type extends string> = {
@@ -150,6 +153,8 @@ export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<k
 }: ForkedWorkerOptions<keyof Jobs & string>): ForkedWorker<Jobs> {
   const deadlines: Record<string, number> = {...spec.deadlinesMs, ...deadlinesMs};
   const limits: Partial<Record<string, number>> = spec.perTypeLimit ?? {};
+  const groups: Partial<Record<string, string>> = spec.limitGroups ?? {};
+  const groupOf = (type: string) => groups[type] ?? type;
   const queue: Job[] = [];
   const inFlight = new Map<number, Job>();
   let child: ChildProcess | null = null;
@@ -327,7 +332,7 @@ export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<k
       // A job type with a limit waits while that many of it are in flight:
       // the media worker runs one ffmpeg at a time, and a second video job
       // sent now would wait there with its deadline running.
-      const running = (type: string) => [...inFlight.values()].filter((each) => each.type === type).length;
+      const running = (type: string) => [...inFlight.values()].filter((each) => groupOf(each.type) === groupOf(type)).length;
       const next = queue.findIndex((each) => running(each.type) < (limits[each.type] ?? Infinity));
       if (next < 0) break;
       const [job] = queue.splice(next, 1) as [Job];

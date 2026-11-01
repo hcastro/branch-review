@@ -156,6 +156,14 @@ describe('createSurface', () => {
     expect(opened).toEqual([]);
   });
 
+  it('names v over SSH when the pane draws pages there', async () => {
+    const {run, calls} = recordingRun(SPLIT);
+    const ssh = createSurface({env: {...CMUX_ENV, SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22'}, run, findTool: found({cmux: CMUX}), opener: () => undefined, platform: 'darwin', inPane: true});
+    expect(ssh.refusal).toBe("open isn't available over SSH · v draws it here");
+    expect(await ssh.show(URL_A)).toEqual({refused: ssh.refusal});
+    expect(calls).toEqual([]);
+  });
+
   it('keeps one cmux call in flight, and of the presses waiting behind it runs only the newest', async () => {
     let release!: () => void;
     const held = new Promise<RunResult>((resolve) => {

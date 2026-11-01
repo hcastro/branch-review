@@ -10,6 +10,7 @@ import {queryTmuxClient, startGraphicsDetection, type TmuxClient, type TtyInput}
 import type {GraphicsCaps} from './media/types.js';
 import {tmuxPassthrough} from './media/kitty.js';
 import {createMediaService, type MediaService} from './media/service.js';
+import {createImageRegistry, type ImageRegistry} from './media/imageRegistry.js';
 import {createWorkerBackend} from './media/workerClient.js';
 import {claimKittyTmux, createMediaTempDir, sweepStaleMediaDirs} from './media/tempDir.js';
 import {defaultOpener, type Opener} from './media/openExternal.js';
@@ -103,7 +104,7 @@ const TMUX_SHARED_NOTICE = 'another branch-review draws images in this tmux serv
  * hooks kill the media worker and remove the session's temp dir. Nothing is
  * sent before the UI enters the alt screen.
  */
-function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching, animations, opener}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; tempDir: SessionDir; watching: boolean; animations: boolean; opener: Opener}): {media: MediaService; caps: GraphicsCaps} {
+function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching, animations, opener}: {caps: GraphicsCaps; cwd: string; env: NodeJS.ProcessEnv; proc: CliProcess; session: SessionLike; tempDir: SessionDir; watching: boolean; animations: boolean; opener: Opener}): {media: MediaService; caps: GraphicsCaps; registry: ImageRegistry} {
   // Every pane of a tmux server draws on the one outer terminal and its one
   // table of image ids, so only the first session there draws Kitty images.
   let caps = detected;
@@ -124,10 +125,14 @@ function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching,
   // Inside tmux every graphics command, the exit deletes too, goes through
   // passthrough to the outer terminal.
   const forTerminal = (sequence: string) => (caps.tmux ? tmuxPassthrough(sequence) : sequence);
+  // One table of image ids for media previews and the in-pane rendered
+  // view, so the exit write below deletes both.
+  const registry = createImageRegistry({write: (sequence) => session.writeGraphics(forTerminal(sequence))});
   const media = createMediaService({
     caps,
     backend,
     sink: {write: (sequence) => session.writeGraphics(forTerminal(sequence))},
+    imageRegistry: registry,
     tempDir: tempDir.get,
     opener,
     env,
@@ -137,7 +142,7 @@ function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching,
   });
   session.setRestorePrefix(() => forTerminal(media.restoreSequence()));
   proc.on('exit', () => media.dispose());
-  return {media, caps};
+  return {media, caps, registry};
 }
 
 type SessionDir = ReturnType<typeof createMediaTempDir>;
@@ -280,10 +285,12 @@ export async function runCli(io: CliIo) {
   const started = caps.protocol !== 'none' ? startMedia({caps, cwd, env, proc, session, tempDir, watching: options.watch, animations: options.animations, opener}) : undefined;
   // The rendered view needs no graphics: its pages open in a browser.
   const renderedModule = await loadingRendered;
+  // Pages in the diff pane are Kitty images, from the media previews' ids.
+  const pane = started && started.caps.protocol === 'kitty' ? {registry: started.registry, caps: started.caps} : undefined;
   const rendered = renderedModule?.startRenderedService({tempDir: () => {
     sweepOnce();
     return tempDir.get();
-  }, env, cwd, animations: options.animations, opener, colors: {...(caps.fg ? {fg: caps.fg} : {}), ...(caps.bg ? {bg: caps.bg} : {})}});
+  }, env, cwd, animations: options.animations, opener, colors: {...(caps.fg ? {fg: caps.fg} : {}), ...(caps.bg ? {bg: caps.bg} : {})}, ...(pane ? {pane} : {})});
   proc.on('exit', () => rendered?.dispose());
   proc.on('exit', tempDir.remove);
   const media = started?.media;

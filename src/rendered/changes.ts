@@ -397,7 +397,10 @@ function rowKey(text: string) {
 // block whose text is the same on both sides pairs ahead of any other;
 // blocks of different kinds never pair. Table rows with the same key pair
 // ahead of rows that only look alike: an edited row keeps its first cell,
-// and a new row can share most of its other cells with it.
+// and a new row can share most of its other cells with it. Other blocks
+// whose old wording runs whole and in order inside the new one pair ahead
+// of blocks that only share letters with it: `A nested tip` was extended
+// into `A nested tip that changed`, not into `A new nested tip`.
 function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
   if (family(baseBlock) !== family(afterBlock)) return null;
   if (baseBlock.text.trim() === afterBlock.text.trim()) return 3;
@@ -407,9 +410,11 @@ function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
   const shared = [...left.parts].filter((part) => right.parts.has(part)).length;
   const total = left.parts.size + right.parts.size;
   const similarity = total === 0 ? 1 : (2 * shared) / total;
+  const held = left.kind === 'words' && holds(left.words, right.words);
   if (baseBlock.tag === 'tr' && rowKey(baseBlock.text) !== '' && rowKey(baseBlock.text) === rowKey(afterBlock.text)) return 2 + similarity / 2;
+  if (baseBlock.tag !== 'tr' && held) return 2 + similarity / 2;
   if (similarity >= MIN_LIKENESS) return 1 + similarity;
-  return left.kind === 'words' && holds(left.words, right.words) ? 1 + MIN_LIKENESS : null;
+  return held ? 1 + MIN_LIKENESS : null;
 }
 
 type AlignOp = {base?: number; after?: number};

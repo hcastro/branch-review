@@ -52,10 +52,16 @@ export function renderedPageKey(parts: {fragment: string; body: string; assets: 
     .slice(0, 20);
 }
 
+// The hex digits of a file's stable page name.
+const ALIAS_HEX = 20;
+
 /** A file's stable page name for the session, which always shows its newest page. */
 export function fileAlias(fileKey: string) {
-  return `f-${createHash('sha256').update(fileKey).digest('hex').slice(0, 20)}`;
+  return `f-${createHash('sha256').update(fileKey).digest('hex').slice(0, ALIAS_HEX)}`;
 }
+
+/** A link to another file's page in the review, `f-….html` with any `#anchor`: the page name it names is group 1. */
+export const FILE_ALIAS_LINK = new RegExp(`^(f-[0-9a-f]{${ALIAS_HEX}})\\.html(?:#.*)?$`);
 
 /** The signature of a rail: which files it lists, in order, and their status. */
 export function railSignature(files: ReadonlyArray<{path: string; status: FileStatus}>) {
