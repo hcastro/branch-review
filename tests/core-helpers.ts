@@ -34,6 +34,10 @@ export function initRepo(files: Record<string, string> = {}, branch = 'main') {
   git(cwd, 'config', 'user.name', 'Test User');
   git(cwd, 'config', 'user.email', 'test@example.com');
   git(cwd, 'config', 'commit.gpgsign', 'false');
+  // A commit can start git's maintenance in the background, which creates and
+  // removes lock files under .git while a test walks the repo.
+  git(cwd, 'config', 'maintenance.auto', 'false');
+  git(cwd, 'config', 'gc.auto', '0');
   writeFiles(cwd, files);
   git(cwd, 'add', '-A');
   git(cwd, 'commit', '-q', '--allow-empty', '-m', 'initial');
@@ -138,11 +142,14 @@ export function gitSpy() {
   };
 }
 
-// Every file under `dir` with its content hash and mtime, keyed by relative path.
-export function snapshotTree(dir: string) {
+// Every file under `dir` with its content hash and mtime, keyed by relative
+// path. `skipGit` leaves out the top-level entries whose names start with
+// `.git`, without reading them, so git's own files can't change under the walk.
+export function snapshotTree(dir: string, {skipGit = false}: {skipGit?: boolean} = {}) {
   const files = new Map<string, {hash: string; mtimeMs: number}>();
   const walk = (current: string) => {
     for (const entry of fs.readdirSync(current, {withFileTypes: true})) {
+      if (skipGit && current === dir && entry.name.startsWith('.git')) continue;
       const absolute = path.join(current, entry.name);
       if (entry.isDirectory()) walk(absolute);
       else if (entry.isFile()) {

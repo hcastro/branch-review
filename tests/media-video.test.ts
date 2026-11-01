@@ -718,7 +718,7 @@ describe('the tools\' cwd and environment in the real media worker', {timeout: 6
     const cwd = initRepo();
     fs.writeFileSync(path.join(cwd, 'clip.mp4'), mp4Bytes());
     commitAll(cwd, 'add clip');
-    const before = [...snapshotTree(cwd)].filter(([name]) => !name.startsWith('.git'));
+    const before = [...snapshotTree(cwd, {skipGit: true})];
     const tools = fakeMediaTools(makeTempDir('branch-review-fake-tools-'), {probeJson: PROBE, framePng: pngFixture(160, 90)});
     const tempDir = makeTempDir('branch-review-media-session-');
     const env = {
@@ -748,7 +748,7 @@ describe('the tools\' cwd and environment in the real media worker', {timeout: 6
     } finally {
       backend.dispose();
     }
-    expect([...snapshotTree(cwd)].filter(([name]) => !name.startsWith('.git'))).toEqual(before);
+    expect([...snapshotTree(cwd, {skipGit: true})]).toEqual(before);
   });
 
   it('falls back to the OS temp dir, never the repo, when the worker runs outside a session', async () => {

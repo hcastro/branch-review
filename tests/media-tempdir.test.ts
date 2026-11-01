@@ -104,7 +104,7 @@ describe('media temp dir', {timeout: 30_000}, () => {
       fs.writeFileSync(path.join(repo, 'logo.png'), pngFixture(4, 2));
       commitAll(repo, 'add logo');
       const status = git(repo, 'status', '--porcelain');
-      const tree = [...snapshotTree(repo)].filter(([name]) => !name.startsWith('.git'));
+      const tree = [...snapshotTree(repo, {skipGit: true})];
       const env = {...process.env, BRANCH_REVIEW_TMPDIR: value};
       const opened: string[][] = [];
       try {
@@ -128,7 +128,7 @@ describe('media temp dir', {timeout: 30_000}, () => {
         process.chdir(start);
       }
       expect(git(repo, 'status', '--porcelain'), value).toBe(status);
-      expect([...snapshotTree(repo)].filter(([name]) => !name.startsWith('.git')), value).toEqual(tree);
+      expect([...snapshotTree(repo, {skipGit: true})], value).toEqual(tree);
     }
   }, 30_000);
 
