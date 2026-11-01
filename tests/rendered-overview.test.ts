@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {describe, expect, it} from 'vitest';
-import {PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
+import {HEAD_SCRIPT, HEAD_SCRIPT_HASH, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
 import {assembleOverview, contentSecurityPolicy, type OverviewInput} from '../src/rendered/page.js';
 
 // The overview `R` opens: every rendered file of the review with its
@@ -45,9 +45,10 @@ describe('assembleOverview', () => {
     const head = html.slice(html.indexOf('<head>') + '<head>'.length).trimStart();
     expect(head.startsWith(`<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy()}">`)).toBe(true);
     expect(contentSecurityPolicy()).toContain(`style-src '${PAGE_CSS_HASH}'`);
-    expect(contentSecurityPolicy()).toContain(`script-src '${PAGE_SCRIPT_HASH}'`);
+    expect(contentSecurityPolicy()).toContain(`script-src '${HEAD_SCRIPT_HASH}' '${PAGE_SCRIPT_HASH}'`);
     expect(html.split(`<script>${PAGE_SCRIPT}</script>`)).toHaveLength(2);
-    expect(html.replace(`<script>${PAGE_SCRIPT}</script>`, '')).not.toMatch(/<script|\sstyle=|\son[a-z]+=/i);
+    expect(html.split(`<script>${HEAD_SCRIPT}</script>`)).toHaveLength(2);
+    expect(html.replace(`<script>${HEAD_SCRIPT}</script>`, '').replace(`<script>${PAGE_SCRIPT}</script>`, '')).not.toMatch(/<script|\sstyle=|\son[a-z]+=/i);
     expect(html).toContain('<title>Overview · branch-review</title>');
   });
 
@@ -140,4 +141,58 @@ describe('assembleOverview', () => {
     expect(html).toContain('<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub\'s stylesheet · 3 differences: 1 Mermaid diagram shown as code, 2 remote images not loaded: the page works offline</p>');
     expect(overview({differences: []})).toContain('<p class="br-overview-foot">≈ GitHub · rendered offline with GitHub\'s stylesheet</p>');
   });
+
+  // The whole branch: an image and an SVG among the pages, a page whose text
+  // didn't change but shows a changed image, a deleted page, and what won't
+  // render on GitHub.
+  function wholeBranch() {
+    const shown = (width: number, height: number, bytes: number) => ({width, height, bytes});
+    return overview({
+      entries: [
+        {path: 'docs/rendered-view.md', status: 'modified', href: 'f-aaaaaaaaaaaaaaaaaaaa.html', state: 'rendered', changes: {changed: 3, removed: 1}},
+        {path: 'docs/flow.svg', status: 'added', href: 'f-bbbbbbbbbbbbbbbbbbbb.html', state: 'image', changes: null, image: {after: shown(1200, 480, 22_528)}},
+        {path: 'docs/hero.png', status: 'modified', href: 'f-cccccccccccccccccccc.html', state: 'image', changes: null, image: {before: shown(1200, 480, 86_016), after: shown(1200, 520, 93_184)}},
+        {path: 'README.md', status: 'modified', href: 'f-dddddddddddddddddddd.html', state: 'rendered', changes: {changed: 1, removed: 0}},
+        {path: 'docs/old-trip.md', status: 'deleted', href: 'f-eeeeeeeeeeeeeeeeeeee.html', state: 'rendered', changes: {changed: 0, removed: 0}},
+      ],
+      also: [{path: 'CONTRIBUTING.md', status: 'modified', href: 'f-ffffffffffffffffffff.html', state: 'rendered', changes: {changed: 1, removed: 0}, embeds: ['docs/hero.png']}],
+      findings: [
+        {path: 'README.md', line: 41, target: 'setup.md#tokenz', what: 'link', kind: 'badAnchor', reason: 'anchor not found', href: 'f-dddddddddddddddddddd.html'},
+        {path: 'docs/rendered-view.md', line: 18, target: './Flow.svg', what: 'image', kind: 'caseMismatch', reason: 'case mismatch: Flow.svg vs flow.svg', href: 'f-aaaaaaaaaaaaaaaaaaaa.html'},
+        {path: 'README.md', line: 7, target: './notes/draft.png', what: 'image', kind: 'untracked', reason: 'file is untracked', href: 'f-dddddddddddddddddddd.html'},
+      ],
+    });
+  }
+
+  it('reads the whole branch: images with their sizes, what also looks different, the deleted, and what won\'t render on GitHub', () => {
+    const html = wholeBranch();
+    expect(section(html, 'Pages')).toEqual([
+      'M docs/rendered-view.md 3 changed · 1 removed open ›',
+      'A docs/flow.svg added · 1200×480 · 22 KB open ›',
+      'M docs/hero.png 1200×480 · 84 KB → 1200×520 · 91 KB open ›',
+      'M README.md 1 changed open ›',
+    ]);
+    expect(section(html, 'Also looks different')).toEqual(['· CONTRIBUTING.md text unchanged · embeds docs/hero.png open ›']);
+    expect(section(html, 'Deleted')).toEqual(['D docs/old-trip.md shown dimmed from main open ›']);
+    expect(section(html, "Won't render on GitHub")).toEqual([
+      '✗ README.md:41 setup.md#tokenz · anchor not found',
+      '✗ docs/rendered-view.md:18 ./Flow.svg · case mismatch: Flow.svg vs flow.svg',
+      '✗ README.md:7 ./notes/draft.png · file is untracked',
+    ]);
+    // Each finding opens its page at its line.
+    expect(html).toContain('<a class="br-row br-row-finding" href="f-dddddddddddddddddddd.html#at=L41&#x26;d=short">');
+    expect(html).toMatch(/<ul class="br-rail-stats">\s*<li>4 pages<\/li>\s*<li>1 also looks different<\/li>\s*<li>1 deleted<\/li>\s*<li>3 findings<\/li>\s*<\/ul>/);
+    expect(html).toContain('<p class="br-summary">4 pages · 1 also looks different · 1 deleted · 3 findings</p>');
+    // The strip says how many links won't resolve, and goes to the list.
+    expect(html).toContain('<a class="br-findings" href="#br-findings" data-short="✗ 3">1 broken link · 2 images won\'t render</a>');
+  });
+
+  it('matches its snapshot for the whole branch', async () => {
+    // The body, less the page script: the stylesheet and the script have
+    // tests of their own.
+    const html = wholeBranch();
+    const body = html.slice(html.indexOf('<body>'), html.indexOf(`<script>${PAGE_SCRIPT}</script>`));
+    await expect(body).toMatchFileSnapshot('./fixtures/rendered/overview.html');
+  });
 });
+

@@ -43,8 +43,35 @@ export type RefusedReason =
 /** The most image bytes one page inlines; images past it show a card. */
 export const PAGE_INLINE_LIMIT = 32 * 1024 * 1024;
 
-/** How one relative link resolved: to another rendered page, or not. */
-export type LinkAnswer = {kind: 'inReview'; href: string} | {kind: 'outside'} | {kind: 'missing'} | {kind: 'badAnchor'};
+/**
+ * How one relative link resolved: to another rendered page, to a file git
+ * holds that the review didn't render (`outside`), or to nothing GitHub
+ * would find: no such file, a file git doesn't track or ignores, a name
+ * whose capitals differ from the file's, or a heading that isn't there.
+ * `unchecked`: no answer came in time, so the page claims nothing of it.
+ */
+export type LinkAnswer =
+  | {kind: 'inReview'; href: string}
+  | {kind: 'outside'}
+  | {kind: 'unchecked'}
+  | {kind: 'missing'}
+  | {kind: 'badAnchor'}
+  | {kind: 'untracked'}
+  | {kind: 'ignored'}
+  | {kind: 'caseMismatch'; hint: string};
+
+/** What a link on the page came to: `ok`, or how it resolved when it opens no page. */
+export type LinkStatus = 'ok' | Exclude<LinkAnswer['kind'], 'inReview'>;
+
+/**
+ * One link on the page, as written, with its line. A link to a heading on
+ * another rendered page names it in `ref`, which the page checks once that
+ * page's anchors are known: `index` names the link in the page's HTML.
+ */
+export type PageLink = {href: string; status: LinkStatus; line: number; hint?: string; ref?: {path: string; anchor: string; index: number}};
+
+/** One repo image the page's own text shows, as written, and how it resolved. */
+export type PageImageUse = {path: string; url: string; line: number; status: 'embed' | 'skipped' | RefusedReason; hint?: string};
 
 export type RenderInput = {
   /** The file's repo-relative POSIX path; relative links resolve from its folder. */
@@ -57,6 +84,12 @@ export type RenderInput = {
   basePath?: string;
   /** How the review sees the file; the first frame of a new or deleted one is all one tint. */
   status?: FileStatus;
+  /**
+   * The text is the same on both sides, as in a file the review doesn't
+   * list that shows an image the branch changed: its blocks are marked by
+   * the images they show alone.
+   */
+  textUnchanged?: true;
   source: string;
   groups: ChangeGroup[];
   asset: (repoPath: string) => Promise<AssetAnswer>;
@@ -67,7 +100,7 @@ export type RenderInput = {
   // where the base side's text finds it at `basePath`. A block that shows
   // one is marked even when its text didn't change.
   assetChanged?: (repoPath: string, basePath: string) => Promise<boolean>;
-  link: (repoPath: string, hash?: string) => LinkAnswer;
+  link: (repoPath: string, hash?: string) => LinkAnswer | Promise<LinkAnswer>;
 };
 
 export type RenderedBlock = {
@@ -85,7 +118,17 @@ export type RenderedFragment = {
   html: string;
   blocks: RenderedBlock[];
   headings: Array<{id: string; depth: number; text: string}>;
-  links: Array<{href: string; status: 'ok' | 'outside' | 'missing' | 'badAnchor'; line: number}>;
+  links: PageLink[];
+  /** Every id a link can point at on the page: its headings' and its HTML's, `user-content-` first. */
+  anchors: string[];
+  /** The repo images the page's own text shows. */
+  images: PageImageUse[];
+  /**
+   * Where in `html` each link with a `ref` starts its attributes, right
+   * after `<a`, by the ref's index: the page, once it knows the other
+   * pages' anchors, draws the ones that point nowhere broken there.
+   */
+  refOffsets?: number[];
   assetOids: string[];
   /** Where the page is known to differ from github.com, counted. */
   differences: Array<{kind: DifferenceKind; count: number}>;
@@ -99,6 +142,8 @@ type Lookups = Pick<RenderInput, 'asset' | 'baseAsset' | 'assetChanged' | 'link'
 
 type TreeOptions = Lookups & {
   path: string;
+  status?: FileStatus;
+  textUnchanged?: true;
   basePath?: string;
   // Where this text's images resolve from, when not `path`: the base
   // side's text of a file the review moved.
@@ -122,17 +167,38 @@ type RenderedTree = {
   blocks: RenderedBlock[];
   headings: RenderedFragment['headings'];
   links: RenderedFragment['links'];
+  anchors: string[];
+  images: PageImageUse[];
+  refAttribute?: string;
   changes: RenderedFragment['changes'];
 };
+
+// The HTML of the page's tree, and where each link a ref names starts its
+// attributes. The refs ride on an attribute made fresh for this render,
+// which no repo text holds, and come out here.
+function stringifyWithRefs(tree: Root, attribute: string | undefined): {html: string; refOffsets?: number[]} {
+  const marked = unified().use(rehypeStringify).stringify(tree);
+  if (!attribute) return {html: marked};
+  const refOffsets: number[] = [];
+  let removed = 0;
+  const html = marked.replace(new RegExp(` ${attribute}="(\\d+)"`, 'g'), (found: string, index: string, at: number) => {
+    refOffsets[Number(index)] = at - removed;
+    removed += found.length;
+    return '';
+  });
+  return refOffsets.length > 0 ? {html, refOffsets} : {html};
+}
 
 export async function renderMarkdown(input: RenderInput): Promise<RenderedFragment> {
   const tally: Tally = {differences: new Map(), assetOids: new Set(), inlined: {bytes: 0}};
   const rendered = await renderTree(input.source, {...input, groups: input.groups, anchors: true}, tally);
   return {
-    html: unified().use(rehypeStringify).stringify(rendered.tree),
+    ...stringifyWithRefs(rendered.tree, rendered.refAttribute),
     blocks: rendered.blocks,
     headings: rendered.headings,
     links: rendered.links,
+    anchors: rendered.anchors,
+    images: rendered.images,
     assetOids: [...tally.assetOids],
     differences: [...tally.differences].map(([kind, count]) => ({kind, count})),
     changes: rendered.changes,
@@ -146,9 +212,9 @@ async function renderTree(source: string, options: TreeOptions, tally: Tally): P
   const {mdast, hast: raw} = await parseOnGitLines(processor, source);
   const sourceLines = source.split('\n');
   const candidates = options.groups ? collectBlocks(raw, sourceLines, stamp.property) : [];
-  // Read before the sanitizer runs, from the tree the page is made of.
-  const context = options.groups && options.groups.length > 0 ? sideContext(mdast, raw, source) : null;
 
+  // The sanitizer makes a new tree: `raw` stays as parsed, for the side's
+  // context below.
   const tree = unified().use(rehypeSanitize, sanitizeSchema(stamp.property)).runSync(raw) as Root;
 
   const headings = options.anchors ? addHeadingAnchors(tree, stamp.property) : [];
@@ -156,19 +222,30 @@ async function renderTree(source: string, options: TreeOptions, tally: Tally): P
   replaceEmoji(tree);
   finishGithubMarkup(tree, tally);
   await highlightCode(tree, tally);
-  const links = resolveLinks(tree, options, tally);
-  const images = await resolveImages(tree, options, tally);
+  // Only the page's own text says where links point and what they can
+  // point at; nested renders are views of it.
+  const refs = options.anchors ? privateAttribute() : null;
+  // Links and images are looked up side by side, so a slow link check
+  // never spends the time the page's images have. The images' differences
+  // count after the links', as if looked up second, so the chip's list
+  // keeps one order.
+  const imageTally: Tally = {...tally, differences: new Map()};
+  const [{links, anchors}, {looked, uses}] = await Promise.all([resolveLinks(tree, options, tally, refs?.property ?? null), resolveImages(tree, options, imageTally)]);
+  for (const [kind, n] of imageTally.differences) tally.differences.set(kind, (tally.differences.get(kind) ?? 0) + n);
 
   const blocks: RenderedBlock[] = [];
   const changes = {changed: 0, removed: 0};
   if (options.groups) {
     const groups = options.groups;
+    // A changed image marks its block even where the text is the same, as
+    // in a file the branch didn't touch at all.
+    const imageLines = groups.length > 0 || options.textUnchanged ? await changedImageLines(looked, options) : new Set<number>();
+    const compare = groups.length > 0 || imageLines.size > 0;
     // The base side is parsed only for its blocks' positions. Nothing of it
     // shows except through the nested renders below, which sanitize.
-    const base = groups.length > 0 ? await baseSide(processor, source, groups) : emptySide();
-    const page: Side = {blocks: candidates, lines: sourceLines, ...(context ?? emptySide())};
-    const imageLines = groups.length > 0 ? await changedImageLines(images, options) : new Set<number>();
-    const {marks, removals} = groups.length > 0
+    const base = compare ? await baseSide(processor, source, groups) : emptySide();
+    const page: Side = {blocks: candidates, lines: sourceLines, ...(compare ? sideContext(mdast, raw, source) : emptySide())};
+    const {marks, removals} = compare
       ? markBlocks({blocks: candidates, lines: sourceLines}, {blocks: base.blocks, lines: base.lines}, groups, imageLines)
       : {marks: [], removals: []};
     // Nested renders count their own differences: the page's chip counts
@@ -223,7 +300,7 @@ async function renderTree(source: string, options: TreeOptions, tally: Tally): P
     }
   }
 
-  return {tree, blocks, headings, links, changes};
+  return {tree, blocks, headings, links, anchors, images: uses, ...(refs ? {refAttribute: refs.attribute} : {}), changes};
 }
 
 function parser(stampProperty: string) {
@@ -621,18 +698,25 @@ function decodeHash(hash: string) {
 // Links resolve here, without a script on the page: `#slug` points at the
 // `user-content-` id GitHub's own script would scroll to, a link to another
 // rendered file points at its page, and a link to anything else in the repo
-// is inert, since there is no page to open. External links open with no
-// referrer and no opener.
-function resolveLinks(tree: Root, options: TreeOptions, tally: Tally): RenderedFragment['links'] {
-  const ids = new Set<string>();
-  walk(tree, (node) => {
-    for (const key of ['id', 'name']) {
-      const value = node.properties[key];
-      if (typeof value === 'string') ids.add(value);
-    }
-  });
+// is inert, since there is no page to open: dotted when GitHub would find
+// the file, drawn broken when it wouldn't. External links open with no
+// referrer and no opener. A link to a heading on another rendered page
+// carries `refProperty` until the page is assembled, which then knows that
+// page's anchors. Every path is asked at once; the answers apply in page
+// order.
+async function resolveLinks(tree: Root, options: TreeOptions, tally: Tally, refProperty: string | null): Promise<{links: PageLink[]; anchors: string[]}> {
+  const anchors = pageAnchors(tree);
+  const ids = new Set(anchors);
+  // Only the text the report checks draws a link broken: the page's own,
+  // on a page that stays on GitHub and that the review changed. `before`
+  // views and removed markers are old text, a deleted file's page is gone,
+  // and a page whose text is unchanged isn't the review's; their links stay
+  // inert and dotted.
+  const drawn = options.anchors && !options.textUnchanged && options.status !== 'deleted';
 
-  const links: RenderedFragment['links'] = [];
+  type Pending = {node: Element; link: PageLink; repoPath: string | null; hash: string | undefined; answer: Promise<LinkAnswer>};
+  const links: PageLink[] = [];
+  const pending: Pending[] = [];
   walk(tree, (node) => {
     if (node.tagName !== 'a' || typeof node.properties.href !== 'string') return;
     const href = node.properties.href;
@@ -643,14 +727,15 @@ function resolveLinks(tree: Root, options: TreeOptions, tally: Tally): RenderedF
     if (href.startsWith('#')) {
       const target = decodeHash(href.slice(1));
       if (tripHashLike(href.slice(1)) || tripHashLike(target)) {
-        makeInert(node, 'badAnchor');
+        makeInert(node, {kind: 'badAnchor'}, drawn);
         links.push({href, status: 'badAnchor', line});
         return;
       }
-      const prefixed = target.startsWith('user-content-') ? target : `user-content-${target}`;
-      const found = ids.has(prefixed) || target === '';
-      if (ids.has(prefixed)) node.properties.href = `#${prefixed}`;
-      links.push({href, status: found ? 'ok' : 'badAnchor', line});
+      const found = anchorTarget(ids, target);
+      if (found !== null && found !== 'top') node.properties.href = `#${found}`;
+      // As on GitHub, a link to a heading that isn't there stays a link.
+      else if (found === null && drawn) Object.assign(node.properties, {className: ['br-broken'], title: LINK_TEXT.badAnchor});
+      links.push({href, status: found !== null ? 'ok' : 'badAnchor', line});
       return;
     }
 
@@ -662,25 +747,115 @@ function resolveLinks(tree: Root, options: TreeOptions, tally: Tally): RenderedF
 
     const repoPath = repoPathFor(options.path, href);
     const hash = href.includes('#') ? decodeHash(href.slice(href.indexOf('#') + 1)) : undefined;
-    const answer: LinkAnswer = repoPath === null ? {kind: 'outside'} : hash !== undefined && tripHashLike(hash) ? {kind: 'badAnchor'} : options.link(repoPath, hash);
-    if (answer.kind === 'inReview') {
-      const suffix = hash ? `#${hash.startsWith('user-content-') ? hash : `user-content-${hash}`}` : '';
-      node.properties.href = `${answer.href}${suffix}`;
-      links.push({href, status: 'ok', line});
-      return;
-    }
-    makeInert(node, answer.kind);
-    if (answer.kind === 'outside') count(tally, 'outsideLink');
-    links.push({href, status: answer.kind, line});
+    const answer = repoPath === null ? {kind: 'outside' as const} : hash !== undefined && tripHashLike(hash) ? {kind: 'badAnchor' as const} : options.link(repoPath, hash);
+    // A lookup that fails is no finding: a wrong mark is worse than a missing one.
+    const settled = Promise.resolve(answer).catch((): LinkAnswer => ({kind: 'outside'}));
+    const link: PageLink = {href, status: 'ok', line};
+    links.push(link);
+    pending.push({node, link, repoPath, hash, answer: settled});
   });
-  return links;
+
+  const answers = await Promise.all(pending.map((each) => each.answer));
+  let refs = 0;
+  for (const [index, {node, link, repoPath, hash}] of pending.entries()) {
+    const answer = answers[index]!;
+    if (answer.kind === 'inReview') {
+      const anchor = hash ? withPrefix(hash) : '';
+      node.properties.href = `${answer.href}${anchor ? `#${anchor}` : ''}`;
+      // The top of a page is always there, so only a heading needs checking.
+      if (anchor && !pageTop(hash!) && refProperty && repoPath !== null) {
+        // First of the link's attributes, so the page knows where they
+        // start when it draws the link broken (finishRefs).
+        node.properties = {[refProperty]: String(refs), ...node.properties};
+        link.ref = {path: repoPath, anchor, index: refs};
+        refs += 1;
+      }
+      continue;
+    }
+    makeInert(node, answer, drawn);
+    if (answer.kind === 'outside') count(tally, 'outsideLink');
+    link.status = answer.kind;
+    if (answer.kind === 'caseMismatch') link.hint = answer.hint;
+  }
+  return {links, anchors};
 }
 
-// No page to open for it: the link stays readable, inert, and says why.
-function makeInert(node: Element, kind: Exclude<LinkAnswer['kind'], 'inReview'>) {
+const withPrefix = (anchor: string) => (anchor.startsWith('user-content-') ? anchor : `user-content-${anchor}`);
+
+// Every id on the page a link can point at: those its headings, footnotes
+// and HTML carry once the sanitizer gave them their prefix, by `id` or by
+// `name`, sorted.
+function pageAnchors(tree: Root): string[] {
+  const ids = new Set<string>();
+  walk(tree, (node) => {
+    for (const key of ['id', 'name']) {
+      const value = node.properties[key];
+      if (typeof value === 'string' && value.startsWith('user-content-')) ids.add(value);
+    }
+  });
+  return [...ids].sort();
+}
+
+// An empty fragment, or `top` in any case, opens a page at its top, as the
+// HTML standard says, whatever ids the page has.
+const pageTop = (fragment: string) => fragment === '' || fragment.toLowerCase() === 'top';
+
+/**
+ * Where a link's fragment lands on a page with `ids` (`anchors`), as GitHub
+ * finds it: the `user-content-` id it names, else that id in lowercase,
+ * which GitHub's page script also tries; `top` for the top of the page; or
+ * null when it lands nowhere. One rule for a link into the same page,
+ * another rendered page, and a markdown file outside the review.
+ */
+export function anchorTarget(ids: ReadonlySet<string>, fragment: string): string | 'top' | null {
+  const id = withPrefix(fragment);
+  if (ids.has(id)) return id;
+  if (ids.has(id.toLowerCase())) return id.toLowerCase();
+  return pageTop(fragment) ? 'top' : null;
+}
+
+/**
+ * The ids a link can point at on the page `source` renders to, as that
+ * page's own render lists them in `anchors`, for a markdown file the
+ * review doesn't render: a link into it can still be checked.
+ */
+export async function markdownAnchors(source: string): Promise<string[]> {
+  const stamp = privateAttribute();
+  const processor = parser(stamp.property);
+  const hast = await processor.run(processor.parse(source)) as Root;
+  const tree = unified().use(rehypeSanitize, sanitizeSchema(stamp.property)).runSync(hast) as Root;
+  addHeadingAnchors(tree, stamp.property);
+  return pageAnchors(tree);
+}
+
+/** What a link that opens no page says of itself. */
+export const LINK_TEXT: Record<Exclude<LinkStatus, 'ok'>, string> = {
+  outside: 'not part of this review',
+  unchecked: 'not checked in time',
+  missing: 'file not found',
+  badAnchor: 'anchor not found',
+  untracked: 'file is untracked',
+  ignored: 'ignored by git',
+  caseMismatch: 'case mismatch',
+};
+
+/** The words for a link that won't resolve on GitHub: its reason, and for a case mismatch the names it confused. */
+export function linkReason(status: Exclude<LinkStatus, 'ok' | 'outside' | 'unchecked'>, hint?: string) {
+  return status === 'caseMismatch' && hint ? `${LINK_TEXT.caseMismatch}: ${hint}` : LINK_TEXT[status];
+}
+
+// No page to open for it: the link stays readable, inert, and says why. One
+// GitHub wouldn't resolve either is drawn broken, where `drawn`. One with
+// no answer is plain text: neither the dotted underline of a file outside
+// the review nor a broken one would be true of it.
+function makeInert(node: Element, answer: Exclude<LinkAnswer, {kind: 'inReview'}>, drawn: boolean) {
   delete node.properties.href;
-  node.properties.className = ['br-inert'];
-  node.properties.title = kind === 'outside' ? 'not part of this review' : kind === 'missing' ? 'file not found' : 'anchor not found';
+  if (answer.kind === 'unchecked') {
+    Object.assign(node.properties, {className: ['br-unchecked'], title: LINK_TEXT.unchecked});
+    return;
+  }
+  node.properties.className = answer.kind === 'outside' || !drawn ? ['br-inert'] : ['br-inert', 'br-broken'];
+  node.properties.title = answer.kind === 'outside' ? LINK_TEXT.outside : linkReason(answer.kind, 'hint' in answer ? answer.hint : undefined);
 }
 
 // A fragment the page script would read as a trip's hash (`d=full`,
@@ -707,6 +882,33 @@ const REFUSED_TEXT: Record<Extract<AssetAnswer, {kind: 'refused'}>['reason'], st
   unreadable: 'image not inlined',
 };
 
+const GITHUB_REFUSAL = "won't render on GitHub: ";
+
+/**
+ * What the card in place of an image says, and whether it is soft: an
+ * image GitHub can show that this page leaves out, in amber, rather than
+ * one GitHub won't show either, in red.
+ */
+export function refusedCard(reason: RefusedReason, hint?: string): {text: string; soft: boolean} {
+  const soft = reason === 'tooLarge' || reason === 'pageLimit' || reason === 'unreadable';
+  const text = !hint ? REFUSED_TEXT[reason]
+    : reason === 'caseMismatch' ? `${REFUSED_TEXT.caseMismatch}: ${hint}`
+      : reason === 'unreadable' ? `${REFUSED_TEXT.unreadable} · ${hint}` : REFUSED_TEXT[reason];
+  return {text, soft};
+}
+
+/**
+ * What an image card says after `won't render on GitHub:`, for an image
+ * GitHub won't show either, or null for one only this page leaves out
+ * (remote, too large, unreadable).
+ */
+export function imageFinding(reason: RefusedReason, hint?: string): string | null {
+  const text = REFUSED_TEXT[reason];
+  if (!text.startsWith(GITHUB_REFUSAL)) return null;
+  const said = text.slice(GITHUB_REFUSAL.length);
+  return reason === 'caseMismatch' && hint ? `${said}: ${hint}` : said;
+}
+
 // The first URL of a `srcset`, which is all a markdown `<picture>` uses.
 function srcsetUrl(srcset: unknown) {
   const value = Array.isArray(srcset) ? srcset.join(',') : typeof srcset === 'string' ? srcset : '';
@@ -719,8 +921,9 @@ type PageImage = {repoPath: string; url: string; line: number};
 // Every image becomes bytes inside the page or a card in its place, so the
 // page never asks for anything: a remote image is a dashed pill, never a
 // request, and a `<source>` that can't be inlined is dropped so the
-// `<img>` fallback shows. Returns the repo images it looked up.
-async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Promise<PageImage[]> {
+// `<img>` fallback shows. Returns the repo images it looked up, and how
+// each `<img>` among them resolved.
+async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Promise<{looked: PageImage[]; uses: PageImageUse[]}> {
   const images: Array<{node: Element; parent: Parents; url: string}> = [];
   walk(tree, (node, parent) => {
     if (node.tagName === 'img' && typeof node.properties.src === 'string') images.push({node, parent, url: node.properties.src});
@@ -732,6 +935,7 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Pr
   // in page order, which is the order the page budget counts them in.
   const answers = new Map<string, Promise<AssetAnswer>>();
   const looked: PageImage[] = [];
+  const uses: PageImageUse[] = [];
   const repoPathOf = (url: string) => (url === '' || isRemote(url) ? null : repoPathFor(options.imagesFrom ?? options.path, url));
   for (const {node, url} of images) {
     const repoPath = repoPathOf(url);
@@ -766,6 +970,11 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Pr
     if (answer.kind === 'embed') {
       if (tally.inlined.bytes + answer.dataUrl.length > PAGE_INLINE_LIMIT) answer = {kind: 'refused', reason: 'pageLimit'};
       else tally.inlined.bytes += answer.dataUrl.length;
+    }
+    if (!remote && !isSource && url !== '') {
+      const status = answer.kind === 'refused' ? answer.reason : answer.kind;
+      const hint = answer.kind === 'refused' && answer.reason === 'caseMismatch' ? answer.hint : undefined;
+      uses.push({path: repoPath ?? url, url, line: node.position?.start.line ?? 0, status, ...(hint ? {hint} : {})});
     }
 
     if (answer.kind === 'embed') {
@@ -802,11 +1011,8 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Pr
       countCard('localImage', theme);
       next = card(['br-card', 'br-skipped'], [alt, repoPath ?? url, 'not embedded']);
     } else {
-      const soft = answer.reason === 'tooLarge' || answer.reason === 'pageLimit' || answer.reason === 'unreadable';
-      const reason = !answer.hint ? REFUSED_TEXT[answer.reason]
-        : answer.reason === 'caseMismatch' ? `${REFUSED_TEXT.caseMismatch}: ${answer.hint}`
-          : answer.reason === 'unreadable' ? `${REFUSED_TEXT.unreadable} · ${answer.hint}` : REFUSED_TEXT[answer.reason];
-      next = card(['br-card', soft ? 'br-soft' : 'br-refused'], [reason, repoPath ?? url]);
+      const said = refusedCard(answer.reason, answer.hint);
+      next = card(['br-card', said.soft ? 'br-soft' : 'br-refused'], [said.text, repoPath ?? url]);
     }
     // The card shows in the theme the image would, as the image does.
     if (theme) next.properties.dataGhTheme = theme;
@@ -815,7 +1021,7 @@ async function resolveImages(tree: Root, options: TreeOptions, tally: Tally): Pr
   for (const [kind, {plain, dark, light}] of cards) {
     tally.differences.set(kind, (tally.differences.get(kind) ?? 0) + plain + Math.max(dark, light));
   }
-  return looked;
+  return {looked, uses};
 }
 
 // The source lines that show an image whose content changed on the branch.

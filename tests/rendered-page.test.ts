@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import {createHash} from 'node:crypto';
+import vm from 'node:vm';
 import {describe, expect, it} from 'vitest';
-import {PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
+import {HEAD_SCRIPT, HEAD_SCRIPT_HASH, PAGE_CSS, PAGE_CSS_HASH, PAGE_SCRIPT, PAGE_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
 import {assembleFilePage, contentSecurityPolicy, railLabel, type PageFile, type PageInput} from '../src/rendered/page.js';
 import {renderMarkdown} from '../src/rendered/markdown.js';
 import {rawSource} from '../src/rendered/raw.js';
@@ -64,10 +65,10 @@ async function page(overrides: Partial<PageInput> = {}) {
   return assembleFilePage(input({path: 'docs/page.md', status: 'modified', body: {kind: 'rendered', fragment}}, overrides));
 }
 
-// The page less its own script, so a check for any other script, or for
+// The page less its own scripts, so a check for any other script, or for
 // markup a repo string could have opened, reads the rest of the page.
 function withoutOurScript(html: string) {
-  return html.replace(`<script>${PAGE_SCRIPT}</script>`, '');
+  return html.replace(`<script>${HEAD_SCRIPT}</script>`, '').replace(`<script>${PAGE_SCRIPT}</script>`, '');
 }
 
 function sha256Base64(text: string) {
@@ -80,20 +81,50 @@ describe('assembleFilePage', () => {
     expect(html.startsWith('<!doctype html>\n<html lang="en">\n<head>\n<meta http-equiv="Content-Security-Policy" content="')).toBe(true);
     const csp = /<meta http-equiv="Content-Security-Policy" content="([^"]+)">/.exec(html)![1];
     expect(csp).toBe(contentSecurityPolicy());
-    expect(csp).toBe(`default-src 'none'; img-src data:; style-src '${PAGE_CSS_HASH}'; script-src '${PAGE_SCRIPT_HASH}'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'`);
+    expect(csp).toBe(`default-src 'none'; img-src data:; style-src '${PAGE_CSS_HASH}'; script-src '${HEAD_SCRIPT_HASH}' '${PAGE_SCRIPT_HASH}'; base-uri 'none'; form-action 'none'; frame-src 'none'; connect-src 'none'`);
   });
 
-  it('allows its inline style and its one script by their hashes, and no other script', async () => {
+  it('allows its inline style and its two scripts by their hashes, and no other script', async () => {
     const html = await page();
     const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((match) => match[1]!);
     expect(styles).toHaveLength(1);
     expect(`sha256-${sha256Base64(styles[0]!)}`).toBe(PAGE_CSS_HASH);
     expect(styles[0]).toBe(PAGE_CSS);
     const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map((match) => match[0]);
-    expect(scripts).toEqual([`<script>${PAGE_SCRIPT}</script>`]);
+    expect(scripts).toEqual([`<script>${HEAD_SCRIPT}</script>`, `<script>${PAGE_SCRIPT}</script>`]);
     expect(`sha256-${sha256Base64(PAGE_SCRIPT)}`).toBe(PAGE_SCRIPT_HASH);
+    expect(`sha256-${sha256Base64(HEAD_SCRIPT)}`).toBe(HEAD_SCRIPT_HASH);
     // Last in the body, once everything it reads is parsed.
     expect(html.endsWith(`<script>${PAGE_SCRIPT}</script>\n</body>\n</html>\n`)).toBe(true);
+  });
+
+  it('paints the terminal\'s background before its first frame, from a script that runs ahead of the stylesheet', async () => {
+    const html = await page();
+    const head = html.slice(html.indexOf('<head>'), html.indexOf('</head>'));
+    // The policy, the charset, the schemes the page supports, then the
+    // script that reads the trip's colors, all before the stylesheet.
+    expect(head.indexOf('<meta name="color-scheme" content="dark light">')).toBeGreaterThan(head.indexOf('<meta charset="utf-8">'));
+    expect(head.indexOf(`<script>${HEAD_SCRIPT}</script>`)).toBeGreaterThan(head.indexOf('<meta name="color-scheme"'));
+    expect(head.indexOf(`<script>${HEAD_SCRIPT}</script>`)).toBeLessThan(head.indexOf('<style>'));
+    // The stylesheet paints the first frame from that color while the
+    // script's mark is on the root, which the page script takes off.
+    expect(PAGE_CSS).toMatch(/:root\[data-br-first\],\s*:root\[data-br-first\] body \{\s*background: var\(--br-first-bg, #111318\);/);
+  });
+
+  it('marks the first frame of a full develop with reduced motion too, where the raw frame still fades out', () => {
+    // The head script on its own, as the browser runs it before the page script.
+    const firstFrame = (hash: string, reduced: boolean) => {
+      const marks = new Map<string, string>();
+      const root = {setAttribute: (name: string, value: string) => marks.set(name, value), style: {setProperty: (name: string, value: string) => marks.set(name, value)}};
+      vm.runInNewContext(HEAD_SCRIPT, {location: {hash}, document: {documentElement: root}, matchMedia: () => ({matches: reduced})});
+      return Object.fromEntries(marks);
+    };
+    for (const reduced of [false, true]) {
+      expect(firstFrame('#at=L7&d=full&m=1&bg=0a0b0c&n=1', reduced), `reduced ${reduced}`).toEqual({'--br-first-bg': '#0a0b0c', 'data-br-first': ''});
+      // Motion off and a revisit show no raw frame: the page's own background.
+      expect(firstFrame('#at=L7&d=full&m=0&bg=0a0b0c&n=2', reduced)).toEqual({});
+      expect(firstFrame('#at=L7&d=short&m=1&bg=0a0b0c&n=3', reduced)).toEqual({});
+    }
   });
 
   it('carries no style attribute anywhere, so the CSP never needs unsafe-inline', async () => {
@@ -273,6 +304,16 @@ describe('page.css', () => {
         for (const surface of ['bg', 'surface', 'raised']) expect(contrast(t[text]!, t[surface]!), `${scheme} ${text} on ${surface}`).toBeGreaterThanOrEqual(4.5);
       }
       for (const bar of ['added', 'modified', 'removed']) expect(contrast(t[bar]!, t.bg!), `${scheme} ${bar} bar`).toBeGreaterThanOrEqual(3);
+    }
+    // The strip's findings chip: red text on a red tint over the strip.
+    const color = /color: var\(--br-([\w-]+)\)/.exec(rule('.br-findings'))?.[1];
+    for (const scheme of ['light', 'dark'] as const) {
+      const t = tokens(scheme);
+      const blocks = [...CHROME_CSS.matchAll(/:root \{([^}]*)\}/g)].map((match) => match[1]!);
+      const tint = /--br-removed-soft:\s*#([0-9a-f]{6})([0-9a-f]{2})\b/.exec(blocks[scheme === 'light' ? 0 : 1]!)!;
+      const alpha = parseInt(tint[2]!, 16) / 255;
+      const over = (surface: string) => `#${[1, 3, 5].map((at) => Math.round(parseInt(tint[1]!.slice(at - 1, at + 1), 16) * alpha + parseInt(surface.slice(at, at + 2), 16) * (1 - alpha)).toString(16).padStart(2, '0')).join('')}`;
+      for (const surface of ['bg', 'surface']) expect(contrast(t[color!]!, over(t[surface]!)), `${scheme} findings chip on ${surface}`).toBeGreaterThanOrEqual(4.5);
     }
     // Status letters and the opened chip use the text shades, not the bar shades.
     expect(rule('.br-status-modified')).toContain('var(--br-modified-text)');
@@ -528,6 +569,56 @@ describe('the page\'s keys and controls', () => {
     expect(html).not.toContain('class="br-control br-marks');
     expect(html).toContain('<dd>previous or next page</dd>');
     expect(html).toContain('<div><dt><kbd>⏎</kbd></dt><dd>open</dd></div>');
+  });
+});
+
+describe('the rail and strip of a page in a review with findings', () => {
+  it('lists the pages that also look different apart, each with a dot, and says the review\'s findings in a few words', async () => {
+    const fragment = await rendered('See [nowhere](#nowhere).\n');
+    const html = assembleFilePage(input({path: 'docs/page.md', status: 'modified', body: {kind: 'rendered', fragment}}, {
+      rail: [
+        {path: 'docs/page.md', status: 'modified', href: 'aaaa.html', label: '1', current: true},
+        {path: 'CONTRIBUTING.md', status: 'modified', href: 'bbbb.html', label: 'img', current: false, also: true},
+      ],
+      report: {own: [{path: 'docs/page.md', line: 1, target: '#nowhere', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}], notes: ['1 link won\'t resolve', '1 image: case mismatch']},
+    }));
+    const rail = html.slice(html.indexOf('<nav class="br-rail"'), html.indexOf('</nav>', html.indexOf('<nav class="br-rail"')));
+    expect(rail).toContain('<p class="br-rail-title">CHANGED · 1 rendered</p>');
+    expect(rail).toMatch(/<p class="br-rail-title">ALSO LOOKS DIFFERENT<\/p>\n<span class="br-rail-dir">\(root\)<\/span>\n<ul>\n<li><a class="br-rail-file" href="bbbb\.html"><span class="br-status br-status-also">·<\/span><span class="br-rail-name">CONTRIBUTING\.md<\/span><span class="br-rail-count">img<\/span><\/a><\/li>/);
+    expect(rail).toContain('<ul class="br-rail-findings"><li>1 link won&#x27;t resolve</li><li>1 image: case mismatch</li></ul>'.replace('&#x27;', "'"));
+    expect(html).toContain('<span class="br-findings" title="Won\'t resolve on GitHub" data-short="✗ 1">1 broken link</span>');
+    // A page whose text didn't change says so in its head, with no status letter.
+    const also = assembleFilePage(input({path: 'CONTRIBUTING.md', status: 'modified', also: {embeds: ['docs/hero.png']}, body: {kind: 'rendered', fragment}}));
+    expect(also).toContain('<p class="br-summary"><span class="br-status br-status-also">·</span> text unchanged · embeds docs/hero.png');
+  });
+
+  it('folds the same rail into the narrow screen\'s switcher: the pages that also look different apart, then the findings', async () => {
+    const fragment = await rendered('See [nowhere](#nowhere).\n');
+    const rail = [
+      {path: 'README.md', status: 'modified' as const, href: 'aaaa.html', label: '1', current: true},
+      {path: 'docs/guide.md', status: 'modified' as const, href: 'cccc.html', label: '2', current: false},
+      {path: 'CONTRIBUTING.md', status: 'modified' as const, href: 'bbbb.html', label: 'img', current: false, also: true as const},
+    ];
+    const report = {own: [], notes: ['2 links won\'t resolve']};
+    const switcherOf = (html: string) => html.slice(html.indexOf('<details class="br-switcher">'), html.indexOf('</details>', html.indexOf('<details class="br-switcher">')));
+    const readme = switcherOf(assembleFilePage(input({path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment}}, {rail, report})));
+    // Counted against the review's two files, as the rail's title counts them.
+    expect(readme).toContain('<span class="br-switcher-count">1 of 2</span>');
+    expect(readme).toMatch(/README\.md[\s\S]*guide\.md[\s\S]*<p class="br-rail-title">ALSO LOOKS DIFFERENT<\/p>\n<span class="br-rail-dir">\(root\)<\/span>\n<ul>\n<li><a class="br-rail-file" href="bbbb\.html"><span class="br-status br-status-also">·<\/span><span class="br-rail-name">CONTRIBUTING\.md/);
+    expect(readme).toContain('<ul class="br-rail-findings"><li>2 links won\'t resolve</li></ul>');
+    // The page outside the review names itself so, rather than a place it doesn't have.
+    const also = switcherOf(assembleFilePage(input({path: 'CONTRIBUTING.md', status: 'modified', also: {embeds: ['docs/hero.png']}, body: {kind: 'rendered', fragment}}, {rail: rail.map((entry) => ({...entry, current: entry.also === true})), report})));
+    expect(also).toContain('<span class="br-switcher-count">also looks different</span>');
+    // The notes line up as they do in the rail, not as the switcher's lists do.
+    expect(CHROME_CSS).toContain(':is(.br-rail, .br-switcher-list) .br-rail-findings {');
+  });
+
+  it('heads a page that also looks different with its note alone, though the image marks a block', async () => {
+    const fragment = await rendered('![Hero](docs/hero.png)\n');
+    const also = assembleFilePage(input({path: 'CONTRIBUTING.md', status: 'modified', also: {embeds: ['docs/hero.png']}, body: {kind: 'rendered', fragment: {...fragment, changes: {changed: 1, removed: 0}}}}));
+    expect(also).toContain('<p class="br-summary"><span class="br-status br-status-also">·</span> text unchanged · embeds docs/hero.png</p>');
+    // The step through the marked block stays.
+    expect(also).toContain('change 1 of 1');
   });
 });
 

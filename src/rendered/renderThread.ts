@@ -2,7 +2,7 @@ import {createRequire} from 'node:module';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {Worker, isMainThread, parentPort, workerData} from 'node:worker_threads';
 import type {FileStatus} from '../git.js';
-import {createAssetResolver, LOOKUP_BUDGET_MS, pageLookups, type AssetResolver, type AssetSides} from './assets.js';
+import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from './assets.js';
 import type {ChangeGroup} from './changes.js';
 import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown.js';
 
@@ -14,11 +14,16 @@ import {renderMarkdown, type LinkAnswer, type RenderedFragment} from './markdown
 
 /**
  * One file to render. Links resolve from `links` by repo path; any other
- * path is outside the review. Images follow the asset rule on `assets`.
+ * path resolves against what git holds. Images follow the asset rule on
+ * `assets`, their lookups within `budgetMs`. `textUnchanged`: markdown the
+ * review didn't change, marked by the images it shows alone.
  */
-export type RenderJob = {cwd: string; path: string; oldPath?: string; status: FileStatus; source: string; groups: ChangeGroup[]; links: Record<string, LinkAnswer>; assets: AssetSides};
+export type RenderJob = {cwd: string; path: string; oldPath?: string; status: FileStatus; textUnchanged?: true; source: string; groups: ChangeGroup[]; links: Record<string, LinkAnswer>; assets: AssetSides; budgetMs: number};
 
-type Reply = {fragment: RenderedFragment} | {error: string};
+/** A render, and whether any of its lookups ran out of time: then it shows less than it will once they answer. */
+export type RenderThreadResult = {fragment: RenderedFragment; late?: true};
+
+type Reply = RenderThreadResult | {error: string};
 
 const THREAD_TAG = 'branch-review-render-thread';
 
@@ -52,7 +57,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
 
   return {
     /** The fragment, or a one-line error for a file that threw or ran past the deadline. */
-    async render(job: RenderJob): Promise<RenderedFragment> {
+    async render(job: RenderJob): Promise<RenderThreadResult> {
       current ??= start();
       let worker: Worker;
       try {
@@ -61,7 +66,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
         current = null;
         throw error;
       }
-      return new Promise<RenderedFragment>((resolve, reject) => {
+      return new Promise<RenderThreadResult>((resolve, reject) => {
         const finish = () => {
           clearTimeout(timer);
           worker.off('message', onMessage);
@@ -71,7 +76,7 @@ export function createRenderThread({deadlineMs}: {deadlineMs: number}) {
         const onMessage = (reply: Reply) => {
           finish();
           if ('error' in reply) reject(new Error(reply.error));
-          else resolve(reply.fragment);
+          else resolve(reply);
         };
         // A thread that crashed or ran out of memory is replaced for the next file.
         const onError = (error: Error) => {
@@ -108,18 +113,21 @@ if (!isMainThread && workerData === THREAD_TAG) {
       resolver = createAssetResolver({cwd: job.cwd});
       resolvers.set(job.cwd, resolver);
     }
+    // Within the render deadline, so a slow git costs cards, not the page.
+    const uses: AssetUse[] = [];
+    const lookups = pageLookups(resolver, job.assets, job.status === 'deleted', uses, {budgetMs: job.budgetMs});
     renderMarkdown({
       path: job.path,
       ...(job.oldPath ? {basePath: job.oldPath} : {}),
       status: job.status,
+      ...(job.textUnchanged ? {textUnchanged: true as const} : {}),
       source: job.source,
       groups: job.groups,
-      // Within the render deadline, so a slow git costs cards, not the page.
-      ...pageLookups(resolver, job.assets, job.status === 'deleted', [], {budgetMs: LOOKUP_BUDGET_MS}),
+      ...lookups,
       // Own keys only: a link to `constructor` names no file in the review.
-      link: (repoPath) => (Object.hasOwn(job.links, repoPath) ? job.links[repoPath]! : {kind: 'outside'}),
+      link: (repoPath, hash) => (Object.hasOwn(job.links, repoPath) ? job.links[repoPath]! : lookups.linkTarget(repoPath, hash)),
     }).then(
-      (fragment) => port.postMessage({fragment} satisfies Reply),
+      (fragment) => port.postMessage({fragment, ...(uses.some((use) => use.identity === LATE_IDENTITY) ? {late: true as const} : {})} satisfies Reply),
       (error: unknown) => port.postMessage({error: error instanceof Error ? error.message : String(error)} satisfies Reply),
     );
   });

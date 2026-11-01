@@ -29,6 +29,8 @@
   --br-modified-text: #875900;
   --br-modified-soft: #b879001f;
   --br-removed: #c4323c;
+  /* Red text on a red tint, a shade darker for 4.5:1. */
+  --br-removed-text: #b42a34;
   --br-removed-soft: #c4323c14;
   --br-renamed: #7a49c8;
   --br-shadow: 0 8px 24px #16222626, 0 1px 3px #1622261a;
@@ -37,6 +39,9 @@
   --br-tint-added: #2b8a3e33;
   --br-tint-modified: #b8790033;
   --br-glow: #0a7ea424;
+  /* The squares under a transparent picture. */
+  --br-checker-a: #ffffff;
+  --br-checker-b: #e6ecee;
   --br-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --br-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
 }
@@ -60,12 +65,15 @@
     --br-modified-text: #e8b45a;
     --br-modified-soft: #e0a43a24;
     --br-removed: #ff6b6b;
+    --br-removed-text: #ff6b6b;
     --br-removed-soft: #ff6b6b1a;
     --br-renamed: #b597ff;
     --br-shadow: 0 8px 24px #050809cc, 0 1px 3px #05080999;
     --br-tint-added: #4cc06a33;
     --br-tint-modified: #e0a43a33;
     --br-glow: #39c5cf24;
+    --br-checker-a: #1a2427;
+    --br-checker-b: #223034;
   }
 }
 
@@ -87,6 +95,13 @@ html, body {
   background: var(--br-bg);
   color: var(--br-fg);
   font-family: var(--br-sans);
+}
+/* A trip's first frame, before the page script runs: the terminal's
+   background, which the head script names, so a split that has just opened
+   never shows a white frame before the raw one. */
+:root[data-br-first],
+:root[data-br-first] body {
+  background: var(--br-first-bg, #111318);
 }
 
 /* The strip: unbranded, one line, always on top. */
@@ -414,6 +429,129 @@ html, body {
    decodes; its height follows its width when the column is narrower. */
 .markdown-body img[data-br-size] { height: auto; }
 
+/* What won't resolve on GitHub: a link drawn with a red wavy line, its
+   title saying why, counted in the strip's chip. An inert one's dotted
+   line gives way to it. */
+.markdown-body a.br-broken,
+.markdown-body a.br-inert.br-broken {
+  text-decoration: underline wavy var(--br-removed);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.25rem;
+}
+.markdown-body a.br-broken:not([href]) { color: inherit; cursor: help; }
+.br-findings {
+  padding: 3px 10px;
+  border: 1px solid var(--br-removed);
+  border-radius: 999px;
+  color: var(--br-removed-text);
+  background: var(--br-removed-soft);
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.br-findings:focus-visible { outline: 2px solid var(--br-accent); outline-offset: 2px; }
+/* Under `.br-rail` and the switcher's list, so their rules for lists don't
+   win: the notes line up with the titles and names above them. */
+:is(.br-rail, .br-switcher-list) .br-rail-findings {
+  margin: 4px 8px 12px;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--br-border-muted);
+  list-style: none;
+  color: var(--br-removed);
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+/* An image's own page: the compare modes on top, the sides under them,
+   and where the review's markdown shows the file. */
+.br-image-page { max-width: 980px; margin: 0 auto; padding: 18px var(--br-article-pad) 32px; }
+.br-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 18px;
+  font-size: 13px;
+}
+.br-modes-end { display: flex; gap: 6px; margin-left: auto; }
+.br-mode, .br-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--br-muted);
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+.br-mode:hover, .br-switch:hover { color: var(--br-fg); }
+.br-mode[aria-pressed="true"] { border-color: var(--br-accent); color: var(--br-fg); background: var(--br-accent-soft); }
+.br-switch[aria-pressed="true"] { color: var(--br-fg); }
+.br-switch[aria-pressed="true"] > span { color: var(--br-accent); }
+.br-mode:focus-visible, .br-switch:focus-visible { outline: 2px solid var(--br-accent); outline-offset: 1px; }
+.br-modes kbd {
+  padding: 0 5px;
+  border: 1px solid var(--br-border);
+  border-radius: 4px;
+  background: var(--br-raised);
+  font-family: var(--br-mono);
+  font-size: 11px;
+}
+.br-compare { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; align-items: start; isolation: isolate; }
+.br-single .br-compare { grid-template-columns: minmax(0, 1fr); }
+.br-figure { min-width: 0; margin: 0; }
+.br-figure figcaption { margin: 0 0 8px; color: var(--br-muted); font-size: 13px; }
+.br-figure .br-ref { color: var(--br-fg); font-family: var(--br-mono); font-size: 12px; }
+.br-frame {
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--br-border);
+  border-radius: 8px;
+  background-color: var(--br-checker-a);
+  background-image: conic-gradient(var(--br-checker-b) 25%, transparent 0 50%, var(--br-checker-b) 0 75%, transparent 0);
+  background-size: 16px 16px;
+}
+.br-board-off .br-frame { background: var(--br-surface); }
+.br-frame img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.br-actual .br-frame img { max-width: none; }
+.br-frame-card { background: var(--br-surface); }
+.br-image-page .br-card {
+  display: inline-flex;
+  padding: 3px 10px;
+  border: 1px solid var(--br-border);
+  border-radius: 8px;
+  font-family: var(--br-mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.br-image-page .br-card.br-refused { border-color: var(--br-removed); color: var(--br-removed); background: var(--br-removed-soft); }
+.br-image-page .br-card.br-soft { border-color: var(--br-modified); color: var(--br-modified-text); background: var(--br-modified-soft); }
+/* A deleted image dims, as a deleted file's images do. */
+.br-image-page.br-deleted .br-frame img { opacity: 0.75; }
+/* Flip and difference stack the sides in one cell. Flip shows the after
+   side until it is turned over; difference lays the after side over the
+   before one, so whatever stayed the same goes dark. */
+.br-image-page:is([data-mode="flip"], [data-mode="difference"]) .br-compare { grid-template-columns: minmax(0, 1fr); }
+.br-image-page:is([data-mode="flip"], [data-mode="difference"]) .br-compare { align-items: stretch; }
+/* Both sides take the taller one's height, so neither runs past the other. */
+.br-image-page:is([data-mode="flip"], [data-mode="difference"]) .br-figure { display: flex; flex-direction: column; grid-area: 1 / 1; }
+.br-image-page:is([data-mode="flip"], [data-mode="difference"]) .br-frame { flex: 1; }
+.br-image-page:is([data-mode="flip"], [data-mode="difference"]) .br-frame img { margin-top: 0; }
+.br-image-page[data-mode="flip"] .br-compare { cursor: pointer; }
+.br-image-page[data-mode="flip"]:not(.br-showing-before) .br-before,
+.br-image-page[data-mode="flip"].br-showing-before .br-after { visibility: hidden; }
+.br-image-page[data-mode="difference"] figcaption { visibility: hidden; }
+.br-difference-note { display: none; margin: 8px 0 0; color: var(--br-muted); font-size: 13px; }
+.br-image-page[data-mode="difference"] .br-difference-note { display: block; }
+.br-image-page[data-mode="difference"] .br-after .br-frame { border-color: transparent; background: none; }
+.br-image-page[data-mode="difference"] .br-after img { mix-blend-mode: difference; }
+.br-appears { margin: 20px 0 0; color: var(--br-muted); font-size: 13px; }
+.br-appears a { color: var(--br-accent); }
+
 /* The overview: one row per rendered file, in groups, at the article's
    measure. Each row is one link with its status bar on the left, the way
    the rail marks the current file. */
@@ -474,6 +612,12 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 }
 .br-row-modified .br-row-bar, .br-row-renamed .br-row-bar { background: var(--br-modified); }
 .br-row-added .br-row-bar, .br-row-untracked .br-row-bar { background: var(--br-added); }
+/* A page whose text didn't change shows a changed picture: a dotted bar.
+   A finding is red. */
+.br-row-also .br-row-bar { background: repeating-linear-gradient(to bottom, var(--br-modified) 0 3px, transparent 3px 6px); }
+.br-row-finding .br-row-bar { background: var(--br-removed); }
+.br-status-also { color: var(--br-faint); }
+.br-status-finding { color: var(--br-removed); }
 /* A deleted file has nothing on the branch to mark: a dash on its first
    line, as the rail shows. */
 .br-row-deleted .br-row-bar { top: 17px; bottom: auto; width: 8px; height: 2px; background: var(--br-removed); }
@@ -580,6 +724,7 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 /* With the marks hidden (`m`), the page reads as GitHub's alone: no bars,
    no removed markers, no before chips and no room kept for them. */
 :root.br-marks-off { --br-chip-room: 0px; }
+:root.br-marks-off { --br-row-chip-room: 0px; }
 .br-marks-off .markdown-body [data-mark]::before,
 .br-marks-off .markdown-body tr[data-mark] > :first-child::before { content: none; }
 .br-marks-off .markdown-body :is(details.br-removed, details.br-before, li.br-removed-item, tr.br-removed-row) { display: none; }
@@ -691,8 +836,9 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
    margin), lifted back by it into room the block keeps at its foot, so it
    never sits on the block's last line of text, card or image. Opened, it
    joins the flow so its view takes room, and its summary stays where the
-   chip was. In a list item the chip follows the item's last word, as it
-   does a table cell's text, unless the item ends in a paragraph. */
+   chip was. In a list item the chip follows the item's last word, unless
+   the item ends in a paragraph, and stays there opened: its view starts
+   on the next line. A table row's chip is the row's own, past its cells. */
 :root { --br-chip-room: 26px; }
 .markdown-body [data-mark="modified"]:has(+ details.br-before),
 .markdown-body li > p:has(+ details.br-before) { padding-block-end: var(--br-chip-room); }
@@ -706,16 +852,42 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
 .markdown-body details.br-before[open] > summary { position: absolute; top: -16px; right: 0; transform: translateY(-100%); }
 .markdown-body li > details.br-before { display: inline-block; margin-left: 8px; vertical-align: middle; }
 .markdown-body li > details.br-before:not([open]) { position: static; right: auto; transform: none; }
-.markdown-body li > details.br-before[open] { display: block; margin: 4px 0 8px; }
-.markdown-body li > details.br-before[open] > summary { position: static; transform: none; }
+.markdown-body li > details.br-before[open] { display: contents; }
+.markdown-body li > details.br-before[open] > summary { position: static; margin-left: 8px; transform: none; vertical-align: middle; }
+.markdown-body li > details.br-before[open] > .br-before-body { margin: 4px 0 8px; }
 .markdown-body li > p + details.br-before:not([open]) { position: absolute; right: 0; transform: translateY(calc(-100% - 16px)); }
 .markdown-body li > p + details.br-before[open] { margin: 0 0 8px; }
 .markdown-body li > p + details.br-before[open] > summary { position: absolute; top: -16px; right: 0; transform: translateY(-100%); }
-.markdown-body :is(td, th) > details.br-before { display: inline-block; margin-left: 8px; vertical-align: middle; }
+/* A row's chip follows its last cell's text and takes none of the cell's
+   width: its end margin gives back its whole box, so no column changes
+   its width or alignment, and the room the table keeps at its right holds
+   it. Opened, it stays there, and the old row, under its table's header,
+   lies over what follows the row; the table stops clipping while it
+   shows, and never reflows around it. */
+/* The gap clears the cell's padding and border, so the chip sits past the cell. */
+:root { --br-row-chip: 60px; --br-row-chip-gap: 22px; --br-row-chip-room: 76px; }
+.markdown-body table:has(details.br-before) { padding-right: var(--br-row-chip-room); }
+.markdown-body :is(td, th):has(> details.br-before) { position: relative; }
+.markdown-body :is(td, th) > details.br-before { display: inline-block; margin: -2px calc(0px - var(--br-row-chip-gap) - var(--br-row-chip)) -2px var(--br-row-chip-gap); vertical-align: middle; }
 /* As specific as the closed chip's rule above, so it wins in a cell. */
 .markdown-body :is(td, th) > details.br-before:not([open]) { position: static; right: auto; transform: none; }
-.markdown-body :is(td, th) > details.br-before[open] { display: block; margin: 8px 0 0; }
+.markdown-body :is(td, th) > details.br-before[open] { position: static; margin: -2px calc(0px - var(--br-row-chip-gap) - var(--br-row-chip)) -2px var(--br-row-chip-gap); }
 .markdown-body :is(td, th) > details.br-before[open] > summary { position: static; transform: none; }
+.markdown-body :is(td, th) > details.br-before > summary { box-sizing: border-box; width: var(--br-row-chip); justify-content: center; }
+.markdown-body :is(td, th) > details.br-before > .br-before-body {
+  position: absolute;
+  top: calc(100% + 4px);
+  /* Its right edge under the chip's: past the cell's 13 px of padding. */
+  right: calc(13px - var(--br-row-chip-gap) - var(--br-row-chip));
+  z-index: 1;
+  width: max-content;
+  background: linear-gradient(var(--br-modified-soft), var(--br-modified-soft)), var(--br-bg);
+  box-shadow: var(--br-shadow);
+}
+.markdown-body table:has(details.br-before[open]) { overflow: visible; }
+/* Each marked row is a stacking context of its own (the develop's tint
+   isolates it), so the open row rises over the rows after it. */
+.markdown-body tr:has(> :is(td, th) > details.br-before[open]) { position: relative; z-index: 2; }
 .markdown-body details.br-before > summary {
   border: 1px solid var(--br-border);
   color: var(--br-muted);
@@ -868,9 +1040,23 @@ a.br-row:focus-visible { outline: 2px solid var(--br-accent); outline-offset: -2
   .br-groups { padding: 8px 15px 0; }
   .br-groups { grid-template-columns: 34px minmax(0, 1fr) auto; }
   .br-row-note { grid-column: 2 / 3; }
+  /* Side by side becomes one side under the other. */
+  .br-compare { grid-template-columns: minmax(0, 1fr); }
+  .br-modes-end { margin-left: 0; }
 
   :root { --br-bar-x: -11px; --br-article-pad: 15px; }
   .br-strip { gap: 10px; padding: 0 12px; }
+  /* The two chips give up their words before the strip runs off the
+     screen, and never half a word: the fidelity chip keeps its sign, the
+     findings chip its sign and count. The fidelity chip's popover and the
+     findings chip's steps say it all again, and a screen reader still
+     reads the words, which only shrink to nothing. The refs give up the
+     rest of the room. */
+  .br-strip-end { gap: 8px; }
+  .br-fidelity > summary,
+  .br-findings[data-short] { font-size: 0; }
+  .br-fidelity > summary::before { content: "≈"; content: "≈" / ""; font-size: 12px; }
+  .br-findings[data-short]::before { content: attr(data-short); content: attr(data-short) / ""; font-size: 12px; }
   /* The strip's buttons push the chip far from the right edge, so here the
      popover spans the screen just under the strip. */
   .br-popover { position: fixed; top: 48px; right: 16px; left: 16px; width: auto; }

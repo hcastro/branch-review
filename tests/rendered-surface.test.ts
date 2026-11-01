@@ -425,3 +425,103 @@ describe('a live refresh', () => {
   });
 });
 
+
+describe('whether a press opens a new split', () => {
+  it('says so while no split is known to be open, so the TUI can finish its beam before cmux resizes it', async () => {
+    const gone: RunResult = {ok: false, timedOut: false, reason: 'exit 1'};
+    const {run} = recordingRun(SPLIT, gone, split({created_split: true, surface_ref: 'surface:21'}));
+    const surface = createSurface({env: CMUX_ENV, run, findTool: found({cmux: CMUX}), opener: recordingOpener().opener, platform: 'darwin'});
+    expect(surface.opensSplit()).toBe(true);
+    await surface.show(URL_A);
+    expect(surface.opensSplit()).toBe(false);
+    // The goto finds the split closed and opens a new one; that one is open.
+    await surface.show(URL_B);
+    expect(surface.opensSplit()).toBe(false);
+  });
+
+  it('opens no split outside cmux, nor once cmux said its browser is off', async () => {
+    const browser = createSurface({env: {}, run: recordingRun().run, findTool: found({}), opener: recordingOpener().opener, platform: 'darwin'});
+    expect(browser.opensSplit()).toBe(false);
+    const {run} = recordingRun(split({browser_disabled: true, created_split: false, opened_externally: true, surface_ref: null}));
+    const off = createSurface({env: CMUX_ENV, run, findTool: found({cmux: CMUX}), opener: recordingOpener().opener, platform: 'darwin'});
+    expect(off.opensSplit()).toBe(true);
+    await off.show(URL_A);
+    expect(off.opensSplit()).toBe(false);
+  });
+});
+
+describe('a live refresh that checks what the split shows', () => {
+  const SHOWS_A = ['aaaaaaaaaaaaaaaaaaaa.html', 'f-00000000000000000000.html'];
+
+  it('asks cmux for the split\'s URL first, and goes only when it shows the page last opened', async () => {
+    const {run, calls} = recordingRun(SPLIT, {ok: true, stdout: `${URL_A}#at=L3&d=full&n=1\n`}, {ok: true, stdout: ''}, {ok: true, stdout: JSON.stringify({url: 'file:///tmp/session/rendered/f-00000000000000000000.html'})}, {ok: true, stdout: ''});
+    const surface = createSurface({env: CMUX_ENV, run, findTool: found({cmux: CMUX}), opener: recordingOpener().opener, platform: 'darwin'});
+    await surface.show(URL_A);
+    expect(await surface.refresh(`${URL_B}#d=none&n=2`, SHOWS_A)).toBe(true);
+    expect(await surface.refresh(`${URL_B}#d=none&n=3`, SHOWS_A)).toBe(true);
+    expect(calls.slice(1).map((call) => [call.args, call.timeoutMs])).toEqual([
+      [['browser', '--surface', 'surface:17', 'url'], 1500],
+      [['browser', '--surface', 'surface:17', 'goto', `${URL_B}#d=none&n=2`], 1500],
+      [['browser', '--surface', 'surface:17', 'url'], 1500],
+      [['browser', '--surface', 'surface:17', 'goto', `${URL_B}#d=none&n=3`], 1500],
+    ]);
+  });
+
+  it('skips the refresh, keeping the split, when it shows another page, or cmux is slow to say', async () => {
+    const {run, calls} = recordingRun(
+      SPLIT,
+      {ok: true, stdout: 'file:///tmp/session/rendered/cccccccccccccccccccc.html#d=full\n'},
+      {ok: true, stdout: 'not a url\n'},
+      {ok: false, timedOut: true, reason: 'timed out'},
+      {ok: true, stdout: ''},
+    );
+    const {opener, opened} = recordingOpener();
+    const surface = createSurface({env: CMUX_ENV, run, findTool: found({cmux: CMUX}), opener, platform: 'darwin'});
+    await surface.show(URL_A);
+    for (let each = 0; each < 3; each += 1) expect(await surface.refresh(URL_B, SHOWS_A)).toBe('skipped');
+    expect(calls.slice(1).every((call) => call.args.at(-1) === 'url')).toBe(true);
+    // The split is still the place pages go.
+    expect(await surface.show(URL_B)).toEqual({where: 'cmux-reuse', message: 'in the split →'});
+    expect(opened).toEqual([]);
+  });
+
+  it('gives way to a press made while cmux says what the split shows, so the press goes next', async () => {
+    let answer!: () => void;
+    const asked = new Promise<RunResult>((resolve) => {
+      answer = () => resolve({ok: true, stdout: `${URL_A}\n`});
+    });
+    const {run, calls} = recordingRun(SPLIT, () => asked, {ok: true, stdout: ''});
+    const surface = createSurface({env: CMUX_ENV, run, findTool: found({cmux: CMUX}), opener: recordingOpener().opener, platform: 'darwin'});
+    await surface.show(URL_A);
+    const refresh = surface.refresh(`${URL_A}#d=none&n=2`, SHOWS_A);
+    // The reader presses r on another file while cmux is still answering.
+    const press = surface.show(URL_B);
+    answer();
+    expect(await refresh).toBe(false);
+    expect(await press).toEqual({where: 'cmux-reuse', message: 'in the split →'});
+    expect(calls.slice(1).map((call) => call.args.slice(3))).toEqual([['url'], ['goto', URL_B]]);
+  });
+
+  it('forgets the split without a word when a fake cmux on PATH prints that it is gone, so the next press opens a new one', async () => {
+    const bin = makeTempDir('branch-review-fake-cmux-');
+    const log = path.join(bin, 'calls.log');
+    writeExecutable(path.join(bin, 'cmux'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\ncase "$1" in --json) echo '{"created_split":true,"opened_externally":false,"surface_ref":"surface:4"}' ;; *) echo "Error: invalid_params: Browser operation failed"; exit 1 ;; esac\n`);
+    const env = {PATH: bin, CMUX_WORKSPACE_ID: 'workspace:9'};
+    const cwd = makeTempDir('branch-review-surface-repo-');
+    const {opener, opened} = recordingOpener();
+    const surface = createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform: 'darwin'});
+    await surface.show(URL_A);
+    expect(surface.opensSplit()).toBe(false);
+    expect(await surface.refresh(URL_B, SHOWS_A)).toBe(false);
+    // Nothing is sent to it again: no refresh, and the press opens a split.
+    expect(surface.opensSplit()).toBe(true);
+    expect(await surface.refresh(URL_B, SHOWS_A)).toBe(false);
+    expect(await surface.show(URL_B)).toEqual({where: 'cmux-new', message: 'in the split →'});
+    expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual([
+      `--json browser open-split ${URL_A} --workspace workspace:9 --focus false`,
+      'browser --surface surface:4 url',
+      `--json browser open-split ${URL_B} --workspace workspace:9 --focus false`,
+    ]);
+    expect(opened).toEqual([]);
+  });
+});

@@ -7,6 +7,11 @@ export type RenderableKind = 'markdown' | 'raster' | 'svg';
 // At least one character before the extension: `.md` alone is a dotfile.
 const MARKDOWN = /^.+\.(?:md|markdown|mdown|mkd)$/i;
 
+/** Whether a repo path is named as markdown, by the extensions a page is rendered for. */
+export function isMarkdownName(repoPath: string) {
+  return MARKDOWN.test(repoPath.slice(repoPath.lastIndexOf('/') + 1));
+}
+
 /**
  * What kind of rendered page a review file gets, or null for none. Markdown
  * goes by extension and needs a regular text file's patch, so a symlink

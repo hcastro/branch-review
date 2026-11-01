@@ -1,10 +1,10 @@
 # Rendered markdown pages
 
-This document describes how `branch-review` renders the branch's changed markdown files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, how a page arrives, the `--render-out` option, what a page shows and its keys, which images a page includes, how close a page is to github.com, and the JSON report. For the other options, see the [Options](../README.md#options) section of the README.
+This document describes how `branch-review` renders the branch's changed markdown, image, and SVG files as the pages GitHub would show, with what changed marked on each page. It covers opening a page from the review, how a page arrives, the `--render-out` option, what a page shows and its keys, image pages, pages that also look different, the links and images that won't resolve on GitHub, which images a page includes, how close a page is to github.com, and the JSON reports. For the other options, see the [Options](../README.md#options) section of the README.
 
 ## Open a page from the review
 
-To open the page of the markdown file in view, press `r`, or click **Rendered ⇗** in the file header. The button is the first one in the header of a changed markdown file, and it's the last to go when the pane is too narrow for all of them. To open an overview of every page, press `R`. Neither key changes what the review shows, and you can keep reading while the page opens.
+To open the page of the markdown, image, or SVG file in view, press `r`, or click **Rendered ⇗** in the file header. The button is the first one in the header of each of those files, and it's the last to go when the pane is too narrow for all of them. An image or an SVG opens its own page, described in [Image pages](#image-pages). To open an overview of every page, press `R`. Neither key changes what the review shows, and you can keep reading while the page opens.
 
 Where the page opens depends on where you run `branch-review`:
 
@@ -15,7 +15,7 @@ Where the page opens depends on where you run `branch-review`:
 | In another terminal on macOS or Linux | A new tab in your default browser, on each press. On Linux, `xdg-open` on your `PATH` opens it. |
 | Over SSH | Nothing opens. |
 
-After each press the footer says where the page went, such as `⇗ setup.md · in the split →`. The first page of a session adds `nothing left this machine`. When the file in view has no page, `r` opens the review's first page and names it, such as `⇗ docs/setup.md · first rendered file · in the split →`. When the branch changed no markdown, the footer reads `nothing to render · no markdown files on this branch`.
+After each press the footer says where the page went, such as `⇗ setup.md · in the split →`. The first page of a session adds `nothing left this machine`. When the file in view has no page, `r` opens the review's first page and names it, such as `⇗ docs/setup.md · first rendered file · in the split →`. When the branch changed no markdown, image, or SVG file, the footer reads `nothing to render · no markdown, images or SVG on this branch`.
 
 The pages render in the background while you read, so a page is usually ready before you press `r`. If it isn't, the footer reads `rendering setup.md…` until the page opens. After 5 seconds it gives up with `setup.md took too long to render`.
 
@@ -35,7 +35,13 @@ The pages live in the session's temp directory, which only you can read, and `br
 
 ### The overview
 
-The overview lists every page of the review, in the review's order. Each row shows the file's status letter, its path, and what its page marks, such as `3 changed · 1 removed`, and opens that page. A deleted file is listed under **Deleted**, and its page shows the base version. The foot of the overview sums the ways the pages differ from github.com.
+The overview lists every page of the review, in the review's order. Each row shows the file's status letter, its path, and what its page marks, such as `3 changed · 1 removed`, and opens that page. An image's row gives its sizes, such as `1200×480 · 84 KB → 1200×520 · 91 KB`. Under the pages, the overview has the following groups:
+
+- **Also looks different** lists markdown files the branch didn't change that show an image it did. For more information, see [Pages that also look different](#pages-that-also-look-different).
+- **Deleted** lists deleted files. Each one's page shows the base version.
+- **Won't render on GitHub** lists each link and image that won't resolve on GitHub, with its file and line, such as `README.md:41  setup.md#tokenz · anchor not found`. Each row opens its page at that line. For more information, see [Find what won't resolve on GitHub](#find-what-wont-resolve-on-github).
+
+The rail counts each group, and the strip's red chip, such as `1 broken link · 2 images won't render`, jumps to the last group. The foot of the overview sums the ways the pages differ from github.com.
 
 `R` waits up to 3 seconds for pages that are still rendering. A file whose page isn't ready by then reads `not rendered yet` and has no link. Press `R` again later to see it. A row links only to a page rendered from the review as it is now, so a file you edited since its last page reads `not rendered yet` too. When its page can't be written, the row adds the reason, such as `not rendered yet · disk full`.
 
@@ -44,6 +50,8 @@ A page you open before the other files have rendered shows no count beside them 
 ### Motion on the way
 
 While the page opens, a shade band sweeps the diff toward the split, for about a third of a second. The band crosses only the rows that hold diff text. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
+
+A new split narrows the review as it opens, so a press that opens one plays the band first and opens the split after it. A press that goes to an open split opens the page while the band plays.
 
 The following settings change the motion in the terminal:
 
@@ -57,6 +65,8 @@ The following settings change the motion in the terminal:
 A page opens on the block you were reading. `branch-review` takes the diff line at the top of the pane, and the page scrolls so that the block holding that line sits as far down the window as the line sat down the pane. To open a page at a given change, press `]` until the change is at the top of the diff, then press `r`.
 
 The first time a file's page opens in a session, it starts as the text you were reading: the file's source in your terminal's colors, with added lines tinted green and removed lines back in red. A new file starts all green, and a deleted one all red. After a moment the text develops into the rendered page. Each block in view grows from its lines into place while the tints shrink into the bars in the margin. The **before** chips and removed markers appear once their blocks have landed, and then the changed blocks glow once. The page is final in under a second. Any key, click, or scroll finishes the develop at once.
+
+A split that has just opened paints your terminal's background from its first frame, so it never flashes white before the source shows.
 
 A split in a cmux workspace you aren't looking at holds its page still. A page that opens there plays its develop when you switch to it, unless you pressed a key or scrolled in it first. A develop that the browser holds back past its schedule ends on the final page.
 
@@ -74,17 +84,17 @@ The following settings change how the page arrives:
 
 In watch mode inside cmux, when the file you last opened with `r` changes, the split goes to its new page within a second, at the place you scrolled the split to. The new page doesn't develop. The blocks that are new since the last page glow once instead. The split gets at most one update a second, and an update never takes the place of a page you just opened with `r`. After you close the split, the updates stop until the next `r` opens one. The page in a browser tab, and the overview, don't update.
 
-`branch-review` can't see a move you make inside the split. After you go to another page with `{`, `}` or a link, the next change to the file you opened with `r` brings the split back to that file. To follow the page you moved to, press `r` on its file in the review.
+Before each update, `branch-review` asks cmux which page the split shows. The split updates only while it shows that file's page. After you go to another page with `{`, `}` or a link, the split stays where you went, and updates to the file resume once you go back to its page. When cmux doesn't answer within 1.5 seconds, that update is skipped. To follow the page you moved to, press `r` on its file in the review.
 
 ## Write the pages
 
-To write a page for every changed markdown file, pass `--render-out` with a directory:
+To write a page for every changed markdown, image, and SVG file, pass `--render-out` with a directory:
 
 ```sh
 branch-review --render-out ../rendered
 ```
 
-`branch-review` builds the same review that the UI shows, writes one HTML file per page, prints a summary, and exits. It doesn't open the UI or a browser, and it doesn't watch for changes. A relative directory resolves from where you run the command, and `branch-review` creates the directory when it doesn't exist. Pick a directory outside the repo: pages written inside it show up as untracked files in the next review.
+`branch-review` builds the same review that the UI shows, writes one HTML file per page, prints a summary, and exits. The directory also gets `overview.html`, the overview that `R` opens, and `links.json`, which lists every link on the pages. For more information about `links.json`, see [Use the JSON reports](#use-the-json-reports). It doesn't open the UI or a browser, and it doesn't watch for changes. A relative directory resolves from where you run the command, and `branch-review` creates the directory when it doesn't exist. Pick a directory outside the repo: pages written inside it show up as untracked files in the next review.
 
 The summary lists each page with its status letter, its file, and what changed:
 
@@ -94,11 +104,11 @@ Rendered 2 pages to ../rendered/ · nothing left this machine
   A docs/flow.md      ../rendered/9be1f0c2d4a6b8e0f2a4.html  new file
 ```
 
-A page whose changes left nothing to mark, such as a new link definition, reads `no blocks marked`.
+A page whose changes left nothing to mark, such as a new link definition, reads `no blocks marked`. An image's line gives its sizes, and a page that also looks different is listed after the review's pages, with a `·` for its status. A page that Git was too slow to check in full, even on a second render, adds `git was slow · some links and images unchecked`. Such a page that shows a changed image is listed with the pages that also look different, though its mark may be missing.
 
 Open any page in a browser. The rail on its left links to the other pages.
 
-Each file name is a hash of the file's content and of the set of rendered files, so a file name never carries repo text. A run that renders the same content writes the same names and replaces its earlier files. `branch-review` writes nothing else in the directory and never deletes a file there.
+Each page's file name is a hash of the file's content and of the set of rendered files, so a file name never carries repo text. A run that renders the same content writes the same names and replaces its earlier files. `branch-review` writes nothing else in the directory and never deletes a file there.
 
 `--render-out` takes the same refs as the UI. For example, `branch-review my-feature main --render-out ../rendered` renders `my-feature`'s commits against `main`.
 
@@ -109,16 +119,16 @@ A page shows the file the way GitHub's file view renders it, with GitHub's style
 Changes are marked by block. A block is a paragraph, a heading, a code block, a list item, or a table row:
 
 - A green bar in the margin marks a block that the branch added. A table row's bar sits in the same margin, as tall as the row.
-- An amber bar marks a block that the branch changed. A paragraph that was only rewrapped counts as changed. The **before** chip under the right end of a changed block fades in the whole block as it was on the base. In a list item, the chip follows the item's text.
+- An amber bar marks a block that the branch changed. A paragraph that was only rewrapped counts as changed. The **before** chip under the right end of a changed block fades in the whole block as it was on the base. In a list item, the chip follows the item's text and stays there when you open it. In a table, the chip sits just past the changed row's last cell, and opening it lays the old row, under its header, over the rows below it.
 - A dashed red marker, such as `− 1 paragraph removed · show`, sits where the branch removed content. Click it to see the removed text on a red tint.
 
 When the branch rewrote a stretch of the file, each new block is matched with the old block it replaced, by kind and wording. A matched block is marked changed. A new block with no match is marked added, and an old block with no match gets a removed marker. Blocks match only when their wording is close, so a new paragraph never shows as an edit of unrelated old text. A block of images matches by the images it shows. A block whose text is the same on both sides, such as a heading that Git's diff lists as removed and added again around a rewritten section, carries no mark.
 
 A block that the diff didn't touch carries no mark. Changes in blank lines alone carry no mark either, and neither does text that renders as nothing, such as a link definition or an HTML comment. A block whose text changed but renders the same also carries no mark, such as a list item renumbered by an item added above it, or a line that lost a trailing space.
 
-A table is marked by its rows. A change to a column's alignment marks the header row.
+A table is marked by its rows. A changed row is matched with the old row that has the same first cell, so a row added under an edited one is marked added. A change to a column's alignment marks the header row.
 
-On a narrow screen, such as a narrow split, the rail folds into a one-line file switcher above the file's head.
+On a narrow screen, such as a narrow split, the rail folds into a one-line file switcher above the file's head. The switcher lists what the rail lists, and its count, such as `1 of 7`, counts the review's files. The strip's chips shorten to a sign: `≈` for the fidelity chip, and the findings chip to a count such as `✗ 2`.
 
 ### Keys on a page
 
@@ -132,6 +142,10 @@ A page has keys of its own, which work in the split after you click into it. The
 | `m` | Show or hide the change marks: the bars, the removed markers, and the **before** chips. The **▍ Changes** button in the strip does the same. |
 | `?` | Show the keys. `Esc` closes them. |
 
+An image page has keys of its own too. For more information, see [Image pages](#image-pages).
+
+When the page has links or images that won't resolve on GitHub, a red chip in the strip counts them, such as `1 broken link`. Click it to scroll to each one in turn.
+
 The browser remembers your theme and marks choice for the pages it opens, when it allows the pages to store it.
 
 A new file shows a `new file` banner in place of bars, and an untracked file shows `untracked · not part of a push yet`. A deleted file shows the base version under `deleted on this branch`, with its images dimmed and its text at full contrast. A renamed file names its old path.
@@ -144,6 +158,48 @@ A file that can't render as a page shows a card in its place, and its head names
 - A file that fails to render shows `couldn't render this file` with the reason, followed by its text. A file that takes the renderer more than 5 seconds shows `took too long to render` as the reason, and the other pages still render.
 - A file whose diff couldn't be read gets the same card, with the reason the review gives. A file whose terminal diff failed still renders, since its page needs only the diff.
 - A working tree file that changes after `branch-review` reads its diff gets the same card, with the reason `doesn't match the diff`, so no mark lands on the wrong text. Run the command again to render the new text.
+
+## Image pages
+
+An image or an SVG that the branch changed gets a page of its own. Its head gives each version's dimensions and size, such as `1200×480 · 84 KB → 1200×520 · 91 KB`. Under the pictures, `appears in` names each line of the review's pages that shows the image, such as `README.md:18`, and each one opens that page at that line.
+
+A modified image shows its two versions side by side, the base's on the left, each on a checkerboard so its transparent parts show. The following keys compare them, the same digits as an image preview in the review:
+
+| Key | Action |
+| --- | --- |
+| `1` | Show the two versions side by side. |
+| `2` | Flip between the versions in one place, the branch's first. Press `2` again, press `f`, or click the picture to show the other one. |
+| `3` | Show the difference: the branch's version laid over the base's, dark where they match and light where they differ. |
+
+The buttons over the pictures do the same. **◐ checkerboard** turns the checkerboard off and on, and **fit** switches between fitting the picture to the page and showing it at its own size. The browser remembers the compare mode for the next image page.
+
+A new image shows alone on its checkerboard under a `new file` banner. A deleted image shows its base version dimmed under `deleted on this branch`. A version that can't go on the page, such as one over 8 MiB, shows a card in its place, such as `image not inlined · page limit · o opens it in branch-review`. The compare keys then stay off.
+
+An SVG goes on its page as an image, the same way GitHub shows it, so a script in it never runs and it loads nothing.
+
+## Pages that also look different
+
+A markdown file that the branch didn't change can still look different on GitHub, when it shows an image that the branch changed. `branch-review` searches the branch for markdown files that name a changed image's file name, or the name a moved image had before, for 2 seconds at most, and renders up to 40 of them. In the review, they count toward the 40 files that render in the background, after the review's own pages, so a review with 40 pages or more searches for none. A file whose page shows a changed image gets a page. Its head reads `text unchanged · embeds docs/hero.png`, and the block that shows the image carries a bar and a **before** chip, the way any changed block does.
+
+These pages are listed under **ALSO LOOKS DIFFERENT** in every page's rail and under **Also looks different** in the overview. A file that only names the image in its text gets no page.
+
+## Find what won't resolve on GitHub
+
+Each page checks its links and images against what GitHub would find. A link that won't resolve gets a red wavy underline, and a tooltip names the reason. A link to a heading on another rendered page is checked against that page's headings. A link to a heading in a markdown file the review didn't change is checked against the headings of that file as Git holds it on the branch. A link to `#top` opens a page at its top, and a heading named in other capitals, such as `#Install` for `## Install`, counts as found. The following table lists the reasons:
+
+| Reason | What it means |
+| --- | --- |
+| `anchor not found` | No heading or anchor on the page has that name. |
+| `file not found` | No file or folder has that path on the branch. |
+| `file is untracked` | The file is in the working tree, and Git doesn't track it. |
+| `ignored by git` | The ignore rules hide the file. |
+| `case mismatch: Docs/Setup.md vs docs/setup.md` | The file exists with other capitals. macOS finds it, and GitHub doesn't. |
+
+A link to a file that Git tracks and the review didn't render keeps its dotted underline. An image that won't render on GitHub keeps its red card, described in [Images on a page](#images-on-a-page).
+
+A page's link checks get 3 seconds, as its images do. A link that names no file on the branch is found missing at once. Git has to say whether such a file is untracked or ignored, and whether a heading in another file is there. A link that Git hasn't answered for by then keeps its first answer. One that has no answer at all is plain text with the tooltip `not checked in time`, and it isn't counted. The page renders again once Git answers. `--render-out` renders such a page once more.
+
+The strip's chip counts the page's own findings. The rail sums the review's in a few words, such as `2 links won't resolve` and `1 image: case mismatch`. The overview lists each one. The pages of a deleted file and of a page that also looks different aren't checked, and neither is the old text in a **before** view or a removed marker. Their links keep a dotted underline.
 
 ## Images on a page
 
@@ -174,7 +230,7 @@ An amber card marks an image that GitHub can show and the page leaves out. `imag
 | `can't read the file` | The working tree file can't be opened, for example because nobody may read it. |
 | `can't read it from git` | Git couldn't give the image's bytes. In a partial clone, `branch-review` fetches nothing, so an image whose blob the clone lacks gets this card. Git 2.44 and later can read a partial clone without fetching. With an older Git, every image in a partial clone gets this card. |
 | `doesn't match git: changed since the review read it, or by a git filter` | The working tree file isn't the content the review read. Run the command again to include it. |
-| `took too long to read` | A page's images get 3 seconds in all. The page still renders, with this card for each image left. |
+| `took too long to read` | A page's images get 3 seconds in all. The page still renders, with this card for each image left, and renders again once Git answers. `--render-out` renders it once more. |
 
 An image whose line endings only differ from what Git holds, as `eol=crlf` writes them, shows as usual.
 
@@ -188,7 +244,7 @@ The **≈ GitHub** chip in the strip lists what differs on that page, with a cou
 
 - A Mermaid diagram, a math block, a map, or a 3D model shows as its source with a tag, such as `diagram · GitHub draws this`. Inline math stays as text.
 - A remote image, such as a badge, shows as a dashed card with its alt text and host, such as `build passing · img.shields.io · not loaded (offline)`. An image marked `#gh-dark-mode-only` or `#gh-light-mode-only` shows its card only in that theme, and a pair of them counts once.
-- A link to a file that isn't part of the review is inert, with a dotted underline. A link to another rendered file opens that file's page, and a link to a heading scrolls to it.
+- A link to a file that isn't part of the review is inert, with a dotted underline. A link to another rendered file opens that file's page, and a link to a heading scrolls to it. A link that won't resolve on GitHub is drawn broken, as described in [Find what won't resolve on GitHub](#find-what-wont-resolve-on-github).
 - Code colors come from the same grammars as GitHub's and can drift between versions.
 
 ## What a page can reach
@@ -201,7 +257,7 @@ Repo content can't run on a page. HTML in a markdown file passes GitHub's saniti
 
 To open a page, `branch-review` runs cmux, `/usr/bin/open` on macOS, or `xdg-open` on Linux, each by its full path. Each one gets the page's file URL, whose name is a hash. cmux also gets the workspace and the split it named. No repo text reaches any of them.
 
-## Use the JSON report
+## Use the JSON reports
 
 To print the report as JSON in place of the summary, add `--json`:
 
@@ -217,21 +273,38 @@ The report has the following fields:
 | `base`, `branch` | The refs, as the UI names them, such as `HEAD + worktree` |
 | `dir` | The directory's absolute path |
 | `pages` | One entry per page, in the review's order |
+| `also` | One entry per page that also looks different |
+| `findings` | Each link and image that won't resolve on GitHub |
 
-Each entry in `pages` has the following fields:
+Each entry in `pages` and `also` has the following fields:
 
 | Field | Value |
 | --- | --- |
 | `path` | The file's path relative to the repo root |
 | `status` | `modified`, `added`, `deleted`, `renamed`, or `untracked` |
 | `file` | The page's file name inside `dir` |
-| `state` | `rendered`, `empty`, `tooLarge`, `notUtf8`, or `failed` |
+| `state` | `rendered`, `image`, `empty`, `tooLarge`, `notUtf8`, or `failed` |
 | `changes` | `changed`, the number of blocks marked added or changed, and `removed`, the number of removed markers |
 | `differences` | Each way the page differs from github.com, as `kind` and `count`. The kinds are `mermaid`, `math`, `diagram`, `remoteImage`, and `outsideLink`. |
+| `image` | On an image's page, `before` and `after`, each with `bytes`, `width`, and `height` |
+| `embeds` | On a page that also looks different, the changed images it shows |
+| `late` | `true` when Git was slow to answer for some of the page's links and images, even on its second render. Those links read `unchecked`, and a page that also looks different may show its changed image unmarked. |
 | `reason` | Why the file failed to render, when `state` is `failed` |
 
-Hidden characters in paths and ref names, such as control characters and bidi overrides, are written as `\u` escapes, so the report prints as plain text and decodes to the real names.
+Each entry in `findings` has the following fields:
 
-When no markdown changed, the summary reads `nothing to render · no markdown files on this branch`, and the JSON report has an empty `pages` list.
+| Field | Value |
+| --- | --- |
+| `path`, `line` | The page's file and the line the link or image is on |
+| `target` | The link or image path as the file writes it |
+| `what` | `link` or `image` |
+| `kind` | `badAnchor`, `missing`, `untracked`, `ignored`, or `caseMismatch` for a link, and the reason an image card gives for an image, such as `caseMismatch` or `lfs` |
+| `reason` | The reason in words, as the page says it |
+
+`links.json` in the directory has `version`, `base`, `branch`, the same `findings`, and `links`, every link on the review's pages. Each link has its `path`, `line`, the `href` as written, and a `status`: `ok`, `outside` for a file Git tracks that the review didn't render, `unchecked` for a link Git didn't answer for in time, or one of the link kinds in the preceding table.
+
+Hidden characters in paths and ref names, such as control characters and bidi overrides, are written as `\u` escapes, so the reports print as plain text and decode to the real names.
+
+When no markdown, image, or SVG file changed, the summary reads `nothing to render · no markdown, images or SVG on this branch`, the JSON report has empty lists, and the directory gets no files.
 
 If the directory can't be written, `branch-review` prints a one-line reason, such as `can't write the pages to ../rendered: not a directory`, and exits with status 1. `--json` without `--render-out` is an error too.

@@ -15,6 +15,8 @@ const RENDERED_WORKER: ForkedWorkerSpec<keyof RenderedJobs> = {
     fragment: 5_000,
     // Covers rendering the fragment again when the worker no longer holds it.
     page: 8_000,
+    // Its git grep stops itself at 2 seconds.
+    embedders: 4_000,
   },
   maxInFlight: 2,
 };
@@ -28,6 +30,7 @@ export function createRenderedBackend(options: RenderedBackendOptions): Rendered
     prioritize: worker.prioritize,
     // Ahead of every fragment: a page is what someone is waiting for.
     page: (request, signal) => worker.submit('page', request, signal, -1),
+    embedders: (request, signal) => worker.submit('embedders', request, signal, 1),
     dispose: worker.dispose,
     disabledReason: worker.disabledReason,
   };

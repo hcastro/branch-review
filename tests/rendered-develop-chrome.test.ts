@@ -7,6 +7,7 @@ import sharp from 'sharp';
 import {afterAll, beforeAll, describe, expect, it} from 'vitest';
 import {changeGroups} from '../src/rendered/changes.js';
 import {renderMarkdown, type AssetAnswer} from '../src/rendered/markdown.js';
+import {PAGE_SCRIPT} from '../src/rendered/assets.generated.js';
 import {assembleFilePage, assembleOverview, type PageInput, type RailEntry} from '../src/rendered/page.js';
 import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
 import {diffFile} from './rendered-helpers.js';
@@ -183,6 +184,27 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
       differences: [],
     }));
     pageUrl = urlOf('page.html');
+    // An image's page, both sides the same size in two colors, and a page
+    // with a link to a heading that isn't there.
+    const side = async (red: number, green: number, blue: number) => {
+      const png = await sharp({create: {width: 320, height: 120, channels: 3, background: {r: red, g: green, b: blue}}}).png().toBuffer();
+      return {kind: 'shown' as const, dataUrl: `data:image/png;base64,${png.toString('base64')}`, mime: 'image/png', bytes: png.length, width: 320, height: 120};
+    };
+    fs.writeFileSync(path.join(dir, 'image.html'), assembleFilePage({
+      title,
+      file: {path: 'docs/hero.png', status: 'modified', body: {kind: 'image', image: {format: 'raster', before: await side(200, 40, 40), after: await side(40, 40, 200)}}},
+      rail: [],
+      appears: [{path: 'docs/rendered-view.md', line: 9, href: 'page.html'}],
+    }));
+    const broken = await renderMarkdown({path: 'docs/broken.md', source: '# Broken\n\nSee [nowhere](#nowhere) and [gone](gone.md).\n', groups: [], asset, link: () => ({kind: 'missing'})});
+    fs.writeFileSync(path.join(dir, 'broken.html'), assembleFilePage({
+      title,
+      file: {path: 'docs/broken.md', status: 'modified', body: {kind: 'rendered', fragment: broken}},
+      rail: [],
+      report: {own: [{path: 'docs/broken.md', line: 3, target: '#nowhere', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}, {path: 'docs/broken.md', line: 3, target: 'gone.md', what: 'link', kind: 'missing', reason: 'file not found'}], notes: ['2 links won\'t resolve']},
+    }));
+    // The page as it is before its page script runs: the head script alone.
+    fs.writeFileSync(path.join(dir, 'first.html'), fs.readFileSync(path.join(dir, 'page.html'), 'utf8').replace(`<script>${PAGE_SCRIPT}</script>`, ''));
 
     child = spawn(CHROME!, [
       '--headless', '--remote-debugging-pipe', `--user-data-dir=${path.join(dir, 'profile')}`,
@@ -248,6 +270,89 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
       .toEqual({veil: false, tints: 0, styled: 0});
     expect(differing(await shot(), still)).toBe(0);
   }, 60_000);
+
+  it('paints its first frame in the terminal\'s background before the page script runs, and hands it back after', async () => {
+    const corner = {x: VIEW.width - 8, y: VIEW.height - 8, width: 1, height: 1};
+    const pixel = async () => [...(await shot(corner)).subarray(0, 3)];
+    await load('at=L7&d=full&m=1&bg=0a0b0c&n=90', urlOf('first.html'));
+    expect(await pixel()).toEqual([0x0a, 0x0b, 0x0c]);
+    // Motion off, or a revisit: the page's own background from the start.
+    await load('at=L7&d=full&m=0&bg=0a0b0c&n=91', urlOf('first.html'));
+    expect(await pixel()).toEqual([0x0e, 0x14, 0x16]);
+    await load('at=L7&d=short&m=1&bg=0a0b0c&n=92', urlOf('first.html'));
+    expect(await pixel()).toEqual([0x0e, 0x14, 0x16]);
+    // The page script takes the first frame over at once, under its raw frame.
+    await load('at=L7&d=full&m=1&bg=0a0b0c&n=93');
+    expect(await evaluate('({first: document.documentElement.hasAttribute("data-br-first"), style: document.documentElement.hasAttribute("style"), veil: !!document.querySelector(".br-veil")})')).toEqual({first: false, style: false, veil: true});
+    await evaluate('new Promise((resolve) => setTimeout(resolve, 2_000))');
+    expect(await pixel()).toEqual([0x0e, 0x14, 0x16]);
+  }, 30_000);
+
+  it('paints the terminal\'s background first with reduced motion too, where the raw frame fades out', async () => {
+    const corner = {x: VIEW.width - 8, y: VIEW.height - 8, width: 1, height: 1};
+    await media(true);
+    try {
+      await load('at=L7&d=full&m=1&bg=0a0b0c&n=94', urlOf('first.html'));
+      expect([...(await shot(corner)).subarray(0, 3)]).toEqual([0x0a, 0x0b, 0x0c]);
+    } finally {
+      await media(false);
+    }
+  }, 30_000);
+
+  it('compares an image side by side, by flipping and as a difference, on the TUI\'s digits', async () => {
+    await load('m=0&n=170', urlOf('image.html'));
+    const visible = '[...document.querySelectorAll(".br-figure")].filter((figure) => getComputedStyle(figure).visibility === "visible").map((figure) => figure.className.split(" ")[1])';
+    const boxes = '[...document.querySelectorAll(".br-frame img")].map((image) => Math.round(image.getBoundingClientRect().left))';
+    expect(await evaluate<string>('document.querySelector(".br-image-page").dataset.mode')).toBe('side');
+    expect(await evaluate<boolean>('!document.querySelector(".br-modes").hidden')).toBe(true);
+    const [left, right] = await evaluate<number[]>(boxes);
+    expect(right! - left!).toBeGreaterThan(300);
+
+    await key('2');
+    expect(await evaluate<string[]>(visible)).toEqual(['br-after']);
+    await key('f');
+    expect(await evaluate<string[]>(visible)).toEqual(['br-before']);
+    await key('2');
+    expect(await evaluate<string[]>(visible)).toEqual(['br-after']);
+    expect(await evaluate<string>('document.querySelector(\'.br-mode[aria-pressed="true"]\').dataset.mode')).toBe('flip');
+
+    // Difference: the after side over the before side, each channel apart.
+    await key('3');
+    const center = await evaluate<{x: number; y: number}>('(() => { const rect = document.querySelector(".br-after img").getBoundingClientRect(); return {x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2)}; })()');
+    const pixel = await shot({x: center.x, y: center.y, width: 1, height: 1});
+    expect([...pixel.subarray(0, 3)]).toEqual([160, 0, 160]);
+
+    await key('1');
+    expect(await evaluate<number[]>(boxes)).toEqual([left, right]);
+    // The choice stays for the next image page this browser opens.
+    await key('3');
+    await load('m=0&n=171', urlOf('image.html'));
+    expect(await evaluate<string>('document.querySelector(".br-image-page").dataset.mode')).toBe('difference');
+    await key('1');
+  }, 30_000);
+
+  it('brings an image page\'s pictures in from a blur on a first visit, and shows them sharp without motion', async () => {
+    await withPageScript(HOLD_DEADLINE, () => load('d=full&m=1&n=172', urlOf('image.html')));
+    expect(await evaluate<number>('document.getAnimations().length')).toBe(2);
+    await evaluate('document.getAnimations().forEach((a) => { a.pause(); a.currentTime = 0; })');
+    expect(await evaluate<string>('getComputedStyle(document.querySelector(".br-frame img")).filter')).toBe('blur(6px)');
+    await key('Shift');
+    expect(await evaluate<number>('document.getAnimations().length')).toBe(0);
+    await load('d=full&m=0&n=173', urlOf('image.html'));
+    expect(await evaluate<number>('document.getAnimations().length')).toBe(0);
+  }, 30_000);
+
+  it('draws a link that won\'t resolve with a red wavy line, and its strip chip steps to each', async () => {
+    await load('m=0&n=180', urlOf('broken.html'));
+    const lines = await evaluate<string[]>('[...document.querySelectorAll(".markdown-body a.br-broken")].map((link) => getComputedStyle(link).textDecorationStyle)');
+    expect(lines).toEqual(['wavy', 'wavy']);
+    expect(await evaluate<string>('document.querySelector(".br-findings").textContent')).toBe('2 broken links');
+    expect(await evaluate<string>('document.querySelector(".br-findings").getAttribute("role")')).toBe('button');
+    expect(await evaluate<string[]>('[...document.querySelectorAll(".br-rail .br-rail-findings li")].map((item) => item.textContent)')).toEqual(['2 links won\'t resolve']);
+    await evaluate('document.querySelector(".br-findings").click()');
+    await sleep(50);
+    expect(await evaluate<string>('document.getAnimations()[0]?.effect.target.textContent ?? ""')).toBe('nowhere');
+  }, 30_000);
 
   it('opens on the block under the reader\'s eyes, at the same height', async () => {
     await load('at=L7&f=0.3&d=full&m=0&n=30');
@@ -555,6 +660,98 @@ describe.skipIf(!CHROME)('the develop in a real Chromium', () => {
     const scale = await evaluate<number>('new DOMMatrix(getComputedStyle(document.querySelector(\'[data-lines="3-3"]\')).transform).d');
     expect(scale).not.toBeCloseTo(1, 2);
     await key('Shift');
+  }, 30_000);
+
+  it('steps its strip chip through the page\'s own findings, never through old text', async () => {
+    // Old text in a before view, with a link and a card a build could still draw broken.
+    const old = '<details class="br-before"><summary>before</summary><div class="br-before-body"><p><a class="br-inert br-broken">old</a> <span class="br-card br-refused">old card</span></p></div></details>';
+    const html = fs.readFileSync(path.join(pageDir, 'broken.html'), 'utf8').replace('<article class="markdown-body">', `<article class="markdown-body">\n${old}`);
+    fs.writeFileSync(path.join(pageDir, 'old-text.html'), html);
+    await load('m=0&n=183', urlOf('old-text.html'));
+    await evaluate('window.__seen = []; Element.prototype.scrollIntoView = function () { window.__seen.push(this.textContent); }');
+    for (let step = 0; step < 3; step += 1) await evaluate('document.querySelector(".br-findings").click()');
+    expect(await evaluate<string[]>('window.__seen')).toEqual(['nowhere', 'gone', 'nowhere']);
+  }, 30_000);
+
+  it('lines the rail\'s findings up with its titles', async () => {
+    await load('m=0&n=181', urlOf('broken.html'));
+    const left = (selector: string) => `Math.round(document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect().left)`;
+    expect(await evaluate<number>(left('.br-rail-findings li'))).toBe(await evaluate<number>(left('.br-rail-title')));
+  }, 30_000);
+
+  it('keeps a strip with every chip on a 400 px screen, in both themes', async () => {
+    const narrow = {width: 400, height: 760};
+    // The longest chips a page has: a difference, and links and images that won't resolve.
+    const html = fs.readFileSync(path.join(pageDir, 'broken.html'), 'utf8')
+      .replace('<summary>≈ GitHub</summary>', '<summary>≈ GitHub · 1 difference</summary>')
+      .replace(/<span class="br-findings"([^>]*)>[^<]*<\/span>/, '<span class="br-findings"$1>1 broken link · 2 images won\'t render</span>');
+    expect(html).toContain('1 broken link · 2 images won\'t render');
+    fs.writeFileSync(path.join(pageDir, 'chips.html'), html);
+    await page('Emulation.setDeviceMetricsOverride', {...narrow, deviceScaleFactor: 1, mobile: false});
+    try {
+      for (const theme of ['light', 'dark']) {
+        await load('m=0&n=182', urlOf('chips.html'));
+        await evaluate(`document.documentElement.dataset.theme = ${JSON.stringify(theme)}`);
+        const fit = await evaluate<{scroll: number; client: number; right: number}>('({scroll: document.documentElement.scrollWidth, client: document.documentElement.clientWidth, right: Math.max(...[...document.querySelectorAll(".br-strip > *, .br-strip-end > *")].map((each) => each.getBoundingClientRect().right))})');
+        expect(fit.scroll, theme).toBeLessThanOrEqual(fit.client);
+        expect(fit.right, theme).toBeLessThanOrEqual(narrow.width - 12);
+        // Each control still shows whole: no narrower than it is tall.
+        const controls = await evaluate<Array<{scroll: number; width: number; height: number}>>('[...document.querySelectorAll(".br-strip-end > button")].map((each) => ({scroll: each.scrollWidth, width: each.offsetWidth, height: each.offsetHeight}))');
+        expect(controls).toHaveLength(3);
+        for (const control of controls) {
+          expect(control.scroll).toBeLessThanOrEqual(control.width);
+          expect(control.width).toBeGreaterThanOrEqual(control.height);
+        }
+      }
+    } finally {
+      await page('Emulation.setDeviceMetricsOverride', {...VIEW, deviceScaleFactor: 1, mobile: false});
+    }
+  }, 30_000);
+
+  it('shortens the strip\'s chips on a 400 px screen to whole signs and counts, never half a word', async () => {
+    const narrow = {width: 400, height: 760};
+    await page('Emulation.setDeviceMetricsOverride', {...narrow, deviceScaleFactor: 1, mobile: false});
+    try {
+      await load('m=0&n=183', urlOf('chips.html'));
+      const chips = await evaluate<Array<{scroll: number; client: number; text: string}>>('[".br-fidelity > summary", ".br-findings"].map((selector) => { const chip = document.querySelector(selector); return {scroll: chip.scrollWidth, client: chip.clientWidth, text: chip.textContent}; })');
+      for (const chip of chips) expect(chip.scroll, chip.text).toBeLessThanOrEqual(chip.client);
+      // The words stay in the page for a screen reader.
+      expect(chips.map((chip) => chip.text)).toEqual(['≈ GitHub · 1 difference', '1 broken link · 2 images won\'t render']);
+      expect(await evaluate<string>('getComputedStyle(document.querySelector(".br-findings"), "::before").content')).toMatch(/✗ 2/);
+    } finally {
+      await page('Emulation.setDeviceMetricsOverride', {...VIEW, deviceScaleFactor: 1, mobile: false});
+    }
+  }, 30_000);
+
+  it('keeps a table row\'s before chip past its cells, so its column stays aligned and opening it reflows nothing', async () => {
+    const before = '# Features\n\n| Feature | Status | Notes |\n| --- | :---: | ---: |\n| Offline mode | done | 12 |\n| Sync | planned | 3 |\n\n- [x] First release\n- [ ] Plugin system\n- [ ] Remote widgets\n';
+    const after = before.replace('| Sync | planned | 3 |', '| Sync | in progress | 5 |\n| Themes | planned | 1 |').replace('- [ ] Plugin system', '- [x] Plugin system');
+    const fragment = await renderMarkdown({path: 'README.md', source: after, groups: changeGroups(diffFile(before, after, 'README.md')), asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const title: PageInput['title'] = {repo: 'project', base: 'main', branch: 'feature', worktree: false, renderedAt: 0};
+    fs.writeFileSync(path.join(pageDir, 'rows.html'), assembleFilePage({title, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment}}, rail: []}));
+    // The right edge of each row's last number, the table's box, and the
+    // list item's chip, as a reader sees them.
+    const measure = `(() => {
+      const table = document.querySelector('.markdown-body > table');
+      const ends = [...table.querySelectorAll(':scope > tbody > tr')].map((row) => { const range = document.createRange(); range.selectNodeContents(row.lastElementChild.firstChild); return Math.round(range.getBoundingClientRect().right); });
+      const box = table.getBoundingClientRect();
+      const chip = document.querySelector('.markdown-body li details.br-before > summary').getBoundingClientRect();
+      return {ends, table: [Math.round(box.width), Math.round(box.height)], chip: [Math.round(chip.left), Math.round(chip.top)]};
+    })()`;
+    await load('m=0&n=184', urlOf('rows.html'));
+    const closed = await evaluate<{ends: number[]; table: number[]; chip: number[]}>(measure);
+    expect(new Set(closed.ends).size, JSON.stringify(closed.ends)).toBe(1);
+    await evaluate('for (const chip of document.querySelectorAll(".markdown-body details.br-before")) chip.open = true');
+    await frames();
+    const open = await evaluate<{ends: number[]; table: number[]; chip: number[]}>(measure);
+    expect(open.ends).toEqual(closed.ends);
+    expect(open.table).toEqual(closed.table);
+    // The list item's chip stays after the item's words, on their line.
+    expect(open.chip[0]).toBe(closed.chip[0]);
+    expect(Math.abs(open.chip[1]! - closed.chip[1]!)).toBeLessThanOrEqual(3);
+    // The old row lies over the rows after it, not under them.
+    const onTop = await evaluate<boolean>('(() => { const view = document.querySelector("table .br-before-body").getBoundingClientRect(); return document.elementFromPoint(view.left + view.width / 2, view.top + view.height / 2).closest(".br-before-body") !== null; })()');
+    expect(onTop).toBe(true);
   }, 30_000);
 
   it('fits a narrow screen: a forced theme keeps its lengths, the popover stays on screen, and the raw lines wrap', async () => {

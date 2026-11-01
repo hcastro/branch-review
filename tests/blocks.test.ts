@@ -1,5 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
+import {buildBlockDiffPayload, buildBlockPromptPayload, buildCodePayload} from '../src/clipboard/payloads.js';
 
 describe('parseUnifiedDiffBlocks', () => {
   it('keeps added lines that start with ++ in the block code', () => {
@@ -23,6 +24,21 @@ describe('parseUnifiedDiffBlocks', () => {
     const blocks = parseUnifiedDiffBlocks(rawDiff, 'x');
 
     expect(blocks.map((block) => block.rawDiff)).toEqual(['@@ -1,2 +1,2 @@\n-a\n+b\n \n', '@@ -9 +9 @@\n-c\n+d\n']);
+  });
+
+  it('keeps a hunk whose function context holds a lone carriage return, and its copy payloads', () => {
+    // git ends a line only at `\n`, so a `\r` inside a line can land in the
+    // function context it prints after a hunk's `@@`.
+    const hunk = '@@ -1,3 +1,3 @@ Title\rstill the title\n Title\rstill the title\n-old line\n+new line\n context\n';
+    const rawDiff = `diff --git a/notes.md b/notes.md\nindex 1111111..2222222 100644\n--- a/notes.md\n+++ b/notes.md\n${hunk}`;
+
+    const blocks = parseUnifiedDiffBlocks(rawDiff, 'notes.md');
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, functionHeader: 'Title\rstill the title', addedCode: 'new line'});
+    expect(buildBlockDiffPayload(blocks[0]!)).toBe(hunk);
+    expect(buildCodePayload(blocks[0]!)).toBe('new line');
+    expect(buildBlockPromptPayload({path: 'notes.md'}, blocks[0]!)).toBe(buildBlockPromptPayload({path: 'notes.md'}, {...blocks[0]!, functionHeader: 'Title\rstill the title'}));
   });
 
   it('extracts block ranges, function headers, raw diff, and added code', () => {

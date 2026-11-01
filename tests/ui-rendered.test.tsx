@@ -15,6 +15,7 @@ import {
   markdownFile,
   renderFixture,
   sideInfo,
+  svgMediaFile,
 } from './ui-fixtures.js';
 import {cleanupTempDirs} from './core-helpers.js';
 
@@ -60,6 +61,25 @@ describe('the Rendered button', () => {
     const other = frameLines(instance.lastFrame())[4]!;
     expect(other).toContain('src/app.ts');
     expect(other).not.toContain('Rendered');
+    instance.unmount();
+  });
+
+  it('leads an image\'s and an SVG\'s header actions too, and r opens that file\'s own page', async () => {
+    const fixture = buildFixture([binaryMediaFile('docs/hero.png'), svgMediaFile('docs/flow.svg'), markdownFile('README.md', ['# Readme', '', '![Hero](docs/hero.png)'])]);
+    const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
+    const instance = renderFixture({...fixture, rendered: service}, SIZE);
+    await flush();
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/hero\.png\s+╭─Rendered ⇗─╮/);
+    instance.stdin.write('r');
+    await waitForFrame(instance, '⇗ hero.png · in the split → · nothing left this machine');
+    expect(calls[0]!.args.slice(0, 3)).toEqual(['--json', 'browser', 'open-split']);
+
+    instance.stdin.write('\u001B[B');
+    await flush(2);
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/flow\.svg\s+╭─Rendered ⇗─╮/);
+    instance.stdin.write('r');
+    await waitForFrame(instance, '⇗ flow.svg · in the split →');
+    expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
     instance.unmount();
   });
 
@@ -267,7 +287,7 @@ describe('r and R', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('r');
-    await waitForFrame(instance, 'nothing to render · no markdown files on this branch');
+    await waitForFrame(instance, 'nothing to render · no markdown, images or SVG on this branch');
     instance.stdin.write('R');
     await flush(2);
     expect(calls).toEqual([]);

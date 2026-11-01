@@ -88,8 +88,8 @@ describe('renderMarkdown fixtures', () => {
     expect(html).toContain('id="user-content-setup-1"');
     expect(html).toContain('<a href="#user-content-setup-1">the second setup</a>');
     expect(html).toContain('<a href="#user-content-setup">the top</a>');
-    // An anchor with no heading stays as written and is reported.
-    expect(html).toContain('<a href="#nowhere">nowhere</a>');
+    // An anchor with no heading stays as written, drawn broken, and is reported.
+    expect(html).toContain('<a href="#nowhere" class="br-broken" title="anchor not found">nowhere</a>');
     expect(fragment.links).toContainEqual({href: '#nowhere', status: 'badAnchor', line: 9});
     // Emoji shortcodes become the character, outside code only.
     expect(html).toContain('heading 🚀</h2>');

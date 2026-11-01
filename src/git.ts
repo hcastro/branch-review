@@ -1355,6 +1355,31 @@ export function* untrackedStateOperation(cwd: string, filePath: string): GitOper
   return null;
 }
 
+/**
+ * The files in a tree whose text holds any of `words`, as fixed strings.
+ * Pathspecs are literal in every call, so the caller filters the names.
+ * Binary files are skipped. git's own answer for no match (exit 1, nothing
+ * said) is an empty list.
+ */
+export function* grepTreeFilesOperation(cwd: string, treeOid: string, words: readonly string[]): GitOperation<string[]> {
+  if (!OBJECT_ID.test(treeOid)) throw new Error(`not an object id: ${treeOid}`);
+  if (words.length === 0) return [];
+  let output: Buffer;
+  try {
+    output = yield* gitBytesOperation(cwd, ['grep', '-l', '-z', '-F', '-I', '--no-color', ...words.flatMap((word) => ['-e', word]), treeOid, '--'], {local: true});
+  } catch (error) {
+    const {status, stderr} = error as {status?: number; stderr?: string};
+    if (status === 1 && !stderr) return [];
+    throw error;
+  }
+  const prefix = `${treeOid}:`;
+  return splitNul(output).flatMap((field) => {
+    if (!isUtf8(field)) return [];
+    const name = field.toString('utf8');
+    return name.startsWith(prefix) ? [name.slice(prefix.length)] : [];
+  });
+}
+
 /** A blob's full id and size, by its (abbreviated) id. */
 export function* blobFactsOperation(cwd: string, abbrevId: string): GitOperation<{oid: string; size: number}> {
   if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);

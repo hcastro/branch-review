@@ -3,6 +3,8 @@ import path from 'node:path';
 import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
+import {renderToDirectory} from '../src/rendered/renderOut.js';
+import {prepareStartup} from '../src/startup.js';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, snapshotTree, writeExecutable, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
 
@@ -75,6 +77,7 @@ type Report = {
     state: string;
     changes: {changed: number; removed: number};
     differences: Array<{kind: string; count: number}>;
+    embeds?: string[];
     reason?: string;
   }>;
 };
@@ -129,10 +132,11 @@ describe('--render-out', () => {
     expect(guide.changes).toEqual({changed: 1, removed: 1});
     expect(report.pages[1]!.differences).toEqual([{kind: 'remoteImage', count: 1}]);
 
-    // Content-addressed names, never repo text, and nothing else in the dir.
+    // Content-addressed names, never repo text, and nothing else in the dir
+    // but the overview and the link report.
     const files = fs.readdirSync(out).sort();
-    expect(files).toEqual(report.pages.map((page) => page.file).sort());
-    for (const file of files) expect(file).toMatch(/^[0-9a-f]{20}\.html$/);
+    expect(files).toEqual([...report.pages.map((page) => page.file), 'links.json', 'overview.html'].sort());
+    for (const page of report.pages) expect(page.file).toMatch(/^[0-9a-f]{20}\.html$/);
 
     const guideHtml = fs.readFileSync(path.join(out, guide.file), 'utf8');
     expect(guideHtml).toMatch(/^<!doctype html>\n<html lang="en">\n<head>\n<meta http-equiv="Content-Security-Policy"/);
@@ -160,7 +164,7 @@ describe('--render-out', () => {
     const readme = fs.readFileSync(path.join(out, file('README.md')), 'utf8');
     expect(readme).toContain(`<a href="${file('docs/a.md')}#user-content-a">A</a>`);
     expect(readme).toContain('<a class="br-inert" title="not part of this review">the app</a>');
-    expect(readme).toContain('<a class="br-inert" title="not part of this review">gone</a>');
+    expect(readme).toContain('<a class="br-inert br-broken" title="file not found">gone</a>');
     expect(fs.readFileSync(path.join(out, file('docs/a.md')), 'utf8')).toContain(`<a href="${file('README.md')}">readme</a>`);
   });
 
@@ -202,7 +206,7 @@ describe('--render-out', () => {
     expect(report.dir).toBe(path.join(repo, 'docs', 'rendered'));
     const again = runCli(path.join(repo, 'docs'), ['--render-out', 'rendered', '--json']);
     expect(again.status).toBe(0);
-    expect(fs.readdirSync(path.join(repo, 'docs', 'rendered'))).toEqual([report.pages[0]!.file]);
+    expect(fs.readdirSync(path.join(repo, 'docs', 'rendered')).sort()).toEqual([report.pages[0]!.file, 'links.json', 'overview.html'].sort());
   });
 
   it('prints a short summary without --json, with paths as given', () => {
@@ -228,7 +232,7 @@ describe('--render-out', () => {
     const out = makeTempDir('branch-review-out-');
     const text = runCli(repo, ['HEAD', 'main', '--render-out', out]);
     expect(text.status).toBe(0);
-    expect(text.stdout).toBe('nothing to render · no markdown files on this branch\n');
+    expect(text.stdout).toBe('nothing to render · no markdown, images or SVG on this branch\n');
     const json = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
     expect(json.status).toBe(0);
     expect((JSON.parse(json.stdout) as Report).pages).toEqual([]);
@@ -382,7 +386,7 @@ describe('--render-out', () => {
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     const guide = fs.readFileSync(path.join(out, report.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
-    expect(guide).toContain('<a class="br-inert" title="file not found">old notes</a>');
+    expect(guide).toContain('<a class="br-inert br-broken" title="file not found">old notes</a>');
   });
 
   it('gives a renamed file the same cards as any other file, read no further than the render limit', () => {
@@ -447,8 +451,9 @@ describe('--render-out', () => {
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
     const readme = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
-    for (const text of ['a', 'b', 'c', 'd']) expect(readme).toContain(`<a class="br-inert" title="not part of this review">${text}</a>`);
-    expect(report.pages[0]!.differences).toEqual([{kind: 'outsideLink', count: 4}]);
+    // None names a file git holds, so each is drawn broken.
+    for (const text of ['a', 'b', 'c', 'd']) expect(readme).toContain(`<a class="br-inert br-broken" title="file not found">${text}</a>`);
+    expect(report.pages[0]!.differences).toEqual([]);
   });
 
   it('marks a work tree file only when its text is the text the diff was read from', () => {
@@ -489,13 +494,14 @@ describe('--render-out', () => {
     const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
     expect(result.stderr).toBe('');
     const report = JSON.parse(result.stdout) as Report;
-    const html = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    const readme = report.pages.find((page) => page.path === 'README.md')!;
+    const html = fs.readFileSync(path.join(out, readme.file), 'utf8');
     const inlined = (bytes: Buffer) => `data:image/png;base64,${bytes.toString('base64')}`;
     // The page shows the branch's logo; its before view, the base's.
     expect(html).toContain(inlined(blue));
     expect(html).toMatch(new RegExp(`class="br-before-body">[\\s\\S]*${inlined(red).replace(/[+/]/g, '\\$&')}`));
     expect(html).toContain("won't render on GitHub: file is untracked · notes/draft.png");
-    expect(report.pages[0]!.differences).toEqual([]);
+    expect(readme.differences).toEqual([]);
   });
 
   it('renders from the published bundle, render thread included', () => {
@@ -525,5 +531,149 @@ describe('--render-out', () => {
       ['b-fine.md', 'rendered', undefined],
     ]);
     expect(fs.readFileSync(path.join(out, report.pages[1]!.file), 'utf8')).toMatch(/<p data-block="[^"]+" data-lines="3-3">Text\.<\/p>/);
+  });
+});
+
+describe('--render-out over the whole branch', () => {
+  type Whole = Report & {also: Report['pages']; findings: Array<{path: string; line: number; target: string; what: string; kind: string; reason: string}>};
+  type Links = {version: number; findings: Whole['findings']; links: Array<{path: string; line: number; href: string; status: string}>};
+
+  // main has a README that shows the hero image and a guide; the branch
+  // changes the image alone, and `extra` on top of that.
+  function heroRepo(extra: Record<string, string> = {}) {
+    const repo = initRepo({
+      'README.md': '# Project\n\nThe hero:\n\n![Hero](docs/hero.png)\n',
+      'docs/guide.md': '# Guide\n\n## Install\n\nRun it.\n',
+      'docs/other.md': '# Other\n\nNo pictures, though it names hero.png in its text.\n',
+    });
+    fs.writeFileSync(path.join(repo, 'docs/hero.png'), pngFixture(3, 2, [200, 40, 40, 255]));
+    commitAll(repo, 'hero');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, 'docs/hero.png'), pngFixture(4, 5, [40, 40, 200, 255]));
+    writeFiles(repo, extra);
+    commitAll(repo, 'a new hero');
+    return repo;
+  }
+
+  it('shows the README that embeds a changed image under "also looks different", with the image\'s page saying where it appears', () => {
+    const repo = heroRepo();
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as Whole;
+    expect(report.pages.map((page) => [page.path, page.state])).toEqual([['docs/hero.png', 'image']]);
+    // Its text didn't change; the image it shows did. A file that only
+    // names the image in its text shows nothing that changed.
+    expect(report.also.map((page) => [page.path, page.status, page.state, page.changes])).toEqual([['README.md', 'modified', 'rendered', {changed: 1, removed: 0}]]);
+
+    const overview = fs.readFileSync(path.join(out, 'overview.html'), 'utf8');
+    expect(overview).toContain('<h2 class="br-group-title">Also looks different</h2>');
+    expect(overview).toMatch(/<span class="br-row-path">README\.md<\/span><span class="br-row-note">text unchanged · embeds docs\/hero\.png<\/span>/);
+    const readme = fs.readFileSync(path.join(out, report.also[0]!.file), 'utf8');
+    expect(readme).toMatch(/<p [^>]*data-mark="modified"><img src="data:image\/png;base64,/);
+    expect(readme).toContain('text unchanged · embeds docs/hero.png');
+    const hero = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    expect(hero).toContain(`<p class="br-appears">appears in <a href="${report.also[0]!.file}#at=L5&#x26;d=short">README.md:5</a></p>`);
+    expect(hero).toMatch(/<p class="br-summary">.*· 3×2 · \d+ B → 4×5 · \d+ B<\/p>/);
+  });
+
+  it('renders a page whose lookups ran out of time once more, so a cold git leaves out no page and claims nothing', async () => {
+    const repo = heroRepo({'docs/guide.md': '# Guide\n\nSee [the notes](notes.md).\n'});
+    const {cwd, range, review} = await prepareStartup({cwd: repo, options: {requestedBranch: 'feature', requestedBase: 'main', watch: false, watchPoll: false, animations: false}, width: 100});
+    const out = makeTempDir('branch-review-out-');
+    // No time at all for a lookup: every first render, before git has read
+    // a tree or an image, runs out of it.
+    const report = await renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0});
+    expect(report.also.map((page) => [page.path, page.embeds])).toEqual([['README.md', ['docs/hero.png']]]);
+    expect(report.findings).toEqual([{path: 'docs/guide.md', line: 3, target: 'notes.md', what: 'link', kind: 'missing', reason: 'file not found'}]);
+    const links = JSON.parse(fs.readFileSync(path.join(out, 'links.json'), 'utf8')) as Links;
+    expect(links.links).toEqual([{path: 'docs/guide.md', line: 3, href: 'notes.md', status: 'missing'}]);
+  });
+
+  it('finds markdown that still shows a moved image by its old name', () => {
+    const repo = initRepo({'README.md': '# Project\n\n![Logo](docs/old.svg)\n'});
+    fs.mkdirSync(path.join(repo, 'docs'));
+    fs.writeFileSync(path.join(repo, 'docs/old.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>\n');
+    commitAll(repo, 'logo');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    git(repo, 'mv', 'docs/old.svg', 'docs/new.svg');
+    fs.writeFileSync(path.join(repo, 'docs/new.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="blue"/></svg>\n');
+    commitAll(repo, 'move the logo');
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as Whole;
+    expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/new.svg', 'renamed']]);
+    // On GitHub the README now shows a broken image, where it showed the logo.
+    expect(report.also.map((page) => [page.path, page.changes, page.embeds])).toEqual([['README.md', {changed: 1, removed: 0}, ['docs/old.svg']]]);
+  });
+
+  it('lists neither name of a file the work tree moved under "also looks different", next to a changed image', () => {
+    const repo = initRepo({'docs/old.md': '# Old\n\n![Hero](hero.png)\n', 'CHANGES.md': '# Changes\n\n![Hero](docs/hero.png)\n'});
+    fs.writeFileSync(path.join(repo, 'docs/hero.png'), pngFixture(3, 2, [200, 40, 40, 255]));
+    commitAll(repo, 'hero');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    git(repo, 'mv', 'docs/old.md', 'docs/new.md');
+    fs.writeFileSync(path.join(repo, 'docs/hero.png'), pngFixture(4, 5, [40, 40, 200, 255]));
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['HEAD', 'main', '--render-out', out, '--json']);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as Whole;
+    expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/hero.png', 'modified'], ['docs/new.md', 'renamed']]);
+    // The file left alone that shows the hero is the one page outside the review.
+    expect(report.also.map((page) => page.path)).toEqual(['CHANGES.md']);
+  });
+
+  it('keeps hidden characters in an embedded image\'s name off the terminal, in the summary of a page that also looks different', () => {
+    const name = 'docs/x\u202Egnp.\u009B31mexe.png';
+    const repo = initRepo({'README.md': `# Project\n\n![x](<${name}>)\n`});
+    fs.mkdirSync(path.join(repo, 'docs'));
+    fs.writeFileSync(path.join(repo, name), pngFixture(3, 2, [200, 40, 40, 255]));
+    commitAll(repo, 'hero');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    fs.writeFileSync(path.join(repo, name), pngFixture(4, 5, [40, 40, 200, 255]));
+    commitAll(repo, 'a new hero');
+    const text = runCli(repo, ['feature', 'main', '--render-out', makeTempDir('branch-review-out-')]);
+    expect(text.status).toBe(0);
+    expect(text.stdout).not.toMatch(HIDDEN);
+    expect(text.stdout).toContain('text unchanged · embeds docs/x<U+202E>gnp.<U+009B>31mexe.png');
+  });
+
+  it('finds a planted bad anchor and a link to a file that isn\'t there, in links.json, the overview and the page', () => {
+    const repo = heroRepo({'docs/guide.md': '# Guide\n\n## Install\n\nRun it. Then [read the readme](../README.md#nope), the [install step](#install) and [the notes](notes.md).\n'});
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['feature', 'main', '--render-out', out, '--json']);
+    expect(result.status).toBe(0);
+    const report = JSON.parse(result.stdout) as Whole;
+    // The README isn't in the review: its anchors come from the file git holds.
+    const findings = [
+      {path: 'docs/guide.md', line: 5, target: '../README.md#nope', what: 'link', kind: 'badAnchor', reason: 'anchor not found'},
+      {path: 'docs/guide.md', line: 5, target: 'notes.md', what: 'link', kind: 'missing', reason: 'file not found'},
+    ];
+    expect(report.findings).toEqual(findings);
+    const links = JSON.parse(fs.readFileSync(path.join(out, 'links.json'), 'utf8')) as Links;
+    expect(links.version).toBe(1);
+    expect(links.findings).toEqual(findings);
+    expect(links.links).toEqual([
+      {path: 'docs/guide.md', line: 5, href: '../README.md#nope', status: 'badAnchor'},
+      {path: 'docs/guide.md', line: 5, href: '#install', status: 'ok'},
+      {path: 'docs/guide.md', line: 5, href: 'notes.md', status: 'missing'},
+    ]);
+
+    // With the README in the review, its anchors are known: #nope isn't one.
+    const both = heroRepo({'docs/guide.md': '# Guide\n\nRead the [readme](../README.md#nope) or [its top](../README.md#project).\n', 'README.md': '# Project\n\nThe hero, now:\n\n![Hero](docs/hero.png)\n'});
+    const again = makeTempDir('branch-review-out-');
+    const second = JSON.parse(runCli(both, ['feature', 'main', '--render-out', again, '--json']).stdout) as Whole;
+    expect(second.findings).toEqual([{path: 'docs/guide.md', line: 3, target: '../README.md#nope', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}]);
+    const guide = fs.readFileSync(path.join(again, second.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
+    const readmeFile = second.pages.find((page) => page.path === 'README.md')!.file;
+    expect(guide).toContain(`<a href="${readmeFile}#user-content-nope" class="br-broken" title="anchor not found">readme</a>`);
+    expect(guide).toContain(`<a href="${readmeFile}#user-content-project">its top</a>`);
+    expect(guide).toContain('1 broken link');
+    const overview = fs.readFileSync(path.join(again, 'overview.html'), 'utf8');
+    expect(overview).toContain("<h2 class=\"br-group-title\">Won't render on GitHub</h2>");
+    expect(overview).toContain('../README.md#nope · anchor not found');
+    expect((JSON.parse(fs.readFileSync(path.join(again, 'links.json'), 'utf8')) as Links).links.map((link) => link.status)).toEqual(['badAnchor', 'ok']);
   });
 });

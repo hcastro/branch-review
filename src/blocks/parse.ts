@@ -1,6 +1,8 @@
 import type {ReviewBlock} from '../review/model.js';
 
-const BLOCK_HEADER_PATTERN = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
+// git ends a line only at `\n`, so the function context after the `@@` can
+// hold a lone `\r`, which `.` alone would not match.
+const BLOCK_HEADER_PATTERN = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@([^\n]*)$/;
 
 function hashText(text: string) {
   let hash = 2166136261;

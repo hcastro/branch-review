@@ -5,15 +5,16 @@ import {patchObjectIds} from '../media/classify.js';
 import type {Opener} from '../media/openExternal.js';
 import {findTool} from '../media/worker/tools.js';
 import type {ReviewFile, ReviewModel} from '../review/model.js';
-import {reviewAssetSides, type AssetSides} from './assets.js';
+import {reviewAssetSides, reviewPaths, type AssetSides} from './assets.js';
 import type {FragmentRequest, FragmentSummary, PageRequest, RenderedBackend} from './backend.js';
 import {changeGroups} from './changes.js';
-import {failedMarkdownPage, renderableKind} from './classify.js';
+import {failedMarkdownPage, renderableKind, type RenderableKind} from './classify.js';
 import {formatPageHash, type PageHash} from './hash.js';
 import {fileAlias, OVERVIEW_ALIAS, overviewKey, pageKey, railSignature, renderedPageKey} from './keys.js';
 import type {LinkAnswer, RenderedFragment} from './markdown.js';
 import {resolveMotion, type Motion} from './motion.js';
 import {assembleOverview, railLabel, type OverviewEntry, type PageBody, type PageInput, type RailEntry} from './page.js';
+import {appearances, findingNotes, linkReport, type ReportSource} from './report.js';
 import {runTool} from './run.js';
 import {createRenderedSite, type RenderedSite} from './site.js';
 import {oneLine, sourceSpec} from './source.js';
@@ -31,6 +32,13 @@ import {createRenderedBackend} from './workerClient.js';
 // full develop on a file's first visit and the short revisit after, motion
 // and the terminal's colors. In watch mode, a page the split shows that a
 // refresh rewrote is sent there again, with the blocks that are new.
+//
+// Images and SVG get pages of their own. Markdown the review doesn't list
+// whose text is the same, but which shows an image the review changed, also
+// looks different: a bounded search finds candidates, their renders say
+// which show a changed image, and those get pages too. Once the review's
+// renders are in, the link and anchor report reads them all, and each page
+// is written with its part of it.
 
 // The first review waits for the UI to settle; a watch refresh waits for
 // a burst of writes to end.
@@ -49,7 +57,7 @@ const OVERVIEW_WAIT_MS = 3_000;
 const MAX_REWRITES = 3;
 // The fewest ms between two live refreshes of the split.
 const LIVE_GAP_MS = 1_000;
-const NOTHING_TO_RENDER = 'nothing to render · no markdown files on this branch';
+const NOTHING_TO_RENDER = 'nothing to render · no markdown, images or SVG on this branch';
 
 /**
  * The mark for "opens outside the pane". `↗` would read better, but
@@ -69,7 +77,7 @@ export type OpenOutcome = {message: string; kind: 'info' | 'error'};
  */
 export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void};
 
-export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh'>>;
+export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh' | 'opensSplit'>>;
 
 export type SetTimer = (run: () => void, ms: number) => () => void;
 
@@ -85,6 +93,10 @@ type Planned = {
   fileKey: string;
   alias: string;
   order: number;
+  kind: RenderableKind;
+  // Markdown the review doesn't list, rendered to see whether it shows an
+  // image the review changed.
+  also?: true;
   // Null when the review entry itself failed: the page is that card.
   request: Omit<FragmentRequest, 'assets'> | null;
   // The review's asset sides, shared by its files and read from its
@@ -114,6 +126,10 @@ export function createRenderedService({backend, site, surface, motion, animation
   setTimer?: SetTimer;
 }) {
   let plan = new Map<string, Planned>();
+  // Markdown outside the review that shows an image the review changed, by
+  // file key, once the search for this review found it; and that search.
+  let also = new Map<string, Planned>();
+  let alsoSearch: {cwd: string; links: Record<string, LinkAnswer>; linkSignature: string; sides: () => AssetSides; done: Promise<void> | null} | null = null;
   let title: Omit<PageInput['title'], 'renderedAt'> | null = null;
   let epoch = 0;
   let started = false;
@@ -257,16 +273,77 @@ export function createRenderedService({backend, site, surface, motion, animation
     return answer !== undefined && 'failed' in answer;
   };
 
-  const railFor = (planned: Planned): RailEntry[] => [...plan.values()].map((each) => {
+  const summaryOf = (planned: Planned) => {
+    const answer = answerFor(planned);
+    return answer && 'summary' in answer ? answer.summary : undefined;
+  };
+
+  // The pages outside the review that show an image it changed: those whose
+  // render marked a block, which only a changed image can, their text being
+  // the same on both sides.
+  const alsoShown = () => [...also.values()].filter((planned) => {
+    const summary = summaryOf(planned);
+    return summary?.kind === 'rendered' && summary.changes.changed > 0;
+  });
+
+  // Every page the pass writes: the review's, then those that also look different.
+  const allPages = () => [...plan.values(), ...alsoShown()];
+
+  // The review's images by every path they go by: markdown outside the
+  // review may still name a moved image where it was.
+  const changedImages = () => reviewPaths([...plan.values()].filter((each) => each.kind !== 'markdown').map((each) => each.file));
+
+  // The changed images a page outside the review shows.
+  const embedsOf = (planned: Planned) => {
+    const changed = changedImages();
+    return [...new Set((summaryOf(planned)?.images ?? []).map((image) => image.path).filter((image) => changed.has(image)))];
+  };
+
+  const railFor = (planned: Planned): RailEntry[] => allPages().map((each) => {
     const answer = answerFor(each);
+    const {status} = each.file;
+    const changes = each.request && !answer ? 'pending' : answer && 'summary' in answer && answer.summary.kind === 'rendered' ? answer.summary.changes : null;
+    // A changed image's count is its picture, as is that of a page that shows one.
+    const picture = each.also || (each.kind !== 'markdown' && status !== 'added' && status !== 'untracked' && status !== 'deleted');
     return {
       path: each.file.path,
-      status: each.file.status,
+      status,
       href: `${each.alias}.html`,
-      label: railLabel(each.file.status, each.request && !answer ? 'pending' : answer && 'summary' in answer && answer.summary.kind === 'rendered' ? answer.summary.changes : null),
+      label: picture && changes !== 'pending' ? 'img' : railLabel(status, changes),
       current: each === planned,
+      ...(each.also ? {also: true as const} : {}),
     };
   });
+
+  // The link and anchor report over the review's markdown as rendered so
+  // far: a page not rendered yet adds nothing, and its anchors are no one's
+  // finding.
+  function report() {
+    const sources: ReportSource[] = [...plan.values()].flatMap((planned) => {
+      const summary = summaryOf(planned);
+      if (planned.kind !== 'markdown' || summary?.kind !== 'rendered') return [];
+      return [{path: planned.file.path, status: planned.file.status, links: summary.links, images: summary.images ?? [], anchors: summary.anchors ?? []}];
+    });
+    return linkReport(sources);
+  }
+
+  // What a page shows from the other pages' renders: its part of the link
+  // report, and on an image's page where the markdown shows it.
+  function pageExtras(planned: Planned): Pick<PageRequest, 'brokenRefs' | 'appears' | 'report'> {
+    const {findings, broken} = report();
+    const notes = findingNotes(findings);
+    const own = planned.also ? [] : findings.filter((finding) => finding.path === planned.file.path);
+    const appears = planned.kind === 'markdown' ? [] : appearances(allPages().flatMap((each) => {
+      const summary = summaryOf(each);
+      return each.kind === 'markdown' && summary?.images ? [{path: each.file.path, status: each.file.status, images: summary.images}] : [];
+    }), planned.file.path).map((place) => ({...place, href: `${(plan.get(fileKey({path: place.path})) ?? also.get(fileKey({path: place.path})))!.alias}.html`}));
+    const refs = broken.get(planned.file.path) ?? [];
+    return {
+      ...(refs.length > 0 && !planned.also ? {brokenRefs: refs} : {}),
+      ...(appears.length > 0 ? {appears} : {}),
+      ...(own.length > 0 || notes.length > 0 ? {report: {own, notes}} : {}),
+    };
+  }
 
   // Writes the file's page for the review as it is now, unless it is on
   // disk already. Showing it is the caller's business. `placeholder`: a
@@ -281,6 +358,8 @@ export function createRenderedService({backend, site, surface, motion, animation
     const body: PageBody | null = failure !== undefined ? {kind: 'failed', reason: failure, source: ''} : placeholder && !answer ? {kind: 'pending'} : null;
     const summary = answer && 'summary' in answer ? answer.summary : undefined;
     const rail = railFor(planned);
+    const extras = pageExtras(planned);
+    const alsoFile = planned.also ? {also: {embeds: embedsOf(planned)}} : {};
     const key = renderedPageKey({
       fragment: planned.request?.key ?? planned.fileKey,
       // A failed page and the page that renders once the failure passes
@@ -289,6 +368,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       assets: summary?.assets ?? '',
       rail,
       title: title!,
+      extra: JSON.stringify([extras, alsoFile]),
     });
     const askedAt = epoch;
     // The page on disk, which the stable name already points at, is the one
@@ -303,9 +383,10 @@ export function createRenderedService({backend, site, surface, motion, animation
       const request: PageRequest = {
         key,
         title: {...title!, renderedAt: now()},
-        file: {path: planned.file.path, status: planned.file.status, ...(planned.file.oldPath ? {oldPath: planned.file.oldPath} : {})},
+        file: {path: planned.file.path, status: planned.file.status, ...(planned.file.oldPath ? {oldPath: planned.file.oldPath} : {}), ...alsoFile},
         rail,
         content: body ? {body} : {fragment: fragmentRequest(planned)},
+        ...extras,
       };
       pending = backend.page(request, new AbortController().signal).then((result): Written => {
         if (!result.ok) {
@@ -371,12 +452,17 @@ export function createRenderedService({backend, site, surface, motion, animation
     const pass = running.epoch;
     try {
       const chosen = [...plan.values()].sort((left, right) => priorityOf(left) - priorityOf(right) || left.order - right.order).slice(0, MAX_PRERENDER);
-      const unanswered = chosen.filter((planned) => planned.request && !failedBefore(planned) && answers.get(planned.request.key)?.epoch !== pass);
-      await Promise.all(unanswered.map((planned) => ask(planned, priorityOf(planned))));
+      const unanswered = (each: Planned) => each.request && !failedBefore(each) && answers.get(each.request.key)?.epoch !== pass;
+      await Promise.all(chosen.filter(unanswered).map((planned) => ask(planned, priorityOf(planned))));
+      if (disposed || pass !== epoch || offReason()) return;
+      // Then the markdown outside the review that may show its images.
+      await searchAlso(MAX_PRERENDER - chosen.length);
+      if (disposed || pass !== epoch) return;
+      await Promise.all([...also.values()].filter(unanswered).map((planned) => ask(planned, 2)));
       if (disposed || pass !== epoch || offReason()) return;
       for (let round = 0; round < MAX_REWRITES; round += 1) {
         stale = false;
-        for (const planned of [...plan.values()]) {
+        for (const planned of allPages()) {
           await writePage(planned, true);
           if (disposed || pass !== epoch) return;
         }
@@ -384,17 +470,56 @@ export function createRenderedService({backend, site, surface, motion, animation
       }
       refreshSplit();
       site.prune({
-        current: new Map([...plan.values()].flatMap((planned) => {
+        current: new Map(allPages().flatMap((planned) => {
           const key = current.get(planned.fileKey);
           return key ? [[planned.alias, key] as const] : [];
         }).concat(overview ? [[OVERVIEW_ALIAS, overview] as const] : [])),
-        previous: new Set([...plan.keys()].flatMap((key) => (previous.has(key) ? [previous.get(key)!] : []))),
+        previous: new Set(allPages().flatMap(({fileKey: key}) => (previous.has(key) ? [previous.get(key)!] : []))),
       });
     } finally {
       // In the same turn as the last check above, so a count that moves
       // after it finds no pass running and starts one.
       if (background === running) background = null;
     }
+  }
+
+  // The search for markdown outside the review that shows one of its images,
+  // once per review, and only for a review with images. Each file found is
+  // planned for a render, which says whether it shows a changed one, up to
+  // `room`: what the prerender budget has left after the review's own files.
+  function searchAlso(room: number): Promise<void> {
+    const search = alsoSearch;
+    if (!search || !backend.embedders || room <= 0) return Promise.resolve();
+    search.done ??= (async () => {
+      const files = [...plan.values()];
+      const names = [...new Set([...changedImages()].map((imagePath) => path.posix.basename(imagePath)))];
+      const found = await backend.embedders!({cwd: search.cwd, assets: search.sides(), names, skip: [...reviewPaths(files.map((each) => each.file))]}, new AbortController().signal);
+      if (!found.ok || alsoSearch !== search) return;
+      for (const [index, {path: repoPath, oid}] of found.files.slice(0, room).entries()) {
+        const key = fileKey({path: repoPath});
+        const file = {path: repoPath, status: 'modified', metrics: {path: repoPath, additions: 0, deletions: 0, changedLines: 0}, rawDiff: '', renderedLines: [], blocks: []} as ReviewFile;
+        also.set(key, {
+          file,
+          fileKey: key,
+          alias: fileAlias(key),
+          order: files.length + index,
+          kind: 'markdown',
+          also: true,
+          request: {
+            cwd: search.cwd,
+            textUnchanged: true,
+            key: pageKey({path: repoPath, status: 'modified', after: oid, groups: [], rail: `${search.linkSignature}\0also`}),
+            path: repoPath,
+            status: 'modified',
+            source: {kind: 'blob', id: oid},
+            groups: [],
+            links: search.links,
+          },
+          sides: search.sides,
+        });
+      }
+    })();
+    return search.done;
   }
 
   const schedule = () => {
@@ -439,7 +564,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     const off = offReason();
     if (off) return {ok: false, reason: off};
     const differences = new Map<RenderedFragment['differences'][number]['kind'], number>();
-    const entries = [...plan.values()].map((planned): OverviewEntry => {
+    const entryOf = (planned: Planned): OverviewEntry => {
       const answer = answerFor(planned);
       const summary = answer && 'summary' in answer ? answer.summary : undefined;
       const failure = planned.failure ?? (answer && 'failed' in answer ? answer.failed : undefined);
@@ -456,9 +581,24 @@ export function createRenderedService({backend, site, surface, motion, animation
         state: !written ? 'pending' : failure !== undefined ? 'failed' : summary?.kind ?? 'pending',
         changes: summary?.kind === 'rendered' ? summary.changes : null,
         ...(reason !== undefined ? {reason} : {}),
+        ...(summary?.image ? {image: summary.image} : {}),
+        ...(planned.also ? {embeds: embedsOf(planned)} : {}),
       };
-    });
-    const input = {title: {...title!, renderedAt: now()}, entries, differences: [...differences].map(([kind, count]) => ({kind, count}))};
+    };
+    const entries = [...plan.values()].map(entryOf);
+    const alsoEntries = alsoShown().map(entryOf);
+    const hrefOf = (repoPath: string) => {
+      const planned = plan.get(fileKey({path: repoPath}));
+      return planned && pointedNow(planned) ? `${planned.alias}.html` : null;
+    };
+    const findings = report().findings.map((finding) => ({...finding, href: hrefOf(finding.path)}));
+    const input = {
+      title: {...title!, renderedAt: now()},
+      entries,
+      differences: [...differences].map(([kind, count]) => ({kind, count})),
+      ...(alsoEntries.length > 0 ? {also: alsoEntries} : {}),
+      ...(findings.length > 0 ? {findings} : {}),
+    };
     const key = overviewKey(input);
     try {
       if (!site.has(key)) site.write(key, assembleOverview(input));
@@ -478,8 +618,11 @@ export function createRenderedService({backend, site, surface, motion, animation
   // The split shows a file page a refresh just rewrote: it goes to the new
   // page where it was, with no develop and a pulse on the blocks that are
   // new. At most once a second; a refresh inside the second waits, and the
-  // newest page goes then. A split that is gone ends live refreshes until
-  // the next trip opens one.
+  // newest page goes then. The split goes only while it still shows the
+  // page the last trip or refresh sent it, by that page's name or the
+  // file's stable one: the reader may have moved on inside it, and the next
+  // change tries again. A split that is gone ends live refreshes until the
+  // next trip opens one.
   function refreshSplit() {
     const shown = inSplit;
     if (!shown || !surface?.refresh || disposed || cancelLive) return;
@@ -504,14 +647,18 @@ export function createRenderedService({backend, site, surface, motion, animation
     const place = {...(shown.at !== undefined ? {at: shown.at} : {}), ...(shown.f !== undefined ? {f: shown.f} : {})};
     const next = {...shown, key, blocks};
     inSplit = next;
-    void surface.refresh(site.url(key, tripHash({...place, d: 'none', g: fresh}))).then((went) => {
-      if (!went && inSplit === next) inSplit = null;
+    void surface.refresh(site.url(key, tripHash({...place, d: 'none', g: fresh})), [`${shown.key}.html`, `${planned.alias}.html`]).then((went) => {
+      if (inSplit !== next) return;
+      if (went === 'skipped') inSplit = shown;
+      else if (!went) inSplit = null;
     });
   }
 
   // One trip to a page: the TUI's crossing, played while the page is
   // written and placed on the surface, so the crossing covers the split
-  // opening. `name` is how the footer names the page, and `note` what it
+  // opening. A new split narrows the TUI as it opens, which would cut the
+  // beam off, so a press that opens one places the page once the crossing
+  // has ended; one that goes to an open split places it while it plays. `name` is how the footer names the page, and `note` what it
   // adds about it. Nothing crosses toward a surface that refuses. A page
   // still unwritten after the crossing is said to be rendering, until the
   // deadline gives up on it, and then it opens nowhere. A press made after
@@ -540,10 +687,11 @@ export function createRenderedService({backend, site, surface, motion, animation
       // After dispose the session dir is going: nothing is placed.
       if (gaveUp || disposed || press !== presses) return null;
       if (!written.ok) return {error: written.reason};
-      return place.show(written.url).then((result) => {
+      const show = () => (gaveUp || disposed || press !== presses ? null : place.show(written.url).then((result) => {
         if ('where' in result) opened?.(result.where, written.key);
         return result;
-      });
+      }));
+      return place.opensSplit?.() ? crossing.then(show) : show();
     });
     void shown.catch(() => null).then(() => {
       travelling -= 1;
@@ -574,10 +722,11 @@ export function createRenderedService({backend, site, surface, motion, animation
       if (disposed) return;
       epoch += 1;
       title = {repo: path.basename(cwd), base: range.base, branch: review.branch, worktree: range.includeWorktree};
-      const files = review.files.flatMap((file) => {
-        if (renderableKind(file, range) === 'markdown') return [{file}];
+      const files = review.files.flatMap((file): Array<{file: ReviewFile; kind: RenderableKind; failure?: string}> => {
+        const kind = renderableKind(file, range);
+        if (kind) return [{file, kind}];
         const failed = failedMarkdownPage(file, range);
-        return failed === null ? [] : [{file, ...('reason' in failed ? {failure: failed.reason} : {})}];
+        return failed === null ? [] : [{file, kind: 'markdown', ...('reason' in failed ? {failure: failed.reason} : {})}];
       });
       const linkSignature = railSignature(files.map(({file}) => file));
       const aliases = new Map(files.map(({file}) => [file.path, fileAlias(fileKey({path: file.path, nameError: file.pathError}))]));
@@ -592,24 +741,28 @@ export function createRenderedService({backend, site, surface, motion, animation
       const sides = () => (assets ??= reviewAssetSides(review, range, reviewEpoch));
 
       const next = new Map<string, Planned>();
-      for (const [order, {file, failure}] of files.entries()) {
+      for (const [order, {file, kind, failure}] of files.entries()) {
         const key = fileKey({path: file.path, nameError: file.pathError});
         const ids = patchObjectIds(file.rawDiff) ?? {};
-        const groups = changeGroups(file);
+        // An image's page marks no blocks: its sides are the change.
+        const groups = kind === 'markdown' ? changeGroups(file) : [];
         const moved = file.oldPath ? {oldPath: file.oldPath} : {};
         const request: Planned['request'] = failure !== undefined ? null : {
           cwd,
+          ...(kind === 'markdown' ? {} : {kind}),
           key: pageKey({path: file.path, ...moved, status: file.status, ...ids, groups, rail: linkSignature}),
           path: file.path,
           ...moved,
           status: file.status,
-          source: sourceSpec(file, range, ids),
+          source: kind === 'markdown' ? sourceSpec(file, range, ids) : {kind: 'none', reason: 'an image page reads its sides as images'},
           groups,
           links,
         };
-        next.set(key, {file, fileKey: key, alias: aliases.get(file.path)!, order, request, sides, ...(failure !== undefined ? {failure} : {})});
+        next.set(key, {file, fileKey: key, alias: aliases.get(file.path)!, order, kind, request, sides, ...(failure !== undefined ? {failure} : {})});
       }
       plan = next;
+      also = new Map();
+      alsoSearch = files.some(({kind}) => kind !== 'markdown') ? {cwd, links, linkSignature, sides, done: null} : null;
 
       const wanted = new Set([...next.values()].flatMap((planned) => (planned.request ? [planned.request.key] : [])));
       for (const [key, running] of asking) {

@@ -1,8 +1,10 @@
+import {isUtf8} from 'node:buffer';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
   FileTooLargeError,
   gitBlobId,
+  grepTreeFilesOperation,
   localBlobOperation,
   matchingBlobId,
   objectFormatOperation,
@@ -10,12 +12,15 @@ import {
   runOperationAsync,
   type DiffRange,
   type ObjectFormat,
+  type TreeEntry,
 } from '../git.js';
 import {patchObjectIds} from '../media/classify.js';
 import {createLru} from '../media/lru.js';
 import {isFormat, magicFormat, sniffImage} from '../media/worker/sniff.js';
 import type {ReviewModel} from '../review/model.js';
-import type {AssetAnswer, RefusedReason} from './markdown.js';
+import {isMarkdownName} from './classify.js';
+import {anchorTarget, markdownAnchors, type AssetAnswer, type LinkAnswer, type RefusedReason} from './markdown.js';
+import {RENDER_LIMIT} from './source.js';
 import {createTreeReader, type RunOperation, type TreeIndex} from './tree.js';
 
 // The asset rule: which images a page inlines. An image is inlined only when
@@ -39,6 +44,14 @@ const CACHE_BYTES = 64 * MIB;
 // Reads at once: a page with dozens of images reads several side by side
 // without starting dozens of git processes.
 const MAX_READS = 6;
+// How long the search for markdown that shows a changed image may take, and
+// how many files it may find.
+const EMBEDDERS_MS = 2_000;
+const MAX_EMBEDDERS = 40;
+// The anchors of markdown files outside the review that links point into,
+// by blob id: a few hundred bytes of ids each.
+const MAX_ANCHOR_SETS = 256;
+
 /**
  * How long one page's image lookups may take, from the start of its render,
  * where a deadline of 5 seconds stops a render that runs longer.
@@ -84,6 +97,14 @@ export type AssetSide = 'base' | 'after';
 const LINK_AFTER = /^(?:new file mode|new mode|index [0-9a-f]+\.\.[0-9a-f]+) (120000|160000)$/m;
 // Where a patch's header ends: its first hunk, or its binary content.
 const PATCH_BODY = /^(?:@@ |GIT binary patch$|Binary files )/m;
+
+/**
+ * Every path the review's files go by, a moved file's old one included:
+ * none of them is a file the review left alone.
+ */
+export function reviewPaths(files: ReadonlyArray<Pick<ReviewModel['files'][number], 'path' | 'oldPath'>>): Set<string> {
+  return new Set(files.flatMap((file) => (file.oldPath ? [file.path, file.oldPath] : [file.path])));
+}
 
 /** The asset sides of a review. Pure: reads only the patches. */
 export function reviewAssetSides(review: Pick<ReviewModel, 'files'>, range: Pick<DiffRange, 'diffArg' | 'branch' | 'includeWorktree'>, epoch: number): AssetSides {
@@ -195,6 +216,9 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
   const trees = createTreeReader({cwd, run});
   const verified = createLru<Verified>(CACHE_BYTES, (entry) => entry.bytes.byteLength);
   const limit = createLimiter(MAX_READS);
+  // Link checks wait for their own turns, so a page with hundreds of links
+  // never starts hundreds of git processes, nor holds up its images.
+  const checks = createLimiter(MAX_READS);
   let root: Promise<string> | null = null;
   let format: Promise<ObjectFormat> | null = null;
   // Names an answer that is no answer to hold: each one differs from every
@@ -354,7 +378,112 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
   // may read or a git that failed, is tried again next time.
   const passing = (answer: AssetAnswer) => answer.kind === 'refused' && answer.reason === 'unreadable' && (answer.hint === UNREADABLE.file || answer.hint === UNREADABLE.git);
 
+  // The anchors of a markdown blob, read once. Null when it can't be read
+  // as text within the render limit: nothing to check it against.
+  // A read that fails is asked again next time.
+  const anchorSets = createLru<Promise<ReadonlySet<string> | null>>(MAX_ANCHOR_SETS, () => 1);
+  function blobAnchors(oid: string): Promise<ReadonlySet<string> | null> {
+    let ids = anchorSets.get(oid);
+    if (!ids) {
+      ids = checks(() => run(localBlobOperation(cwd, oid, RENDER_LIMIT))).then(async (bytes) => (bytes && isUtf8(bytes) ? new Set(await markdownAnchors(bytes.toString('utf8'))) : null));
+      anchorSets.set(oid, ids);
+      ids.catch(() => anchorSets.delete(oid));
+    }
+    return ids;
+  }
+
+  // What the trees and the review's change list say of a link, and, where
+  // only a git process can say more, how to ask it (`checked`).
+  type LinkStages = {known: LinkAnswer; checked?: () => Promise<LinkAnswer>};
+
+  // A link into a markdown file git holds, at a heading: one GitHub
+  // wouldn't find there is a bad anchor. A file that can't be read is a
+  // link that works.
+  function intoFile(entry: TreeEntry | undefined, repoPath: string, hash: string | undefined): LinkStages {
+    if (!hash || !entry || (entry.mode !== '100644' && entry.mode !== '100755') || !isMarkdownName(repoPath)) return {known: {kind: 'outside'}};
+    return {
+      known: {kind: 'outside'},
+      checked: async () => {
+        const ids = await blobAnchors(entry.oid);
+        return ids && anchorTarget(ids, hash) === null ? {kind: 'badAnchor'} : {kind: 'outside'};
+      },
+    };
+  }
+
+  // Whether GitHub would find a file or folder a link names on the after
+  // side: one git holds, or one the review shows, is there; and, for a
+  // markdown file the review didn't change, the heading `hash` names. A
+  // path in neither is missing, which git can only refine: the work tree
+  // may hold it untracked or ignored.
+  async function linkStages(sides: AssetSides, repoPath: string, hash?: string): Promise<LinkStages> {
+    const found = (index: TreeIndex | null) => Boolean(index && (index.get(repoPath) || index.hasFolder(repoPath)));
+    if (!('worktree' in sides.after)) {
+      const index = await trees.tree(sides.after.tree, sides.epoch);
+      if (found(index) || index.linkAbove(repoPath)) return intoFile(index.get(repoPath), repoPath, hash);
+      const match = index.caseMatch(repoPath);
+      if (match) return {known: {kind: 'caseMismatch', hint: caseHint(repoPath, match)}};
+    } else {
+      const changes = sides.after.worktree;
+      const change = changes.find((each) => each.path === repoPath);
+      if (change) return {known: change.mode === null ? {kind: 'missing'} : change.untracked ? {kind: 'untracked'} : {kind: 'outside'}};
+      const base = sides.base === null ? null : await trees.tree(sides.base, sides.epoch);
+      const gone = new Set(changes.filter((each) => each.mode === null).map((each) => each.path));
+      const under = (each: WorktreeChange) => each.mode !== null && each.path.startsWith(`${repoPath}/`);
+      // Unchanged by the review: on disk as the base holds it.
+      if (found(base) || base?.linkAbove(repoPath) || changes.some(under)) return intoFile(base?.get(repoPath), repoPath, hash);
+      const lower = repoPath.toLowerCase();
+      const match = changes.find((each) => each.mode !== null && each.path.toLowerCase() === lower)?.path ?? base?.caseMatch(repoPath);
+      if (match && !gone.has(match)) return {known: {kind: 'caseMismatch', hint: caseHint(repoPath, match)}};
+    }
+    return {known: {kind: 'missing'}, checked: async () => ({kind: (await checks(() => trees.untrackedState(repoPath, sides.epoch))) ?? 'missing'})};
+  }
+
   return {
+    /**
+     * The markdown files the review didn't change that hold any of `names`
+     * (images' file names), with the blob each one is. A file the review
+     * didn't change is on the after side as the after ref holds it, or, in
+     * a work tree review, as the base holds it, which is what the diff
+     * found on disk. One bounded `git grep` finds them; a search that fails
+     * or runs past its time finds none. Each one is only a candidate: its
+     * render tells whether it shows a changed image.
+     */
+    async embedders(sides: AssetSides, names: readonly string[], skip: ReadonlySet<string>): Promise<Array<{path: string; oid: string}>> {
+      const ref = 'tree' in sides.after ? sides.after.tree : sides.base;
+      if (ref === null || names.length === 0) return [];
+      // The base tree holds files the work tree has since deleted or moved away.
+      const gone = new Set('worktree' in sides.after ? sides.after.worktree.filter((each) => each.mode === null).map((each) => each.path) : []);
+      try {
+        const oid = await trees.treeOid(ref, sides.epoch);
+        const index = await trees.tree(ref, sides.epoch);
+        const found = await run(grepTreeFilesOperation(cwd, oid, [...new Set(names)]), {signal: AbortSignal.timeout(EMBEDDERS_MS)});
+        return found.filter((file) => isMarkdownName(file) && !skip.has(file) && !gone.has(file)).flatMap((file) => {
+          const entry = index.get(file);
+          return entry && (entry.mode === '100644' || entry.mode === '100755') ? [{path: file, oid: entry.oid}] : [];
+        }).slice(0, MAX_EMBEDDERS);
+      } catch {
+        return [];
+      }
+    },
+    /**
+     * How a link to a repo path the review didn't render resolves on the
+     * after side: a file or folder git holds, or no such file, or one git
+     * doesn't track or ignores, or one whose capitals differ; or, into a
+     * markdown file git holds, a heading `hash` names that isn't there.
+     * `known` is what the trees and the review's change list say, with no
+     * git process of its own; `checked` adds what only git can tell: that
+     * a missing file is untracked or ignored, and the headings of a
+     * markdown file. Neither rejects: a lookup that fails is a link that
+     * works.
+     */
+    linkTarget(sides: AssetSides, repoPath: string, hash?: string): {known: Promise<LinkAnswer>; checked: Promise<LinkAnswer>} {
+      const works: LinkAnswer = {kind: 'outside'};
+      const stages = linkStages(sides, repoPath, hash);
+      return {
+        known: stages.then((stage) => stage.known, () => works),
+        checked: stages.then((stage) => (stage.checked ? stage.checked() : stage.known)).catch(() => works),
+      };
+    },
     /** How the image resolves on that side. Never throws: a failure is a card. */
     async answer(sides: AssetSides, side: AssetSide, repoPath: string): Promise<Answered> {
       try {
@@ -393,7 +522,10 @@ export function createAssetResolver({cwd, run = runOperationAsync}: {cwd: string
 
 export type AssetResolver = ReturnType<typeof createAssetResolver>;
 
-/** An image a render looked up, and what its answer depended on. */
+/**
+ * An image a render looked up, and what its answer depended on; or a link
+ * it couldn't check in time, under LATE_IDENTITY.
+ */
 export type AssetUse = {side: AssetSide; path: string; identity: string};
 
 /** The identity of a lookup that ran out of time: no image has it, so a page that used it renders again. */
@@ -428,6 +560,16 @@ export function pageLookups(resolver: AssetResolver, sides: AssetSides, deleted:
   return {
     asset: lookup(deleted ? 'base' : 'after'),
     baseAsset: lookup('base'),
+    // Out of time, a link says what the trees alone tell of it, or, before
+    // they answer, nothing at all: no claim without an answer. Either way
+    // the page renders again for git's word.
+    async linkTarget(repoPath: string, hash?: string): Promise<LinkAnswer> {
+      const {known, checked} = resolver.linkTarget(sides, repoPath, hash);
+      const answer = await inTime<LinkAnswer | null>(checked, null);
+      if (answer) return answer;
+      uses.push({side: 'after', path: repoPath, identity: LATE_IDENTITY});
+      return (await inTime<LinkAnswer | null>(known, null)) ?? {kind: 'unchecked'};
+    },
     async assetChanged(repoPath: string, basePath = repoPath) {
       const {changed, base, after} = await inTime(resolver.compare(sides, repoPath, basePath), {changed: false, base: LATE_IDENTITY, after: LATE_IDENTITY});
       uses.push({side: 'base', path: basePath, identity: base}, {side: 'after', path: repoPath, identity: after});

@@ -13,7 +13,8 @@ import {
 // id. Answers that depend on the work tree (is this untracked, is it
 // ignored) are asked again for each new review.
 
-export type RunOperation = <T>(operation: GitOperation<T>) => Promise<T>;
+// `signal` stops a call that has run too long.
+export type RunOperation = <T>(operation: GitOperation<T>, scope?: {signal?: AbortSignal}) => Promise<T>;
 
 export type TreeIndex = {
   get(repoPath: string): TreeEntry | undefined;
@@ -21,6 +22,8 @@ export type TreeIndex = {
   caseMatch(repoPath: string): string | undefined;
   /** The symlink or submodule a folder of `repoPath` is, if one is. */
   linkAbove(repoPath: string): {path: string; mode: string} | undefined;
+  /** Whether `repoPath` is a folder the tree holds files in. */
+  hasFolder(repoPath: string): boolean;
 };
 
 // A session sees few trees: the base, the branch, and a branch tip that
@@ -29,6 +32,7 @@ const MAX_TREES = 4;
 
 export function treeIndex(entries: ReadonlyMap<string, TreeEntry>): TreeIndex {
   let folded: Map<string, string> | null = null;
+  let folders: Set<string> | null = null;
   return {
     get: (repoPath) => entries.get(repoPath),
     caseMatch(repoPath) {
@@ -48,6 +52,15 @@ export function treeIndex(entries: ReadonlyMap<string, TreeEntry>): TreeIndex {
         if (entry && (entry.mode === '120000' || entry.mode === '160000')) return {path: folder, mode: entry.mode};
       }
       return undefined;
+    },
+    hasFolder(repoPath) {
+      if (!folders) {
+        folders = new Set();
+        for (const name of entries.keys()) {
+          for (let at = name.indexOf('/'); at >= 0; at = name.indexOf('/', at + 1)) folders.add(name.slice(0, at));
+        }
+      }
+      return folders.has(repoPath);
     },
   };
 }
@@ -86,6 +99,11 @@ export function createTreeReader({cwd, run = runOperationAsync}: {cwd: string; r
   });
 
   return {
+    /** The id of the tree `ref` names, as the diff reads it. */
+    treeOid(ref: string, reviewEpoch: number) {
+      atEpoch(reviewEpoch);
+      return treeOid(ref);
+    },
     /** The files `ref` holds. `epoch` names the review asking. */
     async tree(ref: string, reviewEpoch: number): Promise<TreeIndex> {
       atEpoch(reviewEpoch);

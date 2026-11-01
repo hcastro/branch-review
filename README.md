@@ -114,6 +114,8 @@ To read a changed markdown file as the page GitHub would show, press `r`. The pa
 
 The page opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the rendered page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
 
+On a changed image or SVG, `r` opens a page that compares its versions side by side, by flipping, or as a difference, on the same `1`, `2`, and `3` keys as the diff, and names the lines of the review's markdown that show it. A markdown file the branch didn't touch gets a page too when it shows an image the branch changed, since it will look different on GitHub. Each page draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading, and the overview lists them all.
+
 To write the pages to a directory without opening the UI, pass `--render-out`:
 
 ```sh
@@ -122,7 +124,7 @@ branch-review --render-out ../rendered
 
 Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
 
-Each page is a single HTML file whose only script is its own. Images from the repo travel inside it, and nothing on it loads from the network. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
+Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets the overview, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, how close a page is to GitHub, and the report, see [Rendered markdown pages](docs/rendered-view.md).
 
 ## Review untrusted changes safely
 
@@ -215,7 +217,7 @@ branch-review my-feature release/2026.04
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
-| `--render-out DIR` | Write a page for each changed markdown file to `DIR`, print a summary, and exit without opening the UI. |
+| `--render-out DIR` | Write a page for each changed markdown, image, and SVG file to `DIR`, with `overview.html` and `links.json`, print a summary, and exit without opening the UI. |
 | `--json` | With `--render-out`, print the report as JSON. |
 
 For `--animations` and `--images`, the last flag of each pair wins.
@@ -247,7 +249,7 @@ The following table lists the keys for moving through a review:
 | `[` / `]` | Focus the previous or next diff block |
 | `Enter` / `Space` | Collapse or expand the focused block |
 | `t` | Show or hide the file tree |
-| `r` | Open the rendered page of the markdown file in view, or of the first changed markdown file |
+| `r` | Open the rendered page of the markdown, image, or SVG file in view, or of the review's first such file |
 | `R` | Open an overview of every rendered page |
 | `q` / `Esc` / `Control+C` | Quit |
 
@@ -287,6 +289,7 @@ A rendered page has keys of its own, which work after you click into the page:
 | `{` / `}` | Open the previous or next rendered file |
 | `t` | Switch the page's theme between your system's, light, and dark |
 | `m` | Show or hide the change marks |
+| `1` / `2` / `3` | On an image's page, compare its versions side by side, by flipping, or as a difference. `2` again, or `f`, flips to the other version. |
 | `?` | Show the page's keys |
 
 ### Small terminals

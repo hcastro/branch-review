@@ -3,8 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import type {ReviewFile} from '../src/review/model.js';
+import {runOperationAsync} from '../src/git.js';
 import {createAssetResolver, LATE_IDENTITY, pageLookups, reviewAssetSides, type AssetResolver, type AssetSides, type AssetUse} from '../src/rendered/assets.js';
-import type {FragmentRequest, FragmentResult, PageResult} from '../src/rendered/backend.js';
+import type {EmbeddersResult, FragmentRequest, FragmentResult, PageResult} from '../src/rendered/backend.js';
+import type {RunOperation} from '../src/rendered/tree.js';
 import {changeGroups, type ChangeGroup} from '../src/rendered/changes.js';
 import {renderMarkdown, repoPathFor, PAGE_INLINE_LIMIT, type AssetAnswer} from '../src/rendered/markdown.js';
 import {createRenderedHandler, summarize} from '../src/rendered/worker/handler.js';
@@ -241,6 +243,23 @@ describe('lookups that must never reach git or the network', () => {
     // Held under no identity the resolver gives, so the page renders again next time.
     expect(uses).toEqual([{side: 'after', path: 'a.png', identity: 'late'}]);
   }, 10_000);
+
+  it('inlines a page\'s images while its link checks run past the budget, which leaves those links unchecked', async () => {
+    const embed: AssetAnswer = {kind: 'embed', mime: 'image/png', dataUrl: dataUrl('image/png', RED), oid: 'abc123'};
+    const later = <T>(ms: number, value: T) => new Promise<T>((resolve) => setTimeout(() => resolve(value), ms));
+    // Each image reads in 40 ms; each link check takes 600 ms, as git does on a busy machine.
+    const slowLinks = {
+      answer: () => later(40, {answer: embed, identity: 'blob:abc123'}),
+      identity: async () => 'blob:abc123',
+      compare: async () => ({changed: false, base: 'b', after: 'a'}),
+      linkTarget: () => ({known: later(600, {kind: 'missing'} as const), checked: later(600, {kind: 'missing'} as const)}),
+    } as unknown as AssetResolver;
+    const lookups = pageLookups(slowLinks, refSides(), false, [], {budgetMs: 300});
+    const fragment = await renderMarkdown({path: 'README.md', source: '# Title\n\n[a](a.md) and [b](b.md).\n\n![a](a.png)\n', groups: [], ...lookups, link: lookups.linkTarget});
+    expect(fragment.html).toContain(`src="${embed.dataUrl}"`);
+    expect(fragment.html).not.toContain('took too long to read');
+    expect(fragment.links.map((link) => link.status)).toEqual(['unchecked', 'unchecked']);
+  }, 10_000);
 });
 
 describe('the asset rule in the work tree', () => {
@@ -413,6 +432,85 @@ describe('the asset rule in the work tree', () => {
     const resolver = createAssetResolver({cwd: repo});
     expect((await resolver.answer(sides, 'after', 'locked.png')).answer).toEqual({kind: 'refused', reason: 'unreadable', hint: "can't read the file"});
     expect((await resolver.answer(sides, 'after', 'was-file.png')).answer).toEqual({kind: 'refused', reason: 'symlink'});
+  });
+});
+
+describe('the search for markdown that shows a changed image', () => {
+  // `main` holds markdown that shows the hero, a text file that only names
+  // it, and a page the review changed; `feature` changes the hero and adds
+  // a page of its own that names it too.
+  function heroRepo(extra: Record<string, string> = {}) {
+    const repo = initRepo({
+      'README.md': '# Project\n\n![Hero](docs/hero.png)\n',
+      'docs/guide.md': 'The [hero](hero.png) again.\n',
+      'notes.txt': '![Hero](docs/hero.png)\n',
+      'CHANGES.md': '![Hero](docs/hero.png)\n',
+      ...extra,
+    });
+    writeBytes(repo, 'docs/hero.png', RED);
+    commitAll(repo, 'hero');
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    writeBytes(repo, 'docs/hero.png', BLUE);
+    writeFiles(repo, {'docs/extra.md': '![Hero](hero.png)\n'});
+    commitAll(repo, 'a new hero');
+    return repo;
+  }
+  const pathsOf = (found: Array<{path: string}>) => found.map((each) => each.path).sort();
+
+  it('finds the markdown files that name the image, never another kind of file or one the review lists', async () => {
+    const repo = heroRepo();
+    const resolver = createAssetResolver({cwd: repo});
+    const found = await resolver.embedders(refSides(), ['hero.png'], new Set(['docs/hero.png', 'CHANGES.md']));
+    expect(pathsOf(found)).toEqual(['README.md', 'docs/extra.md', 'docs/guide.md']);
+    expect(found.find((each) => each.path === 'README.md')!.oid).toBe(blobId(repo, 'feature:README.md'));
+  });
+
+  it('searches the base tree in a work tree review, leaving out what the work tree deleted or moved away', async () => {
+    const repo = heroRepo();
+    const resolver = createAssetResolver({cwd: repo});
+    // On disk, an unchanged file is as the base holds it: `docs/extra.md`
+    // is only on the branch.
+    const sides: AssetSides = {base: 'main', after: {worktree: [{path: 'docs/hero.png', id: null, mode: 'regular'}, {path: 'docs/guide.md', id: null, mode: null}]}, epoch: 0};
+    const found = await resolver.embedders(sides, ['hero.png'], new Set(['docs/hero.png']));
+    expect(pathsOf(found)).toEqual(['CHANGES.md', 'README.md']);
+    expect(found.find((each) => each.path === 'README.md')!.oid).toBe(blobId(repo, 'main:README.md'));
+  });
+
+  it('leaves out a markdown name that is a symlink, even when the search names it', async () => {
+    const repo = heroRepo();
+    fs.symlinkSync('../README.md', path.join(repo, 'docs/link.md'));
+    commitAll(repo, 'a link');
+    // git grep skips a symlink's blob today; the search's answer names one
+    // here, as another git could, and the tree says what it is.
+    const naming: RunOperation = (operation, scope) => (scope?.signal ? Promise.resolve(['docs/link.md', 'README.md'] as never) : runOperationAsync(operation));
+    const found = await createAssetResolver({cwd: repo, run: naming}).embedders(refSides(), ['hero.png'], new Set(['docs/hero.png']));
+    expect(pathsOf(found)).toEqual(['README.md']);
+  });
+
+  it('finds at most 40', async () => {
+    const many = Object.fromEntries(Array.from({length: 45}, (_, index) => [`docs/page-${String(index).padStart(2, '0')}.md`, '![Hero](hero.png)\n']));
+    const repo = heroRepo(many);
+    const found = await createAssetResolver({cwd: repo}).embedders(refSides(), ['hero.png'], new Set());
+    expect(found).toHaveLength(40);
+  });
+
+  it('finds nothing when the search runs past 2 seconds, or fails', async () => {
+    const repo = heroRepo();
+    // The search is the one git call with a signal: here it hangs until stopped.
+    const hanging: RunOperation = (operation, scope) => (scope?.signal
+      ? new Promise((_, reject) => scope.signal!.addEventListener('abort', () => reject(new Error('stopped'))))
+      : runOperationAsync(operation));
+    const started = Date.now();
+    expect(await createAssetResolver({cwd: repo, run: hanging}).embedders(refSides(), ['hero.png'], new Set())).toEqual([]);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
+    const failing: RunOperation = (operation, scope) => (scope?.signal ? Promise.reject(new Error('git failed')) : runOperationAsync(operation));
+    expect(await createAssetResolver({cwd: repo, run: failing}).embedders(refSides(), ['hero.png'], new Set())).toEqual([]);
+  }, 10_000);
+
+  it('answers the worker\'s embedders job from the search', async () => {
+    const repo = heroRepo();
+    const result = await createRenderedHandler().handle({type: 'embedders', cwd: repo, assets: refSides(), names: ['hero.png'], skip: ['docs/hero.png', 'docs/extra.md', 'CHANGES.md']}) as EmbeddersResult;
+    expect(result).toEqual({ok: true, files: [{path: 'README.md', oid: blobId(repo, 'feature:README.md')}, {path: 'docs/guide.md', oid: blobId(repo, 'feature:docs/guide.md')}]});
   });
 });
 

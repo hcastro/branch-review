@@ -2,12 +2,13 @@ import {blockForSourceLine} from '../anchor.js';
 import {DEVELOP, flipFrom, planDevelop, type DevelopPlan, type DevelopStep, type DevelopUnit, type Rect} from '../develop.js';
 import {readPageHash, type PageHash} from '../hash.js';
 
-// The rendered page's one script, inlined and allowed by its hash. It plays
+// The rendered page's script, inlined and allowed by its hash. It plays
 // the arrival a trip asks for in the URL hash (the develop from the raw
 // terminal frame on a first visit, a short scroll and glow on a revisit, a
 // pulse on a live refresh), keeps the page on the block the reader had on
 // screen in the diff, and gives the page its keys: changes, files, theme,
-// marks and help. Everything it changes it sets from script, so a page
+// marks and help. On an image's page it switches the compare modes the TUI
+// keys `1` `2` `3`: side by side, flip and difference. Everything it changes it sets from script, so a page
 // whose script doesn't run is the finished page, and nothing it does reads
 // repo text into markup: raw lines go in as text nodes.
 
@@ -26,6 +27,7 @@ const STEP_SCROLL_MS = 700;
 const MAX_ANIMATED_CELLS = 400;
 const MAX_ANIMATED_TOKENS = 1500;
 const THEME_KEY = 'branch-review-theme';
+const COMPARE_KEY = 'branch-review-compare';
 const MARKS_KEY = 'branch-review-marks';
 const PLACE_KEY = 'branch-review-place';
 const THEMES: readonly Theme[] = ['auto', 'light', 'dark'];
@@ -38,6 +40,7 @@ const INLINE_MARKS = /(`{3,}|~{3,}|\||\*\*|__)/;
 
 const root = document.documentElement;
 const article = document.querySelector<HTMLElement>('.br-main > article.markdown-body');
+const imagePage = document.querySelector<HTMLElement>('.br-image-page');
 const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
 /** Every animation of the arrival playing now, so any input can finish them all at once. */
@@ -475,8 +478,29 @@ function finishAll() {
 // it plays when the page shows, unless the reader acted first.
 let whenShown: PageHash | null = null;
 
+// The head script painted the trip's first frame in the terminal's
+// background. Once the raw frame covers the page, or when nothing plays,
+// the page's own background takes over, leaving no attribute behind.
+function releaseFirstFrame() {
+  if (!root.hasAttribute('data-br-first')) return;
+  root.removeAttribute('data-br-first');
+  root.removeAttribute('style');
+}
+
 function arrive(hash: PageHash) {
+  try {
+    arriveAt(hash);
+  } finally {
+    releaseFirstFrame();
+  }
+}
+
+function arriveAt(hash: PageHash) {
   whenShown = null;
+  if (imagePage) {
+    arriveAtImage(hash);
+    return;
+  }
   if (!article || (hash.at === undefined && hash.d === undefined)) return;
   finishAll();
   // Place-keeping: the block the reader had on screen, where they had it.
@@ -520,6 +544,87 @@ function arrive(hash: PageHash) {
   });
   if (!plan.veil) veil?.el.remove();
   perform(plan, units, plan.veil ? veil : null);
+}
+
+// An image's page has no blocks to develop: on a first visit its pictures
+// come in as a markdown page's do, from a blur to sharp. A page out of
+// sight waits until it shows.
+function arriveAtImage(hash: PageHash) {
+  if (hash.d !== 'full' || hash.m === false) return;
+  if (document.visibilityState === 'hidden') {
+    whenShown = hash;
+    return;
+  }
+  finishAll();
+  const step = {start: 0, duration: DEVELOP.imageMs, easing: 'ease-out'};
+  const running = [...imagePage!.querySelectorAll('.br-frame img')].map((image) => (reducedMotion.matches
+    ? play(image, [{opacity: 0}, {opacity: 1}], {...step, duration: 160})
+    : play(image, [{opacity: 0, filter: 'blur(6px)'}, {opacity: 1, filter: 'blur(0)'}], step)));
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    playing.length = 0;
+    settleArrival = null;
+  };
+  settleArrival = settle;
+  void Promise.all(running).then(settle);
+  setTimeout(() => {
+    if (!settled) finishAll();
+  }, DEVELOP.imageMs + 500);
+}
+
+// ---------------------------------------------------------------------------
+// An image's compare modes, as the TUI keys them: `1` side by side, `2`
+// flip, `3` difference. Flip shows one side at a time; `f`, `2` again or a
+// click on the picture turns it over. Difference lays the after side over
+// the before side, so only what changed is light.
+
+type Compare = 'side' | 'flip' | 'difference';
+const COMPARES: readonly Compare[] = ['side', 'flip', 'difference'];
+const comparing = Boolean(imagePage?.querySelector('.br-modes'));
+
+function applyCompare(mode: Compare) {
+  if (!imagePage || !comparing) return;
+  imagePage.dataset.mode = mode;
+  for (const button of imagePage.querySelectorAll<HTMLElement>('.br-mode')) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+}
+
+let compare: Compare = COMPARES.find((each) => each === store(COMPARE_KEY)) ?? 'side';
+function chooseCompare(mode: Compare) {
+  if (!comparing) return;
+  if (mode === 'flip' && compare === 'flip') {
+    turnOver();
+    return;
+  }
+  compare = mode;
+  store(COMPARE_KEY, mode);
+  applyCompare(mode);
+}
+
+// Flip shows the after side first; each turn shows the other.
+function turnOver() {
+  if (!imagePage || compare !== 'flip') return;
+  imagePage.classList.toggle('br-showing-before');
+}
+
+function toggleSwitch(name: 'board' | 'fit') {
+  if (!imagePage) return;
+  const off = imagePage.classList.toggle(name === 'board' ? 'br-board-off' : 'br-actual');
+  imagePage.querySelector(`.br-${name}`)?.setAttribute('aria-pressed', String(!off));
+}
+
+// What won't resolve on GitHub on this page, in page order: the strip's
+// chip steps from one to the next. Old text in `before` views and removed
+// markers is no finding.
+let finding = -1;
+function nextFinding() {
+  const all = [...document.querySelectorAll<HTMLElement>('.br-main :is(a.br-broken, .br-card.br-refused):not(:is(.br-before-body, .br-removed-body) *)')];
+  if (all.length === 0) return;
+  finding = (finding + 1) % all.length;
+  const target = all[finding]!;
+  target.scrollIntoView({block: 'center', behavior: reducedMotion.matches ? 'instant' : 'smooth'});
+  if (!reducedMotion.matches) void glow(target, {id: '', effect: 'glow', start: 0, duration: 600, easing: 'ease-out'});
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +751,7 @@ function onKey(event: KeyboardEvent) {
     '{': () => stepFile(-1),
     t: cycleTheme,
     m: toggleMarks,
+    ...(comparing ? {'1': () => chooseCompare('side'), '2': () => chooseCompare('flip'), '3': () => chooseCompare('difference'), f: turnOver} : {}),
     '?': () => toggleHelp(),
     Escape: () => toggleHelp(false),
   };
@@ -658,6 +764,7 @@ function onKey(event: KeyboardEvent) {
 function wire() {
   applyTheme(theme);
   applyMarks(marksShown);
+  applyCompare(compare);
   showControls();
   showChangePosition();
   // Any input ends the arrival at once, and one still waiting for the page
@@ -685,6 +792,25 @@ function wire() {
   document.querySelector('.br-theme')?.addEventListener('click', cycleTheme);
   document.querySelector('.br-marks')?.addEventListener('click', toggleMarks);
   document.querySelector('.br-help-button')?.addEventListener('click', () => toggleHelp());
+  for (const button of document.querySelectorAll<HTMLElement>('.br-mode')) {
+    button.addEventListener('click', () => chooseCompare(button.dataset.mode as Compare));
+  }
+  document.querySelector('.br-board')?.addEventListener('click', () => toggleSwitch('board'));
+  document.querySelector('.br-fit')?.addEventListener('click', () => toggleSwitch('fit'));
+  imagePage?.querySelector('.br-compare')?.addEventListener('click', turnOver);
+  // The strip's count of what won't resolve becomes a step through it.
+  const chip = document.querySelector<HTMLElement>('span.br-findings');
+  if (chip) {
+    chip.setAttribute('role', 'button');
+    chip.tabIndex = 0;
+    chip.addEventListener('click', nextFinding);
+    chip.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        nextFinding();
+      }
+    });
+  }
   for (const button of document.querySelectorAll<HTMLElement>('.br-changes [data-step]')) {
     button.addEventListener('click', () => stepChange(button.dataset.step === '-1' ? -1 : 1));
   }

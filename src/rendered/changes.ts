@@ -149,9 +149,10 @@ export type Removal = {group: ChangeGroup; before: number | null; blocks: number
  * paired in order by kind and wording, the way a reader would match them: a
  * pair is one `modified` block, a new block left over is `added`, and a
  * removed block left over becomes a marker where it was. Blocks pair only
- * when their wording mostly matches, so a new block is never shown as an
- * edit of unrelated old text. A run that only added lines makes `added`
- * blocks.
+ * when their wording mostly matches, or one holds the other's whole
+ * wording, as a sentence extended in place does, so a new block is never
+ * shown as an edit of unrelated old text. A run that only added lines
+ * makes `added` blocks.
  *
  * An after block whose text didn't change is `modified` when one of its
  * lines shows an image whose content changed (`imageLines`), with its base
@@ -345,26 +346,58 @@ const LINK_DESTINATION = /\]\([^)]*\)/g;
 // of its words, so `Theme` and `Theming` are close and unrelated sentences
 // are far apart. A block that is only images shows its images, so it
 // compares by their sources.
-function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>} {
+function likeness(text: string): {kind: 'words' | 'images'; parts: Set<string>; words: string[]} {
   const prose = text.replace(IMAGE, ' ').replace(LINK_DESTINATION, ']').toLowerCase();
   const words = prose.match(/[\p{L}\p{N}]+/gu) ?? [];
-  if (words.length === 0) return {kind: 'images', parts: new Set([...text.matchAll(IMAGE_SOURCE)].map((match) => match[1]!))};
+  if (words.length === 0) return {kind: 'images', parts: new Set([...text.matchAll(IMAGE_SOURCE)].map((match) => match[1]!)), words};
   const parts = new Set<string>();
   for (const word of words) {
     const letters = [...word];
     if (letters.length === 1) parts.add(word);
     for (let at = 0; at + 1 < letters.length; at += 1) parts.add(letters[at]! + letters[at + 1]!);
   }
-  return {kind: 'words', parts};
+  return {kind: 'words', parts, words};
 }
 
 // Below this share of parts in common, two blocks are different text, not
 // an edit of one another.
 const MIN_LIKENESS = 0.3;
+// The fewest words a block's whole wording needs for it to pair with a
+// block that holds that wording and more: fewer could turn up anywhere.
+const MIN_HELD_WORDS = 3;
+
+// Whether the shorter wording runs, word for word and in order, inside the
+// longer: a sentence extended or cut down in place, however much it grew.
+// Knuth-Morris-Pratt over words, so a long paragraph of repeated words
+// costs a pass over each side, never their product.
+function holds(left: readonly string[], right: readonly string[]) {
+  const [short, long] = left.length <= right.length ? [left, right] : [right, left];
+  if (short.length < MIN_HELD_WORDS) return false;
+  // How far each prefix of `short` overlaps itself, to resume a match without stepping back.
+  const overlap = new Int32Array(short.length);
+  for (let at = 1, run = 0; at < short.length; at += 1) {
+    while (run > 0 && short[at] !== short[run]) run = overlap[run - 1]!;
+    if (short[at] === short[run]) run += 1;
+    overlap[at] = run;
+  }
+  for (let at = 0, run = 0; at < long.length; at += 1) {
+    while (run > 0 && long[at] !== short[run]) run = overlap[run - 1]!;
+    if (long[at] === short[run]) run += 1;
+    if (run === short.length) return true;
+  }
+  return false;
+}
+
+// A table row's key: its first cell, which names what the row is about.
+function rowKey(text: string) {
+  return text.trim().replace(/^\|/, '').split(/(?<!\\)\|/)[0]!.trim().toLowerCase();
+}
 
 // Blocks of one kind pair when they look alike, the closer the better, and a
 // block whose text is the same on both sides pairs ahead of any other;
-// blocks of different kinds never pair.
+// blocks of different kinds never pair. Table rows with the same key pair
+// ahead of rows that only look alike: an edited row keeps its first cell,
+// and a new row can share most of its other cells with it.
 function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
   if (family(baseBlock) !== family(afterBlock)) return null;
   if (baseBlock.text.trim() === afterBlock.text.trim()) return 3;
@@ -374,7 +407,9 @@ function pairScore(baseBlock: MarkableBlock, afterBlock: MarkableBlock) {
   const shared = [...left.parts].filter((part) => right.parts.has(part)).length;
   const total = left.parts.size + right.parts.size;
   const similarity = total === 0 ? 1 : (2 * shared) / total;
-  return similarity < MIN_LIKENESS ? null : 1 + similarity;
+  if (baseBlock.tag === 'tr' && rowKey(baseBlock.text) !== '' && rowKey(baseBlock.text) === rowKey(afterBlock.text)) return 2 + similarity / 2;
+  if (similarity >= MIN_LIKENESS) return 1 + similarity;
+  return left.kind === 'words' && holds(left.words, right.words) ? 1 + MIN_LIKENESS : null;
 }
 
 type AlignOp = {base?: number; after?: number};

@@ -1,3 +1,4 @@
+import {spawnSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -5,12 +6,14 @@ import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it} from 'vitest';
 import type {DiffRange} from '../src/git.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
-import type {FragmentRequest, FragmentResult, FragmentSummary, PageRequest, PageResult, RenderedBackend} from '../src/rendered/backend.js';
+import type {EmbeddersRequest, FragmentRequest, FragmentResult, FragmentSummary, PageRequest, PageResult, RenderedBackend} from '../src/rendered/backend.js';
 import {createRenderedService} from '../src/rendered/service.js';
-import type {Surface} from '../src/rendered/surface.js';
+import type {RunTool} from '../src/rendered/run.js';
+import {createSurface, type Surface} from '../src/rendered/surface.js';
 import {createRenderedSite} from '../src/rendered/site.js';
 import {createRenderedBackend} from '../src/rendered/workerClient.js';
 import {cleanupTempDirs, makeTempDir} from './core-helpers.js';
+import {pngFixture} from './media-helpers.js';
 import {diffFile} from './rendered-helpers.js';
 
 // The rendered service on its own, over a scripted backend and a fake
@@ -543,11 +546,15 @@ function openingService(backend: RenderedBackend, {
   return {service, clock, surface, trip, events, dir: path.join(session, 'rendered'), motionAsked: () => motionAsked};
 }
 
-function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true} = {}) {
+function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal = null as string | null, answer = {where: 'cmux-new', message: 'in the split →'} as Awaited<ReturnType<Surface['show']>>, refreshes = true as boolean | 'skipped', opensSplit = undefined as (() => boolean) | undefined} = {}) {
   const shown: string[] = [];
   const refreshed: string[] = [];
+  // The page names each refresh said the split may show.
+  const showing: Array<readonly string[] | undefined> = [];
   const disposed = {count: 0};
   return {
+    ...(opensSplit ? {opensSplit} : {}),
+    showing,
     kind,
     refusal,
     destination: kind === 'cmux' ? 'in a split to the right' : kind === 'browser' ? 'in your browser' : null,
@@ -559,8 +566,9 @@ function recordingSurface({kind = 'cmux' as 'cmux' | 'browser' | 'none', refusal
       return answer;
     },
     // A live refresh sends the split it opened to `url`; false once it can't.
-    async refresh(url: string) {
+    async refresh(url: string, names?: readonly string[]) {
       refreshed.push(url);
+      showing.push(names);
       return refreshes;
     },
     dispose() {
@@ -600,8 +608,8 @@ describe('opening pages', () => {
     const {backend, turnOff} = scriptedBackend();
     const nothing = openingService(backend);
     nothing.service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts')]), CTX);
-    expect(await nothing.service.open({fileKey: 'src/app.ts'}, nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown files on this branch'});
-    expect(await nothing.service.openOverview(nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown files on this branch'});
+    expect(await nothing.service.open({fileKey: 'src/app.ts'}, nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown, images or SVG on this branch'});
+    expect(await nothing.service.openOverview(nothing.trip)).toEqual({kind: 'info', message: 'nothing to render · no markdown, images or SVG on this branch'});
 
     const refusal = "open isn't available over SSH · branch-review --render-out <dir> writes the pages";
     const ssh = openingService(backend, {surface: recordingSurface({kind: 'none', refusal})});
@@ -1210,5 +1218,268 @@ describe('the trip\'s hash', () => {
     service.setReview(review([edited('docs/guide.md')]), CTX);
     await clock.advance(2_000);
     expect(surface.refreshed).toEqual([]);
+  });
+
+  it('names the pages the split may show for a live refresh, and tries again after one the split skipped', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const surface = recordingSurface({refreshes: 'skipped'});
+    const {service, clock, trip} = openingService(backend, {surface});
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md', line: 1, fraction: 0}, trip);
+    const shownName = new URL(surface.shown[0]!).pathname.split('/').at(-1)!;
+    const alias = (await service.page('docs/guide.md'));
+    expect(alias.ok).toBe(true);
+
+    ids = ['b-0000000a-0', 'b-0000000b-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited again.\n')]), CTX);
+    await clock.advance(250);
+    expect(surface.refreshed).toHaveLength(1);
+    // The page the trip opened, by its own name or by the file's stable name.
+    expect(surface.showing[0]).toEqual([shownName, expect.stringMatching(/^f-[0-9a-f]{20}\.html$/)]);
+
+    // The split showed another page: the next change tries again, with
+    // every block new since the page the split was sent.
+    ids = ['b-0000000a-0', 'b-0000000b-0', 'b-0000000c-0'];
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, third.\n')]), CTX);
+    await clock.advance(1_000);
+    expect(surface.refreshed.map((url) => url.slice(url.indexOf('#') + 1))).toEqual([
+      'at=L1&f=0&d=none&m=1&g=b-0000000b-0&n=2',
+      'at=L1&f=0&d=none&m=1&g=b-0000000b-0,b-0000000c-0&n=3',
+    ]);
+    expect(surface.showing[1]).toEqual(surface.showing[0]);
+  });
+});
+
+describe('the order of the beam and the split', () => {
+  async function pressWith(opensSplit: boolean) {
+    const {backend} = scriptedBackend();
+    const surface = recordingSurface({opensSplit: () => opensSplit});
+    const {service, clock} = openingService(backend, {surface});
+    service.setReview(review([edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    const crossing = deferred<void>();
+    const trip = {cross: () => crossing.promise, waiting: () => undefined};
+    const opening = service.open({fileKey: 'docs/guide.md'}, trip);
+    await clock.advance(0);
+    const duringBeam = surface.shown.length;
+    crossing.resolve();
+    await opening;
+    return {duringBeam, after: surface.shown.length};
+  }
+
+  it('opens a new split once the beam has ended, since the split narrows the pane the beam crosses', async () => {
+    expect(await pressWith(true)).toEqual({duringBeam: 0, after: 1});
+  });
+
+  it('sends an open split to the page while the beam plays', async () => {
+    expect(await pressWith(false)).toEqual({duringBeam: 1, after: 1});
+  });
+
+  it('opens a new split once the beam has ended on the press after a live refresh found the split closed', async () => {
+    let text = 'One, edited.\n';
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: [{id: `b-${(text.length % 16).toString(16).padStart(8, '0')}-0`, kind: 'p', lines: [1, 1] as const}]})}));
+    // cmux as the lab found it: a split opens, then the reader closes it, and
+    // every call to it fails at once.
+    const calls: string[] = [];
+    const run: RunTool = async (_command, args) => {
+      calls.push(args.join(' '));
+      return args.includes('open-split') ? {ok: true, stdout: `${JSON.stringify({created_split: true, surface_ref: 'surface:4'})}\n`} : {ok: false, timedOut: false, reason: 'exit 1'};
+    };
+    const surface = createSurface({env: {CMUX_WORKSPACE_ID: 'workspace:3'}, run, findTool: () => '/fake/bin/cmux', opener: () => undefined, platform: 'darwin'});
+    const {service, clock} = openingService(backend, {surface: surface as unknown as ReturnType<typeof recordingSurface>});
+    const edit = async (next: string) => {
+      text = next;
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(2_000);
+    };
+    await edit('One, edited.\n');
+    await service.open({fileKey: 'docs/guide.md'}, {cross: async () => undefined, waiting: () => undefined});
+    await edit('One, edited twice.\n');
+    await edit('One, edited three times.\n');
+    // One question, which found the split gone, and none after it.
+    expect(calls.map((call) => call.split(' ').at(-1))).toEqual(['false', 'url']);
+
+    const crossing = deferred<void>();
+    const opening = service.open({fileKey: 'docs/guide.md'}, {cross: () => crossing.promise, waiting: () => undefined});
+    await clock.advance(0);
+    const duringBeam = calls.length;
+    crossing.resolve();
+    await opening;
+    expect(duringBeam).toBe(2);
+    expect(calls.slice(2)).toEqual([expect.stringMatching(/^--json browser open-split file:\/\/.+ --workspace workspace:3 --focus false$/)]);
+  });
+});
+
+describe('the whole branch', () => {
+  // A review entry for an image file, with the patch real git prints for it.
+  function imageFile(before: Buffer | null, after: Buffer | null, filePath: string): ReviewFile {
+    const dir = makeTempDir('branch-review-rendered-image-');
+    const left = path.join(dir, `before${path.extname(filePath)}`);
+    const right = path.join(dir, `after${path.extname(filePath)}`);
+    if (before) fs.writeFileSync(left, before);
+    if (after) fs.writeFileSync(right, after);
+    const rawDiff = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--full-index', before ? left : '/dev/null', after ? right : '/dev/null'], {encoding: 'utf8'}).stdout
+      .replaceAll(`a${left}`, `a/${filePath}`).replaceAll(`b${right}`, `b/${filePath}`).replaceAll(left, filePath).replaceAll(right, filePath);
+    return {path: filePath, status: before === null ? 'added' : after === null ? 'deleted' : 'modified', metrics: {path: filePath, additions: 0, deletions: 0, changedLines: 0}, rawDiff, renderedLines: [], blocks: []};
+  }
+  const hero = () => imageFile(pngFixture(3, 2), pngFixture(4, 5), 'docs/hero.png');
+  const embed = (imagePath: string, line: number) => ({path: imagePath, url: path.posix.basename(imagePath), line, status: 'embed' as const});
+
+  it('gives an image a page of its own, shows where the review\'s markdown shows it, and names it img in the rail', async () => {
+    const {backend, fragments, pages} = scriptedBackend((request) => ({ok: true, summary: request.kind
+      ? summary({kind: 'image', changes: {changed: 0, removed: 0}, image: {before: {width: 3, height: 2, bytes: 70}, after: {width: 4, height: 5, bytes: 80}}})
+      : summary({images: [embed('docs/hero.png', 18)]})}));
+    const {service, clock} = serviceWith(backend);
+    service.setReview(review([edited('README.md'), hero()]), CTX);
+    expect(service.renderable('docs/hero.png')).toBe(true);
+    await clock.advance(2_000);
+
+    expect(fragments.find((each) => each.request.path === 'docs/hero.png')!.request).toMatchObject({kind: 'raster', groups: []});
+    const imagePage = pages.find((page) => page.file.path === 'docs/hero.png')!;
+    const readmeAlias = pages.find((page) => page.file.path === 'README.md')!.rail.find((entry) => entry.current)!.href;
+    expect(imagePage.appears).toEqual([{path: 'README.md', line: 18, href: readmeAlias}]);
+    expect(imagePage.rail.map((entry) => [entry.path, entry.label])).toEqual([['README.md', '1'], ['docs/hero.png', 'img']]);
+    // A link to the image opens its page.
+    expect(fragments.find((each) => each.request.path === 'README.md')!.request.links['docs/hero.png']).toEqual({kind: 'inReview', href: imagePage.rail.find((entry) => entry.current)!.href});
+  });
+
+  it('finds markdown outside the review that shows a changed image, renders it marked by its images, and lists those that do', async () => {
+    const embedders: EmbeddersRequest[] = [];
+    const {backend, fragments, pages} = scriptedBackend((request) => ({ok: true, summary: request.kind
+      ? summary({kind: 'image', changes: {changed: 0, removed: 0}})
+      : request.path === 'CONTRIBUTING.md' ? summary({images: [embed('docs/hero.png', 3)]})
+        : request.path === 'docs/other.md' ? summary({changes: {changed: 0, removed: 0}, images: [embed('docs/other.png', 1)]})
+          : summary()}));
+    backend.embedders = async (request) => {
+      embedders.push(request);
+      return {ok: true, files: [{path: 'CONTRIBUTING.md', oid: 'abc1234'}, {path: 'docs/other.md', oid: 'def5678'}]};
+    };
+    const {service, clock} = serviceWith(backend);
+    service.setReview(review([edited('README.md'), hero()]), CTX);
+    await clock.advance(2_000);
+
+    expect(embedders).toHaveLength(1);
+    expect(embedders[0]).toMatchObject({cwd: '/repo/project', names: ['hero.png'], skip: ['README.md', 'docs/hero.png']});
+    expect(fragments.find((each) => each.request.path === 'CONTRIBUTING.md')!.request).toMatchObject({textUnchanged: true, status: 'modified', source: {kind: 'blob', id: 'abc1234'}, groups: []});
+    // The file whose render marked nothing shows no changed image: no page.
+    expect(pages.map((page) => page.file.path)).toEqual(['README.md', 'docs/hero.png', 'CONTRIBUTING.md']);
+    const contributing = pages.find((page) => page.file.path === 'CONTRIBUTING.md')!;
+    expect(contributing.file.also).toEqual({embeds: ['docs/hero.png']});
+    expect(contributing.rail.map((entry) => [entry.path, entry.label, entry.also ?? false])).toEqual([['README.md', '1', false], ['docs/hero.png', 'img', false], ['CONTRIBUTING.md', 'img', true]]);
+    // The image's page says the page outside the review shows it.
+    expect(pages.find((page) => page.file.path === 'docs/hero.png')!.appears).toEqual([{path: 'CONTRIBUTING.md', line: 3, href: contributing.rail.find((entry) => entry.current)!.href}]);
+
+    // The overview lists it under its own heading.
+    const overview = await service.openOverview();
+    expect(overview).toEqual({kind: 'error', message: 'pages open only in the full app'});
+  });
+
+  it('lists a page that also looks different in the overview under its own heading', async () => {
+    const {backend} = scriptedBackend((request) => ({ok: true, summary: request.kind
+      ? summary({kind: 'image', changes: {changed: 0, removed: 0}})
+      : request.path === 'CONTRIBUTING.md' ? summary({images: [embed('docs/hero.png', 3)]}) : summary()}));
+    backend.embedders = async () => ({ok: true, files: [{path: 'CONTRIBUTING.md', oid: 'abc1234'}]});
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('README.md'), hero()]), CTX);
+    await clock.advance(2_000);
+
+    expect(await service.openOverview(trip)).toMatchObject({kind: 'info'});
+    const html = fs.readFileSync(new URL(surface.shown.at(-1)!).pathname, 'utf8');
+    expect(html).toContain('<h2 class="br-group-title">Also looks different</h2>');
+    expect(html).toMatch(/<span class="br-row-path">CONTRIBUTING\.md<\/span><span class="br-row-note">text unchanged · embeds docs\/hero\.png<\/span>/);
+    expect(html).toContain('1 also looks different');
+  });
+
+  it('searches for a moved image by its old name too, and lists the markdown that still names it there', async () => {
+    const embedders: EmbeddersRequest[] = [];
+    const {backend, pages} = scriptedBackend((request) => ({ok: true, summary: request.kind
+      ? summary({kind: 'image', changes: {changed: 0, removed: 0}})
+      : request.path === 'README.md' ? summary({images: [embed('docs/old.png', 3)]}) : summary()}));
+    backend.embedders = async (request) => {
+      embedders.push(request);
+      return {ok: true, files: [{path: 'README.md', oid: 'abc1234'}]};
+    };
+    const {service, clock} = serviceWith(backend);
+    const moved: ReviewFile = {...imageFile(pngFixture(3, 2), pngFixture(4, 5), 'docs/new.png'), status: 'renamed', oldPath: 'docs/old.png'};
+    service.setReview(review([moved]), CTX);
+    await clock.advance(2_000);
+    expect(embedders.map((request) => [...request.names].sort())).toEqual([['new.png', 'old.png']]);
+    expect(pages.find((page) => page.file.path === 'README.md')!.file.also).toEqual({embeds: ['docs/old.png']});
+  });
+
+  it('never searches for a file the review lists, by its new name or the one it moved from', async () => {
+    const embedders: EmbeddersRequest[] = [];
+    const {backend} = scriptedBackend((request) => ({ok: true, summary: request.kind ? summary({kind: 'image', changes: {changed: 0, removed: 0}}) : summary()}));
+    backend.embedders = async (request) => {
+      embedders.push(request);
+      return {ok: true, files: []};
+    };
+    const {service, clock} = serviceWith(backend);
+    const moved: ReviewFile = {...edited('docs/new.md'), status: 'renamed', oldPath: 'docs/old.md'};
+    service.setReview(review([moved, hero()]), CTX);
+    await clock.advance(2_000);
+    expect(embedders.map((request) => [...request.skip].sort())).toEqual([['docs/hero.png', 'docs/new.md', 'docs/old.md']]);
+  });
+
+  it('renders the pages outside the review only in what the 40-file prerender has left', async () => {
+    const answer = (request: FragmentRequest): FragmentResult => ({ok: true, summary: request.kind ? summary({kind: 'image', changes: {changed: 0, removed: 0}}) : summary({images: [embed('docs/hero.png', 1)]})});
+    const candidates = ['a.md', 'b.md', 'c.md'].map((file, index) => ({path: `outside/${file}`, oid: `abc12${index}`}));
+    const run = async (count: number) => {
+      const {backend, fragments} = scriptedBackend(answer);
+      let searched = 0;
+      backend.embedders = async () => {
+        searched += 1;
+        return {ok: true, files: candidates};
+      };
+      const {service, clock} = serviceWith(backend);
+      service.setReview(review([...Array.from({length: count}, (_, index) => edited(`docs/page-${index}.md`)), hero()]), CTX);
+      await clock.advance(2_000);
+      return {searched, outside: [...new Set(fragments.map((each) => each.request.path).filter((file) => file.startsWith('outside/')))]};
+    };
+    // 38 pages and the hero leave room for one; 39 and the hero fill it.
+    expect(await run(38)).toEqual({searched: 1, outside: ['outside/a.md']});
+    expect(await run(39)).toEqual({searched: 0, outside: []});
+  });
+
+  it('searches for no markdown outside the review when the review changed no image', async () => {
+    const {backend} = scriptedBackend();
+    let searched = 0;
+    backend.embedders = async () => {
+      searched += 1;
+      return {ok: true, files: []};
+    };
+    const {service, clock} = serviceWith(backend);
+    service.setReview(review([edited('README.md')]), CTX);
+    await clock.advance(2_000);
+    expect(searched).toBe(0);
+  });
+
+  it('sends each page its part of the link report, and the overview every finding with its page', async () => {
+    const guideLinks = [{href: 'README.md#nope', status: 'ok' as const, line: 4, ref: {path: 'README.md', anchor: 'user-content-nope', index: 0}}];
+    const readmeLinks = [{href: 'gone.md', status: 'missing' as const, line: 2}];
+    const {backend, pages} = scriptedBackend((request) => ({ok: true, summary: summary(request.path === 'README.md'
+      ? {links: readmeLinks, anchors: ['user-content-readme'], images: [{path: 'Logo.png', url: 'Logo.png', line: 6, status: 'caseMismatch', hint: 'Logo.png vs logo.png'}]}
+      : {links: guideLinks, anchors: []})}));
+    const {service, clock, surface, trip} = openingService(backend);
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+
+    const guide = [...pages].reverse().find((page) => page.file.path === 'docs/guide.md')!;
+    expect(guide.brokenRefs).toEqual([0]);
+    expect(guide.report).toEqual({
+      own: [{path: 'docs/guide.md', line: 4, target: 'README.md#nope', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}],
+      notes: ['2 links won\'t resolve', '1 image: case mismatch'],
+    });
+    const readme = [...pages].reverse().find((page) => page.file.path === 'README.md')!;
+    expect(readme.brokenRefs).toBeUndefined();
+    expect(readme.report!.own.map((finding) => finding.kind)).toEqual(['missing', 'caseMismatch']);
+
+    await service.openOverview(trip);
+    const html = fs.readFileSync(new URL(surface.shown.at(-1)!).pathname, 'utf8');
+    expect(html).toContain('<h2 class="br-group-title">Won\'t render on GitHub</h2>');
+    expect(html).toContain(`href="${readme.rail.find((entry) => entry.current)!.href}#at=L2&#x26;d=short"`);
+    expect(html).toContain('<a class="br-findings" href="#br-findings" data-short="✗ 3">2 broken links · 1 image won\'t render</a>');
   });
 });

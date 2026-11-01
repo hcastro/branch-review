@@ -117,7 +117,7 @@ describe('sanitizer', () => {
     ].join('\n');
     const fragment = await renderMarkdown({path: 'README.md', source, groups: [], asset: lookups.asset, link: () => ({kind: 'inReview', href: 'f-other.html'})});
     expect(fragment.html).not.toMatch(/href="[^"]*(?:d=|g=|bg=|d%3D)/);
-    expect(fragment.html.match(/<a class="br-inert" title="anchor not found">/g)).toHaveLength(5);
+    expect(fragment.html.match(/<a class="br-inert br-broken" title="anchor not found">/g)).toHaveLength(5);
     expect(fragment.html).toContain('<a href="#user-content-title">heading</a>');
     expect(fragment.html).toContain('<a href="f-other.html#user-content-title">file</a>');
     expect(fragment.links.map((link) => link.status)).toEqual(['badAnchor', 'badAnchor', 'badAnchor', 'badAnchor', 'badAnchor', 'ok', 'ok']);

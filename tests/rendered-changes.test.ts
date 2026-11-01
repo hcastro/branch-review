@@ -311,6 +311,44 @@ describe('change marks on the page', () => {
     expect(html.indexOf('Old closing line.')).toBeGreaterThan(html.indexOf('cache, edited.'));
   });
 
+  it('marks a sentence extended or cut down in place as modified, however much it grew', async () => {
+    const short = 'Intro.\n\nSee the [guide](docs/guide.md) for more.\n\nEnd.\n';
+    const long = 'Intro.\n\nSee the [guide](docs/guide.md) for more, and [configuration](docs/config.md) for every key, flag and environment variable the tool reads when it starts, with examples of each kind, a quick way to check what is set, and which file wins when two of them disagree about a value.\n\nEnd.\n';
+    // Few letter pairs in common, since so much is new: the old sentence runs whole inside the new one.
+    const grown = await marksFor(short, long);
+    expect(grown.marked).toEqual([{tag: 'p', mark: 'modified', text: 'See the guide for more, and configuratio'}]);
+    expect(grown.removed).toEqual([]);
+    expect(beforeViews(grown.html)).toEqual(['See the guide for more.']);
+
+    const cut = await marksFor(long, short);
+    expect(cut.marked).toEqual([{tag: 'p', mark: 'modified', text: 'See the guide for more.'}]);
+    expect(cut.removed).toEqual([]);
+  });
+
+  it('pairs a long paragraph against its old self in time, however its words repeat', async () => {
+    // The old wording, long runs of one word, nearly turns up in the new
+    // one again and again, which a word-by-word search pays for at every start.
+    let seed = 7;
+    const letter = () => String.fromCharCode(97 + ((seed = (seed * 1103515245 + 12345) % 2147483648) % 26));
+    const words = Array.from({length: 3000}, () => Array.from({length: 6}, letter).join(''));
+    const before = `# T\n\n${'aa '.repeat(40_000)}bb\n`;
+    const after = `# T\n\n${words.join(' ')} ${'aa '.repeat(80_000)}cc\n`;
+    const started = Date.now();
+    const {marked} = await marksFor(before, after);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(marked).toHaveLength(1);
+  });
+
+  it('pairs an edited table row with its old self by its first cell, and marks the new row after it as added', async () => {
+    const head = '| Feature | Status | Notes |\n| --- | --- | ---: |\n| Search | done | 12 |\n';
+    // `planned` and the pipes make the new row look more like the old one than the edited row does.
+    const {marked, html} = await marksFor(`${head}| Sync | planned | 3 |\n`, `${head}| Sync | in progress | 5 |\n| Themes | planned | 1 |\n`);
+    expect(marked).toEqual([{tag: 'tr', mark: 'modified', text: 'Sync'}, {tag: 'tr', mark: 'added', text: 'Themes'}]);
+    expect(html).toMatch(/<tr data-block="[^"]+" data-lines="4-4" data-mark="modified">/);
+    expect(html).toMatch(/<tr data-block="[^"]+" data-lines="5-5" data-mark="added">/);
+    expect(beforeViews(html)).toEqual(['FeatureStatusNotesSyncplanned3']);
+  });
+
   it('puts the before chip of a list item inside the item', async () => {
     const {marked, html} = await marksFor('- Theme\n- Two\n', '- Theming\n- Two\n');
     expect(marked).toEqual([{tag: 'li', mark: 'modified', text: 'Theming'}]);
