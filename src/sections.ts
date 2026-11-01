@@ -221,8 +221,23 @@ function normalizeSgrToken(token: string): string {
   return groups.map((group) => `\x1B[${group.join(';')}m`).join('');
 }
 
+// A diff repeats a few dozen distinct escapes on every row, so each is
+// normalized once; on a large diff this was most of the cost of wrapping.
+const NORMALIZED_SGR_LIMIT = 4096;
+const normalizedSgr = new Map<string, string>();
+
+function normalizeSgrTokenOnce(token: string): string {
+  let normalized = normalizedSgr.get(token);
+  if (normalized === undefined) {
+    if (normalizedSgr.size >= NORMALIZED_SGR_LIMIT) normalizedSgr.clear();
+    normalized = normalizeSgrToken(token);
+    normalizedSgr.set(token, normalized);
+  }
+  return normalized;
+}
+
 function stripNonSgrCsi(line: string): string {
-  return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, normalizeSgrToken);
+  return line.replace(/\x1B\[[0-9;:]*[A-Za-z]/g, normalizeSgrTokenOnce);
 }
 
 export function truncateAnsi(line: string, maxWidth: number) {
@@ -508,62 +523,113 @@ export type WrapOptions = {
   plusMinusMarkers?: boolean;
 };
 
+// One section's wrap so far: its rows and the index of its current block.
+type SectionWrap = {lines: string[]; rows: SectionRow[]; block: number};
+
+function wrapSectionLine(wrap: SectionWrap, line: string, sectionPath: string, maxWidth: number, options: WrapOptions) {
+  const {lines, rows} = wrap;
+  const header = parseBlockHeader(line, sectionPath);
+  if (header) {
+    wrap.block += 1;
+    const block = wrap.block;
+    const framed = frameBlockHeader(header.label, maxWidth);
+    lines.push(...framed.lines);
+    rows.push(...framed.kinds.map((kind): SectionRow => kind === 'header'
+      ? {block, kind, continuation: false, label: header.label, lineNumber: header.lineNumber}
+      : {block, kind, continuation: false}));
+    return;
+  }
+
+  const plain = stripAnsi(line);
+  const gutterIndex = plain.indexOf('│');
+  const markerWidth = options.plusMinusMarkers && gutterIndex > 0 && /^[+\- ]/.test(plain.slice(gutterIndex + 1)) ? 1 : 0;
+  // With markers, continuation rows hang one cell further in, under the code.
+  const continuationPrefix = markerWidth
+    ? `${' '.repeat(cellWidth(plain.slice(0, gutterIndex)))}│ `
+    : getContinuationPrefix(line);
+  const wrapped = wrapAnsiRows(line, maxWidth, continuationPrefix);
+  for (const [index, row] of wrapped.rows.entries()) {
+    lines.push(row);
+    rows.push({
+      block: wrap.block,
+      kind: 'body',
+      continuation: index > 0,
+      ...(index === 0 && gutterIndex > 0
+        ? {codeColumn: cellWidth(plain.slice(0, gutterIndex + 1)) + markerWidth, ...(markerWidth ? {markerWidth} : {})}
+        : index > 0 && wrapped.prefix.includes('│')
+          ? {codeColumn: cellWidth(wrapped.prefix)}
+          : {}),
+    });
+  }
+}
+
+function wrappedSection(section: DiffSection, wrap: SectionWrap, startLine: number): DiffSection {
+  return {
+    path: section.path,
+    signature: section.signature,
+    metrics: section.metrics,
+    lines: wrap.lines,
+    rows: wrap.rows,
+    startLine,
+    endLineExclusive: startLine + wrap.lines.length,
+  };
+}
+
 export function wrapSections(sections: DiffSection[], maxWidth: number, options: WrapOptions = {}): DiffSection[] {
   let cursor = 0;
   return sections.map((section) => {
-    const lines: string[] = [];
-    const rows: SectionRow[] = [];
-    let block = -1;
-
+    const wrap: SectionWrap = {lines: [], rows: [], block: -1};
     for (const line of section.lines) {
-      const header = parseBlockHeader(line, section.path);
-      if (header) {
-        block += 1;
-        const framed = frameBlockHeader(header.label, maxWidth);
-        lines.push(...framed.lines);
-        rows.push(...framed.kinds.map((kind): SectionRow => kind === 'header'
-          ? {block, kind, continuation: false, label: header.label, lineNumber: header.lineNumber}
-          : {block, kind, continuation: false}));
-        continue;
-      }
-
-      const plain = stripAnsi(line);
-      const gutterIndex = plain.indexOf('│');
-      const markerWidth = options.plusMinusMarkers && gutterIndex > 0 && /^[+\- ]/.test(plain.slice(gutterIndex + 1)) ? 1 : 0;
-      // With markers, continuation rows hang one cell further in, under the code.
-      const continuationPrefix = markerWidth
-        ? `${' '.repeat(cellWidth(plain.slice(0, gutterIndex)))}│ `
-        : getContinuationPrefix(line);
-      const wrapped = wrapAnsiRows(line, maxWidth, continuationPrefix);
-      for (const [index, row] of wrapped.rows.entries()) {
-        lines.push(row);
-        rows.push({
-          block,
-          kind: 'body',
-          continuation: index > 0,
-          ...(index === 0 && gutterIndex > 0
-            ? {codeColumn: cellWidth(plain.slice(0, gutterIndex + 1)) + markerWidth, ...(markerWidth ? {markerWidth} : {})}
-            : index > 0 && wrapped.prefix.includes('│')
-              ? {codeColumn: cellWidth(wrapped.prefix)}
-              : {}),
-        });
-      }
+      wrapSectionLine(wrap, line, section.path, maxWidth, options);
     }
 
-    const startLine = cursor;
-    const endLineExclusive = cursor + lines.length;
-    cursor = endLineExclusive;
-
-    return {
-      path: section.path,
-      signature: section.signature,
-      metrics: section.metrics,
-      lines,
-      rows,
-      startLine,
-      endLineExclusive,
-    };
+    const result = wrappedSection(section, wrap, cursor);
+    cursor = result.endLineExclusive;
+    return result;
   });
+}
+
+export type WrapSliceOptions = {
+  // How long one slice may hold the thread before handing it back.
+  sliceMs?: number;
+  // Stops the wrap at the next slice boundary; the promise rejects with the
+  // signal's reason.
+  signal?: AbortSignal;
+};
+
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/**
+ * The same result as wrapSections, built a slice at a time: after each
+ * `sliceMs` of work it hands the event loop back, so timers, input and IPC
+ * keep moving while a diff of hundreds of thousands of lines is wrapped.
+ */
+export async function wrapSectionsInSlices(
+  sections: DiffSection[],
+  maxWidth: number,
+  options: WrapOptions = {},
+  {sliceMs = 8, signal}: WrapSliceOptions = {},
+): Promise<DiffSection[]> {
+  const result: DiffSection[] = [];
+  let cursor = 0;
+  let sliceStart = performance.now();
+  for (const section of sections) {
+    const wrap: SectionWrap = {lines: [], rows: [], block: -1};
+    for (const line of section.lines) {
+      if (performance.now() - sliceStart >= sliceMs) {
+        await yieldToEventLoop();
+        signal?.throwIfAborted();
+        sliceStart = performance.now();
+      }
+      wrapSectionLine(wrap, line, section.path, maxWidth, options);
+    }
+
+    const wrapped = wrappedSection(section, wrap, cursor);
+    cursor = wrapped.endLineExclusive;
+    result.push(wrapped);
+  }
+
+  return result;
 }
 
 // Delta renders each hunk header as `• <path>:<line>: <context>`. The label

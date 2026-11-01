@@ -5,19 +5,25 @@ import {escapeHiddenCharacters} from '../controlChars.js';
 // builder and the Ink UI. Ink measures with string-width, so everything that
 // pads, wraps, truncates or maps mouse columns must measure the same way.
 
-const PRINTABLE_ASCII = /^[\x20-\x7E]*$/;
+// Printable ASCII, plus the symbols delta and the panes draw on nearly every
+// row: box drawing (the gutter `│`, frames), `⋮`, `•` and `…`. Each of these
+// is its own grapheme next to any other one and one cell wide in
+// string-width, so text made only of them is as wide as it is long.
+// string-width costs tens of microseconds on a diff row, which adds up to
+// seconds on a large diff.
+export const SINGLE_CELL_TEXT = /^[\x20-\x7E\u2022\u2026\u22EE\u2500-\u257F]*$/;
 const segmenter = new Intl.Segmenter(undefined, {granularity: 'grapheme'});
 
 export type Grapheme = {text: string; width: number};
 
 export function cellWidth(text: string): number {
-  return PRINTABLE_ASCII.test(text) ? text.length : stringWidth(text);
+  return SINGLE_CELL_TEXT.test(text) ? text.length : stringWidth(text);
 }
 
 // Splits plain text (no escape sequences) into grapheme clusters with their
 // cell widths, so a surrogate pair or combining sequence is never split.
 export function graphemes(text: string): Grapheme[] {
-  if (PRINTABLE_ASCII.test(text)) {
+  if (SINGLE_CELL_TEXT.test(text)) {
     return Array.from(text, (char) => ({text: char, width: 1}));
   }
 

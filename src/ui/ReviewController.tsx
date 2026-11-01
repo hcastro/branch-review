@@ -8,7 +8,8 @@ import type {ClipboardWriter} from '../commands/execute.js';
 import {createRepoWatcher, type CreateRepoWatcherOptions, type RepoWatcher} from '../watch/repoWatcher.js';
 import {refreshReviewInWorker} from '../review/workerRefresh.js';
 import {debounce} from '../watch/debounce.js';
-import {App} from './App.js';
+import {App, prewrapSections} from './App.js';
+import type {DiffSection} from '../sections.js';
 import type {GraphicsCaps} from '../media/types.js';
 import type {MediaService} from '../media/service.js';
 import type {RenderedService} from '../rendered/service.js';
@@ -27,6 +28,10 @@ type WorkerRefresher = typeof refreshReviewInWorker;
 const WATCH_UPDATE_STATUS_TIMEOUT_MS = 2200;
 // A drag-resize sends a burst of events; rebuild once it stops.
 const RESIZE_REBUILD_DELAY_MS = 150;
+// A refreshed review with at least this many diff lines is wrapped ahead of
+// the render that shows it, in slices, so landing it never freezes the UI.
+// Smaller ones wrap in that render, as the first review does.
+export const PREWRAP_MIN_LINES = 10_000;
 
 export type ReviewControllerProps = {
   cwd: string;
@@ -111,6 +116,22 @@ export function formatWatchFooterStatus(status: WatchState, now = Date.now()) {
   return `updated ${seconds === 0 ? 'now' : `${seconds}s ago`}`;
 }
 
+// Wraps a large review at the diff pane's width before it is shown. If the
+// pane's width settles on another value meanwhile, it wraps again at that
+// one, so the render finds the width it uses.
+async function prewrapLargeReview(sections: DiffSection[], wrapWidthRef: {current: number | null}, signal: AbortSignal) {
+  let lineCount = 0;
+  for (const section of sections) lineCount += section.lines.length;
+  if (lineCount < PREWRAP_MIN_LINES) return;
+
+  let width = wrapWidthRef.current;
+  while (width !== null && !signal.aborted) {
+    await prewrapSections(sections, width, signal);
+    if (wrapWidthRef.current === width) return;
+    width = wrapWidthRef.current;
+  }
+}
+
 export function ReviewController({
   cwd,
   range,
@@ -150,6 +171,11 @@ export function ReviewController({
   const refreshPendingRef = useRef(false);
   const refreshAbortRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
+  // The width App wraps the diff at, and the sections built for each
+  // refreshed review, so App renders exactly the sections that were wrapped
+  // ahead.
+  const wrapWidthRef = useRef<number | null>(null);
+  const reviewSectionsRef = useRef(new WeakMap<ReviewModel, DiffSection[]>());
   // Read through a ref so a resize or a new callback prop does not recreate
   // the watcher, which would drop changes it had not reported yet.
   const latestRef = useRef({buildReview, media, modelWidth, range, refreshInWorker, requestedBase, requestedBranch, resolveRange});
@@ -219,6 +245,10 @@ export function ReviewController({
         const nextFingerprint = next?.fingerprint ?? getReviewFingerprint(cwd, nextRange);
         if (nextFingerprint !== previousFingerprint) {
           const nextReview = next?.review ?? latest.buildReview({cwd, range: nextRange, width});
+          if (!mountedRef.current) return;
+          const nextSections = buildReviewSections(nextReview);
+          reviewSectionsRef.current.set(nextReview, nextSections);
+          await prewrapLargeReview(nextSections, wrapWidthRef, abort.signal);
           if (!mountedRef.current) return;
           setReview(nextReview);
           setActiveRange(nextRange);
@@ -306,7 +336,7 @@ export function ReviewController({
     return () => clearTimeout(timeout);
   }, [watchStatus]);
 
-  const sections = useMemo(() => buildReviewSections(review), [review]);
+  const sections = useMemo(() => reviewSectionsRef.current.get(review) ?? buildReviewSections(review), [review]);
   // Before App renders the review, so its first frame of a new review
   // already knows which files are media. setReview only starts work and
   // notifies nobody, so calling it while rendering is safe.
@@ -335,6 +365,7 @@ export function ReviewController({
       graphics={graphics}
       media={media}
       rendered={rendered}
+      wrapWidthRef={wrapWidthRef}
     />
   );
 }

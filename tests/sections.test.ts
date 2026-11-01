@@ -1,4 +1,5 @@
 import {describe, expect, it} from 'vitest';
+import stringWidth from 'string-width';
 import stripAnsi from 'strip-ansi';
 import {
   buildDiffSections,
@@ -13,7 +14,21 @@ import {
   visibleWidth,
   wrapAnsi,
   wrapSections,
+  wrapSectionsInSlices,
+  type DiffSection,
 } from '../src/sections.js';
+import {cellWidth, graphemes, SINGLE_CELL_TEXT} from '../src/ui/text.js';
+
+// A delta row as delta draws it: line numbers, the gutter and 24-bit color
+// around each token.
+function deltaRow(index: number) {
+  return `\x1B[34m\x1B[38;5;88m      \x1B[34m⋮\x1B[38;5;28m ${String(index + 1).padStart(5)}  \x1B[34m│\x1B[48;2;0;56;0;38;2;249;38;114mexport\x1B[38;2;248;248;242m \x1B[38;2;102;217;239mconst\x1B[38;2;248;248;242m \x1B[38;2;255;255;255mvalue${index}\x1B[38;2;248;248;242m = { id: \x1B[38;2;190;132;255m${index}\x1B[38;2;248;248;242m, name: \x1B[38;2;230;219;116m"item ${index}"\x1B[38;2;248;248;242m };\x1B[0m\x1B[48;2;0;56;0m\x1B[0K\x1B[0m`;
+}
+
+function deltaSection(path: string, rows: number): DiffSection {
+  const lines = [`\x1B[34m•\x1B[0m \x1B[34m${path}\x1B[0m:\x1B[34m1\x1B[0m: `, ...Array.from({length: rows}, (_, index) => deltaRow(index)), ''];
+  return {path, metrics: {path, additions: rows, deletions: 0, changedLines: rows}, lines, startLine: 0, endLineExclusive: lines.length};
+}
 
 describe('section helpers', () => {
   it('maps scroll offsets back to the file section in view', () => {
@@ -300,5 +315,72 @@ describe('block header labels', () => {
 
   it('leaves a label that fits unchanged', () => {
     expect(fitBlockHeaderLabel('• a.ts:3:', 20)).toBe('• a.ts:3:');
+  });
+});
+
+describe('cell widths of the symbols every diff row draws', () => {
+  it('measures box drawing, ⋮, • and … as string-width does, alone and among other text', () => {
+    const symbols = ['\u2022', '\u2026', '\u22EE'];
+    for (let code = 0x2500; code <= 0x257F; code += 1) symbols.push(String.fromCodePoint(code));
+    for (const symbol of symbols) {
+      expect(SINGLE_CELL_TEXT.test(symbol)).toBe(true);
+      for (const text of [symbol, `a${symbol}b`, `${symbol}${symbol}`, `  12 ${symbol} x`]) {
+        expect(cellWidth(text), text).toBe(stringWidth(text));
+        expect(graphemes(text).map((part) => part.text).join('')).toBe(text);
+        expect(graphemes(text).reduce((sum, part) => sum + part.width, 0)).toBe(stringWidth(text));
+      }
+    }
+  });
+
+  it('still asks string-width when a symbol sits next to a combining mark, a wide character or an emoji', () => {
+    for (const text of ['│\u0301', 'a\u0301│', '│漢', '⋮😀', '•\uFE0F', '│\u200D']) {
+      expect(SINGLE_CELL_TEXT.test(text)).toBe(false);
+      expect(cellWidth(text), text).toBe(stringWidth(text));
+    }
+  });
+});
+
+describe('wrapping in slices', () => {
+  it('builds exactly what wrapSections builds, at any width and with markers', async () => {
+    const sections = [deltaSection('src/one.ts', 300), deltaSection('src/two.ts', 40)];
+    for (const width of [12, 60, 196]) {
+      for (const plusMinusMarkers of [false, true]) {
+        // A zero slice hands the event loop back before every line.
+        expect(await wrapSectionsInSlices(sections, width, {plusMinusMarkers}, {sliceMs: 0}))
+          .toEqual(wrapSections(sections, width, {plusMinusMarkers}));
+      }
+    }
+  });
+
+  it('keeps the event loop turning while it wraps tens of thousands of rows', async () => {
+    // Wrapped in one go, these rows hold the thread for about twice the bound
+    // below on a fast machine.
+    const section = deltaSection('src/big.ts', 60_000);
+    let ticks = 0;
+    let last = performance.now();
+    let longestStall = 0;
+    const ticker = setInterval(() => {
+      const now = performance.now();
+      longestStall = Math.max(longestStall, now - last);
+      last = now;
+      ticks += 1;
+    }, 1);
+    try {
+      const [wrapped] = await wrapSectionsInSlices([section], 120);
+      expect(wrapped!.lines.length).toBeGreaterThan(60_000);
+    } finally {
+      clearInterval(ticker);
+    }
+    longestStall = Math.max(longestStall, performance.now() - last);
+    expect(ticks).toBeGreaterThan(5);
+    // Slices are 8 ms; the bound leaves room for a loaded machine.
+    expect(longestStall).toBeLessThan(150);
+  });
+
+  it('stops at the next slice once its signal aborts', async () => {
+    const abort = new AbortController();
+    const wrapping = wrapSectionsInSlices([deltaSection('src/big.ts', 20_000)], 120, {}, {sliceMs: 0, signal: abort.signal});
+    abort.abort(new Error('stop'));
+    await expect(wrapping).rejects.toThrow('stop');
   });
 });

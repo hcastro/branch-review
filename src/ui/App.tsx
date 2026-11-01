@@ -20,6 +20,7 @@ import {
   truncateAnsi,
   visibleWidth,
   wrapSections,
+  wrapSectionsInSlices,
   type BranchMetrics,
   type DiffSection,
   type SectionRow,
@@ -86,6 +87,9 @@ type AppProps = {
   // The footer's one-time tip, the first time a file can use Preview or
   // Review in browser. On unless turned off.
   tips?: boolean;
+  // When given, App keeps the width it wraps the diff at here, so a caller
+  // can wrap a new review ahead of its render (prewrapSections).
+  wrapWidthRef?: {current: number | null};
 };
 
 const SCROLL_STEP = 3;
@@ -379,9 +383,35 @@ function errorRow(text: string, maxWidth: number) {
   };
 }
 
+// Sections wrapped ahead of the render that shows them, by the lines they
+// wrap. Keyed weakly, so they go with the review.
+const prewrapped = new WeakMap<string[], {maxWidth: number; entry: WrappedSectionCacheEntry}>();
+
+/**
+ * Wraps `sections` at `maxWidth` the way the diff pane does, a slice at a
+ * time so the event loop keeps turning, and keeps each result for the render
+ * that shows these sections at that width. Wrapping a review of hundreds of
+ * thousands of lines in the render itself would freeze the UI for seconds.
+ * A section that fails to wrap is left to the render, which draws it as an
+ * error row. Resolves once done, or early when `signal` aborts.
+ */
+export async function prewrapSections(sections: DiffSection[], maxWidth: number, signal?: AbortSignal) {
+  for (const section of sections) {
+    if (signal?.aborted) return;
+    try {
+      const [wrapped] = await wrapSectionsInSlices([section], maxWidth, {plusMinusMarkers: plainDiffMode}, {signal});
+      if (wrapped) prewrapped.set(section.lines, {maxWidth, entry: {lines: wrapped.lines, rows: wrapped.rows ?? []}});
+    } catch {
+      // Aborted, or this section fails to wrap: the render deals with it.
+    }
+  }
+}
+
 // Wraps one section; a section that fails to wrap becomes a single error row
 // so one bad file never takes down the rest of the review.
 function wrapSectionSafely(section: DiffSection, maxWidth: number): WrappedSectionCacheEntry {
+  const ahead = prewrapped.get(section.lines);
+  if (ahead?.maxWidth === maxWidth) return ahead.entry;
   try {
     const wrappedSection = wrapSections([section], maxWidth, {plusMinusMarkers: plainDiffMode})[0];
     return {lines: wrappedSection?.lines ?? [], rows: wrappedSection?.rows ?? []};
@@ -2427,6 +2457,7 @@ function AppContent({
   media,
   rendered,
   tips = true,
+  wrapWidthRef,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -2461,6 +2492,9 @@ function AppContent({
   const keyedSections = useMemo(() => keySections(rawSections, review), [rawSections, review]);
   const displaySections = useMemo(() => addFileErrorRows(keyedSections), [keyedSections]);
   const wrapWidth = useSettledValue(diffContentWidth, WRAP_SETTLE_MS);
+  useEffect(() => {
+    if (wrapWidthRef) wrapWidthRef.current = wrapWidth;
+  }, [wrapWidth, wrapWidthRef]);
   const wrappedSections = useMemo(
     () => wrapSectionsWithCache(displaySections, wrapWidth, wrappedSectionCacheRef.current),
     [displaySections, wrapWidth],
