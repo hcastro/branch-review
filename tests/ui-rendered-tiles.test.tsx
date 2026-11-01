@@ -65,7 +65,9 @@ function layoutOf(rows: number): PageLayout {
   };
 }
 
-function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides}: {
+function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, layoutError, layoutOf: answerFor, disabled = null, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides, crossingMotion}: {
+  // How much the crossing moves, as the service asks the OS for it.
+  crossingMotion?: () => Promise<'full' | 'reduced' | 'off'>;
   // With media previews, the sides they read by id.
   mediaSides?: NonNullable<Parameters<typeof fakeMediaService>[0]>['sides'];
   layout?: PageLayout;
@@ -75,6 +77,12 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
   readFile?: (path: string) => string | null;
   // How long the layout takes, as on a cold Chromium start.
   layoutDelay?: number;
+  // Why every layout fails, when it does.
+  layoutError?: string;
+  // A file's own layout answer, when it isn't the one every file gets.
+  layoutOf?: (path: string) => Promise<LayoutResult> | undefined;
+  // Why the rendered worker turned off, when it did.
+  disabled?: string | null;
   files?: FixtureFile[];
   env?: NodeJS.ProcessEnv;
   caps?: typeof CAPS | typeof BLOCKS_CAPS;
@@ -92,12 +100,17 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
     timeline.push({kind: 'apc', seq: sequence});
   }, random: () => 0});
   const tiles: TileRequest[] = [];
+  // How often the app looked for Chromium, and asked for a layout.
+  const asked = {chrome: 0, layouts: 0};
   // The text each page is laid out from.
   const sources: Record<string, string> = {'docs/page.md': '# Title\n\nA new paragraph.\n\nSee [the docs](https://example.com/docs).\n\nMore text.\n'};
   const backend: Pick<RenderedBackend, 'layout' | 'tile' | 'disabledReason'> = {
     layout: async (request): Promise<LayoutResult> => {
+      asked.layouts += 1;
+      const own = answerFor?.(request.source.fragment.path);
+      if (own) return own;
       const text = sources[request.source.fragment.path];
-      const answer: LayoutResult = {ok: true, layout: layoutFor?.(request.source.geometry.cssWidth) ?? layout ?? layoutOf(rows), document: `doc-${request.source.fragment.key}`, ...(text === undefined ? {} : {text})};
+      const answer: LayoutResult = layoutError ? {ok: false, state: 'error', reason: layoutError} : {ok: true, layout: layoutFor?.(request.source.geometry.cssWidth) ?? layout ?? layoutOf(rows), document: `doc-${request.source.fragment.key}`, ...(text === undefined ? {} : {text})};
       return layoutDelay ? new Promise((resolve) => setTimeout(() => resolve(answer), layoutDelay)) : answer;
     },
     tile: async (request) => {
@@ -107,7 +120,7 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
       const height = Math.min(geometry.tileRows, request.rows - request.index * geometry.tileRows) * geometry.cellPx.h;
       return {ok: true, png: pngHeaderOnly(geometry.sheetCols * geometry.cellPx.w, height)};
     },
-    disabledReason: () => null,
+    disabledReason: () => disabled,
   };
   const markdown = new Set(files.filter((file) => file.path.endsWith('.md')).map((file) => fileKey({path: file.path})));
   const fragment = (path: string): FragmentRequest => ({cwd: '/repo', key: `frag-${path.replace(/\W/g, '')}`, path, status: 'modified', source: {kind: 'blob', id: 'abcdef1'}, groups: [], links: {}, assets: {base: null, after: {tree: 'HEAD'}, epoch: 0}});
@@ -116,7 +129,10 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
     registry,
     caps: caps as typeof CAPS,
     env,
-    chrome: () => (chrome ? {path: '/fake/chrome-headless-shell', headless: '--headless'} : null),
+    chrome: () => {
+      asked.chrome += 1;
+      return chrome ? {path: '/fake/chrome-headless-shell', headless: '--headless'} : null;
+    },
     source: (key) => (markdown.has(key) ? {fragment: fragment(key), base: 'development'} : null),
     fileForAlias: () => null,
   });
@@ -134,13 +150,13 @@ function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PANE: 'on'} as
       dimensions={dimensions}
       graphics={caps}
       animations={animations}
-      rendered={{focus: () => undefined, pane}}
+      rendered={{focus: (key) => pane.focus(key), pane, ...(crossingMotion ? {crossingMotion} : {})}}
       {...(media ? {media} : {})}
     />
   );
   const instance = renderSized(element(size), size, timeline);
   const resize = (dimensions: {columns: number; rows: number}) => instance.rerender(element(dimensions));
-  return {instance, pane, registry, graphics, timeline, tiles, writes, resize};
+  return {instance, pane, registry, graphics, timeline, tiles, writes, resize, asked};
 }
 
 const settle = (times = 8) => flush(times);
@@ -743,16 +759,29 @@ describe('the page in the pane at the owner\'s width', () => {
   });
 });
 
-describe('when the page in the pane is not offered', () => {
-  it('without BRANCH_REVIEW_PANE=on, v does nothing on markdown and the footer does not name it', async () => {
-    const {instance, tiles} = setup({env: {}});
+describe('whether the page in the pane is offered', () => {
+  it('is offered by default in a terminal that draws Kitty images, with Chromium found', async () => {
+    const {instance} = setup({env: {}});
     await settle();
-    const before = text(instance.lastFrame());
-    expect(before).not.toContain('v here');
+    expect(text(instance.lastFrame())).toContain('v here');
     await press(instance, 'v');
-    expect(text(instance.lastFrame())).toBe(before);
-    expect(tiles).toEqual([]);
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    expect(text(instance.lastFrame())).toContain('◆ rendered · local');
     instance.unmount();
+  });
+
+  it('with BRANCH_REVIEW_PANE=off, 0, false or none, v does nothing on markdown and the footer does not name it', async () => {
+    for (const value of ['off', '0', 'false', 'none']) {
+      const {instance, tiles, asked} = setup({env: {BRANCH_REVIEW_PANE: value}});
+      await settle();
+      const before = text(instance.lastFrame());
+      expect(before).not.toContain('v here');
+      await press(instance, 'v');
+      expect(text(instance.lastFrame())).toBe(before);
+      expect(tiles).toEqual([]);
+      expect(asked).toEqual({chrome: 0, layouts: 0});
+      instance.unmount();
+    }
   });
 
   it('in a terminal without Kitty images, v does nothing new', async () => {
@@ -765,12 +794,257 @@ describe('when the page in the pane is not offered', () => {
     instance.unmount();
   });
 
-  it('names Chrome when none is found, and keeps the diff', async () => {
+  it('names Chrome when none is found, keeps the diff, and the footer does not name v', async () => {
     const {instance} = setup({chrome: false});
     await settle();
+    expect(text(instance.lastFrame())).not.toContain('v here');
     await press(instance, 'v');
     expect(text(instance.lastFrame())).toContain(PANE_NEEDS_CHROME.slice(0, 40));
     expect(text(instance.lastFrame())).toContain('A new paragraph.');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    instance.unmount();
+  });
+
+  it('does not name v once the rendered worker turned off before the first v, and v says why', async () => {
+    const {instance} = setup({env: {}, disabled: 'rendered view turned off: the worker exited 3 times in a minute'});
+    await settle();
+    expect(text(instance.lastFrame())).not.toContain('v here');
+    await press(instance, 'v');
+    expect(text(instance.lastFrame())).toContain('✗ rendered view turned off: the worker exited 3 times in a minute');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    instance.unmount();
+  });
+
+  it('looks for no Chromium in a review without markdown, whose frames are those of the pane turned off', async () => {
+    const frames = async (env: NodeJS.ProcessEnv) => {
+      const {instance, asked} = setup({files: [CODE], env});
+      await settle();
+      await press(instance, 'jkv');
+      const all = [...instance.frames];
+      instance.unmount();
+      return {all, asked};
+    };
+    const on = await frames({});
+    const off = await frames({BRANCH_REVIEW_PANE: 'off'});
+    expect(on.all).toEqual(off.all);
+    expect(on.asked).toEqual({chrome: 0, layouts: 0});
+  });
+
+  it('asks the OS how much to move no more often in a review without markdown than with the pane turned off', async () => {
+    const asked = async (files: FixtureFile[], env: NodeJS.ProcessEnv) => {
+      let motions = 0;
+      const {instance} = setup({files, env, animations: true, crossingMotion: async () => {
+        motions += 1;
+        return 'full';
+      }});
+      await settle();
+      await press(instance, 'jk');
+      instance.unmount();
+      return motions;
+    };
+    expect(await asked([CODE], {})).toBe(await asked([CODE], {BRANCH_REVIEW_PANE: 'off'}));
+    expect(await asked([CODE], {})).toBe(0);
+    // With a page for v to draw, it is asked once, ahead of the first press.
+    expect(await asked([PAGE, CODE], {})).toBe(1);
+  });
+
+  it('lays nothing out before the first v on a markdown file', async () => {
+    const {instance, asked, tiles} = setup({env: {}});
+    await settle();
+    await press(instance, 'jk');
+    expect(asked.layouts).toBe(0);
+    expect(tiles).toEqual([]);
+    await press(instance, 'v');
+    expect(asked.layouts).toBeGreaterThan(0);
+    instance.unmount();
+  });
+});
+
+describe('when the page in the pane fails', () => {
+  // An 80-line page, one block of two page rows per source line, then a code file.
+  const LONG = markdownFile('docs/long.md', Array.from({length: 80}, (_, index) => `Line ${index + 1}`));
+  const LONG_LAYOUT: PageLayout = {heightCss: 160 * ROW, blocks: Array.from({length: 80}, (_, index) => ({id: `b-${index}`, top: 2 * index * ROW, bottom: (2 * index + 2) * ROW, lines: [index + 1, index + 1] as const})), removed: [], links: [], anchors: []};
+  const topLine = (frame: string | undefined) => {
+    const lines = frameLines(frame);
+    return stripAnsi(lines[lines.findIndex((each) => /file \d+\/\d+|rendered here/.test(stripAnsi(each))) + 1] ?? '');
+  };
+  const sheet = (request: TileRequest): TileResult => {
+    const {geometry} = request.source;
+    return {ok: true, png: pngHeaderOnly(geometry.sheetCols * geometry.cellPx.w, Math.min(geometry.tileRows, request.rows - request.index * geometry.tileRows) * geometry.cellPx.h)};
+  };
+
+  it('goes back to the diff in one frame, at the line the page showed at the top, with one toast, and v draws it again', async () => {
+    // The first tile draws; the second, cut ahead of the screen, fails once the test says.
+    let failSecond: () => void = () => undefined;
+    let fails = true;
+    const {instance} = setup({files: [LONG, CODE], layout: LONG_LAYOUT, tile: (request) => (request.index === 0 || !fails ? Promise.resolve(sheet(request)) : new Promise((resolve) => {
+      failSecond = () => resolve({ok: false, state: 'error', reason: 'the browser exited (code 3)'});
+    }))});
+    await settle();
+    await press(instance, 'j'.repeat(20));
+    const top = Number(/│Line (\d+)/.exec(topLine(instance.lastFrame()))![1]);
+    await press(instance, 'v');
+    await press(instance, 'jjjjj');
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    const before = instance.frames.length;
+    failSecond();
+    await settle();
+    // The first frame after the failure is the diff, with no placeholder
+    // cell left, already at the reader's line: page row 2 × (top − 1) + 5
+    // shows line top + 2.
+    expect(decodePlaceholders(instance.frames[before])).toEqual([]);
+    expect(topLine(instance.frames[before])).toContain(`│Line ${top + 2}`);
+    const shown = text(instance.lastFrame());
+    expect(shown).toContain('✗ in-pane view: the browser exited (code 3) · r opens it in the browser');
+    expect(shown).not.toContain('rendered here');
+    expect(topLine(instance.lastFrame())).toContain(`│Line ${top + 2}`);
+    expect(instance.frames.slice(before).every((frame) => decodePlaceholders(frame).length === 0)).toBe(true);
+    // The next v asks again, and draws.
+    fails = false;
+    await press(instance, 'v');
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    instance.unmount();
+  });
+
+  it('comes back from the page on v in one frame at the line the page showed at the top', async () => {
+    const {instance} = setup({files: [LONG, CODE], layout: LONG_LAYOUT, tile: async (request) => sheet(request)});
+    await settle();
+    await press(instance, 'j'.repeat(20));
+    const top = Number(/│Line (\d+)/.exec(topLine(instance.lastFrame()))![1]);
+    await press(instance, 'v');
+    await press(instance, 'jjjjj');
+    expect(decodePlaceholders(instance.lastFrame()).length).toBeGreaterThan(0);
+    const before = instance.frames.length;
+    instance.stdin.write('v');
+    await settle();
+    expect(decodePlaceholders(instance.frames[before])).toEqual([]);
+    expect(topLine(instance.frames[before])).toContain(`│Line ${top + 2}`);
+    expect(instance.frames.slice(before).every((frame) => topLine(frame).includes(`│Line ${top + 2}`))).toBe(true);
+    instance.unmount();
+  });
+
+  it('keeps the reader where they are when a page above the screen fails its layout late, and says so only once the reader gets there', async () => {
+    const ABOVE = markdownFile('docs/a.md', Array.from({length: 30}, (_, index) => `Alpha ${index + 1}`));
+    let failAbove: () => void = () => undefined;
+    const {instance} = setup({files: [ABOVE, LONG, CODE], layout: LONG_LAYOUT, tile: async (request) => sheet(request), layoutOf: (path) => (path === 'docs/a.md' ? new Promise((resolve) => {
+      failAbove = () => resolve({ok: false, state: 'error', reason: 'timed out'});
+    }) : undefined)});
+    await settle();
+    await press(instance, '\u001B[B');
+    await press(instance, 'v');
+    await press(instance, 'jjjjjjjjjj');
+    // The diff pane's header: the file it shows, by its buttons.
+    const header = (frame: string | undefined) => frameLines(frame).map((line) => stripAnsi(line)).find((line) => line.includes('╭─Copy path─╮')) ?? '';
+    expect(header(instance.lastFrame())).toContain('docs/long.md');
+    const cells = decodePlaceholders(instance.lastFrame());
+    expect(cells.length).toBeGreaterThan(0);
+    failAbove();
+    await settle();
+    const shown = text(instance.lastFrame());
+    expect(header(instance.lastFrame())).toContain('docs/long.md');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual(cells);
+    expect(shown).not.toContain('Alpha');
+    expect(shown).not.toContain('✗ in-pane view');
+    // Back up on that file, its diff and why.
+    await press(instance, '\u001B[A');
+    const there = text(instance.lastFrame());
+    expect(there).toContain('Alpha 1');
+    expect(there).toContain('✗ in-pane view: timed out · r opens it in the browser');
+    instance.unmount();
+  });
+
+  it('goes back to the diff where it was when the page fails as v opens it, its first tile or its layout', async () => {
+    const {instance} = setup({files: [LONG, CODE], layout: LONG_LAYOUT, tile: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    await settle();
+    await press(instance, 'j'.repeat(20));
+    const before = topLine(instance.lastFrame());
+    await press(instance, 'v');
+    const shown = text(instance.lastFrame());
+    expect(shown).toContain('✗ in-pane view: timed out · r opens it in the browser');
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
+    expect(topLine(instance.lastFrame())).toBe(before);
+    instance.unmount();
+
+    // A cold Chromium that crashes while the pane says it is laying out the page.
+    const cold = setup({files: [LONG, CODE], layoutDelay: 300, layoutError: 'the browser exited (code 3)'});
+    await settle();
+    await press(cold.instance, 'j'.repeat(20));
+    const was = topLine(cold.instance.lastFrame());
+    await press(cold.instance, 'v');
+    expect(text(cold.instance.lastFrame())).toContain('laying out the page');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    await settle();
+    expect(text(cold.instance.lastFrame())).toContain('✗ in-pane view: the browser exited (code 3) · r opens it in the browser');
+    expect(text(cold.instance.lastFrame())).not.toContain('laying out the page');
+    expect(topLine(cold.instance.lastFrame())).toBe(was);
+    cold.instance.unmount();
+  });
+
+  it('goes back to the diff when the tiles on screen still haven\'t come after 5 s', async () => {
+    const {instance} = setup({tile: () => new Promise(() => undefined)});
+    await settle();
+    await press(instance, 'v');
+    expect(text(instance.lastFrame())).toContain('rendered here');
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+    await settle();
+    expect(text(instance.lastFrame())).toContain('rendered here');
+    await new Promise((resolve) => setTimeout(resolve, 1_300));
+    await settle();
+    const shown = text(instance.lastFrame());
+    expect(shown).toContain("✗ in-pane view: the page didn't draw within 5 s · r opens it in the browser");
+    expect(shown).toContain('A new paragraph.');
+    expect(shown).not.toContain('rendered here');
+    instance.unmount();
+  }, 20_000);
+
+  it('ends the crossing it held on the way in, back on the diff', async () => {
+    // The tile fails once the crossing holds for it.
+    let failTile: () => void = () => undefined;
+    // No other page whose rows would wait in shade.
+    const {instance} = setup({files: [PAGE, CODE], animations: true, tile: () => new Promise((resolve) => {
+      failTile = () => resolve({ok: false, state: 'error', reason: 'the browser exited (code 3)'});
+    })});
+    await settle();
+    await press(instance, 'v');
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    await settle();
+    expect(text(instance.lastFrame())).toContain('developing');
+    const before = instance.frames.length;
+    failTile();
+    await settle();
+    // Long enough for a crossing that went on to play out to its end.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await settle();
+    const after = instance.frames.slice(before).map(text);
+    const failed = after.findIndex((frame) => frame.includes('✗ in-pane view: the browser exited (code 3)'));
+    expect(failed).toBeGreaterThanOrEqual(0);
+    // No frame from the toast on draws the crossing: no scanline, no shade, no developing.
+    for (const frame of after.slice(failed)) {
+      expect(frame).not.toContain('developing');
+      expect(frame).not.toMatch(/[▀░▒▓]/);
+      expect(frame).toContain('A new paragraph.');
+    }
+    instance.unmount();
+  });
+
+  it('stays off for the session after the browser gave up, and v says why', async () => {
+    const {instance} = setup({tile: async () => ({ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited 3 times in a minute', tilesOff: true})});
+    await settle();
+    await press(instance, 'v');
+    const turnedOff = '✗ in-pane view turned off: the browser exited 3 times in a minute · r opens it in the browser';
+    let shown = text(instance.lastFrame());
+    expect(shown).toContain(turnedOff);
+    expect(shown).toContain('A new paragraph.');
+    // Once the toast is gone, the footer names no v.
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    await settle();
+    shown = text(instance.lastFrame());
+    expect(shown).not.toContain(turnedOff);
+    expect(shown).not.toContain('v here');
+    await press(instance, 'v');
+    shown = text(instance.lastFrame());
+    expect(shown).toContain(turnedOff);
+    expect(decodePlaceholders(instance.lastFrame())).toEqual([]);
     instance.unmount();
   });
 });

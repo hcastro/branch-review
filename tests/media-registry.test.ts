@@ -212,6 +212,39 @@ describe('image registry budgets and pools', () => {
     expect(instance.liveCount('page')).toBe(sent);
   });
 
+  it('says whether one more tile fits once every image off screen is let go, counting only media on screen within the shared budget', () => {
+    const {instance} = pooled({page: {maxLive: 50}});
+    const keys = Array.from({length: 12}, (_, index) => `page:${index}`);
+    for (const key of keys) instance.acquire(key, TILE, 131, 40, undefined, 'page');
+    // The pool is full, but only two of its tiles are on screen.
+    expect(instance.fits(TILE, undefined, 'page')).toBe(false);
+    expect(instance.fitsOnScreen(TILE, new Set(keys.slice(0, 2)), 'page')).toBe(true);
+    // With all twelve on screen, there is no room for a thirteenth.
+    expect(instance.fitsOnScreen(TILE, new Set(keys), 'page')).toBe(false);
+    // Media previews their last sweep kept on screen count in the decoded
+    // budget both pools share.
+    const media = pooled();
+    const mediaKeys = Array.from({length: 25}, (_, at) => `media-${at}`);
+    for (const key of mediaKeys) media.instance.acquire(key, TILE, 131, 40);
+    media.instance.sweep(new Set(mediaKeys), new Set(mediaKeys));
+    expect(media.instance.fitsOnScreen(TILE, new Set(), 'page')).toBe(false);
+    expect(media.instance.fitsOnScreen(pngHeaderOnly(100, 100), new Set(), 'page')).toBe(true);
+    // Off screen, the media sweep lets them go once a tile is live, so they
+    // leave room: nine screenshots seen earlier in the review, 204 MB.
+    media.instance.sweep(new Set(mediaKeys), new Set());
+    expect(media.instance.fitsOnScreen(TILE, new Set(), 'page')).toBe(true);
+    const shots = pooled();
+    const shotKeys = Array.from({length: 9}, (_, at) => `shot-${at}`);
+    for (const key of shotKeys) shots.instance.acquire(key, pngHeaderOnly(3024, 1964), 10, 10);
+    shots.instance.sweep(new Set(shotKeys), new Set());
+    expect(shots.instance.decodedBytes('media')).toBeGreaterThan(192 * MB);
+    expect(shots.instance.fitsOnScreen(TILE, new Set(), 'page')).toBe(true);
+    // Which the media sweep does once the tile is in.
+    shots.instance.acquire('page:0', TILE, 131, 40, undefined, 'page');
+    shots.instance.sweep(new Set(shotKeys), new Set());
+    expect(shots.instance.decodedBytes()).toBeLessThanOrEqual(192 * MB);
+  });
+
   it('keeps every image within 192 MB decoded across both pools', () => {
     const {instance} = pooled({maxDecoded: 192 * MB, maxBytes: 1024 * MB});
     const big = pngHeaderOnly(4096, 4096);

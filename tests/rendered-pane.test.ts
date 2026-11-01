@@ -48,8 +48,10 @@ const FRAGMENT: FragmentRequest = {cwd: '/repo', key: 'frag-abc', path: 'docs/pa
 // The worker names a tile document by what it draws; here, by its fragment.
 const documentOf = (request: LayoutRequest) => `doc-${request.source.fragment.key}`;
 
-function setup({env = {BRANCH_REVIEW_PANE: 'on'}, caps = CAPS, chrome = true, layout = async (request): Promise<LayoutResult> => ({ok: true, layout: LAYOUT, document: documentOf(request)}), tile, disabled = null as string | null | (() => string | null), registry: registryOptions = {}, now}: {
+function setup({env = {BRANCH_REVIEW_PANE: 'on'}, caps = CAPS, chrome = true, layout = async (request): Promise<LayoutResult> => ({ok: true, layout: LAYOUT, document: documentOf(request)}), tile, disabled = null as string | null | (() => string | null), registry: registryOptions = {}, now, browserOpens}: {
   env?: NodeJS.ProcessEnv;
+  // False where `r` opens nothing, as over SSH.
+  browserOpens?: boolean;
   caps?: typeof CAPS | typeof BLOCKS_CAPS;
   chrome?: boolean;
   layout?: (request: LayoutRequest) => Promise<LayoutResult>;
@@ -83,6 +85,7 @@ function setup({env = {BRANCH_REVIEW_PANE: 'on'}, caps = CAPS, chrome = true, la
     chrome: () => (chrome ? {path: '/fake/chrome-headless-shell', headless: '--headless'} : null),
     source: (fileKey) => (fileKey === 'docs/page.md' ? {fragment: FRAGMENT, base: 'main'} : null),
     fileForAlias: (alias) => (alias === OTHER_ALIAS ? 'docs/other.md' : null),
+    ...(browserOpens === undefined ? {} : {browserOpens}),
   });
   return {pane, registry, writes, layouts, tiles};
 }
@@ -98,18 +101,58 @@ async function ready(env = setup()) {
 }
 
 describe('whether the pane is offered', () => {
-  it('is offered only with BRANCH_REVIEW_PANE=on in a terminal that draws Kitty images', () => {
-    expect(setup().pane.offered()).toBe(true);
-    expect(setup({env: {}}).pane.offered()).toBe(false);
-    expect(setup({env: {BRANCH_REVIEW_PANE: 'off'}}).pane.offered()).toBe(false);
+  it('is offered by default in a terminal that draws Kitty images, and BRANCH_REVIEW_PANE=off, 0, false or none turns it off', () => {
+    expect(setup({env: {}}).pane.offered()).toBe(true);
+    expect(setup({env: {BRANCH_REVIEW_PANE: 'on'}}).pane.offered()).toBe(true);
+    for (const value of ['off', '0', 'false', 'none', 'OFF', ' False ']) expect(setup({env: {BRANCH_REVIEW_PANE: value}}).pane.offered()).toBe(false);
+    // A value it doesn't know changes nothing.
+    expect(setup({env: {BRANCH_REVIEW_PANE: 'yes'}}).pane.offered()).toBe(true);
     expect(setup({caps: {...BLOCKS_CAPS, bg: '#000000', scheme: 'dark'} as typeof CAPS}).pane.offered()).toBe(false);
+  });
+
+  it('is advertised only where it can draw: Chromium found, the cell size known, and not turned off for the session', async () => {
+    expect(setup({env: {}}).pane.advertised()).toBe(true);
+    expect(setup({env: {BRANCH_REVIEW_PANE: 'off'}}).pane.advertised()).toBe(false);
+    expect(setup({chrome: false}).pane.advertised()).toBe(false);
+    expect(setup({caps: {...CAPS, cellPxSource: 'csi14'}}).pane.advertised()).toBe(false);
+    const env = await ready(setup({tile: async () => ({ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited (code 3)', tilesOff: true})}));
+    const box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    await flush();
+    expect(env.pane.advertised()).toBe(false);
+  });
+
+  it('is not advertised once the rendered worker turned off, though v was never pressed, and v says why', () => {
+    const {pane} = setup({env: {}, disabled: 'rendered view turned off: the worker exited 3 times in a minute'});
+    expect(pane.offered()).toBe(true);
+    expect(pane.advertised()).toBe(false);
+    expect(pane.enter()).toEqual({ok: false, message: '✗ rendered view turned off: the worker exited 3 times in a minute'});
   });
 
   it('names Chrome and r when no browser is found, and stays on the diff', () => {
     const {pane} = setup({chrome: false});
+    expect(pane.offered()).toBe(true);
     expect(pane.enter()).toEqual({ok: false, message: PANE_NEEDS_CHROME});
-    expect(PANE_NEEDS_CHROME).toBe('the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · r opens it rendered');
+    expect(PANE_NEEDS_CHROME).toBe('the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · r opens it in the browser');
     expect(pane.mode()).toBe('diff');
+  });
+
+  it('names the pages --render-out writes in place of r where r opens nothing, as over SSH', async () => {
+    const ssh = {BRANCH_REVIEW_PANE: 'on', SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22'};
+    const headless = 'branch-review --render-out <dir> writes the pages';
+    expect(setup({env: ssh, browserOpens: false, chrome: false}).pane.enter()).toEqual({ok: false, message: `the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · ${headless}`});
+
+    const layout = setup({env: ssh, browserOpens: false, layout: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    layout.pane.focus('docs/page.md');
+    await ready(layout);
+    expect(layout.pane.takeNotices()).toEqual([`✗ in-pane view: timed out · ${headless}`]);
+
+    const strikes = await ready(setup({env: ssh, browserOpens: false, tile: async () => ({ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited (code 3)', tilesOff: true})}));
+    const box = boxRows(strikes.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    strikes.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    await flush();
+    expect(strikes.pane.takeNotices()).toEqual([`✗ in-pane view turned off: the browser exited (code 3) · ${headless}`]);
+    expect(strikes.pane.enter()).toEqual({ok: false, message: `✗ in-pane view turned off: the browser exited (code 3) · ${headless}`});
   });
 
   it('names the cell size when the terminal didn\'t report it, since a tile sized from a guess is scaled', () => {
@@ -217,29 +260,40 @@ describe('a page in the pane', () => {
     expect(after[0]!.boxes[0]!.imageKey).toContain('frag-def');
   });
 
-  it('says why when the layout fails, and asks again for a new geometry or on the next v', async () => {
-    let fails = true;
-    const {pane, layouts} = setup({layout: async (request) => (fails ? {ok: false, state: 'error', reason: 'the browser exited (code 3)'} : {ok: true, layout: LAYOUT, document: documentOf(request)})});
-    pane.enter();
-    pane.rows('docs/page.md', GEOM);
-    await flush();
-    const rows = pane.rows('docs/page.md', GEOM);
-    expect(JSON.stringify(rows)).toContain('the browser exited (code 3)');
-    // Not on every redraw: the row says why until the reader acts.
-    expect(layouts).toHaveLength(1);
-    pane.rows('docs/page.md', {...GEOM, innerCols: 120});
-    expect(layouts).toHaveLength(2);
-    // The browser starts anew after a crash: leaving and coming back asks again, and draws the page.
-    fails = false;
-    pane.leave();
-    pane.enter();
-    pane.rows('docs/page.md', GEOM);
-    expect(layouts).toHaveLength(3);
-    await flush();
-    expect(boxRows(pane.rows('docs/page.md', GEOM))).toHaveLength(150);
+  it('goes back to the diff for the file when its layout fails, with one toast, and asks again only on the next v', async () => {
+    for (const failure of [
+      {state: 'error' as const, reason: 'the browser exited (code 3)'},
+      // A cold Chromium that never came up: the job's deadline.
+      {state: 'error' as const, reason: 'timed out'},
+    ]) {
+      let fails = true;
+      const {pane, layouts} = setup({layout: async (request) => (fails ? {ok: false, ...failure} : {ok: true, layout: LAYOUT, document: documentOf(request)})});
+      // The reader is on the file.
+      pane.focus('docs/page.md');
+      pane.enter();
+      pane.rows('docs/page.md', GEOM);
+      expect(pane.shows('docs/page.md')).toBe(true);
+      await flush();
+      expect(pane.shows('docs/page.md')).toBe(false);
+      expect(pane.rows('docs/page.md', GEOM)).toEqual([]);
+      expect(pane.takeNotices()).toEqual([`✗ in-pane view: ${failure.reason} · r opens it in the browser`]);
+      // The pane stays on for other files; this one stays on its diff, at any width.
+      expect(pane.mode()).toBe('rendered');
+      pane.rows('docs/page.md', {...GEOM, innerCols: 120});
+      expect(layouts).toHaveLength(1);
+      expect(pane.takeNotices()).toEqual([]);
+      // The browser starts anew after a crash: the next v asks again, and draws the page.
+      fails = false;
+      expect(pane.enter()).toEqual({ok: true});
+      expect(pane.shows('docs/page.md')).toBe(true);
+      pane.rows('docs/page.md', GEOM);
+      expect(layouts).toHaveLength(2);
+      await flush();
+      expect(boxRows(pane.rows('docs/page.md', GEOM))).toHaveLength(150);
+    }
   });
 
-  it('cuts a tile that failed once more on the next v, and draws it', async () => {
+  it('goes back to the diff for the file when a tile fails, and cuts it again on the next v', async () => {
     let fails = true;
     const env = await ready(setup({tile: async (request) => (fails
       ? {ok: false, state: 'error', reason: 'the browser exited (code 3)'}
@@ -251,15 +305,190 @@ describe('a page in the pane', () => {
       await flush();
     };
     await want();
-    expect(env.pane.boxState(box)).toEqual({status: 'error', reason: 'the browser exited (code 3)'});
-    await want();
+    expect(env.pane.shows('docs/page.md')).toBe(false);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: the browser exited (code 3) · r opens it in the browser']);
+    // Back on the diff, nothing more is cut for that file.
+    env.pane.want([], new Set());
+    env.pane.sweep(new Set(), new Set());
+    await flush();
     expect(env.tiles).toHaveLength(1);
     fails = false;
-    env.pane.leave();
     env.pane.enter();
+    expect(boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!.imageKey).toBe(box.imageKey);
     await want();
     expect(env.tiles).toHaveLength(2);
     expect(env.pane.boxState(box).status).toBe('kitty');
+    expect(env.pane.shows('docs/page.md')).toBe(true);
+  });
+
+  it('goes back to the diff for the file when the screen still waits for its page after 5 s, and not before', async () => {
+    vi.useFakeTimers();
+    try {
+      // A tile that never comes, as from a Chromium that hangs.
+      const env = setup({tile: () => new Promise(() => undefined)});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      const box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+      env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]), new Set(['docs/page.md']));
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(env.pane.shows('docs/page.md')).toBe(true);
+      expect(env.pane.takeNotices()).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(env.pane.shows('docs/page.md')).toBe(false);
+      expect(env.pane.takeNotices()).toEqual(["✗ in-pane view: the page didn't draw within 5 s · r opens it in the browser"]);
+
+      // A page still laying out is no hold: the layout job's own deadline,
+      // long enough for Chromium's cold start, says when it failed.
+      let answerLayout: (result: LayoutResult) => void = () => undefined;
+      const cold = setup({layout: () => new Promise((resolve) => {
+        answerLayout = resolve;
+      })});
+      cold.pane.enter();
+      cold.pane.rows('docs/page.md', GEOM);
+      cold.pane.want([], new Set(), new Set(['docs/page.md']));
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(cold.pane.shows('docs/page.md')).toBe(true);
+      expect(cold.pane.takeNotices()).toEqual([]);
+      answerLayout({ok: false, state: 'error', reason: 'timed out'});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cold.pane.shows('docs/page.md')).toBe(false);
+      expect(cold.pane.takeNotices()).toEqual(['✗ in-pane view: timed out · r opens it in the browser']);
+
+      // A tile that comes at 4 s, and the screen that moves on from one that
+      // didn't, never fail.
+      let answer: (png: Uint8Array) => void = () => undefined;
+      const slow = setup({tile: () => new Promise((resolve) => {
+        answer = (png) => resolve({ok: true, png});
+      })});
+      slow.pane.enter();
+      slow.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      const boxes = [...new Map(boxRows(slow.pane.rows('docs/page.md', GEOM)).map((row) => [row.boxes[0]!.imageKey, row.boxes[0]!])).values()];
+      const first = boxes[0]!;
+      slow.pane.subscribe(() => slow.pane.want([{fileKey: 'docs/page.md', box: first}], new Set([first.imageKey]), new Set(['docs/page.md'])));
+      slow.pane.want([{fileKey: 'docs/page.md', box: first}], new Set([first.imageKey]), new Set(['docs/page.md']));
+      await vi.advanceTimersByTimeAsync(4_000);
+      answer(pngHeaderOnly(first.cols * 10, first.rows * 20));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(slow.pane.boxState(first).status).toBe('kitty');
+      const second = boxes[1]!;
+      slow.pane.want([{fileKey: 'docs/page.md', box: second}], new Set([second.imageKey]), new Set(['docs/page.md']));
+      await vi.advanceTimersByTimeAsync(3_000);
+      // Scrolled back to the tile that is in, before the second waited 5 s.
+      slow.pane.want([{fileKey: 'docs/page.md', box: first}], new Set([first.imageKey]), new Set(['docs/page.md']));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(slow.pane.shows('docs/page.md')).toBe(true);
+      expect(slow.pane.takeNotices()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the page whose tile on screen came just inside the hold, though no want ran before the hold ended', async () => {
+    vi.useFakeTimers();
+    try {
+      let answer: () => void = () => undefined;
+      const env = setup({tile: (request) => new Promise((resolve) => {
+        answer = () => {
+          const range = request.source.geometry;
+          resolve({ok: true, png: pngHeaderOnly(range.sheetCols * range.cellPx.w, Math.min(range.tileRows, request.rows - request.index * range.tileRows) * range.cellPx.h)});
+        };
+      })});
+      env.pane.enter();
+      env.pane.rows('docs/page.md', GEOM);
+      await vi.advanceTimersByTimeAsync(0);
+      const box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+      env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]), new Set(['docs/page.md']));
+      env.pane.sweep(new Set([box.imageKey]), new Set([box.imageKey]));
+      await vi.advanceTimersByTimeAsync(4_990);
+      answer();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(env.pane.boxState(box).status).toBe('kitty');
+      // The app's next want runs after its next commit, which the hold's end comes before.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(env.pane.shows('docs/page.md')).toBe(true);
+      expect(env.pane.takeNotices()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('goes back to the diff for the file, with no shade rows, when the terminal has no room left for a tile on screen', async () => {
+    // A page pool smaller than one tile, decoded.
+    const tight = await ready(setup({registry: {maxDecoded: 1024}}));
+    const box = boxRows(tight.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    tight.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    tight.pane.sweep(new Set([box.imageKey]), new Set([box.imageKey]));
+    await flush();
+    expect(tight.registry.liveCount('page')).toBe(0);
+    expect(tight.pane.shows('docs/page.md')).toBe(false);
+    expect(tight.pane.takeNotices()).toEqual(["✗ in-pane view: the terminal's image memory is full · r opens it in the browser"]);
+
+    // Every terminal image id live: none will come free.
+    const full = await ready();
+    for (let at = 0; at < 255; at += 1) full.registry.acquire(`other-${at}`, pngHeaderOnly(10, 10), 1, 1);
+    const fullBox = boxRows(full.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    full.pane.want([{fileKey: 'docs/page.md', box: fullBox}], new Set([fullBox.imageKey]));
+    full.pane.sweep(new Set([fullBox.imageKey]), new Set([fullBox.imageKey]));
+    await flush();
+    expect(full.pane.shows('docs/page.md')).toBe(false);
+    expect(full.pane.takeNotices()).toEqual(['✗ in-pane view: every terminal image id is in use · r opens it in the browser']);
+  });
+
+  it('draws a tile on screen though media previews off screen fill the shared budget, since their sweep lets them go', async () => {
+    const env = await ready();
+    // Nine screenshots seen earlier in the review, 204 MB decoded, still named by rows but off screen.
+    const shots = Array.from({length: 9}, (_, at) => `media-${at}`);
+    for (const key of shots) env.registry.acquire(key, pngHeaderOnly(3024, 1964), 10, 10);
+    env.registry.sweep(new Set(shots), new Set());
+    const box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    env.pane.sweep(new Set([box.imageKey]), new Set([box.imageKey]));
+    await flush();
+    expect(env.pane.shows('docs/page.md')).toBe(true);
+    expect(env.pane.boxState(box).status).toBe('kitty');
+    expect(env.pane.takeNotices()).toEqual([]);
+  });
+
+  it('looks for no Chromium and lays nothing out until the first v', async () => {
+    let looked = 0;
+    let laidOut = 0;
+    const env = setup();
+    const pane = createRenderedPane({
+      backend: {
+        layout: async (request) => {
+          laidOut += 1;
+          return {ok: true, layout: LAYOUT, document: documentOf(request)};
+        },
+        tile: async () => ({ok: false, state: 'error', reason: 'unused'}),
+        disabledReason: () => null,
+      },
+      registry: env.registry,
+      caps: CAPS,
+      env: {},
+      chrome: () => {
+        looked += 1;
+        return {path: '/fake/chrome-headless-shell', headless: '--headless'};
+      },
+      source: (fileKey) => (fileKey === 'docs/page.md' ? {fragment: FRAGMENT, base: 'main'} : null),
+      fileForAlias: () => null,
+    });
+    // What the app asks of a review on a file that isn't markdown, before any v.
+    expect(pane.offered()).toBe(true);
+    expect(pane.covers('src/app.ts')).toBe(false);
+    expect(pane.shows('docs/page.md')).toBe(false);
+    pane.want([], new Set(), new Set());
+    pane.sweep(new Set(), new Set());
+    pane.sourcesChanged();
+    await flush();
+    expect(looked).toBe(0);
+    expect(laidOut).toBe(0);
+    // The first v looks for it, and the page's rows ask for the layout.
+    expect(pane.enter()).toEqual({ok: true});
+    expect(looked).toBeGreaterThan(0);
+    pane.rows('docs/page.md', GEOM);
+    expect(laidOut).toBe(1);
   });
 
   it('lays out the active file\'s page ahead of the other pages, and moves a waiting one ahead when it becomes active', async () => {
@@ -511,29 +740,29 @@ describe('a page in the pane', () => {
     expect(after).toHaveLength(150);
   });
 
-  it('gives up on a tile still too large at 20 rows, and says so, after asking twice', async () => {
+  it('gives up on a tile still too large at 20 rows after asking twice, and goes back to the diff for the file', async () => {
     const env = await ready(setup({tile: async () => ({ok: false, state: 'error', reason: 'tile too large', tooLarge: true})}));
     let box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
-    // As the app does: rows, then want, after every change.
-    for (let round = 0; round < 30; round += 1) {
+    // As the app does: rows, then want, after every change, while the file's page shows.
+    for (let round = 0; round < 30 && env.pane.shows('docs/page.md'); round += 1) {
       box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
       env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
       env.pane.sweep(new Set([box.imageKey]), new Set([box.imageKey]));
       await flush();
     }
     expect(env.tiles.map((tile) => tile.source.geometry.tileRows)).toEqual([40, 20]);
-    expect(env.pane.boxState(box)).toEqual({status: 'error', reason: 'too large · r opens it rendered'});
-    expect(env.pane.ready(new Set([box.imageKey]))).toBe(true);
+    expect(env.pane.shows('docs/page.md')).toBe(false);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: a part of the page is too large to draw here · r opens it in the browser']);
   });
 
-  it('turns itself off, back on the diff, when the browser gave up, and says r still works', async () => {
+  it('turns itself off for the session, back on the diff, when the browser gave up, and v says why', async () => {
     const env = await ready(setup({tile: async () => ({ok: false, state: 'unavailable', reason: 'in-pane view turned off: the browser exited (code 3)', tilesOff: true})}));
     const box = boxRows(env.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
     env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
     await flush();
     expect(env.pane.mode()).toBe('diff');
-    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view turned off: the browser exited (code 3) · r still works']);
-    expect(env.pane.enter()).toEqual({ok: false, message: '✗ in-pane view turned off: the browser exited (code 3) · r still works'});
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view turned off: the browser exited (code 3) · r opens it in the browser']);
+    expect(env.pane.enter()).toEqual({ok: false, message: '✗ in-pane view turned off: the browser exited (code 3) · r opens it in the browser'});
   });
 
   it('turns itself off, back on the diff, when the rendered worker gave up on a tile', async () => {
@@ -549,7 +778,7 @@ describe('a page in the pane', () => {
     env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
     await flush();
     expect(env.pane.mode()).toBe('diff');
-    expect(env.pane.takeNotices()).toEqual(['✗ rendered view turned off: timed out']);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: rendered view turned off: timed out']);
     expect(env.pane.boxState(box)).toEqual({status: 'loading'});
   });
 
@@ -562,7 +791,7 @@ describe('a page in the pane', () => {
     disabled = 'rendered view turned off: the worker crashed';
     env.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
     expect(env.pane.mode()).toBe('diff');
-    expect(env.pane.takeNotices()).toEqual(['✗ rendered view turned off: the worker crashed']);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: rendered view turned off: the worker crashed']);
   });
 });
 
@@ -716,7 +945,7 @@ describe('the document each tile is cut from', () => {
     expect(env.pane.mosaic(old)).toBeNull();
   });
 
-  it('says the layout failed when the retry of a late layout fails after the worker let its document go, and v asks again', async () => {
+  it('goes back to the diff for the file when the retry of a late layout fails after the worker let its document go, and v asks again', async () => {
     let calls = 0;
     let failRetry: (result: LayoutResult) => void = () => undefined;
     const env = setup({
@@ -740,8 +969,8 @@ describe('the document each tile is cut from', () => {
     failRetry({ok: false, state: 'error', reason: 'the browser exited (signal SIGKILL)'});
     await flush();
     await flush();
-    const rows = JSON.stringify(env.pane.rows('docs/page.md', GEOM));
-    expect(rows).toContain("couldn't lay out the page · the browser exited (signal SIGKILL)");
+    expect(env.pane.shows('docs/page.md')).toBe(false);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: the browser exited (signal SIGKILL) · r opens it in the browser']);
     // Nothing more is asked by itself; the next v asks again and draws.
     await new Promise((resolve) => setTimeout(resolve, 1_200));
     expect(env.layouts).toHaveLength(2);
@@ -819,7 +1048,7 @@ describe('asking again for a page already drawn', () => {
       const after = env.pane.rows('docs/page.md', GEOM);
       expect(JSON.stringify(after)).not.toContain("couldn't lay out the page");
       expect(boxRows(after).map((row) => row.boxes[0]!.imageKey)).toEqual(drawn);
-      expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
+      expect(env.pane.shows('docs/page.md')).toBe(true);
       expect(env.pane.mode()).toBe('rendered');
       expect(env.pane.takeNotices()).toEqual([]);
     } finally {
@@ -871,6 +1100,8 @@ describe('asking again for a page already drawn', () => {
       const rows = env.pane.rows('docs/page.md', GEOM);
       expect(JSON.stringify(rows)).not.toContain("couldn't lay out the page");
       expect(boxRows(rows)[0]!.boxes[0]!.imageKey).toContain('doc-late');
+      expect(env.pane.shows('docs/page.md')).toBe(true);
+      expect(env.pane.takeNotices()).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
@@ -890,30 +1121,135 @@ describe('asking again for a page already drawn', () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(env.layouts).toHaveLength(2);
       expect(env.pane.mode()).toBe('diff');
-      expect(env.pane.takeNotices()).toEqual(['✗ in-pane view turned off: the browser exited (code 3) · r still works']);
+      expect(env.pane.takeNotices()).toEqual(['✗ in-pane view turned off: the browser exited (code 3) · r opens it in the browser']);
     } finally {
       vi.useRealTimers();
     }
   });
 });
 
+describe('telling the screen a page failed', () => {
+  // How often the pane told its listeners since this was called.
+  const counted = (pane: ReturnType<typeof setup>['pane']) => {
+    let told = 0;
+    pane.subscribe(() => {
+      told += 1;
+    });
+    return () => told;
+  };
+
+  it('tells its listeners once per failure, so the rows above the screen change in one step', async () => {
+    // A layout that fails.
+    const layout = setup({layout: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    layout.pane.enter();
+    const toldLayout = counted(layout.pane);
+    layout.pane.rows('docs/page.md', GEOM);
+    await flush();
+    expect(layout.pane.shows('docs/page.md')).toBe(false);
+    expect(toldLayout()).toBe(1);
+
+    // A tile that fails.
+    const tile = await ready(setup({tile: async () => ({ok: false, state: 'error', reason: 'the browser exited (code 3)'})}));
+    const box = boxRows(tile.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    const toldTile = counted(tile.pane);
+    tile.pane.want([{fileKey: 'docs/page.md', box}], new Set([box.imageKey]));
+    await flush();
+    expect(tile.pane.shows('docs/page.md')).toBe(false);
+    expect(toldTile()).toBe(1);
+
+    // A worker that gave up as the page was laid out.
+    let disabled: string | null = null;
+    const worker = setup({disabled: () => disabled, layout: async () => {
+      disabled = 'rendered view turned off: timed out';
+      return {ok: false, state: 'unavailable', reason: 'rendered view turned off: timed out'};
+    }});
+    worker.pane.enter();
+    const toldWorker = counted(worker.pane);
+    worker.pane.rows('docs/page.md', GEOM);
+    await flush();
+    expect(worker.pane.mode()).toBe('diff');
+    expect(toldWorker()).toBe(1);
+
+    // A screen with no room for its tile.
+    const tight = await ready(setup({registry: {maxDecoded: 1024}}));
+    const tightBox = boxRows(tight.pane.rows('docs/page.md', GEOM))[0]!.boxes[0]!;
+    tight.pane.want([{fileKey: 'docs/page.md', box: tightBox}], new Set([tightBox.imageKey]));
+    await flush();
+    // The tile is cut; the next want finds no room for it.
+    const toldTight = counted(tight.pane);
+    tight.pane.want([{fileKey: 'docs/page.md', box: tightBox}], new Set([tightBox.imageKey]));
+    expect(tight.pane.shows('docs/page.md')).toBe(false);
+    expect(toldTight()).toBe(1);
+  });
+
+  it('says nothing of a page that fails off screen while the reader is on another file, until the reader gets there', async () => {
+    const {pane} = setup({layout: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    pane.focus('docs/other.md');
+    pane.enter();
+    pane.rows('docs/page.md', GEOM);
+    // The screen shows another file.
+    pane.want([], new Set(), new Set(['docs/other.md']));
+    await flush();
+    expect(pane.shows('docs/page.md')).toBe(false);
+    expect(pane.takeNotices()).toEqual([]);
+    let told = 0;
+    pane.subscribe(() => {
+      told += 1;
+    });
+    pane.focus('docs/page.md');
+    expect(told).toBe(1);
+    expect(pane.takeNotices()).toEqual(['✗ in-pane view: timed out · r opens it in the browser']);
+    // Said once.
+    pane.focus('docs/other.md');
+    pane.focus('docs/page.md');
+    expect(pane.takeNotices()).toEqual([]);
+
+    // On screen though the reader is on another file, it is said at once.
+    const shown = setup({layout: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    shown.pane.focus('docs/other.md');
+    shown.pane.enter();
+    shown.pane.rows('docs/page.md', GEOM);
+    shown.pane.want([], new Set(), new Set(['docs/other.md', 'docs/page.md']));
+    await flush();
+    expect(shown.pane.takeNotices()).toEqual(['✗ in-pane view: timed out · r opens it in the browser']);
+  });
+
+  it('says nothing of a page that failed off screen once v went back to the diff, when the reader gets there later', async () => {
+    const {pane} = setup({layout: async () => ({ok: false, state: 'error', reason: 'timed out'})});
+    pane.focus('docs/other.md');
+    pane.enter();
+    pane.rows('docs/page.md', GEOM);
+    pane.want([], new Set(), new Set(['docs/other.md']));
+    await flush();
+    expect(pane.takeNotices()).toEqual([]);
+    pane.leave();
+    expect(pane.mode()).toBe('diff');
+    pane.focus('docs/page.md');
+    expect(pane.takeNotices()).toEqual([]);
+  });
+});
+
 describe('a resize whose new layout fails', () => {
-  it('says the layout failed, so a place kept for the resize lets go, and is no failure back at the width it drew at', async () => {
+  it('goes back to the diff for the file, with one toast, and stays there at the width it drew at until the next v', async () => {
     let calls = 0;
     const env = setup({layout: async (request) => {
       calls += 1;
       return calls === 1 ? {ok: true, layout: LAYOUT, document: documentOf(request)} : {ok: false, state: 'error', reason: 'the browser exited (code 3)'};
     }});
     await ready(env);
+    env.pane.focus('docs/page.md');
     const narrow = {...GEOM, innerCols: 120};
     env.pane.rows('docs/page.md', narrow);
     // On its way, not failed yet.
-    expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
+    expect(env.pane.shows('docs/page.md')).toBe(true);
     await flush();
-    expect(JSON.stringify(env.pane.rows('docs/page.md', narrow))).toContain("couldn't lay out the page · the browser exited (code 3)");
-    expect(env.pane.layoutFailed('docs/page.md')).toBe(true);
+    expect(env.pane.shows('docs/page.md')).toBe(false);
+    expect(env.pane.takeNotices()).toEqual(['✗ in-pane view: the browser exited (code 3) · r opens it in the browser']);
+    expect(env.pane.rows('docs/page.md', GEOM)).toEqual([]);
+    // The page drawn before still answers where the reader was.
+    expect(env.pane.lineAtRow('docs/page.md', 3)).toBe(3);
+    env.pane.enter();
     expect(boxRows(env.pane.rows('docs/page.md', GEOM))).toHaveLength(150);
-    expect(env.pane.layoutFailed('docs/page.md')).toBe(false);
   });
 });
 

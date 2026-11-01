@@ -31,6 +31,8 @@ export type SiteKeep = {
   current: ReadonlyMap<string, string>;
   /** Pages a file showed before its newest, worth keeping while there is room. */
   previous: ReadonlySet<string>;
+  /** Pages on their way to a browser, kept like a file's newest. */
+  sending?: ReadonlySet<string>;
 };
 
 export function createRenderedSite({tempDir, now = Date.now, maxBytes = DEFAULT_MAX_BYTES}: {tempDir: () => string; now?: () => number; maxBytes?: number}) {
@@ -107,14 +109,14 @@ export function createRenderedSite({tempDir, now = Date.now, maxBytes = DEFAULT_
     },
     /**
      * Removes every page no file shows now or showed just before, unless it
-     * was shown in the last two minutes, and every stable name of a file that
-     * left the review. Past the disk budget, kept pages that no file shows
-     * now go too, oldest first.
+     * was shown in the last two minutes or is on its way to be, and every
+     * stable name of a file that left the review. Past the disk budget,
+     * kept pages that no file shows now go too, oldest first.
      */
-    prune({current, previous}: SiteKeep) {
+    prune({current, previous, sending = new Set()}: SiteKeep) {
       if (!dir) return;
       const at = now();
-      const currentKeys = new Set(current.values());
+      const currentKeys = new Set([...current.values(), ...sending]);
       const kept = new Map<string, {bytes: number; written: number}>();
       let names: string[];
       try {

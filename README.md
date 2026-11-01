@@ -114,7 +114,7 @@ To read a changed markdown file as the page GitHub would show, press `r`. The pa
 
 The page opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the rendered page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
 
-To read the page inside the diff pane in Ghostty, cmux, or Kitty, start `branch-review` with `BRANCH_REVIEW_PANE=on` and press `v` on a markdown file. A headless Chromium already on disk draws the page there, with the change marks in the margin, and `v` again brings the diff back. This view is turned off by default.
+To read the page inside the diff pane in Ghostty, cmux, or Kitty, press `v` on a markdown file. A headless Chromium already on disk draws the page there, with the change marks in the margin, and `v` again brings the diff back. When the page can't be drawn, the pane goes back to the diff where you were reading, and the footer says why. To turn this view off, set `BRANCH_REVIEW_PANE=off`.
 
 On a changed image or SVG, `r` opens a page that compares its versions side by side, by flipping, or as a difference, on the same `1`, `2`, and `3` keys as the diff, and names the lines of the review's markdown that show it. A markdown file the branch didn't touch gets a page too when it shows an image the branch changed, since it will look different on GitHub. Each page draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading, and the overview lists them all.
 
@@ -235,7 +235,7 @@ For `--animations` and `--images`, the last flag of each pair wins.
 | `TERM` | `dumb` turns off color and image previews. `linux`, and `screen*` outside tmux, turn off image previews. |
 | `BRANCH_REVIEW_IMAGES` | `auto`, the default, detects what the terminal can draw. `kitty` forces pictures in a terminal that supports them but isn't recognized. `blocks` forces the block preview. `off`, `none`, `0`, or `false` turns previews off. |
 | `BRANCH_REVIEW_MOTION` | `full`, `reduce`, or `off` sets the motion on the way to a rendered page, in place of the macOS **Reduce motion** setting. |
-| `BRANCH_REVIEW_PANE` | `on` turns on the in-pane view, which draws a markdown file's rendered page in the diff pane on `v`, in a terminal that draws Kitty images. |
+| `BRANCH_REVIEW_PANE` | `off`, `0`, `false`, or `none` turns off the in-pane view, which draws a markdown file's rendered page in the diff pane on `v`, in a terminal that draws Kitty images. `on`, like any other value, leaves it on. |
 | `BRANCH_REVIEW_CHROME` | The absolute path of the headless Chromium or Chrome that the in-pane view draws pages with, in place of the one `branch-review` finds on disk. |
 | `BRANCH_REVIEW_PANE_DPR` | A fixed scale for the in-pane view's pages, such as `2`, in place of the one that makes their text as tall as the terminal's. For comparing the two. |
 | `BRANCH_REVIEW_TMPDIR` | The directory for temp files, such as the private index copy and media files. The default is the system temp directory. |
@@ -256,7 +256,7 @@ The following table lists the keys for moving through a review:
 | `t` | Show or hide the file tree |
 | `r` | Open the rendered page of the markdown, image, or SVG file in view, or of the review's first such file |
 | `R` | Open an overview of every rendered page |
-| `v` | With `BRANCH_REVIEW_PANE=on`, on a markdown file, show its rendered page in the diff pane and back. On the page, `[` and `]` move between changes and `c` copies the markdown of the block at the top. |
+| `v` | On a markdown file, in a terminal that draws Kitty images, show its rendered page in the diff pane and back. On the page, `[` and `]` move between changes and `c` copies the markdown of the block at the top. |
 | `q` / `Esc` / `Control+C` | Quit |
 
 The tree highlights the file at the top of the diff and keeps that row in view as you scroll. That file's header shows its added, deleted, and changed line counts and its place in the review, such as `file 6/8`. Each block header names the file and the block's first line, such as `src/middleware/rateLimit.ts:1:`.

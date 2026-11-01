@@ -7,7 +7,7 @@ import {afterEach, describe, expect, it} from 'vitest';
 import type {DiffRange} from '../src/git.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {EmbeddersRequest, FragmentRequest, FragmentResult, FragmentSummary, LayoutRequest, PageRequest, PageResult, RenderedBackend} from '../src/rendered/backend.js';
-import {createRenderedService} from '../src/rendered/service.js';
+import {createRenderedService, startRenderedService} from '../src/rendered/service.js';
 import type {RunTool} from '../src/rendered/run.js';
 import {createSurface, type Surface} from '../src/rendered/surface.js';
 import {createRenderedSite} from '../src/rendered/site.js';
@@ -1520,6 +1520,44 @@ describe('live refreshes behind a goto cmux is slow to finish', () => {
     expect(gotos.map((url) => /g=([^&]*)/.exec(url)?.[1])).toEqual(['b-0000000b-0,b-0000000c-0']);
   });
 
+  it('keeps the page a refresh is about to show on disk until its goto ends, though newer pages of the file came since', async () => {
+    let ids = ['b-0000000a-0'];
+    const {backend} = scriptedBackend(() => ({ok: true, summary: summary({blocks: blocks(...ids)})}));
+    const cmux = slowGotoCmux();
+    const {service, clock, trip, dir} = openingService(backend, {surface: cmux.surface as unknown as ReturnType<typeof recordingSurface>});
+    const settle = async () => {
+      for (let turn = 0; turn < 40; turn += 1) await clock.advance(0);
+    };
+    const edit = async (next: string, wait: number, ...more: string[]) => {
+      ids = ['b-0000000a-0', ...more];
+      service.setReview(review([edited('docs/guide.md', 'One.\n', next)]), CTX);
+      await clock.advance(wait);
+      await settle();
+    };
+    const onDisk = (url: string) => fs.existsSync(fileURLToPath(url.replace(/#.*$/, '')));
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    // The first refresh's goto is held; the second waits behind it, its page
+    // named only once it goes.
+    await edit('One, edited twice.\n', 1_100, 'b-0000000b-0');
+    await edit('One, edited three times.\n', 1_100, 'b-0000000b-0', 'b-0000000c-0');
+    // Two more edits inside the second: each a newer page, whose refresh
+    // waits for the gap, and whose pass prunes the pages no one shows.
+    await edit('One, edited four times.\n', 300, 'b-0000000d-0');
+    await edit('One, edited five times.\n', 300, 'b-0000000e-0');
+    cmux.release();
+    await settle();
+    expect(cmux.gotos).toHaveLength(2);
+    expect(cmux.gotos.map((url) => path.dirname(fileURLToPath(url.replace(/#.*$/, ''))))).toEqual([dir, dir]);
+    expect(cmux.gotos.map(onDisk)).toEqual([true, true]);
+    // The newest page goes once the gap is up, and is on disk too.
+    await clock.advance(1_500);
+    await settle();
+    expect(cmux.gotos).toHaveLength(3);
+    expect(onDisk(cmux.gotos.at(-1)!)).toBe(true);
+  });
+
   it('still skips the refresh when the reader moved the split to another page as the slow goto ended', async () => {
     const {gotos, release, edit, settle} = await editing('file:///elsewhere/notes.html');
     await edit('One, edited twice.\n', 'b-0000000b-0');
@@ -1593,18 +1631,19 @@ describe('the order of the beam and the split', () => {
   });
 });
 
+// A review entry for an image file, with the patch real git prints for it.
+function imageFile(before: Buffer | null, after: Buffer | null, filePath: string): ReviewFile {
+  const dir = makeTempDir('branch-review-rendered-image-');
+  const left = path.join(dir, `before${path.extname(filePath)}`);
+  const right = path.join(dir, `after${path.extname(filePath)}`);
+  if (before) fs.writeFileSync(left, before);
+  if (after) fs.writeFileSync(right, after);
+  const rawDiff = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--full-index', before ? left : '/dev/null', after ? right : '/dev/null'], {encoding: 'utf8'}).stdout
+    .replaceAll(`a${left}`, `a/${filePath}`).replaceAll(`b${right}`, `b/${filePath}`).replaceAll(left, filePath).replaceAll(right, filePath);
+  return {path: filePath, status: before === null ? 'added' : after === null ? 'deleted' : 'modified', metrics: {path: filePath, additions: 0, deletions: 0, changedLines: 0}, rawDiff, renderedLines: [], blocks: []};
+}
+
 describe('the whole branch', () => {
-  // A review entry for an image file, with the patch real git prints for it.
-  function imageFile(before: Buffer | null, after: Buffer | null, filePath: string): ReviewFile {
-    const dir = makeTempDir('branch-review-rendered-image-');
-    const left = path.join(dir, `before${path.extname(filePath)}`);
-    const right = path.join(dir, `after${path.extname(filePath)}`);
-    if (before) fs.writeFileSync(left, before);
-    if (after) fs.writeFileSync(right, after);
-    const rawDiff = spawnSync('git', ['diff', '--no-index', '--no-color', '--no-ext-diff', '--full-index', before ? left : '/dev/null', after ? right : '/dev/null'], {encoding: 'utf8'}).stdout
-      .replaceAll(`a${left}`, `a/${filePath}`).replaceAll(`b${right}`, `b/${filePath}`).replaceAll(left, filePath).replaceAll(right, filePath);
-    return {path: filePath, status: before === null ? 'added' : after === null ? 'deleted' : 'modified', metrics: {path: filePath, additions: 0, deletions: 0, changedLines: 0}, rawDiff, renderedLines: [], blocks: []};
-  }
   const hero = () => imageFile(pngFixture(3, 2), pngFixture(4, 5), 'docs/hero.png');
   const embed = (imagePath: string, line: number) => ({path: imagePath, url: path.posix.basename(imagePath), line, status: 'embed' as const});
 
@@ -1873,5 +1912,61 @@ describe('the rendered service with the in-pane view', () => {
     pane.rows('docs/guide.md', {innerCols: 200, viewportRows: 30});
     expect(layouts.map((request) => request.source.brokenRefs)).toEqual([undefined, [0]]);
     service.dispose();
+  });
+});
+
+describe('the service the CLI runs, over SSH', () => {
+  it('names v in the refusal of r only once the pane can draw there, with a Chromium found', async () => {
+    const outside = makeTempDir('branch-review-chrome-');
+    const chrome = path.join(outside, 'chrome-headless-shell');
+    fs.writeFileSync(chrome, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(chrome, 0o755);
+    const said = async (browser: string) => {
+      const session = makeTempDir('branch-review-session-');
+      const service = startRenderedService({
+        tempDir: () => session,
+        env: {SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22', BRANCH_REVIEW_CHROME: browser},
+        cwd: session,
+        opener: () => undefined,
+        pane: {registry: createImageRegistry({write: () => undefined}), caps: KITTY_CAPS},
+      });
+      service.setReview(review([edited('README.md')]), CTX);
+      const outcome = await service.open({fileKey: 'README.md'});
+      service.dispose();
+      return outcome;
+    };
+    expect(await said(path.join(outside, 'missing'))).toEqual({kind: 'error', message: "open isn't available over SSH · branch-review --render-out <dir> writes the pages"});
+    expect(await said(chrome)).toEqual({kind: 'error', message: "open isn't available over SSH · v draws it here"});
+  });
+
+  it('names v in the refusal only on a file whose page the pane draws, and the in-pane toasts name --render-out in place of r', async () => {
+    const outside = makeTempDir('branch-review-chrome-');
+    const chrome = path.join(outside, 'chrome-headless-shell');
+    fs.writeFileSync(chrome, '#!/bin/sh\nexit 1\n');
+    fs.chmodSync(chrome, 0o755);
+    const headless = 'branch-review --render-out <dir> writes the pages';
+    const started = (browser: string) => {
+      const session = makeTempDir('branch-review-session-');
+      const service = startRenderedService({
+        tempDir: () => session,
+        env: {SSH_CONNECTION: '192.0.2.1 50000 192.0.2.2 22', BRANCH_REVIEW_CHROME: browser},
+        cwd: session,
+        opener: () => undefined,
+        pane: {registry: createImageRegistry({write: () => undefined}), caps: KITTY_CAPS},
+      });
+      service.setReview(review([edited('README.md'), imageFile(pngFixture(3, 2), pngFixture(4, 5), 'docs/hero.png')]), CTX);
+      return service;
+    };
+    const drawn = started(chrome);
+    expect(drawn.pane!.advertised()).toBe(true);
+    // An image keeps its media meaning for v, and the overview is no one file's page.
+    expect(await drawn.open({fileKey: 'docs/hero.png'})).toEqual({kind: 'error', message: `open isn't available over SSH · ${headless}`});
+    expect(await drawn.openOverview()).toEqual({kind: 'error', message: `open isn't available over SSH · ${headless}`});
+    expect(await drawn.open({fileKey: 'README.md'})).toEqual({kind: 'error', message: "open isn't available over SSH · v draws it here"});
+    drawn.dispose();
+
+    const missing = started(path.join(outside, 'missing'));
+    expect(missing.pane!.enter()).toEqual({ok: false, message: `the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · ${headless}`});
+    missing.dispose();
   });
 });

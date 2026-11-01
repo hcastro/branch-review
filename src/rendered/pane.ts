@@ -1,4 +1,4 @@
-import type {ImageRegistry} from '../media/imageRegistry.js';
+import {IMAGE_IDS, type ImageRegistry} from '../media/imageRegistry.js';
 import type {BoxSpec, PlanRow} from '../media/layout.js';
 import {createLru} from '../media/lru.js';
 import type {GraphicsCaps} from '../media/types.js';
@@ -6,6 +6,7 @@ import {blockForSourceLine} from './anchor.js';
 import type {FragmentRequest, LayoutResult, RenderedBackend, TileSource} from './backend.js';
 import {FILE_ALIAS_LINK} from './keys.js';
 import {oneLine} from './source.js';
+import {HEADLESS} from './surface.js';
 import {planRenderedRows, rowAt, rowMarks, rowSpan, type LayoutBlock, type LayoutBox, type LayoutLink, type PageLayout} from './plan.js';
 import {geometryKey, GUTTER_COLS, pageCut, pageRows, SHORT_TILE_ROWS, tileGeometry, type DprMode, type PageGeometry} from './tileGeometry.js';
 import type {ChromeBinary} from './worker/chrome.js';
@@ -19,13 +20,22 @@ import type {ChromeBinary} from './worker/chrome.js';
 // pool of the shared image registry, and answers what a row means: the
 // block to copy, where each change starts, which link a click is on.
 //
-// It is offered only in a terminal that draws Kitty images, and only with
-// BRANCH_REVIEW_PANE=on until the owner's hands-on checks in cmux pass. A
-// failure is never for good, short of the browser or the worker giving up:
-// the next `v` asks again for what failed.
+// It is offered in a terminal that draws Kitty images unless
+// BRANCH_REVIEW_PANE turns it off, and advertised only where it can draw:
+// a Chromium found and the cell size known. A failure never strands the
+// reader on a page that won't come: a layout or tile that failed, tiles
+// on screen still not drawn after a hold of 5 s, or a tile the terminal
+// has no room for sends that file back to its diff, with one toast, until
+// the next `v` asks again. Only the browser or the worker giving up ends it
+// for the session.
 
+// Where the reader can still read the page when the pane can't draw it:
+// `r`, or where `r` opens nothing (over SSH, or with no browser opener),
+// the pages `--render-out` writes.
+const R_OPENS = 'r opens it in the browser';
+const needsChrome = (elsewhere: string) => `the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · ${elsewhere}`;
 /** What `v` says when no Chromium is found; `r` needs none. */
-export const PANE_NEEDS_CHROME = 'the in-pane view needs Chrome · set BRANCH_REVIEW_CHROME or install chrome-headless-shell · r opens it rendered';
+export const PANE_NEEDS_CHROME = needsChrome(R_OPENS);
 /** What `v` says when the terminal didn't answer CSI 16t: a tile sized from a guess would be scaled, and blurred. */
 export const PANE_NEEDS_CELL_SIZE = "the terminal didn't report its cell size, which sharp tiles need · r opens it rendered";
 
@@ -36,8 +46,17 @@ const LAYING_OUT = 'laying out the page…';
 // The shade a page row holds at until its tile comes.
 const SHADE = '░';
 const TOO_NARROW = 'the pane is too narrow for the page · r opens it rendered';
-const TOO_LARGE = 'too large · r opens it rendered';
+const TOO_LARGE = 'a part of the page is too large to draw here';
 const TOO_LONG = 'the page is too long to draw here · r opens it rendered';
+// How long the screen may wait for a page row's tile before the file goes
+// back to its diff. A layout is no part of it: its job has its own
+// deadline, long enough for Chromium's cold start.
+export const PANE_HOLD_MS = 5_000;
+const HELD = `the page didn't draw within ${PANE_HOLD_MS / 1000} s`;
+const NO_ROOM = "the terminal's image memory is full";
+const NO_IDS = 'every terminal image id is in use';
+// Values of BRANCH_REVIEW_PANE that turn the view off; any other leaves it on.
+const TURNED_OFF = new Set(['off', '0', 'false', 'none']);
 // The active file's page is laid out first, then tiles near the screen
 // (priority 0 on it, 1 near it), then every other page the pane covers.
 const ACTIVE_LAYOUT = 0;
@@ -46,6 +65,11 @@ const OTHER_LAYOUT = 2;
 // for again this long after, at most this many times.
 const LATE_RETRY_MS = 1_000;
 const LATE_RETRIES = 3;
+
+/** Whether BRANCH_REVIEW_PANE turns the in-pane view off. */
+export function paneTurnedOff(env: NodeJS.ProcessEnv) {
+  return TURNED_OFF.has((env.BRANCH_REVIEW_PANE ?? '').trim().toLowerCase());
+}
 
 /**
  * The page's scale: type-matched, or the one BRANCH_REVIEW_PANE_DPR names,
@@ -66,7 +90,7 @@ export type LinkTarget = {kind: 'anchor'; row: number} | {kind: 'file'; fileKey:
 /** Why a link isn't copied. */
 export const LINK_HAS_CONTROLS = 'this link holds control characters · not copied';
 
-export type PaneBoxState = {status: 'kitty'; id: number} | {status: 'loading'} | {status: 'error'; reason: string};
+export type PaneBoxState = {status: 'kitty'; id: number} | {status: 'loading'};
 
 export type PaneGeometryInput = {innerCols: number; viewportRows: number};
 
@@ -87,7 +111,7 @@ const sourced = (layout: PageLayout) => layout.blocks.filter((block): block is L
 const CONTROLS = /[\u0000-\u001f\u007f-\u009f]/;
 const WEB_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 
-export function createRenderedPane({backend, registry, caps, env, chrome, source, fileForAlias}: {
+export function createRenderedPane({backend, registry, caps, env, chrome, source, fileForAlias, browserOpens = true}: {
   backend: Pick<RenderedBackend, 'layout' | 'tile' | 'disabledReason'> & Partial<Pick<RenderedBackend, 'prioritize'>>;
   registry: ImageRegistry;
   caps: GraphicsCaps;
@@ -101,8 +125,11 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   source: (fileKey: string) => {fragment: FragmentRequest; base: string; brokenRefs?: readonly number[]} | null;
   /** The review file a page name (`f-….html`) stands for. */
   fileForAlias: (alias: string) => string | null;
+  /** Whether `r` opens a page here, which the toasts point to when it does. */
+  browserOpens?: boolean;
 }) {
-  const offered = env.BRANCH_REVIEW_PANE === 'on' && caps.protocol === 'kitty' && Boolean(backend.layout && backend.tile);
+  const elsewhere = browserOpens ? R_OPENS : HEADLESS;
+  const offered = !paneTurnedOff(env) && caps.protocol === 'kitty' && Boolean(backend.layout && backend.tile);
   // Over SSH and tmux every byte crosses a slow link: no mosaic, and tiles
   // are sent ahead only one below the screen.
   const slow = Boolean(env.SSH_CONNECTION) || caps.tmux;
@@ -132,7 +159,18 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   const tiles = createLru<Tile>(TILE_CACHE_BYTES, (tile) => tile.png.byteLength + (tile.mosaic?.byteLength ?? 0));
   const tileMeta = new Map<string, TileMeta>();
   const rendering = new Map<string, AbortController>();
-  const tileErrors = new Map<string, string>();
+  // By file key: why its page failed. It shows its diff until the next `v`.
+  const failed = new Map<string, string>();
+  // By file key: the toast of a failure off screen, said once the reader
+  // reaches the file, so a page failing in the background never reads as
+  // the one the reader is on.
+  const untold = new Map<string, string>();
+  // The files with a page row on screen at the last want.
+  let screenFiles: ReadonlySet<string> = new Set();
+  // What the screen waits for, and since when: a tile on screen with no id
+  // yet, by its key.
+  const holding = new Map<string, {fileKey: string; since: number}>();
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
   let liveKeys: ReadonlySet<string> = new Set();
   let visibleKeys: ReadonlySet<string> = new Set();
   const notices: string[] = [];
@@ -151,26 +189,46 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     notify();
   };
 
-  // Back to the diff for the session, saying why once.
+  // The file back to its diff until the next `v`, saying why once: now
+  // when the reader is on it or it is on screen, else when the reader
+  // reaches it. Only while the pane draws pages: an answer that comes after
+  // `v` went back is no one's failure. It changes the plan without telling
+  // the listeners, which the caller does once: two renders for one change
+  // would let the place-keeping of the first see rows the second moves.
+  const fail = (fileKey: string, reason: string) => {
+    if (mode !== 'rendered' || off || failed.has(fileKey)) return;
+    failed.set(fileKey, reason);
+    for (const [key, held] of holding) if (held.fileKey === fileKey) holding.delete(key);
+    const notice = `✗ in-pane view: ${oneLine(reason)} · ${elsewhere}`;
+    if (fileKey === focused || screenFiles.has(fileKey)) notices.push(notice);
+    else untold.set(fileKey, notice);
+    planVersion += 1;
+  };
+
+  // Back to the diff for the session, saying why once. Like `fail`, the
+  // caller tells the listeners.
   const turnOff = (message: string) => {
     if (off) return;
     off = message;
     mode = 'diff';
+    untold.clear();
     notices.push(off);
-    planChanged();
+    planVersion += 1;
   };
+  // The worker gave up: `r` and `R` stop too, so the toast offers neither.
+  const workerOff = (reason: string) => turnOff(`✗ in-pane view: ${oneLine(reason)}`);
 
   // Whether a failed job means the pane can't go on: the browser gave up
   // for the session (pages still open with r), or the worker did (they
   // don't). Either way the pane goes back to the diff.
   const gaveUp = (failure: Failure) => {
     if (failure.tilesOff) {
-      turnOff(`✗ ${oneLine(failure.reason)} · r still works`);
+      turnOff(`✗ ${oneLine(failure.reason)} · ${elsewhere}`);
       return true;
     }
     const disabled = backend.disabledReason();
     if (failure.state !== 'unavailable' && !disabled) return false;
-    turnOff(`✗ ${oneLine(disabled ?? failure.reason)}`);
+    workerOff(disabled ?? failure.reason);
     return true;
   };
 
@@ -217,12 +275,11 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   const lastCols = new Map<string, number>();
   const known = (fileKey: string) => shown.get(fileKey) ?? null;
 
-  // Drops what no drawn page names: tile names, errors and short-tile marks
-  // of documents no file draws.
+  // Drops what no drawn page names: tile names and short-tile marks of
+  // documents no file draws.
   const pruneDocuments = () => {
     const live = new Set([...shown.values()].map((each) => each.document));
     for (const [key, meta] of tileMeta) if (!live.has(meta.document)) tileMeta.delete(key);
-    for (const key of tileErrors.keys()) if (!tileMeta.has(key)) tileErrors.delete(key);
     for (const document of shortTiles) if (!live.has(document)) shortTiles.delete(document);
     for (const document of staleDocuments) if (!live.has(document)) staleDocuments.delete(document);
   };
@@ -265,11 +322,15 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         // A retry that failed leaves the page as it was drawn, and the
         // retries it has left still come, unless the browser or the worker
         // gave up for the session. A page whose document the worker no
-        // longer holds can't cut the tiles it still lacks: it stays failed,
-        // so the error row shows and the next `v` asks again.
-        if (!gaveUp(result) && again && drawn?.layoutKey === layoutKey && !staleDocuments.has(drawn.document)) {
-          layouts.set(layoutKey, {status: 'ready', layout: drawn.layout, document: drawn.document, ...(drawn.text === undefined ? {} : {text: drawn.text})});
-          retryLate(fileKey, layoutKey, tileSource);
+        // longer holds can't cut the tiles it still lacks: the file goes
+        // back to its diff, and the next `v` asks again.
+        if (!gaveUp(result)) {
+          if (again && drawn?.layoutKey === layoutKey && !staleDocuments.has(drawn.document)) {
+            layouts.set(layoutKey, {status: 'ready', layout: drawn.layout, document: drawn.document, ...(drawn.text === undefined ? {} : {text: drawn.text})});
+            retryLate(fileKey, layoutKey, tileSource);
+          } else {
+            fail(fileKey, result.reason);
+          }
         }
       }
       planChanged();
@@ -306,7 +367,7 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     askLayout(meta.fileKey, drawn.layoutKey, drawn.tileSource);
   };
 
-  const textRow = (text: string, tone: 'dim' | 'error'): PlanRow => ({type: 'text', role: tone === 'error' ? 'reason' : 'loading', pieces: [{at: GUTTER_COLS, parts: [{text, tone}]}]});
+  const textRow = (text: string): PlanRow => ({type: 'text', role: 'loading', pieces: [{at: GUTTER_COLS, parts: [{text, tone: 'dim'}]}]});
   // A page row whose tile is on its way, in the shade the pane holds at.
   const shadeRow = (geometry: PageGeometry): PlanRow => ({type: 'text', role: 'loading', pieces: [{at: geometry.leftPad, parts: [{text: SHADE.repeat(geometry.sheetCols), tone: 'dim'}]}]});
 
@@ -325,15 +386,58 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   // Sends a cut tile, and says whether a row on screen now draws it. One
   // near the screen is sent ahead only while it fits the page pool: one
   // that didn't would be evicted by the next sweep and sent again by the
-  // next want, a loop of transmits.
-  const send = (box: BoxSpec, tile: Tile) => {
+  // next want, a loop of transmits. One on screen that the terminal has no
+  // room or id for, even with every tile off screen let go, would hold the
+  // screen in shade for good: its file goes back to the diff. An id still
+  // in quarantine comes free in a moment.
+  const send = (box: BoxSpec, tile: Tile, fileKey: string) => {
     if (!visibleKeys.has(box.imageKey)) {
       if (registry.fits(tile.png, undefined, 'page')) registry.acquire(box.imageKey, tile.png, box.cols, box.rows, undefined, 'page');
       return false;
     }
+    if (!registry.fitsOnScreen(tile.png, visibleKeys, 'page')) {
+      fail(fileKey, NO_ROOM);
+      return false;
+    }
     if (registry.acquire(box.imageKey, tile.png, box.cols, box.rows, undefined, 'page') !== null) return true;
-    retryWhenIdFree();
+    if (registry.liveCount() >= IMAGE_IDS) fail(fileKey, NO_IDS);
+    else retryWhenIdFree();
     return false;
+  };
+
+  // Watches what the screen waits for, given as a key to its file: what
+  // has waited a hold's length sends its file back to the diff. What the
+  // screen no longer waits for, or no longer shows, starts afresh.
+  const watchHold = (waiting: ReadonlyMap<string, string>) => {
+    const at = Date.now();
+    for (const key of holding.keys()) if (!waiting.has(key)) holding.delete(key);
+    for (const [key, fileKey] of waiting) if (!holding.has(key)) holding.set(key, {fileKey, since: at});
+    armHold();
+  };
+  const armHold = () => {
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = null;
+    if (holding.size === 0 || disposed) return;
+    const first = Math.min(...[...holding.values()].map((held) => held.since));
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      const at = Date.now();
+      const plan = planVersion;
+      for (const [key, held] of [...holding]) {
+        // A tile that came in since the last want is drawn: the want after
+        // the next commit would have let it go anyway.
+        if (registry.idFor(key) !== undefined) {
+          holding.delete(key);
+          continue;
+        }
+        if (at - held.since < PANE_HOLD_MS) continue;
+        holding.delete(key);
+        fail(held.fileKey, HELD);
+      }
+      if (planVersion !== plan) notify();
+      armHold();
+    }, Math.max(0, first + PANE_HOLD_MS - Date.now()));
+    holdTimer.unref?.();
   };
 
   const render = (box: BoxSpec, meta: TileMeta, priority: number) => {
@@ -351,15 +455,15 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       if (result.ok) {
         const tile: Tile = result.mosaic ? {png: result.png, mosaic: result.mosaic} : {png: result.png};
         tiles.set(box.imageKey, tile);
-        if (liveKeys.has(box.imageKey)) send(box, tile);
+        if (liveKeys.has(box.imageKey)) send(box, tile, meta.fileKey);
       } else if (gaveUp(result)) {
-        return;
+        // Back on the diff for the session.
       } else if (result.tooLarge && meta.source.geometry.tileRows > SHORT_TILE_ROWS) {
         shortTiles.add(meta.document);
         planVersion += 1;
       } else {
-        // Already as short as tiles go, a tile too large stays undrawn.
-        tileErrors.set(box.imageKey, result.tooLarge ? TOO_LARGE : oneLine(result.reason));
+        // Already as short as tiles go, a tile too large can't be drawn either.
+        fail(meta.fileKey, result.tooLarge ? TOO_LARGE : result.reason);
       }
       notify();
     }, () => {
@@ -368,13 +472,26 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
   };
 
   return {
-    /** Whether `v` on markdown draws the page here. */
+    /** Whether `v` on markdown means the page in the pane here, though it may only say why it can't draw. */
     offered: () => offered,
+    /**
+     * Whether the footer names `v`: offered, with a Chromium found, the
+     * cell size known, and neither the pane nor the rendered worker turned
+     * off for the session. Looks for Chromium on disk the first time, and
+     * never starts it.
+     */
+    advertised: () => offered && !off && !backend.disabledReason() && caps.cellPxSource === 'csi16' && chrome() !== null,
     /** The file the reader is on, whose page is laid out ahead of the rest. */
     focus(fileKey: string) {
       if (fileKey === focused) return;
       const before = focused;
       focused = fileKey;
+      const notice = untold.get(fileKey);
+      if (notice) {
+        untold.delete(fileKey);
+        notices.push(notice);
+        notify();
+      }
       for (const key of [before, fileKey]) {
         const controller = key === null ? undefined : waiting.get(key);
         if (controller) backend.prioritize?.(controller.signal, layoutPriority(key!));
@@ -383,6 +500,8 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     mode: () => mode,
     /** Whether the file's diff becomes a page in the pane. */
     covers: (fileKey: string) => source(fileKey) !== null,
+    /** Whether the pane shows the file's page now: it draws pages, and that page hasn't failed since the last `v`. */
+    shows: (fileKey: string) => mode === 'rendered' && !failed.has(fileKey) && source(fileKey) !== null,
 
     /** Turns the pane to pages, or says why it can't. */
     enter(): {ok: true} | {ok: false; message: string} {
@@ -390,19 +509,21 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       if (disabled) return {ok: false, message: `✗ ${oneLine(disabled)}`};
       if (off) return {ok: false, message: off};
       if (caps.cellPxSource !== 'csi16') return {ok: false, message: PANE_NEEDS_CELL_SIZE};
-      if (!chrome()) return {ok: false, message: PANE_NEEDS_CHROME};
+      if (!chrome()) return {ok: false, message: needsChrome(elsewhere)};
       // What failed before is asked for again: a browser that crashed
       // starts anew, and only three failures in a minute turn it off.
       for (const [key, entry] of layouts) if (entry.status === 'failed') layouts.delete(key);
-      tileErrors.clear();
+      failed.clear();
+      untold.clear();
       mode = 'rendered';
       planChanged();
       return {ok: true};
     },
-    /** Back to the diff, at once. */
+    /** Back to the diff, at once. A page that failed out of sight is no one's news now. */
     leave() {
       if (mode === 'diff') return;
       mode = 'diff';
+      untold.clear();
       planChanged();
     },
 
@@ -412,11 +533,12 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
      * not yet. Asks for the layout the first time.
      */
     rows(fileKey: string, {innerCols}: PaneGeometryInput): PlanRow[] {
+      if (failed.has(fileKey)) return [];
       const page = pageFor(fileKey, innerCols);
       if (!page) return [];
-      const label = textRow(page.shown.fragment.path, 'dim');
+      const label = textRow(page.shown.fragment.path);
       layingOut.delete(fileKey);
-      if (!page.geometry || !page.tileSource) return [label, textRow(TOO_NARROW, 'dim')];
+      if (!page.geometry || !page.tileSource) return [label, textRow(TOO_NARROW)];
       lastCols.set(fileKey, innerCols);
       let entry = layouts.get(page.layoutKey);
       if (!entry) {
@@ -429,13 +551,14 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       const before = shown.get(fileKey);
       const drawn = entry.status === 'ready' || (entry.status === 'pending' && before && geometryKey(before.geometry) === geometryKey(page.geometry)) ? before! : null;
       if (!drawn) {
-        if (entry.status === 'failed') return [label, textRow(`couldn't lay out the page · ${entry.reason} · r opens it rendered`, 'error')];
+        // A failure sent the file back to its diff when it landed.
+        if (entry.status === 'failed') return [];
         layingOut.add(fileKey);
         // A new geometry (a resize): the page's rows at its new size, as
         // the shade of a page on its way, never the old tiles stretched.
         // What was drawn stays known, so the reader's place can be found.
         if (before) return [label, ...Array.from({length: pageRows(page.geometry, before.layout.heightCss)}, () => shadeRow(page.geometry))];
-        return [label, textRow(LAYING_OUT, 'dim')];
+        return [label, textRow(LAYING_OUT)];
       }
       const {layout, document} = drawn;
       const geometry = shortTiles.has(document) ? tileGeometry(innerCols, caps.cellPx, dprMode, SHORT_TILE_ROWS)! : drawn.geometry;
@@ -445,12 +568,10 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
         const key = `page:${document}:${geometryKey(geometry)}:${index}`;
         tileMeta.set(key, {source: tileSource, document, index, rows, fileKey, layoutKey: drawn.layoutKey});
         return key;
-      }), ...(pageCut(geometry, layout.heightCss) ? [textRow(TOO_LONG, 'dim')] : [])];
+      }), ...(pageCut(geometry, layout.heightCss) ? [textRow(TOO_LONG)] : [])];
     },
 
     boxState(box: BoxSpec): PaneBoxState {
-      const reason = tileErrors.get(box.imageKey);
-      if (reason !== undefined) return {status: 'error', reason};
       const id = registry.idFor(box.imageKey);
       return id === undefined ? {status: 'loading'} : {status: 'kitty', id};
     },
@@ -461,26 +582,31 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     /**
      * Whether the page on screen can be drawn: no file among `files` (those
      * with a row on screen) is still laying out, and every tile on screen
-     * has its id or failed.
+     * has its id.
      */
     ready: (visible: ReadonlySet<string>, files: ReadonlySet<string> = new Set()) => (
-      ![...files].some((fileKey) => layingOut.has(fileKey)) && [...visible].every((key) => registry.idFor(key) !== undefined || tileErrors.has(key))
+      ![...files].some((fileKey) => layingOut.has(fileKey)) && [...visible].every((key) => registry.idFor(key) !== undefined)
     ),
 
     /**
-     * After each commit, with the page's boxes near the viewport: sends
-     * what is cut, cuts what is not, and marks what is drawn as used. Over
-     * a slow link, only the screen and the next tile below.
+     * After each commit, with the page's boxes near the viewport and the
+     * files with a page row on screen: sends what is cut, cuts what is not,
+     * and marks what is drawn as used. Over a slow link, only the screen
+     * and the next tile below. A tile the screen still waits for is held
+     * for at most PANE_HOLD_MS.
      */
-    want(boxes: ReadonlyArray<{fileKey: string; box: BoxSpec}>, visible: ReadonlySet<string>) {
+    want(boxes: ReadonlyArray<{fileKey: string; box: BoxSpec}>, visible: ReadonlySet<string>, files: ReadonlySet<string> = new Set()) {
       if (disposed || off) return;
       // The worker gave up while the page was drawn from tiles cut before.
       const disabled = backend.disabledReason();
       if (disabled && mode === 'rendered') {
-        turnOff(`✗ ${oneLine(disabled)}`);
+        workerOff(disabled);
+        notify();
         return;
       }
       visibleKeys = visible;
+      screenFiles = new Set([...files, ...boxes.filter(({box}) => visible.has(box.imageKey)).map(({fileKey}) => fileKey)]);
+      const plan = planVersion;
       // A tile still waiting for the worker follows the screen: first when
       // it is on screen, next when near; one the screen has gone past (out
       // of the window `boxes` covers) is dropped, not cut for nothing.
@@ -496,23 +622,28 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
       let lastVisible = -1;
       if (slow) for (const [at, {box}] of boxes.entries()) if (visible.has(box.imageKey)) lastVisible = at;
       let changed = false;
-      for (const [at, {box}] of boxes.entries()) {
+      for (const [at, {fileKey, box}] of boxes.entries()) {
         const key = box.imageKey;
         if (slow && !visible.has(key) && at !== lastVisible + 1) continue;
-        if (tileErrors.has(key)) continue;
+        if (failed.has(fileKey)) continue;
         if (registry.idFor(key) !== undefined) {
           registry.touch(key);
           continue;
         }
         const tile = tiles.get(key);
         if (tile) {
-          if (send(box, tile)) changed = true;
+          if (send(box, tile, fileKey)) changed = true;
           continue;
         }
         const meta = tileMeta.get(key);
         if (meta && !rendering.has(key) && !staleDocuments.has(meta.document)) render(box, meta, visible.has(key) ? 0 : 1);
       }
-      if (changed) notify();
+      const waiting = new Map<string, string>();
+      if (mode === 'rendered') {
+        for (const {fileKey, box} of boxes) if (visible.has(box.imageKey) && !failed.has(fileKey) && registry.idFor(box.imageKey) === undefined) waiting.set(box.imageKey, fileKey);
+      }
+      watchHold(waiting);
+      if (changed || planVersion !== plan) notify();
     },
 
     /** After each commit: frees the page pool's ids no row names, and trims it to budget off screen. */
@@ -542,18 +673,6 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
           return;
         }
       }
-    },
-
-    /**
-     * Whether the file's layout at the width it was last planned at failed,
-     * so its rows say why and no page rows will come, though a page drawn
-     * at another width (before a resize) is still known.
-     */
-    layoutFailed(fileKey: string) {
-      const cols = lastCols.get(fileKey);
-      const page = cols === undefined ? null : pageFor(fileKey, cols);
-      const entry = page?.geometry ? layouts.get(page.layoutKey) : undefined;
-      return entry?.status === 'failed' && shown.get(fileKey)?.layoutKey !== page!.layoutKey;
     },
 
     /**
@@ -694,10 +813,11 @@ export function createRenderedPane({backend, registry, caps, env, chrome, source
     /** Whether tiles cross a slow link: SSH or tmux. */
     slow,
     /** For tests: how much per-file state the pane holds. */
-    stateSizes: () => ({layouts: layouts.size, tileMeta: tileMeta.size, tileErrors: tileErrors.size, shortTiles: shortTiles.size, waiting: waiting.size}),
+    stateSizes: () => ({layouts: layouts.size, tileMeta: tileMeta.size, shortTiles: shortTiles.size, waiting: waiting.size}),
     dispose() {
       disposed = true;
       if (idRetry) clearTimeout(idRetry);
+      if (holdTimer) clearTimeout(holdTimer);
       for (const timer of lateTimers) clearTimeout(timer);
       lateTimers.clear();
       for (const controller of waiting.values()) controller.abort();

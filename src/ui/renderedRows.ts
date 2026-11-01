@@ -5,7 +5,7 @@ import {placeholderRun} from '../media/kitty.js';
 import type {PaneBoxState, RenderedPane} from '../rendered/pane.js';
 import {palette} from './palette.js';
 import {styledParts, styledPlanRow} from './mediaRows.js';
-import {truncateEnd, toDisplayText} from './text.js';
+import {toDisplayText} from './text.js';
 
 // Splices a rendered page's rows in place of a markdown file's diff rows,
 // while the pane shows pages (`v`): its label, then one row per page row,
@@ -17,9 +17,9 @@ import {truncateEnd, toDisplayText} from './text.js';
 export type RenderedRowsLayout = {innerWidth: number; viewportRows: number};
 
 /**
- * The sections with each page the pane covers in place of its diff, and
+ * The sections with each page the pane shows in place of its diff, and
  * start lines renumbered after them. The same array outside the pane's
- * page mode.
+ * page mode. A file whose page failed keeps its diff.
  */
 export function addRenderedRows<S extends WrappedSection & {key: string; file?: ReviewFile}>(sections: S[], pane: RenderedPane | null | undefined, layout: RenderedRowsLayout): S[] {
   if (!pane || pane.mode() !== 'rendered') return sections;
@@ -27,7 +27,7 @@ export function addRenderedRows<S extends WrappedSection & {key: string; file?: 
   let cursor = 0;
   const next = sections.map((section) => {
     let result = section;
-    if (pane.covers(section.key)) {
+    if (pane.shows(section.key)) {
       const plan = pane.rows(section.key, {innerCols: layout.innerWidth, viewportRows: layout.viewportRows});
       if (plan.length > 0) {
         const lines: string[] = [];
@@ -76,8 +76,7 @@ function gutter(lead: readonly TextPart[], glow: 'accent' | 'bright' | null) {
 /**
  * A page row as the pane draws it, `inner` cells wide: the gutter, the
  * letterbox, then the tile's placeholder cells once the terminal has the
- * tile. Until then the row is a dim shade, never a stretched old tile; a
- * tile that failed says why on its first row.
+ * tile. Until then the row is a dim shade, never a stretched old tile.
  */
 export function renderPaneRow(info: NonNullable<SectionRow['pane']>, state: PaneBoxState | null, inner: number, glow: 'accent' | 'bright' | null = null) {
   const {box, lead = []} = info;
@@ -89,10 +88,5 @@ export function renderPaneRow(info: NonNullable<SectionRow['pane']>, state: Pane
   const width = Math.max(0, Math.min(box.cols, inner - Math.max(used, box.leftPad)));
   if (width === 0) return out;
   if (state?.status === 'kitty') return out + placeholderRun(state.id, boxRow, 0, width);
-  if (state?.status === 'error' && boxRow === 0) {
-    const shown = truncateEnd(toDisplayText(`couldn't draw this part of the page · ${state.reason}`), width);
-    return `${out}${palette.sgr.red}${shown}${palette.sgr.reset}`;
-  }
-  if (state?.status === 'error') return out;
   return `${out}${palette.sgr.gray}${LOADING_SHADE.repeat(width)}${palette.sgr.reset}`;
 }

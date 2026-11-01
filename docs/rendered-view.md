@@ -13,7 +13,7 @@ Where the page opens depends on where you run `branch-review`:
 | In a cmux workspace | A browser split to the right of the review. The split doesn't take the keyboard, and each later press sends the same split to the new page. |
 | In cmux, with its browser turned off in its settings | Your default browser. cmux opens it there itself. |
 | In another terminal on macOS or Linux | A new tab in your default browser, on each press. On Linux, `xdg-open` on your `PATH` opens it. |
-| Over SSH | Nothing opens. With the in-pane view turned on, press `v` to read the page in the diff pane. |
+| Over SSH | Nothing opens. On a markdown file the in-pane view can draw, press `v` to read the page in the diff pane. |
 
 After each press the footer says where the page went, such as `⇗ setup.md · in the split →`. The first page of a session adds `nothing left this machine`. When the file in view has no page, `r` opens the review's first page and names it, such as `⇗ docs/setup.md · first rendered file · in the split →`. When the branch changed no markdown, image, or SVG file, the footer reads `nothing to render · no markdown, images or SVG on this branch`.
 
@@ -26,7 +26,7 @@ The footer names the following problems:
 | `cmux didn't answer · opened in your browser` | cmux didn't place the page within 1.5 seconds, so your default browser opened it. If a split from an earlier press was closed, the next press opens a new one without a message. |
 | `in the split → · cmux was slow to answer` | cmux took more than 1.5 seconds to send the split to the page. The page may land a moment late, and the next press uses the same split. |
 | `opened in your browser · cmux's browser is off` | cmux's browser is turned off in its settings. Each press opens the page in your default browser. |
-| `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. With the in-pane view turned on, the message names `v`, which draws the page in the diff pane. |
+| `open isn't available over SSH` | Over SSH, nothing opens on the remote machine. To get the pages there, run `branch-review --render-out DIR`. On a markdown file the in-pane view can draw, the message names `v`, which draws the page in the diff pane. |
 | `no browser opener found` | On Linux, no `xdg-open` is on your `PATH`. |
 | `rendered view turned off` | The renderer failed three times in a minute, so `r` and `R` stay off for the session. Image previews keep working. |
 | `can't write the page: disk full` | The session's temp directory is full. |
@@ -88,15 +88,17 @@ Before each update, `branch-review` asks cmux which page the split shows. The sp
 
 ## Read a page in the diff pane
 
-The in-pane view draws a markdown file's rendered page inside the diff pane, in place of its diff. It's turned off by default. To turn it on, set `BRANCH_REVIEW_PANE=on` before you start `branch-review`:
+The in-pane view draws a markdown file's rendered page inside the diff pane, in place of its diff. It's on in a terminal that can draw it, and the footer lists `v here` on a markdown file when it is. To turn it off, set `BRANCH_REVIEW_PANE` to `off`, `0`, `false`, or `none` before you start `branch-review`:
 
 ```sh
-BRANCH_REVIEW_PANE=on branch-review
+BRANCH_REVIEW_PANE=off branch-review
 ```
+
+`BRANCH_REVIEW_PANE=on` is accepted and changes nothing.
 
 The in-pane view needs the following:
 
-- A terminal that draws Kitty images, such as Ghostty, cmux, or Kitty. Other terminals keep the diff, and `v` on a markdown file does nothing new.
+- A terminal that draws Kitty images, such as Ghostty, cmux, or Kitty. Other terminals keep the diff, and `v` on a markdown file does nothing new. Inside tmux, only the session that draws pictures gets the in-pane view, and over SSH it needs a terminal that draws Kitty images on your side.
 - A terminal that reports its cell size in pixels. Each tile is cut to fill its cells exactly, so the terminal never scales it. Ghostty, cmux, and Kitty report it.
 - A headless Chromium on disk. `branch-review` never installs one. When `BRANCH_REVIEW_CHROME` is set, it's used only when it's an absolute path to a program outside the repo. A `BRANCH_REVIEW_CHROME` that can't be used turns the in-pane view off, and `branch-review` looks for no other Chromium. With it unset, `branch-review` uses the newest `chrome-headless-shell` that Playwright or Puppeteer installed, else Google Chrome on macOS. On Linux it then takes the first of `chrome-headless-shell`, `chromium`, `chromium-browser`, and `google-chrome` on your `PATH`. A program inside the repo under review is never used.
 
@@ -118,7 +120,19 @@ While the page is in the pane, the following keys change:
 
 `j`, `k`, `g`, `G`, and the mouse wheel scroll the page. Clicking a link on the page follows it in the review: a heading on the page scrolls there, and a link to another file of the review opens that file. A web or email address is copied to the clipboard and never opened, because it's the repo's. A link that holds control characters isn't copied, and the footer says so. The footer reads `◆ rendered · local` while the page is on screen.
 
-Each page is laid out and cut into tiles by the headless Chromium, in the session's temp directory, with scripts and every network request off. The page loads as a document, never as a file or a URL, and every host resolves to nothing. The tiles go to the terminal as images before any row of the pane shows them, and at most ten of them are kept in the terminal at a time. When the tiles on screen aren't in the terminal yet, the pane holds on the page's colors, and after a moment the footer reads `developing`.
+Each page is laid out and cut into tiles by the headless Chromium, in the session's temp directory, with scripts and every network request off. `branch-review` starts Chromium on the first `v`, never at startup, so a review you don't read this way never runs it. The page loads as a document, never as a file or a URL, and every host resolves to nothing. The tiles go to the terminal as images before any row of the pane shows them, and at most ten of them are kept in the terminal at a time. When the tiles on screen aren't in the terminal yet, the pane holds on the page's colors, and after a moment the footer reads `developing`.
+
+### When the page can't be drawn
+
+A page that can't be drawn never leaves you waiting. The pane goes back to the file's diff in one frame, at the line the page showed at the top, and the footer reads `✗ in-pane view:` with the reason and that `r` opens it in the browser. Over SSH, where `r` opens nothing, the footer names `branch-review --render-out <dir>` in its place. That happens in the following cases:
+
+- Chromium couldn't lay out the page or cut a tile of it, or it crashed. Laying out a page has 15 seconds, which covers Chromium's first start.
+- The tiles on screen still haven't arrived after 5 seconds.
+- The terminal has no room left for a tile on screen, because its image memory or its image ids are used up.
+
+When the rendered view's worker turns off, the pane goes back to the diff the same way, and the footer reads `✗ in-pane view: rendered view turned off:` with the reason. `v`, `r`, and `R` then stop working for the session.
+
+The file keeps its diff until you press `v` again, which tries the page once more. Other markdown files keep their pages. When a page fails while you read another file, the pane stays where you are, and the footer says why once you reach that file. After Chromium fails three times in a minute, the in-pane view stays off for the session, the footer no longer lists `v here`, and `v` says why.
 
 The following settings change the in-pane view:
 
@@ -130,12 +144,13 @@ The footer names the following problems:
 
 | Message | What it means |
 | --- | --- |
-| `the in-pane view needs Chrome` | No headless Chromium was found, or `BRANCH_REVIEW_CHROME` names one that can't be used. Set `BRANCH_REVIEW_CHROME` to the absolute path of one, or install `chrome-headless-shell`. `r` still opens the page. |
+| `the in-pane view needs Chrome` | No headless Chromium was found, or `BRANCH_REVIEW_CHROME` names one that can't be used. Set `BRANCH_REVIEW_CHROME` to the absolute path of one, or install `chrome-headless-shell`. `r` still opens the page. The footer doesn't list `v here` until a Chromium is found at the next start. |
 | `the terminal didn't report its cell size` | The terminal didn't answer the cell size query, so a tile would be scaled and blurred. `r` still opens the page. |
+| `in-pane view:` | This file's page couldn't be drawn, for the reason that follows, so the pane shows its diff. To try again, press `v`. |
+| `the page didn't draw within 5 s` | The tiles on screen didn't arrive in time, as from a Chromium that stopped answering. The pane shows the file's diff. To try again, press `v`. |
+| `the terminal's image memory is full` or `every terminal image id is in use` | The terminal has no room for a tile on screen, because the pictures and tiles on screen already fill it. Pictures off screen don't count, since `branch-review` lets them go to make room. The pane shows the file's diff. |
 | `in-pane view turned off` | Chromium failed three times in a minute, so the pane goes back to the diff for the session. `r` still works. |
-| `rendered view turned off` | The rendered view's worker failed three times in a minute. The pane goes back to the diff, and `r` and `R` stop working for the session. |
-| `couldn't lay out the page` | Chromium couldn't lay out this file's page. The row under the file's name says why. To try again, press `v` twice. |
-| `couldn't draw this part of the page` | Chromium couldn't cut the tile for these rows, or the tile came out too large to send. To try again, press `v` twice. |
+| `in-pane view: rendered view turned off` | The rendered view's worker failed three times in a minute. The pane goes back to the diff, and `v`, `r`, and `R` stop working for the session. The footer no longer lists `v here`. |
 | `the pane is too narrow for the page` | The pane is too narrow to read a page in. Make the window or the diff pane wider. |
 | `the page is too long to draw here` | The page is taller than the 10,000 rows the pane draws, as a page whose HTML sets a huge height can be. The pane draws the top of it, and `r` opens all of it. |
 

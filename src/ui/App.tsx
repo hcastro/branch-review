@@ -1855,6 +1855,24 @@ function diffRowForSourceLine(rows: readonly DiffRow[], fileKey: string, line: n
   return first;
 }
 
+// Where the diff comes back to once a file's page stops showing, or null
+// while none has to: the line `v` asked to go back to (`toDiff`), where
+// the diff was for a page that failed on its way in (`toPage`), or the
+// line the page showed at the top of the last commit (`before`) for one
+// that failed or turned off once drawn.
+function diffReturn(
+  pane: Pick<RenderedPane, 'shows' | 'lineAtRow'>,
+  toPage: {fileKey: string; line: number | null} | null,
+  toDiff: {fileKey: string; line: number | null} | null,
+  before: {rows: readonly DiffRow[]; offset: number; viewRows: number; fileKey: string; inPane: boolean} | null,
+): {fileKey: string; line: number | null} | null {
+  if (toDiff) return toDiff;
+  if (toPage) return pane.shows(toPage.fileKey) ? null : {fileKey: toPage.fileKey, line: toPage.line};
+  if (!before?.inPane || pane.shows(before.fileKey)) return null;
+  const pageRow = topPageRow(before.rows, before.offset, before.viewRows, before.fileKey);
+  return {fileKey: before.fileKey, line: pageRow === null ? null : pane.lineAtRow(before.fileKey, pageRow)};
+}
+
 // The page row at the top of the pane for `fileKey`, when the pane shows
 // that file's page there.
 function topPageRow(rows: readonly DiffRow[], offset: number, viewRows: number, fileKey: string): number | null {
@@ -2427,7 +2445,8 @@ function AppContent({
   // Boxes are sized to the viewport once it holds still, like the wrap width.
   const mediaViewportRows = useSettledValue(mediaOn ? visibleDiffRows : 0, WRAP_SETTLE_MS);
   // The page in the pane (`v`), when it is offered here: a Kitty terminal
-  // with BRANCH_REVIEW_PANE=on. Without it nothing below changes a row.
+  // where BRANCH_REVIEW_PANE doesn't turn it off. Without it nothing below
+  // changes a row.
   const pane = rendered?.pane?.offered() ? rendered.pane : undefined;
   const paneVersion = useSyncExternalStore(pane ? pane.subscribe : noUpdates, pane ? pane.getVersion : noVersion);
   const panePlanVersion = pane ? pane.planVersion() : 0;
@@ -2594,9 +2613,6 @@ function AppContent({
   const activeTreeId = useMemo(() => findTreeSelectionId(rows, activeFileKey), [activeFileKey, rows]);
   const activeRowIndex = rows.findIndex((row) => row.id === activeTreeId);
   const activeFile = activeSection?.file;
-  useEffect(() => {
-    if (activeFileKey) rendered?.focus(activeFileKey);
-  }, [activeFileKey, rendered]);
   // A view that only follows focus, as a stub can, opens no pages.
   const pages = rendered?.open ? rendered as RenderedPages : undefined;
   const activeRenderable = Boolean(pages && activeFileKey && pages.renderable(activeFileKey));
@@ -2610,10 +2626,13 @@ function AppContent({
   useEffect(() => () => paneClock.stop(), [paneClock]);
   const paneDeveloping = useSyncExternalStore(paneClock.subscribe, () => paneClock.snapshot()?.developing ?? false);
   // How much `v` moves: asked once, ahead of the first press, the way the
-  // trip to a split asks; full until the answer is in.
+  // trip to a split asks; full until the answer is in. Only in a review
+  // with a page for `v` to draw: asking can run a program, and a review
+  // without one starts as it would with the pane turned off.
   const [paneMotion, setPaneMotion] = useState<'full' | 'reduced' | 'off'>(animations ? 'full' : 'off');
+  const panePages = useMemo(() => Boolean(pane && review?.files.some((file) => pane.covers(reviewFileKey(file)))), [pane, review]);
   useEffect(() => {
-    if (!pane || !animations || !rendered?.crossingMotion) return;
+    if (!panePages || !animations || !rendered?.crossingMotion) return;
     let live = true;
     void rendered.crossingMotion().then((motion) => {
       if (live) setPaneMotion(motion);
@@ -2621,7 +2640,7 @@ function AppContent({
     return () => {
       live = false;
     };
-  }, [animations, pane, rendered]);
+  }, [animations, panePages, rendered]);
   const paneVisibleRef = useRef<ReadonlySet<string>>(new Set());
   // The files with a page row on screen, which the crossing waits for too.
   const paneFilesRef = useRef<ReadonlySet<string>>(new Set());
@@ -2633,6 +2652,14 @@ function AppContent({
   // What the pane showed at the last commit, for keeping the reader's place when a resize lays the page out anew.
   const paneViewRef = useRef<{width: number; rows: readonly DiffRow[]; offset: number; viewRows: number; fileKey: string; inPane: boolean} | null>(null);
   const pendingDiffAnchor = useRef<{fileKey: string; line: number | null} | null>(null);
+  // The diff comes back in the frame that drops the page's rows, already at
+  // the reader's line: set while rendering, React renders again before it
+  // commits. The place-keeping effect below lands on the same row.
+  const backToDiff = pane ? diffReturn(pane, pendingPaneAnchor.current, pendingDiffAnchor.current, paneViewRef.current) : null;
+  if (backToDiff && !pane!.shows(backToDiff.fileKey) && !allDiffRows.some((row) => row.pane?.fileKey === backToDiff.fileKey)) {
+    const row = diffRowForSourceLine(allDiffRows, backToDiff.fileKey, backToDiff.line);
+    if (row !== null && clamp(row, 0, scrollCeiling) !== diffOffset) setDiffOffset(clamp(row, 0, scrollCeiling));
+  }
   const headerLineIndexes = useMemo(
     () => allDiffRows.flatMap((row, index) => (row.kind === 'header' ? [index] : [])),
     [allDiffRows],
@@ -2665,8 +2692,11 @@ function AppContent({
       ? media!.platform === 'darwin' ? VIDEO_FILE_ACTIONS : VIDEO_FILE_ACTIONS_ELSEWHERE
       : FILE_ACTIONS;
   // The pane shows the active file's page: its first button goes back.
-  const activeInPane = Boolean(paneOn && activeFileKey && pane!.covers(activeFileKey));
-  const paneOfferedHere = Boolean(pane && !paneOn && activeFileKey && pane.covers(activeFileKey));
+  const activeInPane = Boolean(pane && activeFileKey && pane.shows(activeFileKey));
+  // `v` would show it. The footer says so only where the pane can draw it:
+  // elsewhere `v` says why not.
+  const paneOfferedHere = Boolean(pane && !activeInPane && activeFileKey && pane.covers(activeFileKey));
+  const paneAdvertisedHere = paneOfferedHere && pane!.advertised();
   const headerActions = activeInPane
     ? [DIFF_ACTION, ...(activeRenderable ? [RENDERED_ACTION] : []), ...FILE_ACTIONS]
     : activeRenderable ? [RENDERED_ACTION, ...fileActionsHere] : fileActionsHere;
@@ -2842,13 +2872,22 @@ function AppContent({
     if (place) pendingPaneAnchor.current = {fileKey: before.fileKey, line: place.line, fraction: 0, within: place.within, keep: true};
   }, [pane, wrapWidth]);
 
+  // A page that fails, or a pane that turns off, never strands the reader:
+  // the file's diff comes back at the line the page showed at the top, or,
+  // for a page that failed on its way in, where the diff was.
   useEffect(() => {
     const toPage = pendingPaneAnchor.current;
-    if (toPage && paneOn && pane) {
+    const back = pane ? diffReturn(pane, toPage, pendingDiffAnchor.current, paneViewRef.current) : null;
+    if (back && back !== pendingDiffAnchor.current) {
+      pendingPaneAnchor.current = null;
+      paneClock.stop();
+      pendingDiffAnchor.current = back;
+    }
+    if (toPage && pane && pendingPaneAnchor.current) {
       const start = allDiffRows.findIndex((row) => row.pane?.fileKey === toPage.fileKey);
       if (start < 0) return;
       const drawn = allDiffRows.some((row) => row.pane?.fileKey === toPage.fileKey && row.pane.pageRow !== undefined);
-      if (!drawn && !pane.layoutFailed(toPage.fileKey)) {
+      if (!drawn) {
         if (!toPage.keep) setDiffOffset(Math.min(start, scrollCeiling));
         return;
       }
@@ -2858,15 +2897,15 @@ function AppContent({
       return;
     }
     const toDiff = pendingDiffAnchor.current;
-    if (toDiff && !paneOn) {
+    if (toDiff && !pane?.shows(toDiff.fileKey)) {
       pendingDiffAnchor.current = null;
       const row = diffRowForSourceLine(allDiffRows, toDiff.fileKey, toDiff.line);
       if (row !== null) setDiffOffset(clamp(row, 0, scrollCeiling));
     }
-  }, [allDiffRows, pane, paneOn, panePlanVersion, scrollCeiling, visibleDiffRows]);
+  }, [allDiffRows, pane, paneClock, paneOn, panePlanVersion, scrollCeiling, visibleDiffRows]);
 
   useEffect(() => {
-    paneViewRef.current = {width: wrapWidth, rows: allDiffRows, offset: diffOffset, viewRows: visibleDiffRows, fileKey: activeFileKey, inPane: Boolean(paneOn && activeFileKey && pane?.covers(activeFileKey))};
+    paneViewRef.current = {width: wrapWidth, rows: allDiffRows, offset: diffOffset, viewRows: visibleDiffRows, fileKey: activeFileKey, inPane: Boolean(activeFileKey && pane?.shows(activeFileKey))};
   });
 
   useEffect(() => {
@@ -3066,7 +3105,7 @@ function AppContent({
     }
     paneVisibleRef.current = visible;
     paneFilesRef.current = files;
-    pane.want(wanted, visible);
+    pane.want(wanted, visible, files);
     pane.sweep(live, visible);
   }, [allDiffRows, diffOffset, pane, paneBoxRowIndexes, paneVersion, visibleDiffRows]);
 
@@ -3115,7 +3154,7 @@ function AppContent({
   // footer, and the diff stays.
   const togglePane = useCallback(() => {
     if (!pane) return;
-    if (pane.mode() === 'rendered') {
+    if (pane.shows(activeFileKey)) {
       const pageRow = topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey);
       paneClock.stop();
       pendingPaneAnchor.current = null;
@@ -3212,6 +3251,16 @@ function AppContent({
     const outcome = await media.open(ref, media.shownSide(ref), how);
     showToast(outcome.message, undefined, outcome.kind);
   }, [media, showToast]);
+
+  // The file the reader is on renders first, and hears what failed on it
+  // while they were elsewhere. Not the file at the old offset for the one
+  // commit before the remap above puts the view back: the reader never
+  // went there.
+  useEffect(() => {
+    const target = remapTargetRef.current;
+    if ((target !== null && target !== diffOffset) || !activeFileKey) return;
+    rendered?.focus(activeFileKey);
+  }, [activeFileKey, diffOffset, rendered]);
 
   // Flip mode shows each file's after side first, so moving to another file
   // never opens it on a side left over from the last one. A refresh or a mode
@@ -4150,7 +4199,7 @@ function AppContent({
     ? toast.kind === 'error'
       ? {text: `✗ ${toast.text}`, style: ANSI_RED}
       : {text: `${toast.kind === 'success' ? '✓ ' : ''}${toast.text}`, style: ANSI_CYAN}
-    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneOfferedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable && activeIsMarkdown ? RENDERED_KEY_HINT_ITEMS : activeRenderable ? withRenderedHint(mediaHintItems(media, activeMediaRef)) : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
+    : {text: footerHintText(watchStatus ? toDisplayText(watchStatus) : undefined, Math.max(1, columns - 4), activeInPane ? PANE_KEY_HINT_ITEMS : paneAdvertisedHere ? PANE_OFFER_HINT_ITEMS : activeRenderable && activeIsMarkdown ? RENDERED_KEY_HINT_ITEMS : activeRenderable ? withRenderedHint(mediaHintItems(media, activeMediaRef)) : mediaHintItems(media, activeMediaRef)), style: ANSI_GRAY};
   // A block preview is rough on purpose; while one is on screen the footer
   // says why the picture is not drawn properly.
   const footerRight = activeInPane

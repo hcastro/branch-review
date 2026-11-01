@@ -28,7 +28,8 @@ const CMUX_TIMEOUT_MS = 1500;
 // How long an open-split cmux was slow to answer may still run: one that
 // answers late is still the split, and later presses go to it.
 const OPEN_SPLIT_KILL_MS = 10_000;
-const HEADLESS = 'branch-review --render-out <dir> writes the pages';
+/** Where to get the pages when nothing here opens them. */
+export const HEADLESS = 'branch-review --render-out <dir> writes the pages';
 const IN_SPLIT = 'in the split →';
 const IN_BROWSER = 'opened in your browser';
 // A split name cmux gives, such as `surface:17`; anything else is not used.
@@ -79,8 +80,13 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   findTool: (name: string) => string | null;
   opener: Opener;
   platform: NodeJS.Platform;
-  /** The diff pane draws pages too (`v`), which is the way to read one over SSH. */
-  inPane?: boolean;
+  /**
+   * Whether the diff pane draws the page of the file `r` was pressed on
+   * (`v`), which is the way to read one over SSH; null for no one file, as
+   * for the overview. Asked each time a refusal is read, since it may only
+   * be known once Chromium is looked for.
+   */
+  inPane?: boolean | ((fileKey: string | null) => boolean);
   /** How long a cmux call has to answer before the page goes elsewhere (1500 ms). */
   timeoutMs?: number;
 }) {
@@ -89,8 +95,9 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   const cmux = !ssh && workspace ? findTool('cmux') : null;
   // On macOS the first `open` on PATH inside cmux is its own wrapper.
   const browser = ssh ? null : platform === 'darwin' ? '/usr/bin/open' : platform === 'linux' || platform === 'freebsd' || platform === 'openbsd' ? findTool('xdg-open') : null;
-  const refusal = ssh ? `open isn't available over SSH · ${inPane ? 'v draws it here' : HEADLESS}` : !cmux && !browser ? `no browser opener found · ${HEADLESS}` : null;
-  const kind: SurfaceKind = refusal ? 'none' : cmux ? 'cmux' : 'browser';
+  const refused = ssh || (!cmux && !browser);
+  const refusalFor = (fileKey: string | null) => (!refused ? null : ssh ? `open isn't available over SSH · ${(typeof inPane === 'function' ? inPane(fileKey) : inPane) ? 'v draws it here' : HEADLESS}` : `no browser opener found · ${HEADLESS}`);
+  const kind: SurfaceKind = refused ? 'none' : cmux ? 'cmux' : 'browser';
 
   let split: string | null = null;
   // cmux said its browser is off: it hands every page to the default
@@ -135,7 +142,7 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   async function place(target: string | (() => string), reuseOnly: boolean, showing?: readonly string[], outrun = () => false): Promise<ShowResult | {skipped: true} | {gone: true}> {
     let resolved: string | undefined;
     const href = () => (resolved ??= typeof target === 'string' ? target : target());
-    if (refusal) return {refused: refusal};
+    if (refused) return {refused: refusalFor(null)!};
     if (stopped.signal.aborted) return {superseded: true};
     if (reuseOnly && !split) return {gone: true};
     if (!cmux) return inBrowser(href()) ? {where: 'browser', message: IN_BROWSER} : {refused: `no browser opener found · ${HEADLESS}`};
@@ -235,7 +242,11 @@ export function createSurface({env, run, findTool, opener, platform, inPane = fa
   return {
     kind,
     /** Why nothing can open, or null. Known at once, so the TUI throws nothing toward a page that won't open. */
-    refusal,
+    get refusal() {
+      return refusalFor(null);
+    },
+    /** Why `r` on this file opens nothing, or null: over SSH, `v` where the pane draws its page. */
+    refusalFor,
     /** Where a page opens, for the button's hint. */
     destination: kind === 'cmux' ? 'in a split to the right' : kind === 'browser' ? 'in your browser' : null,
     /**

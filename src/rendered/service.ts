@@ -78,7 +78,7 @@ export type OpenOutcome = {message: string; kind: 'info' | 'error'};
  */
 export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void};
 
-export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh' | 'opensSplit'>>;
+export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh' | 'opensSplit' | 'refusalFor'>>;
 
 export type SetTimer = (run: () => void, ms: number) => () => void;
 
@@ -512,6 +512,9 @@ export function createRenderedService({backend, site, surface, motion, animation
           return key ? [[planned.alias, key] as const] : [];
         }).concat(overview ? [[OVERVIEW_ALIAS, overview] as const] : [])),
         previous: new Set(allPages().flatMap(({fileKey: key}) => (previous.has(key) ? [previous.get(key)!] : []))),
+        // A refresh queued behind a slow goto names its page only as it
+        // goes: until it went, newer pages of its file may have come.
+        sending: new Set([...sending].map((each) => each.key)),
       });
     } finally {
       // In the same turn as the last check above, so a count that moves
@@ -723,11 +726,13 @@ export function createRenderedService({backend, site, surface, motion, animation
   // still unwritten after the crossing is said to be rendering, until the
   // deadline gives up on it, and then it opens nowhere. A press made after
   // this one wins: this one's page is never shown over it. `opened` hears
-  // where the page went once it did.
-  async function travel(name: string, note: string | null, write: () => Promise<PageOutcome>, trip?: Trip, opened?: (where: 'cmux-new' | 'cmux-reuse' | 'browser', key: string) => void): Promise<OpenOutcome | null> {
+  // where the page went once it did. `pressedOn`: the file the reader was
+  // on, which a refusal may point `v` to; null for the overview.
+  async function travel(pressedOn: string | null, name: string, note: string | null, write: () => Promise<PageOutcome>, trip?: Trip, opened?: (where: 'cmux-new' | 'cmux-reuse' | 'browser', key: string) => void): Promise<OpenOutcome | null> {
     const place = surface;
     if (!place) return {kind: 'error', message: 'pages open only in the full app'};
-    if (place.refusal) return {kind: 'error', message: place.refusal};
+    const refusal = place.refusalFor ? place.refusalFor(pressedOn) : place.refusal;
+    if (refusal) return {kind: 'error', message: refusal};
     const press = (presses += 1);
     traveling += 1;
     motionAsked ??= motion ? motion() : Promise.resolve('off');
@@ -778,6 +783,7 @@ export function createRenderedService({backend, site, surface, motion, animation
   const pane: RenderedPane | null = paneOptions ? createRenderedPane({
     backend,
     ...paneOptions,
+    browserOpens: surface !== undefined && surface.kind !== 'none',
     source: (fileKey) => {
       const planned = plan.get(fileKey);
       if (planned?.kind !== 'markdown' || !planned.request || !title) return null;
@@ -897,7 +903,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         const written = await page(planned.fileKey);
         return written.ok ? {...written, url: `${written.url}#${hash}`} : written;
       };
-      return travel(fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, write, trip, (where, key) => {
+      return travel(fileKey, fallback ? shownPath : path.posix.basename(shownPath), fallback ? 'first rendered file' : null, write, trip, (where, key) => {
         visited.add(planned.fileKey);
         setSplit(where === 'browser' ? null : {fileKey: planned.fileKey, key, content: contentOf(key), ...place, blocks: blockIds(planned), seq: (seqs += 1)});
       });
@@ -909,7 +915,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       if (off) return {kind: 'error', message: off};
       if (plan.size === 0) return {kind: 'info', message: NOTHING_TO_RENDER};
       // The split shows the overview now, which no file's refresh replaces.
-      return travel('overview', null, writeOverview, trip, () => {
+      return travel(null, 'overview', null, writeOverview, trip, () => {
         setSplit(null);
       });
     },
@@ -974,8 +980,11 @@ export function startRenderedService({tempDir, env, cwd, animations = true, open
   // Looked up the first time `v` asks, and fixed for the session.
   let chrome: ChromeBinary | null | undefined;
   const findBrowser = () => (chrome === undefined ? (chrome = findChrome({env, home: os.homedir(), platform, findTool: (name) => findTool(name, env, cwd), repoRoot: cwd})) : chrome);
-  const inPane = Boolean(pane && env.BRANCH_REVIEW_PANE === 'on' && pane.caps.protocol === 'kitty');
-  return createRenderedService({
+  // Over SSH, `r` names `v` only on a file whose page the pane draws, which
+  // is known once the service, and the pane in it, exists.
+  let service: RenderedService | null = null;
+  const inPane = (fileKey: string | null) => Boolean(fileKey !== null && service?.pane?.covers(fileKey) && service.pane.advertised());
+  service = createRenderedService({
     backend: createRenderedBackend({tempDir, env, cwd}),
     site: createRenderedSite({tempDir}),
     surface: createSurface({env, run: runTool, findTool: (name) => findTool(name, env, cwd), opener, platform, inPane}),
@@ -985,4 +994,5 @@ export function startRenderedService({tempDir, env, cwd, animations = true, open
     colors,
     live,
   });
+  return service;
 }

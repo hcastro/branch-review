@@ -104,6 +104,16 @@ describe('the rendered site', () => {
     expect(fs.readdirSync(tight.dir)).toEqual([`${KEY_A}.html`]);
   });
 
+  it('keeps a page on its way to a browser, never shown yet and no file\'s newest, even past its disk budget', () => {
+    const {dir, site} = siteIn({maxBytes: 10});
+    site.write(KEY_A, 'a'.repeat(1000));
+    site.write(KEY_B, 'b'.repeat(1000));
+    site.write(KEY_C, 'c'.repeat(1000));
+    site.alias(ALIAS, KEY_C);
+    site.prune({current: new Map([[ALIAS, KEY_C]]), previous: new Set([KEY_B]), sending: new Set([KEY_A])});
+    expect(fs.readdirSync(dir).sort()).toEqual([`${KEY_A}.html`, `${KEY_C}.html`, `${ALIAS}.html`].sort());
+  });
+
   it('says the disk is full in a line a toast can show', () => {
     const {session, site} = siteIn();
     // A file where the dir would go fails every write the same way a full disk does: at the write.

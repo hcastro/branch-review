@@ -17,7 +17,9 @@ import {deleteImage, frameGap, placeVirtual, startLoop, transmitFrame, transmitP
 // page tile is live or asked for: media previews alone keep the budgets
 // they had before the pane existed, so they are the same when it is idle.
 
-const MAX_ID = 255;
+/** How many image ids a terminal session has. */
+export const IMAGE_IDS = 255;
+const MAX_ID = IMAGE_IDS;
 const DEFAULT_MAX_LIVE = 64;
 const DEFAULT_MAX_BYTES = 96 * 1024 * 1024;
 const DEFAULT_QUARANTINE_MS = 2_000;
@@ -78,6 +80,13 @@ export type ImageRegistry = {
    */
   fits(png: Uint8Array, animation?: Animation, pool?: ImagePool): boolean;
   /**
+   * Whether one more image of this PNG's size stays within the budgets
+   * once the sweeps let go of every image off screen: the pool's not in
+   * `onScreen`, and the other pool's not on screen at its last sweep. When
+   * it doesn't fit, the screen itself asks for more than the terminal holds.
+   */
+  fitsOnScreen(png: Uint8Array, onScreen: ReadonlySet<string>, pool?: ImagePool): boolean;
+  /**
    * After `acquire` found no free id: how long until the first id leaves
    * quarantine. With every id live, none is due yet, so the full quarantine,
    * which an id released from now on serves.
@@ -116,6 +125,8 @@ export function createImageRegistry({
   let liveBytes = 0;
   const decoded: Record<ImagePool, number> = {media: 0, page: 0};
   const counts: Record<ImagePool, number> = {media: 0, page: 0};
+  // What each pool's last sweep said is on screen: what its next sweep keeps.
+  const onScreenAt: Record<ImagePool, ReadonlySet<string>> = {media: new Set(), page: new Set()};
   // A random start only staggers where a session's ids begin. It does not
   // keep two sessions drawing on one terminal apart: each knows only its own
   // ids, so sooner or later one writes over or deletes the other's. Under
@@ -162,14 +173,20 @@ export function createImageRegistry({
   };
 
   const totalDecoded = () => decoded.media + decoded.page;
-  // Whether a pool is within its own budgets and the decoded one, with
-  // `extra` more of each.
-  const within = (pool: ImagePool, extra: {count: number; base64: number; decoded: number}) => {
-    const shared = pool === 'page' || counts.page > 0;
-    if (shared && totalDecoded() + extra.decoded > maxDecoded) return false;
-    if (pool === 'page') return counts.page + extra.count <= pageMaxLive && decoded.page + extra.decoded <= pageMaxDecoded;
-    return counts.media + extra.count <= maxLive && liveBytes + extra.base64 <= maxBytes;
+  // Whether a pool holding this much is within its own budgets, and, with
+  // both pools holding `shared` decoded, within the decoded one.
+  const allows = (pool: ImagePool, held: {count: number; base64: number; decoded: number; shared: number}) => {
+    if ((pool === 'page' || counts.page > 0) && held.shared > maxDecoded) return false;
+    if (pool === 'page') return held.count <= pageMaxLive && held.decoded <= pageMaxDecoded;
+    return held.count <= maxLive && held.base64 <= maxBytes;
   };
+  // Whether a pool is within its budgets with `extra` more of each.
+  const within = (pool: ImagePool, extra: {count: number; base64: number; decoded: number}) => allows(pool, {
+    count: counts[pool] + extra.count,
+    base64: liveBytes + extra.base64,
+    decoded: decoded[pool] + extra.decoded,
+    shared: totalDecoded() + extra.decoded,
+  });
   const NONE = {count: 0, base64: 0, decoded: 0};
 
   return {
@@ -201,6 +218,7 @@ export function createImageRegistry({
     touch,
     release,
     sweep(live, visible, pool = 'media') {
+      onScreenAt[pool] = visible;
       const own = () => [...entries].filter(([, entry]) => entry.pool === pool).map(([imageKey]) => imageKey);
       for (const imageKey of own()) {
         if (!live.has(imageKey)) release(imageKey);
@@ -221,6 +239,21 @@ export function createImageRegistry({
     liveCount: (pool) => (pool ? counts[pool] : entries.size),
     decodedBytes: (pool) => (pool ? decoded[pool] : totalDecoded()),
     fits: (png, animation, pool = 'media') => within(pool, {count: 1, base64: imageSize(png, animation), decoded: decodedSize(png, animation)}),
+    fitsOnScreen(png, onScreen, pool = 'media') {
+      // What each pool keeps on screen, the images off screen taken away:
+      // either pool's sweep lets go of its own off screen once the decoded
+      // budget both share is exceeded.
+      const held = {count: 1, base64: imageSize(png), decoded: decodedSize(png), shared: decodedSize(png)};
+      for (const [imageKey, entry] of entries) {
+        if (!(entry.pool === pool ? onScreen : onScreenAt[entry.pool]).has(imageKey)) continue;
+        held.shared += entry.decodedBytes;
+        if (entry.pool !== pool) continue;
+        held.count += 1;
+        held.base64 += entry.base64Bytes;
+        held.decoded += entry.decodedBytes;
+      }
+      return allows(pool, held);
+    },
     nextFreeIn() {
       const at = now();
       let soonest = quarantineMs;
