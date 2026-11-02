@@ -477,7 +477,11 @@ describe('change marks on the page', () => {
     const file = diffFile(before, after);
     const started = Date.now();
     const fragment = await renderMarkdown({path: 'doc.md', source: after, groups: changeGroups(file), ...lookups});
-    expect(Date.now() - started).toBeLessThan(3_000);
+    // Giving each view the whole side's definitions took about 16 s here;
+    // giving it only the ones it cites takes about 0.6 s on a laptop and 4 s
+    // on a slow CI runner, so 10 s catches the regression without tripping
+    // on a slow machine.
+    expect(Date.now() - started).toBeLessThan(10_000);
     const views = beforeBodies(fragment.html);
     expect(views).toHaveLength(count);
     // Each view resolves its own reference, by its label in any case and spacing, and its footnote's number.
