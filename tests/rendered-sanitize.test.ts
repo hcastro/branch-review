@@ -102,6 +102,14 @@ describe('sanitizer', () => {
     expect(fragment.differences).toEqual([{kind: 'remoteImage', count: 1}]);
   });
 
+  it('makes a link inert that the review page would read as a live refresh or a trip, and keeps a heading named like a card', async () => {
+    const source = '# File 2\n\n[live](#file-2&l=1) and [trip](#top&m=0&n=7) and [elsewhere](other.md#file-0&l=1) and [heading](#file-2)\n';
+    const fragment = await renderMarkdown({path: 'README.md', source, groups: [], asset: lookups.asset, link: () => ({kind: 'inReview', href: 'f-other.html'})});
+    expect(fragment.html).not.toMatch(/href="[^"]*(?:l=1|m=0|n=7)/);
+    expect(fragment.links.map((link) => link.status)).toEqual(['badAnchor', 'badAnchor', 'badAnchor', 'ok']);
+    expect(fragment.html).toContain('<a href="#user-content-file-2">heading</a>');
+  });
+
   it('makes a link inert that the page script would read as a trip, so repo text never plays a develop or a pulse', async () => {
     const source = [
       '<a href="#at=L1&d=full&g=b-00000000-1">raw</a>',

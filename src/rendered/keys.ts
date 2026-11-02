@@ -1,16 +1,16 @@
 import {createHash} from 'node:crypto';
 import type {FileStatus} from '../git.js';
-import {PAGE_CSS_HASH, PAGE_SCRIPT_HASH} from './assets.generated.js';
+import {PAGE_CSS_HASH} from './assets.generated.js';
 import type {ChangeGroup} from './changes.js';
 
 /** Bumped whenever the renderer's output changes for the same input. */
 export const RENDERER_VERSION = 1;
 
 /**
- * A page's file name: the first 20 hex of a sha256 over everything that
- * decides its content, so a page's name never carries repo text and an
- * unchanged file keeps its name. `rail` is the signature of the rendered
- * file list the page links to. `oldPath` is where a moved file was, which
+ * A rendered file's key: the first 20 hex of a sha256 over everything that
+ * decides its fragment, so a key never carries repo text and an unchanged
+ * file keeps its key. `rail` is the signature of the rendered file list
+ * its links resolve against. `oldPath` is where a moved file was, which
  * decides the images its base side shows.
  */
 export function pageKey(parts: {
@@ -26,7 +26,7 @@ export function pageKey(parts: {
   // Named only when there is one, so a file that didn't move keeps its key.
   const moved = parts.oldPath === undefined ? [] : [parts.oldPath];
   return createHash('sha256')
-    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, PAGE_SCRIPT_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail, ...moved]))
+    .update(JSON.stringify([RENDERER_VERSION, PAGE_CSS_HASH, parts.path, parts.status, parts.before ?? null, parts.after ?? null, groups, parts.rail, ...moved]))
     .digest('hex')
     .slice(0, 20);
 }

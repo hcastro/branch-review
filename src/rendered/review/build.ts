@@ -7,7 +7,8 @@ import type {PageBody} from '../page.js';
 import {oneLine, type SourceReader, type SourceSpec} from '../source.js';
 import {drawHunk, escapeText, parseHunks, type CardDiff, type Hunk} from './diff.js';
 import {highlightLines} from './highlight.js';
-import {assembleReviewPage, contextBudget, CONTEXT_FILE_LIMIT, type BranchState, type ReviewCommit, type ReviewPageCard} from './page.js';
+import {assembleReviewPage, CONTEXT_FILE_LIMIT, diffFolds, textBudget, type BranchState, type ReviewCommit, type ReviewPageCard} from './page.js';
+import {lfsPointerSize, type CardSpecial} from './special.js';
 
 // The worker's half of the Review in browser page: each card's diff read
 // from its hunks, colored by the grammar for its file across each whole
@@ -40,7 +41,7 @@ type Read = {text: string; bytes: number} | {tooLarge: true} | null;
 type Size = {bytes: number; lines: number} | 'tooLarge';
 
 /** What git says of the branch: its commits, and where it stands against its upstream (null: no local branch). Undefined for what couldn't be read. */
-export type BranchReading = {commits?: ReviewCommit[]; upstream?: {remote: string; ahead: number} | {remote: null} | null};
+export type BranchReading = {commits?: ReviewCommit[]; upstream?: {remote: string; ahead: number; behind?: number} | {remote: null} | null};
 
 export type ReadBranch = (cwd: string, refs: ReviewRequest['refs'], signal: AbortSignal) => Promise<BranchReading>;
 
@@ -52,11 +53,29 @@ const readBranch: ReadBranch = async (cwd, refs, signal) => {
   return {...(commits ? {commits} : {}), ...(upstream !== undefined ? {upstream} : {})};
 };
 
+// The reviewed side's lines with those a hunk shows left blank: the page
+// carries each line once, and a gap reveals only lines no hunk shows. A
+// new file's context is then all blank, and costs the page almost nothing.
+function gapsOnly(lines: readonly string[], hunks: readonly Hunk[]) {
+  const gaps = [...lines];
+  for (const hunk of hunks) for (const line of hunk.lines) if (line.n !== undefined) gaps[line.n - 1] = '';
+  return gaps;
+}
+
 // Lets the event loop run, so a job beside this one, and the git this job
 // waits on, are heard between two sides.
 const breathe = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-export function createReviewBuilder({sources, fragment, now = Date.now, highlight = highlightLines, branch = readBranch, gitBudgetMs = GIT_BUDGET_MS}: {
+// A branch with an upstream, by the commits each side has that the other
+// doesn't: one with commits to fetch is never up to date.
+function stateAgainst({remote, ahead, behind = 0}: {remote: string; ahead: number; behind?: number}): BranchState {
+  if (ahead > 0 && behind > 0) return {kind: 'diverged', remote, ahead, behind};
+  if (ahead > 0) return {kind: 'ahead', remote, count: ahead};
+  if (behind > 0) return {kind: 'behind', remote, count: behind};
+  return {kind: 'even', remote};
+}
+
+export function createReviewBuilder({sources, fragment, now = Date.now, highlight = highlightLines, branch = readBranch, gitBudgetMs = GIT_BUDGET_MS, buildBudgetMs = BUILD_BUDGET_MS}: {
   sources: SourceReader;
   // The renderer's fragment for a request, held by the handler.
   fragment: (request: FragmentRequest) => Promise<{body: PageBody}>;
@@ -64,9 +83,13 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
   highlight?: (text: string, path: string) => Promise<string[] | null>;
   branch?: ReadBranch;
   gitBudgetMs?: number;
+  // `--export-html`, which nobody waits on, gives the cards all the time they take.
+  buildBudgetMs?: number;
 }) {
   const diffs = createLru<CardDiff>(CARD_CACHE_BYTES, (diff) => JSON.stringify(diff).length * 2);
   const sizes = createLru<Size>(1024 * 1024, () => 64);
+  // Whether a side is a whole Git LFS pointer, by the same key as its size.
+  const pointers = createLru<boolean>(1024 * 1024, () => 64);
 
   const read = async (cwd: string, spec: SourceSpec | undefined): Promise<Read> => {
     if (!spec) return null;
@@ -148,7 +171,7 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
     const total = size && size !== 'tooLarge' ? size.lines : undefined;
     const diff: CardDiff = {
       hunks: hunks.map((hunk) => drawHunk(hunk, {old: lookup(oldHtml), new: lookup(newHtml)})),
-      context: newLines,
+      context: newLines && gapsOnly(newLines, hunks),
       ...(leftOut ? {contextNote: 'budget' as const} : {}),
       ...(total !== undefined ? {total} : {}),
     };
@@ -171,21 +194,69 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
     clearTimeout(timer);
     stop.abort();
     const {upstream} = reading;
-    const state: BranchState | null = upstream === undefined ? {kind: 'unknown'} : upstream === null ? null
-      : upstream.remote === null ? {kind: 'unpushed'} : upstream.ahead > 0 ? {kind: 'ahead', remote: upstream.remote, count: upstream.ahead} : {kind: 'even', remote: upstream.remote};
+    const state: BranchState | null = upstream === undefined ? {kind: 'unknown'} : upstream === null ? null : upstream.remote === null ? {kind: 'unpushed'} : stateAgainst(upstream);
     return {state, commits: reading.commits ?? null, complete: upstream !== undefined && reading.commits !== undefined};
+  }
+
+  // A Git LFS pointer's card is one line only when its whole side reads as
+  // the pointer its hunk shows: a file that opens like one and goes on past
+  // the hunk draws its diff. So does one whose side can't be read. The
+  // answer is kept by the side's blob id, so a page written again reads
+  // only what changed.
+  async function wholePointer(cwd: string, card: ReviewCardRequest): Promise<CardSpecial | undefined> {
+    const spec = card.status === 'deleted' ? card.sides.before : card.sides.after;
+    const key = sizeKey(cwd, spec);
+    let whole = key ? pointers.get(key) : undefined;
+    if (whole === undefined) {
+      const side = await read(cwd, spec);
+      const text = side && 'text' in side && side.text.endsWith('\n') ? side.text.slice(0, -1) : null;
+      whole = text !== null && lfsPointerSize(text.split('\n')) !== undefined;
+      if (key) pointers.set(key, whole);
+    }
+    return whole ? card.special : undefined;
+  }
+
+  /**
+   * Each card's special kind, with every Git LFS candidate checked against
+   * its side by a few readers at once, as the cards are, while the build's
+   * budget lasts. A candidate left unchecked draws its diff, the safe
+   * answer, and the page says it is partial.
+   */
+  async function checkPointers(request: ReviewRequest, inBudget: () => boolean): Promise<{specials: Array<CardSpecial | undefined>; unchecked: boolean}> {
+    const specials: Array<CardSpecial | undefined> = request.cards.map((card) => (card.special?.kind === 'lfs' ? undefined : card.special));
+    const candidates = [...request.cards.keys()].filter((index) => request.cards[index]!.special?.kind === 'lfs');
+    let unchecked = false;
+    let next = 0;
+    const reader = async () => {
+      while (next < candidates.length) {
+        const index = candidates[next]!;
+        next += 1;
+        if (!inBudget()) {
+          unchecked = true;
+          continue;
+        }
+        specials[index] = await wholePointer(request.cwd, request.cards[index]!);
+      }
+    };
+    await Promise.all(Array.from({length: CONCURRENCY}, reader));
+    return {specials, unchecked};
   }
 
   const shortHash = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
   return {
-    async page(request: ReviewRequest): Promise<{html: string; partial: boolean}> {
+    /** The page, and each card's one line in place of a diff, for a report to say what the page shows. */
+    async page(request: ReviewRequest): Promise<{html: string; partial: boolean; specials: Array<CardSpecial | undefined>}> {
       const startedAt = now();
-      const inBudget = () => now() - startedAt < BUILD_BUDGET_MS;
+      const inBudget = () => now() - startedAt < buildBudgetMs;
       const facts = branchFacts(request);
-      const budget = contextBudget();
+      const budget = textBudget();
+      // The fold decisions need each card's final kind, so the pointers are
+      // checked first.
+      const {specials, unchecked} = await checkPointers(request, inBudget);
+      const folds = diffFolds(request.cards.map((card, index) => ({status: card.status, blocks: card.blocks, special: specials[index]})), budget);
       const cards: ReviewPageCard[] = new Array(request.cards.length);
-      let partial = false;
+      let partial = unchecked;
       // Each card asks the page's budget once its predecessor has, so the
       // first files in the review's order carry their context, as on a
       // page read top down.
@@ -215,19 +286,24 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
           });
           const carry = async (bytes: number | null) => {
             await before;
-            const carried = bytes !== null && budget.take(bytes);
+            const carried = bytes !== null && budget.context(bytes);
             release();
             return carried;
           };
+          // A diff the page has no room to carry isn't read: its card says
+          // so in one line, as a binary file's or a submodule's does.
+          const fold = folds[index]!;
+          const special: CardSpecial | undefined = specials[index] ?? (typeof fold === 'object' ? fold : undefined);
           let drawn: Awaited<ReturnType<typeof cardDiff>>;
           let rendered: PageBody | null;
           try {
-            [drawn, rendered] = await Promise.all([cardDiff(request.cwd, card, inBudget(), carry), renderedOf(card)]);
+            [drawn, rendered] = await Promise.all([special ? carry(null).then(() => ({diff: null, plain: false})) : cardDiff(request.cwd, card, inBudget(), carry), renderedOf(card)]);
           } finally {
             void before.then(release);
           }
           if (drawn.plain) partial = true;
-          const {diff} = drawn;
+          // A long diff arrives folded, its lines in the page's data.
+          const diff = drawn.diff && fold === 'fold' ? {...drawn.diff, fold: true as const} : drawn.diff;
           // An image whose sides couldn't be read says why in place of them.
           const imageFailed = card.kind !== 'text' && card.kind !== 'markdown' && rendered?.kind === 'failed' ? `Couldn't show this image: ${rendered.reason}` : undefined;
           cards[index] = {
@@ -245,7 +321,8 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
             diff,
             ...(card.also ? {also: card.also} : {}),
             ...(imageFailed !== undefined ? {imageFailure: imageFailed} : {}),
-            ...(imageFailed !== undefined && diff === null ? {notice: imageFailed} : card.notice !== undefined && diff === null ? {notice: card.notice} : {}),
+            ...(imageFailed !== undefined && diff === null ? {notice: imageFailed} : special && diff === null ? {special} : {}),
+            ...(card.mode ? {mode: card.mode} : {}),
             ...(rendered?.kind === 'pending' && card.kind !== 'markdown' ? {pending: true} : {}),
             ...(rendered && rendered.kind === 'image' ? {image: rendered.image} : {}),
             ...(rendered && card.kind === 'markdown' ? {rich: {body: rendered, ...(card.brokenRefs ? {brokenRefs: card.brokenRefs} : {})}} : {}),
@@ -255,7 +332,7 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
       await Promise.all(Array.from({length: CONCURRENCY}, work));
       const {state, commits, complete} = await facts;
       const html = assembleReviewPage({title: request.title, reviewId: request.reviewId, builtAt: now(), state, commits, cards, findings: request.findings});
-      return {html, partial: partial || !complete};
+      return {html, partial: partial || !complete, specials: cards.map((each) => each.special)};
     },
   };
 }

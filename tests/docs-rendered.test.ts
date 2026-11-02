@@ -68,6 +68,12 @@ describe('Preview and Review in browser in the docs', () => {
     expect(section).toContain('--export-html');
   });
 
+  it('says what --no-animations turns off on the review page now, which has no develop', () => {
+    const row = raw('README.md').split('\n').find((line) => line.startsWith('| `--no-animations` |'))!;
+    expect(row).not.toContain('develop');
+    expect(row).toContain('its pulse on a live refresh');
+  });
+
   it('lists the keys, the flag and the env var in the README tables', () => {
     const readme = read('README.md');
     expect(readme).toContain('| `--export-html DIR` |');

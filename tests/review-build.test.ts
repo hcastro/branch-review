@@ -3,6 +3,7 @@ import type {ReviewCardRequest, ReviewRequest} from '../src/rendered/backend.js'
 import {patchObjectIds} from '../src/media/classify.js';
 import type {PageBody} from '../src/rendered/page.js';
 import {BUILD_BUDGET_MS, createReviewBuilder, type ReadBranch} from '../src/rendered/review/build.js';
+import {parseHunks, unpackHtml} from '../src/rendered/review/diff.js';
 import {highlightLines} from '../src/rendered/review/highlight.js';
 import {reviewCardRequest} from '../src/rendered/review/request.js';
 import {OPEN_DEADLINE_MS} from '../src/rendered/service.js';
@@ -19,7 +20,12 @@ const RANGE = {branch: 'feature', includeWorktree: false};
 const REFS = {base: 'main', branch: 'feature'};
 
 type Data = {cards: Array<{diff: {context: string[] | null; contextNote?: string; total?: number} | null}>};
-const dataOf = (html: string) => JSON.parse(/<script type="application\/json" id="rv-data">([\s\S]*?)<\/script>/.exec(html)![1]!) as Data;
+// The page's data, its lines' HTML unpacked.
+const dataOf = (html: string) => {
+  const data = JSON.parse(/<script type="application\/json" id="rv-data">([\s\S]*?)<\/script>/.exec(html)![1]!) as Data;
+  for (const card of data.cards) if (card.diff?.context) card.diff.context = card.diff.context.map(unpackHtml);
+  return data;
+};
 const sigs = (html: string) => [...html.matchAll(/data-sig="([^"]+)"/g)].map((match) => match[1]);
 
 // Texts by blob id, as the review's patches name them.
@@ -86,7 +92,8 @@ describe('the review builder', () => {
     const {html} = await builder.page(request([big.card]));
     const [card] = dataOf(html).cards;
     expect(card!.diff!.context).toHaveLength(big.after.split('\n').length - 1);
-    expect(card!.diff!.context![1]).toContain('<span class="pl-s">');
+    // A line between the hunks: the ones a hunk shows ride with it.
+    expect(card!.diff!.context![100]).toContain('<span class="pl-s">');
   }, 60_000);
 
   it('carries a file\'s context up to 400 KB of text and the page\'s up to 2 MiB, in the review\'s order, coloring only what it carries', async () => {
@@ -104,6 +111,170 @@ describe('the review builder', () => {
     expect(new Set(colored)).toEqual(new Set(['a.ts', 'c0.ts', 'c1.ts', 'c2.ts', 'c3.ts', 'c4.ts']));
     // A file past the budget still knows how long it is, for the control that says to open it.
     expect(dataOf(html).cards[1]!.diff!.total).toBe(files[1]!.after.split('\n').length - 1);
+  });
+
+  it('carries in its context only the lines no hunk shows, so a new file carries none of its text twice', async () => {
+    const modified = tsCard('src/a.ts', 4 * 1024);
+    const added = (() => {
+      const after = tsText(2 * 1024);
+      const file = diffFile(null, after, 'src/new.ts');
+      return {file, before: null, after, card: reviewCardRequest(file, RANGE, null)};
+    })();
+    const builder = createReviewBuilder({sources: memorySides([modified, added]), fragment: noFragment, highlight: async () => null, branch: knownBranch});
+    const [first, second] = dataOf((await builder.page(request([modified.card, added.card]))).html).cards;
+    const shown = new Set(parseHunks(modified.card.blocks).flatMap((hunk) => hunk.lines.flatMap((line) => (line.n === undefined ? [] : [line.n]))));
+    expect(first!.diff!.context!.every((line, index) => (shown.has(index + 1) ? line === '' : line !== ''))).toBe(true);
+    expect(second!.diff!.context!.every((line) => line === '')).toBe(true);
+  });
+
+  it('folds a diff past 3,000 lines or 1 MiB, and reads nothing of one past 4 MiB, whose card says it is too large', async () => {
+    // A new file's patch, written here: git's output through a test pipe stops at 1 MiB.
+    const added = (path: string, count: number, text: string): ReviewFile => {
+      const hunk = `@@ -0,0 +1,${count} @@\n${Array.from({length: count}, (_, index) => `+${text} ${index}\n`).join('')}`;
+      const rawDiff = `diff --git a/${path} b/${path}\nnew file mode 100644\nindex 0000000..${String(count).padStart(7, '0')}\n--- /dev/null\n+++ b/${path}\n${hunk}`;
+      return {path, status: 'added', metrics: {path, additions: count, deletions: 0, changedLines: count}, rawDiff, renderedLines: [], blocks: [{rawDiff: hunk}]} as unknown as ReviewFile;
+    };
+    const long = added('data/long.csv', 3_001, 'row');
+    const wide = added('data/wide.csv', 900, 'x'.repeat(1_200));
+    const huge = added('data/huge.csv', 4_000, 'y'.repeat(1_100));
+    const short = added('data/short.csv', 2_999, 'row');
+    const read: string[] = [];
+    const sources = {read: async (_cwd: string, spec: {path?: string; id?: string}) => {
+      read.push(String(spec.id));
+      return {kind: 'unavailable', reason: 'not here'};
+    }} as unknown as SourceReader;
+    const builder = createReviewBuilder({sources, fragment: noFragment, highlight: async () => null, branch: knownBranch});
+    const cards = [long, wide, huge, short].map((file) => reviewCardRequest(file, RANGE, null));
+    const {html} = await builder.page(request(cards));
+    const data = dataOf(html).cards as Array<{diff: {fold?: true} | null}>;
+    expect(data.map((card) => (card.diff === null ? 'none' : card.diff.fold ? 'fold' : 'open'))).toEqual(['fold', 'fold', 'none', 'open']);
+    expect(html).toMatch(/<div class="rv-special rv-special-tooLarge">.*<span>This diff is too large to show here\. Open the file to see it\.<\/span>/);
+    expect(read).not.toContain(patchObjectIds(huge.rawDiff)!.after);
+  });
+
+  it('carries folded diffs within the page\'s 2 MiB of file text, ahead of context, and says the page has no room left for a diff past it', async () => {
+    // Three new files of about 800 KB each, each folded for its 3,001 lines.
+    const added = (path: string): ReviewFile => {
+      const hunk = `@@ -0,0 +1,3001 @@\n${Array.from({length: 3_001}, (_, index) => `+${'z'.repeat(310)} ${index}\n`).join('')}`;
+      const rawDiff = `diff --git a/${path} b/${path}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/${path}\n${hunk}`;
+      return {path, status: 'added', metrics: {path, additions: 3_001, deletions: 0, changedLines: 3_001}, rawDiff, renderedLines: [], blocks: [{rawDiff: hunk}]} as unknown as ReviewFile;
+    };
+    const small = tsCard('src/small.ts', 300 * 1024);
+    const builder = createReviewBuilder({sources: memorySides([small]), fragment: noFragment, highlight: async () => null, branch: knownBranch});
+    const cards = [small.card, ...['a.csv', 'b.csv', 'c.csv'].map((name) => reviewCardRequest(added(`data/${name}`), RANGE, null))];
+    const {html, specials} = await builder.page(request(cards));
+    const data = dataOf(html).cards as Array<{diff: {fold?: true; context: unknown} | null}>;
+    expect(data.map((card) => (card.diff === null ? 'none' : card.diff.fold ? 'fold' : 'open'))).toEqual(['open', 'fold', 'fold', 'none']);
+    // The third would fit in 2 MiB on its own: it is no diff too large to show.
+    expect(specials.map((special) => special?.kind)).toEqual([undefined, undefined, undefined, 'noRoom']);
+    // The two folded diffs leave less than the first file's context.
+    expect(data[0]!.diff!.context).toBeNull();
+    expect(html).not.toContain('class="rv-special rv-special-tooLarge"');
+    expect(html).toMatch(/<div class="rv-special rv-special-noRoom">.*<span>This page has no room left for this diff\. Open the file to see it\.<\/span>/);
+  });
+
+  it('says a small deleted file the page has no room for was deleted, never that its diff is too large, and keeps its counts', async () => {
+    // Forty deleted files of 600 lines, about 60 KB each: more than 2 MiB in all.
+    const deleted = (path: string): ReviewFile => {
+      const hunk = `@@ -1,600 +0,0 @@\n${Array.from({length: 600}, (_, index) => `-${'v'.repeat(95)} ${String(index).padStart(3, '0')}\n`).join('')}`;
+      const rawDiff = `diff --git a/${path} b/${path}\ndeleted file mode 100644\nindex 1234567..0000000\n--- a/${path}\n+++ /dev/null\n${hunk}`;
+      return {path, status: 'deleted', metrics: {path, additions: 0, deletions: 600, changedLines: 600}, rawDiff, renderedLines: [], blocks: [{rawDiff: hunk}]} as unknown as ReviewFile;
+    };
+    const files = Array.from({length: 40}, (_, index) => deleted(`vendor/lib/file-${String(index).padStart(2, '0')}.js`));
+    const builder = createReviewBuilder({sources: memorySides([]), fragment: noFragment, highlight: async () => null, branch: knownBranch});
+    const {html, specials} = await builder.page(request(files.map((file) => reviewCardRequest(file, RANGE, null))));
+    const kinds = specials.map((special) => special?.kind ?? 'fold');
+    // The first ones fold behind Load diff; the rest, once the page is full, say the file was deleted.
+    expect(kinds.indexOf('deleted')).toBeGreaterThan(20);
+    expect(kinds.slice(kinds.indexOf('deleted')).every((kind) => kind === 'deleted')).toBe(true);
+    const cards = html.split('<section class="rv-card"').slice(1);
+    expect(cards.join('')).not.toContain('too large');
+    expect(cards.join('')).not.toContain('no room');
+    for (const [index, card] of cards.entries()) {
+      expect(card, String(index)).toContain('<span class="rv-d">−600</span>');
+      expect(card).toContain(kinds[index] === 'deleted' ? '<span>This file was deleted.</span>' : 'data-act="load">Load diff</button><span>This file was deleted.</span>');
+      if (kinds[index] === 'deleted') expect(card).not.toContain('Load diff');
+    }
+  });
+
+  it('checks Git LFS pointers a few at a time within its time budget, and draws the diff of one it had no time to check', async () => {
+    const pointer = (index: number) => `version https://git-lfs.github.com/spec/v1\noid sha256:${index.toString(16).padStart(64, '0')}\nsize ${1_000 + index}\n`;
+    const files = Array.from({length: 60}, (_, index) => ({file: diffFile(null, pointer(index), `assets/blob-${index}.bin`), before: null, after: pointer(index)}));
+    const cards = files.map(({file}) => reviewCardRequest(file, RANGE, null));
+    expect(cards.every((card) => card.special?.kind === 'lfs')).toBe(true);
+    const inner = memorySides(files);
+    let clock = 0;
+    let reads = 0;
+    let open = 0;
+    let most = 0;
+    // A loaded machine: each read takes 100 ms of the build's clock.
+    const sources = {read: async (cwd: string, spec: never) => {
+      reads += 1;
+      open += 1;
+      most = Math.max(most, open);
+      await new Promise((resolve) => setImmediate(resolve));
+      clock += 100;
+      open -= 1;
+      return inner.read(cwd, spec);
+    }} as unknown as SourceReader;
+    const builder = createReviewBuilder({sources, fragment: noFragment, highlight: async () => null, now: () => clock, branch: knownBranch, buildBudgetMs: 1_000});
+    const {html, partial, specials} = await builder.page(request(cards));
+    // A few readers at once, as the cards have, and none past the budget.
+    expect(most).toBeLessThanOrEqual(4);
+    expect(reads).toBeLessThanOrEqual(1_000 / 100 + 4);
+    expect(partial).toBe(true);
+    const checked = specials.filter((special) => special?.kind === 'lfs').length;
+    expect(checked).toBeGreaterThan(0);
+    expect(checked).toBe(reads);
+    // A pointer left unchecked draws its diff, the safe answer.
+    const drawn = html.split('<section class="rv-card"').slice(1).filter((card) => card.includes('<table class="diff uni">'));
+    expect(drawn).toHaveLength(60 - checked);
+  });
+
+  it('folds a short deleted file behind Load diff over GitHub\'s words, and keeps a deleted markdown file\'s rich view', async () => {
+    const gone = diffFile(`${Array.from({length: 20}, (_, line) => `line ${line}`).join('\n')}\n`, null, 'gone.txt');
+    const doc = diffFile('# Old\n\nA page.\n', null, 'docs/old.md');
+    const markdown: ReviewCardRequest = {...reviewCardRequest(doc, RANGE, null), kind: 'markdown', fragment: {cwd: '/repo', key: 'old', path: 'docs/old.md', status: 'deleted', source: {kind: 'none', reason: 'test'}, groups: []}};
+    const builder = createReviewBuilder({sources: memorySides([]), fragment: async () => ({body: {kind: 'empty'}}), highlight: async () => null, branch: knownBranch});
+    const {html} = await builder.page(request([reviewCardRequest(gone, RANGE, null), markdown]));
+    const data = dataOf(html).cards as Array<{diff: {fold?: true; hunks: unknown[]} | null}>;
+    expect(data.map((card) => card.diff?.fold)).toEqual([true, true]);
+    const [first, second] = html.split('<section class="rv-card"').slice(1);
+    expect(first).toContain('data-act="load">Load diff</button><span>This file was deleted.</span>');
+    expect(first).not.toContain('<table');
+    expect(second).toContain('<div class="rv-v-rich" hidden>');
+    expect(second).toContain('This file was deleted.');
+  });
+
+  it('draws the diff of a file that opens like a Git LFS pointer and goes on past its hunk, and one line for a whole pointer', async () => {
+    const pointer = `version https://git-lfs.github.com/spec/v1\next-0-tool sha256:${'c'.repeat(64)}\noid sha256:${'a'.repeat(64)}\nsize 2500000\n`;
+    const code = Array.from({length: 50}, (_, line) => `echo HIDDEN_PAYLOAD_LINE ${line}`).join('\n');
+    // Only the first line changes, so the hunk's reviewed side is the pointer alone.
+    const forged = {before: `#!/bin/sh\n${pointer.slice(pointer.indexOf('\n') + 1)}${code}\n`, after: `${pointer}${code}\n`};
+    const forgedFile = diffFile(forged.before, forged.after, 'run.sh');
+    const real = {before: pointer.replace('2500000', '1200000').replace(/a{64}/, 'b'.repeat(64)), after: pointer};
+    const realFile = diffFile(real.before, real.after, 'img/big.psd');
+    const files = [{file: forgedFile, ...forged}, {file: realFile, ...real}];
+    const cards = files.map(({file}) => reviewCardRequest(file, RANGE, null));
+    // The patch alone reads as a pointer: only the side says otherwise.
+    expect(cards.map((card) => card.special?.kind)).toEqual(['lfs', 'lfs']);
+    const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, highlight: async () => null, branch: knownBranch});
+    const {html, specials} = await builder.page(request(cards));
+    expect(specials.map((special) => special?.kind)).toEqual([undefined, 'lfs']);
+    const [run, psd] = html.split('<section class="rv-card"').slice(1);
+    expect(run).toContain('<table class="diff uni">');
+    expect(run).not.toContain('rv-special-lfs');
+    // Its context carries the lines past the hunk, for the arrows to reveal.
+    expect(dataOf(html).cards[0]!.diff!.context!.join('\n')).toContain('HIDDEN_PAYLOAD_LINE 49');
+    expect(psd).toContain('<span>Git LFS file not shown.</span>');
+  });
+
+  it('reads no side of a file whose card is one line, and draws no hunk of a submodule\'s commits', async () => {
+    const file = {...diffFile('a\n', 'b\n', 'lib'), rawDiff: 'diff --git a/lib b/lib\nindex 1111111111111111111111111111111111111111..2222222222222222222222222222222222222222 160000\n--- a/lib\n+++ b/lib\n@@ -1 +1 @@\n-Subproject commit 1111111111111111111111111111111111111111\n+Subproject commit 2222222222222222222222222222222222222222\n'};
+    const builder = createReviewBuilder({sources: memorySides([]), fragment: noFragment, branch: knownBranch});
+    const {html} = await builder.page(request([reviewCardRequest({...file, blocks: [{...file.blocks[0]!, rawDiff: file.rawDiff.slice(file.rawDiff.indexOf('@@'))}]}, RANGE, null)]));
+    expect(dataOf(html).cards[0]!.diff).toBeNull();
+    expect(html).toContain('<span>Submodule updated from <code>1111111</code> to <code>2222222</code>.</span>');
   });
 
   it('draws the cards past its time budget plain, with the control that says to open the file, and says the page is partial', async () => {
@@ -142,6 +313,18 @@ describe('the review builder', () => {
     // An image the review hasn't rendered yet says so, never "binary file not shown".
     const image = html.slice(html.indexOf('aria-label="img/new.png"'));
     expect(image).toContain('Still being prepared');
+  });
+
+  it('says a branch with commits its upstream has and it lacks is behind, never up to date, and both counts once they diverged', async () => {
+    const pill = async (upstream: {remote: string; ahead: number; behind?: number}) => {
+      const builder = createReviewBuilder({sources: memorySides([]), fragment: noFragment, branch: async () => ({commits: [], upstream})});
+      const {html} = await builder.page(request([]));
+      return /<span class="rv-state ([^"]*)"[^>]*>(?:<svg[\s\S]*?<\/svg>)?([^<]*)<\/span>/.exec(html)?.slice(1);
+    };
+    expect(await pill({remote: 'origin', ahead: 0, behind: 3})).toEqual(['rv-state-behind', 'Behind origin by 3']);
+    expect(await pill({remote: 'origin', ahead: 2, behind: 1})).toEqual(['rv-state-diverged', 'Ahead 2, behind 1']);
+    expect(await pill({remote: 'origin', ahead: 2})).toEqual(['rv-state-ahead', 'Ahead of origin by 2']);
+    expect(await pill({remote: 'origin', ahead: 0})).toEqual(['rv-state-even', 'Up to date with origin']);
   });
 
   it('says when git couldn\'t say where the branch stands in time, and that the page is partial', async () => {
@@ -189,9 +372,10 @@ describe('the review builder', () => {
     const started = Date.now();
     const {html} = await builder.page(request([reviewCardRequest(file, RANGE, null)]));
     expect(Date.now() - started).toBeLessThan(BUILD_BUDGET_MS + 1_000);
-    const [card] = dataOf(html).cards;
-    expect(card!.diff!.context![0]).not.toContain('<span class="pl-');
-    expect(card!.diff!.context![0]).toContain('{&quot;id&quot;:0');
+    // The one line rides with its hunk, which the table draws.
+    const added = /<tr class="add">.*?<td class="cd">(.*?)<\/td><\/tr>/.exec(html)![1]!;
+    expect(added).not.toContain('<span class="pl-');
+    expect(added).toContain('{&quot;id&quot;:0');
   }, 120_000);
 });
 

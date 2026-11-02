@@ -17,12 +17,10 @@ import type {FileStatus} from '../git.js';
 import {remarkAlerts, type AlertType} from './alerts.js';
 import {createBlockIds, privateAttribute} from './blockIds.js';
 import {baseText, markBlocks, type ChangeGroup, type MarkableBlock} from './changes.js';
-import {readPageHash} from './hash.js';
 import {anchorTarget, LINK_TEXT, linkReason, pageTop, REFUSED_TEXT, refusedCard, withPrefix} from './words.js';
 
 export {anchorTarget, imageFinding, LINK_TEXT, linkReason, refusedCard} from './words.js';
 import {octicon, type OcticonName} from './octicons.js';
-import {rawSource, type RawSource} from './raw.js';
 
 // The offline renderer: markdown in, the HTML GitHub would show for it out,
 // with change marks. Repo text is untrusted all the way through. Raw HTML
@@ -138,8 +136,6 @@ export type RenderedFragment = {
   differences: Array<{kind: DifferenceKind; count: number}>;
   /** Blocks marked changed, and removed-content markers placed. */
   changes: {changed: number; removed: number};
-  /** The source as the diff showed it, for the page's first frame. */
-  raw?: RawSource;
 };
 
 type Lookups = Pick<RenderInput, 'asset' | 'baseAsset' | 'assetChanged' | 'link'>;
@@ -206,7 +202,6 @@ export async function renderMarkdown(input: RenderInput): Promise<RenderedFragme
     assetOids: [...tally.assetOids],
     differences: [...tally.differences].map(([kind, count]) => ({kind, count})),
     changes: rendered.changes,
-    raw: rawSource(input.source, input.groups, input.status),
   };
 }
 
@@ -848,12 +843,15 @@ function makeInert(node: Element, answer: Exclude<LinkAnswer, {kind: 'inReview'}
   node.properties.title = answer.kind === 'outside' ? LINK_TEXT.outside : linkReason(answer.kind, 'hint' in answer ? answer.hint : undefined);
 }
 
-// A fragment the page script would read as a trip's hash (`d=full`,
-// `g=<ids>`, colors), which no GitHub heading slug can be: a repo link
-// carrying one could make the page play a develop or a pulse the diff
-// never asked for.
+// A fragment shaped like one of our hashes: a trip's (`m=1`, `n=3`,
+// `l=1`) or a link the review page draws between its cards (`h=<id>`).
+// Every one holds an `=`, which no GitHub heading slug can, so any
+// fragment that holds one is ours to refuse: a repo link carrying one
+// could fake a live refresh the diff never asked for, or a jump to
+// another card. A bare `file-3` is a heading's slug as well, and the page
+// script keeps a rich view's links in their own card.
 function tripHashLike(fragment: string) {
-  return Object.keys(readPageHash(fragment)).length > 0;
+  return fragment.includes('=');
 }
 
 // The first URL of a `srcset`, which is all a markdown `<picture>` uses.

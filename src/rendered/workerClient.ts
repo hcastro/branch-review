@@ -13,8 +13,6 @@ const RENDERED_WORKER: ForkedWorkerSpec<keyof RenderedJobs> = {
   tempSubdir: 'rendered-worker',
   deadlinesMs: {
     fragment: 5_000,
-    // Covers rendering the fragment again when the worker no longer holds it.
-    page: 8_000,
     // The whole branch: the worker stops coloring and rendering cards well
     // before this, and draws the rest plain or on their way.
     review: 30_000,
@@ -40,8 +38,7 @@ export function createRenderedBackend(options: RenderedBackendOptions): Rendered
   return {
     fragment: (request, signal, priority) => worker.submit('fragment', request, signal, priority),
     prioritize: worker.prioritize,
-    // Ahead of every fragment: a page is what someone is waiting for.
-    page: (request, signal) => worker.submit('page', request, signal, -1),
+    // Ahead of every fragment: the page is what someone is waiting for.
     review: (request, signal) => worker.submit('review', request, signal, -1),
     embedders: (request, signal) => worker.submit('embedders', request, signal, 1),
     layout: (request, signal, priority = 0) => worker.submit('layout', request, signal, priority),

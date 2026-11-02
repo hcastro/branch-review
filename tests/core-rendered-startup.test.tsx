@@ -76,7 +76,8 @@ describe('the rendered view at startup', () => {
     const file = new URL((outcome as {url: string}).url).pathname;
     expect(file.startsWith(fs.realpathSync(parent))).toBe(true);
     const html = fs.readFileSync(file, 'utf8');
-    expect(html).toContain('One, edited.');
+    // The edited line, as the diff table draws it with its word mark.
+    expect(html).toContain('One<span class="x">, edited</span>.');
     // The repo shows by its folder's name only, and no stack trace or absolute path reaches a page.
     expect(html).not.toContain(cwd);
     expect(html).not.toContain('    at ');

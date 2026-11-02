@@ -116,17 +116,17 @@ The first time a file can use them, the footer says so in one line, such as `Tip
 
 Preview needs Ghostty, cmux, or Kitty, and a headless Chromium already on disk. Where either is missing, the footer leaves `v` out, and `r` still works. When Preview can't draw a page, the diff comes back where you were reading, and the footer says why. To turn Preview off, set `BRANCH_REVIEW_PREVIEW=off`.
 
-The page has a card for every changed file, in the review's order, with a file tree and a filter beside them. A code file's card shows its diff with GitHub's syntax colors and word highlights, unified or split, and expands the unchanged lines around each hunk. A markdown file's card switches between its diff and its rich view, the file as GitHub draws it with each added or changed block marked. An image's card compares its versions in 2-up, swipe, and onion skin. Mark a file **Viewed** to fold it, and the browser remembers it for this review. The **Commits** tab lists the branch's commits, and the title says whether the branch is pushed. A rich view draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading.
+The page has a card for every changed file, in the review's order, with a file tree and a filter beside them. A code file's card shows its diff with GitHub's syntax colors and word highlights, unified or split, and expands the unchanged lines around each hunk. A markdown file's card switches between its diff and its rich view, the file as GitHub draws it with each added or changed block marked. An image's card compares its versions in 2-up, swipe, and onion skin. A binary file, a submodule, a Git LFS file, or a rename with no changes gets one line in its card, as on GitHub, and a diff over 3,000 lines waits behind **Load diff**. Mark a file **Viewed** to fold it, and the browser remembers it for this review. The **Commits** tab lists the branch's commits, and the title says whether the branch is pushed, ahead, or behind. A list at the top names each link that won't resolve on GitHub, such as one to a missing file or heading. In watch mode, an open split follows your edits, keeps your place and your viewed marks, and pulses the cards that changed. The page fits a phone's width, with the file tree behind its **Files** button.
 
-To write a page for each changed markdown, image, and SVG file to a directory without opening the UI, pass `--export-html`:
+To write the page for the whole branch to a directory without opening the UI, pass `--export-html`:
 
 ```sh
 branch-review --export-html ../pages
 ```
 
-Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
+Pick a directory outside the repo. A page written inside it shows up as an untracked file in the next review.
 
-Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets a page that lists them all, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
+The directory gets the page as `index.html`, one HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. It also gets `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
 
 ## Review untrusted changes safely
 
@@ -215,11 +215,11 @@ branch-review my-feature release/2026.04
 | `--watch` | Refresh live as files change. On by default in an interactive terminal. |
 | `--no-watch` | Open a snapshot that doesn't refresh, for when an agent is mid-write and the view keeps changing. It overrides `--watch` and `--watch-poll`. |
 | `--watch-poll` | Turn on watch mode, and poll for changes in place of filesystem events. Use it on network mounts and container bind mounts. |
-| `--no-animations` | Skip the arrival highlights, the sweep toward a page in the browser, the page's develop and Preview's arrival, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
+| `--no-animations` | Skip the arrival highlights, the sweep toward a page in the browser, the page's glow on the card it opens at and its pulse on a live refresh, and Preview's arrival, and show an animated GIF or WebP as its first frame. Use it on slow or remote terminals. |
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
-| `--export-html DIR` | Write a page for each changed markdown, image, and SVG file to `DIR`, with a page that lists them all, `overview.html`, and `links.json`. Then print a summary and exit without opening the UI. |
+| `--export-html DIR` | Write the review page for the whole branch to `DIR` as `index.html`, with `links.json`. Then print a summary and exit without opening the UI. |
 | `--json` | With `--export-html`, print the report as JSON. |
 
 For `--animations` and `--images`, the last flag of each pair wins.
@@ -300,16 +300,7 @@ The branch's page in the browser has keys of its own, which work after you click
 | `?` | Show the page's keys |
 | `Esc` | Close the keys, a menu, or the file list |
 
-A page that `--export-html` writes has these keys:
-
-| Key | Action |
-| --- | --- |
-| `[` / `]` | Scroll to the previous or next change |
-| `{` / `}` | Open the previous or next file's page |
-| `t` | Switch the page's theme between your system's, light, and dark |
-| `m` | Show or hide the change marks |
-| `1` / `2` / `3` | On an image's page, compare its versions side by side, by flipping, or as a difference. `2` again, or `f`, flips to the other version. |
-| `?` | Show the page's keys |
+A page that `--export-html` writes has the same keys.
 
 ### Small terminals
 

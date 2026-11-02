@@ -102,4 +102,19 @@ describe('tableHtml', () => {
     const html = tableHtml({hunks, context: null, contextNote: 'budget', total}, [0, 0, 0], 'unified');
     expect(html).toContain('disabled aria-label="Open the file to see more" title="Open the file to see more"');
   });
+
+  it('says beside a control that is off why, in the header itself, for a screen with no tooltip', () => {
+    const {hunks, total} = card();
+    for (const mode of ['unified', 'split'] as const) {
+      const html = tableHtml({hunks, context: null, contextNote: 'budget', total}, [0, 0, 0], mode);
+      const headers = [...html.matchAll(/<tr class="hdr">(.*?)<\/tr>/g)].map((match) => match[1]!);
+      expect(headers.length).toBeGreaterThan(0);
+      for (const header of headers) {
+        if (header.includes('disabled')) expect(header).toMatch(/<td class="hx"[^>]*>(@@[^<]*)?<span class="hx-more( hx-after)?">Open the file to see more<\/span><\/td>/);
+      }
+      expect(html).toMatch(/@@ [^<]*<span class="hx-more hx-after">Open the file to see more<\/span>/);
+    }
+    // A control that works needs no words.
+    expect(tableHtml({hunks, context: null, total}, [0, 0, 0], 'unified')).not.toContain('hx-more');
+  });
 });

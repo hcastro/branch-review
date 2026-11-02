@@ -27,6 +27,8 @@
   --rv-success-emph: #1f883d;
   /* The state pill's green, which white text sits on at 4.5:1 or more. */
   --rv-state-bg: #1f883d;
+  /* The diverged pill's red, which white text sits on at 4.5:1 or more. */
+  --rv-diverged-bg: #cf222e;
   --rv-success-subtle: #dafbe1;
   --rv-danger: #d1242f;
   --rv-danger-subtle: #ffebe9;
@@ -39,6 +41,7 @@
   --rv-add-line: #e6ffec;
   --rv-add-num: #ccffd8;
   --rv-add-word: #abf2bc;
+  --rv-word-link: #0550ae;
   --rv-del-line: #ffebe9;
   --rv-del-num: #ffd7d5;
   --rv-del-word: #ffb8b4;
@@ -86,6 +89,7 @@
     --rv-success: #3fb950;
     --rv-success-emph: #2ea043;
     --rv-state-bg: #238636;
+    --rv-diverged-bg: #da3633;
     --rv-success-subtle: #12261e;
     --rv-danger: #f85149;
     --rv-danger-subtle: #25171c;
@@ -98,6 +102,7 @@
     --rv-add-line: rgba(46, 160, 67, 0.15);
     --rv-add-num: rgba(63, 185, 80, 0.3);
     --rv-add-word: rgba(46, 160, 67, 0.42);
+    --rv-word-link: #a5d6ff;
     --rv-del-line: rgba(248, 81, 73, 0.1);
     --rv-del-num: rgba(248, 81, 73, 0.3);
     --rv-del-word: rgba(248, 81, 73, 0.42);
@@ -175,6 +180,10 @@
 .rv-state { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; height: 30px; border-radius: 999px; background: var(--rv-state-bg); color: var(--rv-on-accent); font-weight: 500; white-space: nowrap; }
 .rv-state.rv-state-ahead { background: var(--rv-attention-bar); color: #1f2328; }
 .rv-state.rv-state-even { background: var(--rv-done); }
+/* Commits to fetch: the attention color, as for commits to push, and red
+   once both sides have their own. */
+.rv-state.rv-state-behind { background: var(--rv-attention-bar); color: #1f2328; }
+.rv-state.rv-state-diverged { background: var(--rv-diverged-bg); }
 /* git didn't say in time: a quiet pill in the same place, so the title
    keeps its shape from one page to the next. */
 .rv-state.rv-state-unknown { background: var(--rv-bg-inset); color: var(--rv-fg-muted); border: 1px solid var(--rv-border); }
@@ -275,6 +284,24 @@
 .rv-card.rv-is-viewed .rv-path b { color: var(--rv-fg-muted); }
 .rv-fb { border-radius: 0 0 6px 6px; overflow: hidden; }
 .rv-notice { margin: 0; padding: 16px; color: var(--rv-fg-muted); text-align: center; font-size: 13px; }
+/* A mode change beside the counts, as GitHub's header names it. */
+.rv-fh-mode { font: 12px/1 var(--rv-mono); color: var(--rv-fg-muted); white-space: nowrap; }
+/* A live refresh's changed card: the accent washes in and out once. */
+.rv-card.rv-pulse { animation: rv-pulse 0.6s ease-out; }
+@keyframes rv-pulse { 0% { box-shadow: 0 0 0 0 transparent; background: var(--rv-bg); } 35% { box-shadow: 0 0 0 3px var(--rv-flash); background: var(--rv-accent-subtle); } 100% { box-shadow: 0 0 0 0 transparent; background: var(--rv-bg); } }
+
+/* ---------- One line in place of a diff ---------- */
+/* GitHub's quiet row: centered, muted, a small icon, a name or a commit
+   in code. Text flow, not flex, so the icon wraps with the first word.
+   Load diff is its link-styled button above the reason. */
+.rv-special { display: block; margin: 0; padding: 16px; color: var(--rv-fg-muted); font-size: 13px; text-align: center; overflow-wrap: anywhere; }
+.rv-special > svg.ic { display: inline-block; vertical-align: -3px; margin-right: 6px; color: var(--rv-fg-muted); }
+.rv-special code { font: 12px/1.6 var(--rv-mono); padding: 1px 5px; border-radius: 6px; background: var(--rv-bg-inset); color: var(--rv-fg); }
+.rv-special .rv-sp-note { margin-left: 6px; color: var(--rv-fg-muted); }
+.rv-special:is(.rv-special-tooLarge, .rv-special-noRoom, .rv-special-unreadable) > .ic { color: var(--rv-attention); }
+.rv-special.rv-load { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 20px 16px; }
+.rv-load-btn { color: var(--rv-accent); font-size: 14px; font-weight: 600; border-radius: 6px; padding: 2px 6px; }
+.rv-load-btn:hover { text-decoration: underline; }
 
 /* ---------- Diff tables ---------- */
 .rv-tbl { overflow-x: auto; }
@@ -301,6 +328,8 @@
 .rv .diff tr.hdr td { background: var(--rv-hunk-bg); color: var(--rv-fg-muted); height: 32px; vertical-align: middle; }
 .rv .diff tr.hdr td.ex { background: var(--rv-hunk-num); padding: 0; }
 .rv .diff tr.hdr td.hx { padding: 0 10px; white-space: pre; }
+.rv .diff tr.hdr .hx-more { font: 12px var(--rv-sans); color: var(--rv-fg-muted); }
+.rv .diff tr.hdr .hx-more.hx-after { margin-left: 12px; }
 .rv .exbtn { display: grid; place-items: center; width: 100%; height: 32px; color: var(--rv-fg-muted); }
 .rv .exbtn:not(:disabled):hover { background: var(--rv-accent); color: var(--rv-on-accent); }
 .rv .exbtn:disabled { opacity: 0.45; }
@@ -353,6 +382,9 @@
    its left padding. */
 .rv-rich { --br-bar-x: -24px; }
 .rv-rich .markdown-body { position: relative; max-width: 980px; padding: 24px 40px 32px 52px; background: transparent; font-size: 16px; }
+/* A deleted file's rich view dims its pictures and cards only: its text
+   keeps the contrast every other view has. */
+.rv-rich .markdown-body.br-dimmed :is(img, picture, video, .br-card) { opacity: 0.75; }
 .rv-rich .br-body { padding: 16px; }
 /* A new file is added from top to bottom: one bar along its article. */
 .rv-rich.rv-all-add { position: relative; }
@@ -377,6 +409,8 @@
 /* The words a changed paragraph, heading or quote gained, as a changed
    source line marks them. */
 .rv-rich .markdown-body ins.rv-word { text-decoration: none; background: var(--rv-add-word); border-radius: 3px; padding: 0 1px; }
+/* A link's words on that green, in a shade that keeps 4.5:1 on it. */
+.rv-rich .markdown-body a ins.rv-word { color: var(--rv-word-link); }
 
 /* The before chip, in GitHub's attention colors with a chevron that flips
    open. The page script moves it to the end of its block's last line of
@@ -504,6 +538,12 @@
   .rv-theme button { width: 28px; }
   .rv-appbar .rv-keys-btn { display: none; }
   .rv-appbar-in { gap: 8px; }
+  /* Why an arrow is off, under the hunk's header where the reader sees
+     it, never past the card's edge at the end of a long one. */
+  .rv .diff tr.hdr .hx-more.hx-after { display: block; margin-left: 0; }
+  /* A note under the line, never a dot at the start of a wrapped one. */
+  .rv-special .rv-sp-note { display: block; margin: 4px 0 0; }
+  .rv-special .rv-sp-note > [aria-hidden="true"] { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .rv *, .rv *::before, .rv *::after { transition: none !important; animation: none !important; }

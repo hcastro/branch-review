@@ -6,7 +6,7 @@ import {createAssetResolver, LATE_IDENTITY, pageLookups, type AssetResolver, typ
 import type {FragmentResult} from '../src/rendered/backend.js';
 import {changeGroups} from '../src/rendered/changes.js';
 import {renderMarkdown, type LinkAnswer, type RenderedFragment} from '../src/rendered/markdown.js';
-import {assembleFilePage, type PageInput} from '../src/rendered/page.js';
+import {articleHtml} from '../src/rendered/page.js';
 import {appearances, findingNotes, linkReport, type ReportSource} from '../src/rendered/report.js';
 import type {RunOperation} from '../src/rendered/tree.js';
 import {createRenderedHandler} from '../src/rendered/worker/handler.js';
@@ -20,7 +20,6 @@ import {diffFile} from './rendered-helpers.js';
 
 afterEach(cleanupTempDirs);
 
-const TITLE: PageInput['title'] = {repo: 'project', base: 'main', branch: 'feature', worktree: false, renderedAt: 0};
 const outside = (): LinkAnswer => ({kind: 'outside'});
 const skipped = async () => ({kind: 'skipped'} as const);
 
@@ -60,7 +59,7 @@ describe('the link and anchor report', () => {
 
     // On the page, the link to the missing anchor is drawn broken and still
     // opens the page; the others are plain links.
-    const html = assembleFilePage({title: TITLE, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, rail: [], brokenRefs: broken.get('README.md') ?? []});
+    const html = articleHtml({path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, broken.get('README.md') ?? []);
     expect(html).toContain('<a href="f-guide.html#user-content-tokenz" class="br-broken" title="anchor not found">tokens</a>');
     expect(html).toContain('<a href="f-guide.html#user-content-install-it">install</a>');
     expect(html).toContain('<a href="f-guide.html#user-content-old-name">the old name</a>');
@@ -80,7 +79,7 @@ describe('the link and anchor report', () => {
     });
     const reportOf = (readme: RenderedFragment) => {
       const {findings, broken} = linkReport([source(readme, 'README.md'), source(guide, 'docs/guide.md')]);
-      const html = assembleFilePage({title: TITLE, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, rail: [], brokenRefs: broken.get('README.md') ?? []});
+      const html = articleHtml({path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, broken.get('README.md') ?? []);
       return {findings, broken: broken.get('README.md') ?? [], drawn: html.match(/class="br-broken" title="anchor not found"/g)?.length ?? 0};
     };
 
@@ -364,7 +363,7 @@ describe('the link and anchor report', () => {
     const {findings, broken} = linkReport([source(readme, 'README.md'), source(guide, 'docs/guide.md')]);
     expect(findings).toEqual([]);
     expect(readme.links.map((link) => link.status)).toEqual(['ok', 'ok', 'ok', 'ok', 'ok']);
-    const html = assembleFilePage({title: TITLE, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, rail: [], brokenRefs: broken.get('README.md') ?? []});
+    const html = articleHtml({path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, broken.get('README.md') ?? []);
     expect(html.slice(html.indexOf('<article'), html.indexOf('</article>'))).not.toContain('br-broken');
     expect(html).toContain('<a href="#top">back to top</a>');
     expect(html).toContain('<a href="#user-content-here">here</a>');
@@ -381,7 +380,7 @@ describe('the link and anchor report', () => {
       link: links,
     });
     const {broken} = linkReport([source(readme, 'README.md'), source(guide, 'docs/guide.md')]);
-    const html = assembleFilePage({title: TITLE, file: {path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, rail: [], brokenRefs: broken.get('README.md') ?? []});
+    const html = articleHtml({path: 'README.md', status: 'modified', body: {kind: 'rendered', fragment: readme}}, broken.get('README.md') ?? []);
     const tags = [...html.matchAll(/<a [^>]*href="f-guide\.html[^>]*>/g)].map((match) => match[0]);
     expect(tags).toEqual([
       '<a href="f-guide.html#user-content-nope" title="anchor not found" class="br-broken">',

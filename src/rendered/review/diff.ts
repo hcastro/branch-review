@@ -20,13 +20,14 @@ export type DrawnHunk = Omit<Hunk, 'lines'> & {lines: DrawnLine[]};
 /**
  * Everything a card's source diff needs on the page. `context` is the
  * reviewed side's lines as HTML, from line 1, which expanding the gaps
- * between hunks reveals; null when the page doesn't carry them, and then
+ * between hunks reveals, any line a hunk shows already left blank; null when the page doesn't carry them, and then
  * `contextNote` says why: `budget` when the file is past what a page
  * embeds, so the control asks the reader to open the file, else nothing
  * can be expanded. `total`: the reviewed side's line count, when it was
- * read, which says how far the last gap runs.
+ * read, which says how far the last gap runs. `fold`: a diff long enough
+ * that the card arrives folded, drawn only when the reader loads it.
  */
-export type CardDiff = {hunks: DrawnHunk[]; context: string[] | null; contextNote?: 'budget'; total?: number};
+export type CardDiff = {hunks: DrawnHunk[]; context: string[] | null; contextNote?: 'budget'; total?: number; fold?: true};
 
 // git ends a line only at `\n`, so the function context can hold a lone `\r`.
 const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@([^\n]*)$/;
@@ -158,6 +159,62 @@ export function markRange(html: string, start: number, end: number) {
   if (inside) out += '</span>';
   // A mark that opened right before a tag and closed after it holds nothing.
   return out.replace(/<span class="x"><\/span>/g, '');
+}
+
+// A line's HTML as the page's data block carries it. The data escapes each
+// `<` as six characters, and a line of code is mostly tags, so its spans
+// ride in a short form: `>k>` for `<span class="pl-k">` (each `pl-` class
+// by its suffix, the word mark as `!`), `>>` for `</span>`. Escaped text
+// never holds a raw `>`, so no text can read as a tag. HTML with anything
+// else in it rides as it is, after a `<` that says so.
+const TAG = /<span class="([a-z0-9 -]+)">|<\/span>/g;
+
+/** `html`, as escapeText, the highlighter and the word mark write it, in its short form. */
+export function packHtml(html: string): string {
+  let plain = true;
+  const packed = html.replace(TAG, (_tag, names: string | undefined) => {
+    if (names === undefined) return '>>';
+    const short = names.split(' ').map((name) => (name === 'x' ? '!' : name.startsWith('pl-') && name.length > 3 ? name.slice(3) : null));
+    if (short.includes(null)) plain = false;
+    return `>${short.join(' ')}>`;
+  });
+  return plain && !/[<>]/.test(html.replace(TAG, '')) ? packed : `<${html}`;
+}
+
+/** The HTML `packHtml` was given. */
+export function unpackHtml(packed: string): string {
+  if (packed.startsWith('<')) return packed.slice(1);
+  return packed.replace(/>([^>]*)>/g, (_tag, names: string) => (names === '' ? '</span>' : `<span class="${names.split(' ').map((name) => (name === '!' ? 'x' : `pl-${name}`)).join(' ')}">`));
+}
+
+/**
+ * A card's diff as the page's data carries it. A hunk's `lines` are only
+ * their count when the page draws the card's table as it arrives: the
+ * table holds each line, and the script reads them back from it. A folded
+ * diff, which arrives with no table, carries its lines, their HTML in the
+ * short form, as it does its context.
+ */
+export type PackedDiff = Omit<CardDiff, 'hunks'> & {hunks: Array<Omit<DrawnHunk, 'lines'> & {lines: DrawnLine[] | number}>};
+
+/** `diff` for the page's data; `drawn`: the page draws its table. */
+export function packDiff(diff: CardDiff, drawn: boolean): PackedDiff {
+  return {
+    ...diff,
+    hunks: diff.hunks.map((hunk) => ({...hunk, lines: drawn ? hunk.lines.length : hunk.lines.map((line) => ({...line, h: packHtml(line.h)}))})),
+    context: diff.context && diff.context.map(packHtml),
+  };
+}
+
+/** The diff `packDiff` was given, with `drawnLines` the rows of the table the page drew for it, in order. */
+export function unpackDiff(packed: PackedDiff, drawnLines: readonly DrawnLine[] = []): CardDiff {
+  let at = 0;
+  const hunks = packed.hunks.map((hunk) => {
+    if (typeof hunk.lines !== 'number') return {...hunk, lines: hunk.lines.map((line) => ({...line, h: unpackHtml(line.h)}))};
+    const lines = drawnLines.slice(at, at + hunk.lines);
+    at += hunk.lines;
+    return {...hunk, lines};
+  });
+  return {...packed, hunks, context: packed.context && packed.context.map(unpackHtml)};
 }
 
 /**

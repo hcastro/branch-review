@@ -93,6 +93,21 @@ describe('upstreamStateOperation', () => {
     expect(await runOperationAsync(upstreamStateOperation(cwd, 'feature/docs'))).toEqual({remote: 'origin', ahead: 1});
   });
 
+  it('counts how far a branch is behind its upstream, and both ways once the two have diverged', async () => {
+    const cwd = branchRepo();
+    const remote = makeTempDir('branch-review-remote-');
+    git(remote, 'init', '-q', '--bare');
+    git(cwd, 'remote', 'add', 'origin', remote);
+    git(cwd, 'push', '-q', '-u', 'origin', 'feature/docs');
+    // The upstream has a commit the branch doesn't, as after a teammate's push.
+    git(cwd, 'reset', '-q', '--hard', 'HEAD~1');
+    expect(await runOperationAsync(upstreamStateOperation(cwd, 'feature/docs'))).toEqual({remote: 'origin', ahead: 0, behind: 1});
+
+    writeFiles(cwd, {'src/c.ts': 'c\n'});
+    commitAll(cwd, 'feat: a different one');
+    expect(await runOperationAsync(upstreamStateOperation(cwd, 'feature/docs'))).toEqual({remote: 'origin', ahead: 1, behind: 1});
+  });
+
   it('names no state for a ref that is no local branch', async () => {
     const cwd = branchRepo();
     const commit = git(cwd, 'rev-parse', 'HEAD').trim();

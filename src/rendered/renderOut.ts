@@ -1,51 +1,68 @@
+import {createHash} from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import {escapeHiddenCharacters, escapeHiddenCharactersInJson} from '../controlChars.js';
-import type {DiffRange, FileStatus} from '../git.js';
+import {fileKey, type DiffRange, type FileStatus} from '../git.js';
 import {patchObjectIds} from '../media/classify.js';
 import type {ReviewModel} from '../review/model.js';
 import type {ReviewFile} from '../review/model.js';
 import {createAssetResolver, LATE_IDENTITY, LOOKUP_BUDGET_MS, pageLookups, reviewAssetSides, reviewPaths, type AssetUse} from './assets.js';
+import type {ReviewCardRequest} from './backend.js';
 import {changeGroups, type ChangeGroup} from './changes.js';
 import {failedMarkdownPage, renderableKind, type RenderableKind} from './classify.js';
 import {describeImage, imageBody, imageFacts, type ImageFacts} from './image.js';
-import {pageKey, railSignature} from './keys.js';
+import {fileAlias, pageKey, railSignature} from './keys.js';
 import type {DifferenceKind, LinkAnswer, RenderedFragment} from './markdown.js';
-import {assembleFilePage, assembleOverview, railLabel, type OverviewEntry, type PageBody, type RailEntry} from './page.js';
-import {appearances, findingNotes, linkReport, type Finding, type ReportSource} from './report.js';
+import type {PageBody} from './page.js';
+import {linkReport, type Finding, type ReportSource} from './report.js';
 import {createRenderThread} from './renderThread.js';
+import {createReviewBuilder} from './review/build.js';
+import {reviewCardRequest} from './review/request.js';
+import {specialText} from './review/special.js';
 import {writeErrorReason} from './site.js';
 import {createSourceReader, oneLine, pageBody, sourceSpec, type SourceSpec} from './source.js';
 
-// `--export-html <dir>`: the review's pages written to a directory, in this
-// process, with no UI and no browser: its markdown and images, the markdown
-// outside it that shows an image it changed, the overview and links.json.
-// The same renderer, report and page shell as the TUI's pages; this module
-// owns only reading each file, naming the pages and writing them.
+// `--export-html <dir>`: the Review in browser page for the whole branch,
+// written to a directory as `index.html`, in this process, with no UI and
+// no browser, beside `links.json`. Its markdown files' rich views, its
+// images' sides and the markdown outside the review that shows an image it
+// changed are rendered here first, then the page is built from them as the
+// worker builds the one `r` opens, with all the time it takes. This module
+// owns only rendering each file, the report and writing the files.
 
 // The renderer's deadline per file, as for a fragment in the UI. A file past
 // it shows its raw text under a one-line reason.
 const RENDER_DEADLINE_MS = 5000;
+// How long the commits and the branch's state may take: nobody waits on
+// the export, but a git that never answers must not hold it forever.
+const EXPORT_GIT_BUDGET_MS = 30_000;
 
-// The report names a markdown page for the file it is, as `image` names an
-// image's, never by how the page was made.
+// The report names a markdown file's rich view for the file it is, as
+// `image` names an image's, never by how it was made.
 export type RenderOutState = 'markdown' | Exclude<PageBody['kind'], 'rendered'>;
 
-export type RenderOutPage = {
+export type RenderOutFile = {
   path: string;
   status: FileStatus;
-  /** The page's file name inside the out dir. */
-  file: string;
-  /** What the page shows: `markdown` for a markdown file's page, else its body's kind. */
-  state: RenderOutState;
-  changes: RenderedFragment['changes'];
-  differences: Array<{kind: DifferenceKind; count: number}>;
-  /** An image's page: each side's size and dimensions. */
+  oldPath?: string;
+  /** Where its card is on the page: `index.html#file-<n>`. */
+  card: string;
+  /** What the card shows beside its diff: a markdown file's rich view, an image's or an SVG's sides, or nothing more. */
+  kind: ReviewCardRequest['kind'];
+  additions: number;
+  deletions: number;
+  /** For a file with no diff to show, the one line its card says instead. */
+  note?: string;
+  /** For markdown, an image or an SVG: what its rich view shows. */
+  state?: RenderOutState;
+  changes?: RenderedFragment['changes'];
+  differences?: Array<{kind: DifferenceKind; count: number}>;
+  /** An image's or an SVG's sides: each one's size and dimensions. */
   image?: ImageFacts;
-  /** A page outside the review, whose text is unchanged: the changed images it shows. */
+  /** Markdown outside the review, whose text is unchanged: the changed images it shows. */
   embeds?: string[];
   /**
-   * Some of the page's lookups ran out of time on both of its renders: it
+   * Some of the file's lookups ran out of time on both of its renders: it
    * claims nothing of the links and images git didn't answer for, and an
    * image's change may be unmarked.
    */
@@ -54,14 +71,17 @@ export type RenderOutPage = {
 };
 
 export type RenderOutReport = {
-  version: 1;
+  version: 2;
   base: string;
   branch: string;
   /** The out dir, absolute. */
   dir: string;
-  pages: RenderOutPage[];
+  /** The page's file name in the out dir, or null when nothing changed and nothing was written. */
+  page: string | null;
+  /** Every changed file, in the page's order. */
+  files: RenderOutFile[];
   /** Markdown the review didn't change that shows an image it did. */
-  also: RenderOutPage[];
+  also: RenderOutFile[];
   /** What won't resolve on GitHub; links.json has every link. */
   findings: Finding[];
 };
@@ -76,16 +96,16 @@ type Options = {
   outLabel: string;
   now: () => number;
   sleep?: (ms: number) => Promise<void>;
-  /** How long one page's lookups may take on each of its renders (LOOKUP_BUDGET_MS). */
+  /** How long one file's lookups may take on each of its renders (LOOKUP_BUDGET_MS). */
   lookupBudgetMs?: number;
   /** How long the search for markdown that shows a changed image may take (2 seconds). */
   embeddersMs?: number;
 };
 
-// One file to write a page for: the review's markdown and images, then the
-// markdown outside it that may show one of its images.
+// One file to render: the review's markdown and images, then the markdown
+// outside it that may show one of its images.
 type Planned = {
-  file: Pick<ReviewFile, 'path' | 'status' | 'oldPath'>;
+  file: ReviewFile;
   kind: RenderableKind;
   key: string;
   failure?: string;
@@ -94,7 +114,7 @@ type Planned = {
   also?: true;
 };
 
-const OVERVIEW_FILE = 'overview.html';
+const PAGE_FILE = 'index.html';
 const LINKS_FILE = 'links.json';
 
 export async function renderToDirectory({cwd, range, review, outDir, outLabel, now, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), lookupBudgetMs = LOOKUP_BUDGET_MS, embeddersMs}: Options): Promise<RenderOutReport> {
@@ -120,12 +140,14 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
     };
   });
 
-  // A link to another rendered file opens its page. A deleted file's page
-  // exists, but the link is broken on GitHub, so it reads as missing. Any
-  // other path resolves against what git holds.
-  const links: Record<string, LinkAnswer> = Object.fromEntries(planned.map(({file, key}): [string, LinkAnswer] => [
+  // A link to another rendered file names its card by the file's stable
+  // page name, which the page script takes to that card, as on the page
+  // `r` opens. A deleted file has a card, but the link is broken on GitHub,
+  // so it reads as missing. Any other path resolves against what git holds.
+  const aliasOf = (file: Pick<ReviewFile, 'path' | 'pathError'>) => fileAlias(fileKey({path: file.path, nameError: file.pathError}));
+  const links: Record<string, LinkAnswer> = Object.fromEntries(planned.map(({file}): [string, LinkAnswer] => [
     file.path,
-    file.status === 'deleted' ? {kind: 'missing'} : {kind: 'inReview', href: `${key}.html`},
+    file.status === 'deleted' ? {kind: 'missing'} : {kind: 'inReview', href: `${aliasOf(file)}.html`},
   ]));
 
   const bodies: PageBody[] = [];
@@ -188,7 +210,8 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
     if (images.length > 0) {
       const names = [...changedImages].map((imagePath) => path.posix.basename(imagePath));
       for (const found of await resolver.embedders(assets, names, reviewPaths(planned.map((each) => each.file)))) {
-        const candidate: Planned = {file: {path: found.path, status: 'modified'}, kind: 'markdown', groups: [], also: true, source: {kind: 'blob', id: found.oid}, key: pageKey({path: found.path, status: 'modified', after: found.oid, groups: [], rail: `${rail}\0also`})};
+        const file = {path: found.path, status: 'modified', metrics: {path: found.path, additions: 0, deletions: 0, changedLines: 0}, rawDiff: '', renderedLines: [], blocks: []} as ReviewFile;
+        const candidate: Planned = {file, kind: 'markdown', groups: [], also: true, source: {kind: 'blob', id: found.oid}, key: pageKey({path: found.path, status: 'modified', after: found.oid, groups: [], rail: `${rail}\0also`})};
         const body = await renderOne(candidate);
         if (body.kind !== 'rendered') continue;
         if (body.fragment.changes.changed === 0 && !(late.has(candidate) && embedsOf(body).length > 0)) continue;
@@ -200,91 +223,82 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
     await thread.close();
   }
 
-  const all = [...planned, ...alsoPlanned];
-  const allBodies = [...bodies, ...alsoBodies];
-  const railEntries = all.map((each, index): Omit<RailEntry, 'current'> => {
-    const body = allBodies[index]!;
-    const picture = each.also || (each.kind !== 'markdown' && each.file.status !== 'added' && each.file.status !== 'untracked' && each.file.status !== 'deleted');
-    return {
-      path: each.file.path,
-      status: each.file.status,
-      href: `${each.key}.html`,
-      label: picture ? 'img' : railLabel(each.file.status, changesOf(body)),
-      ...(each.also ? {also: true as const} : {}),
-    };
-  });
-
   // The link and anchor report over the review's markdown.
   const sources: ReportSource[] = planned.flatMap((each, index) => {
     const body = bodies[index]!;
     return each.kind === 'markdown' && body.kind === 'rendered' ? [{path: each.file.path, status: each.file.status, ...body.fragment}] : [];
   });
   const {findings, broken} = linkReport(sources);
-  const notes = findingNotes(findings);
-  const markdownImages = all.flatMap((each, index) => {
-    const body = allBodies[index]!;
-    return body.kind === 'rendered' ? [{path: each.file.path, status: each.file.status, images: body.fragment.images, href: `${each.key}.html`}] : [];
+
+  // The page, built from the bodies rendered here as the worker builds it
+  // from the fragments it holds: each rendered file's card asks for its
+  // body by its key.
+  const byKey = new Map([...planned, ...alsoPlanned].map((each, index) => [each.key, [...bodies, ...alsoBodies][index]!]));
+  const plannedOf = new Map(planned.map((each) => [each.file.path, each]));
+  const cardFor = (file: ReviewFile, each: Planned | undefined): ReviewCardRequest => reviewCardRequest(file, range, each ? {
+    kind: each.kind,
+    fragment: {cwd, key: each.key, path: file.path, ...(file.oldPath ? {oldPath: file.oldPath} : {}), status: file.status, source: each.source ?? {kind: 'none', reason: 'an image reads its sides as images'}, groups: each.groups},
+    ...(broken.has(file.path) ? {brokenRefs: broken.get(file.path)!} : {}),
+  } : null);
+  const cards: ReviewCardRequest[] = [
+    ...review.files.map((file) => ({...cardFor(file, plannedOf.get(file.path)), alias: aliasOf(file)})),
+    ...alsoPlanned.map((each, index) => ({...cardFor(each.file, each), also: embedsOf(alsoBodies[index]!)})),
+  ];
+  const builder = createReviewBuilder({
+    sources: createSourceReader({sleep, local: true}),
+    fragment: async (request) => ({body: byKey.get(request.key) ?? {kind: 'failed', reason: 'not rendered', source: ''}}),
+    buildBudgetMs: Infinity,
+    gitBudgetMs: EXPORT_GIT_BUDGET_MS,
+  });
+  const reviewId = createHash('sha256').update(JSON.stringify([cwd, range.base, review.branch])).digest('hex').slice(0, 16);
+  const report: RenderOutReport = {version: 2, base: review.base, branch: review.branch, dir: outDir, page: null, files: [], also: [], findings};
+  if (cards.length === 0) return report;
+  const {html, specials} = await builder.page({
+    key: PAGE_FILE,
+    cwd,
+    refs: {base: range.base, branch: range.branch},
+    title: {repo: path.basename(cwd), base: review.base, branch: review.branch, worktree: range.includeWorktree},
+    reviewId,
+    cards,
+    links,
+    assets,
+    findings,
   });
 
   prepareDir(outDir, outLabel);
-  const renderedAt = now();
-  const title = {repo: path.basename(cwd), base: review.base, branch: review.branch, worktree: range.includeWorktree, renderedAt};
-  const pageEntry = (each: Planned, body: PageBody): RenderOutPage => ({
-    path: each.file.path,
-    status: each.file.status,
-    file: `${each.key}.html`,
-    state: reportState(body),
-    changes: body.kind === 'rendered' ? body.fragment.changes : {changed: 0, removed: 0},
-    differences: body.kind === 'rendered' ? body.fragment.differences : [],
-    ...(body.kind === 'image' ? {image: imageFacts(body.image)} : {}),
-    ...(each.also ? {embeds: embedsOf(body)} : {}),
-    ...(late.has(each) ? {late: true as const} : {}),
-    ...(body.kind === 'failed' ? {reason: body.reason} : {}),
+  writeFile(outDir, outLabel, PAGE_FILE, html);
+  writeFile(outDir, outLabel, LINKS_FILE, formatLinks(review, sources, findings));
+
+  // The one line each card shows in place of a diff, as the builder
+  // decided it: a diff too large for the page is known only there.
+  const entry = (file: ReviewFile, index: number, each: Planned | undefined, body: PageBody | undefined): RenderOutFile => {
+    const special = specials[index];
+    return {
+      path: file.path,
+      status: file.status,
+      ...(file.oldPath ? {oldPath: file.oldPath} : {}),
+      card: `${PAGE_FILE}#file-${index}`,
+      kind: each?.kind ?? 'text',
+      additions: file.metrics.additions,
+      deletions: file.metrics.deletions,
+      ...(special && !body ? {note: specialText(special, file)} : {}),
+      ...(body ? {
+        state: reportState(body),
+        // A markdown file's marks, none for one that didn't render.
+        ...(each?.kind === 'markdown' ? {changes: body.kind === 'rendered' ? body.fragment.changes : {changed: 0, removed: 0}, differences: body.kind === 'rendered' ? body.fragment.differences : []} : {}),
+        ...(body.kind === 'image' ? {image: imageFacts(body.image)} : {}),
+        ...(each && late.has(each) ? {late: true as const} : {}),
+        ...(body.kind === 'failed' ? {reason: body.reason} : {}),
+      } : {}),
+    };
+  };
+  report.page = PAGE_FILE;
+  report.files = review.files.map((file, index) => {
+    const each = plannedOf.get(file.path);
+    return entry(file, index, each, each ? byKey.get(each.key) : undefined);
   });
-  for (const [index, each] of all.entries()) {
-    const body = allBodies[index]!;
-    const {file} = each;
-    const own = each.also ? [] : findings.filter((finding) => finding.path === file.path);
-    const appears = each.kind === 'markdown' ? [] : appearances(markdownImages, file.path).map((place) => ({...place, href: markdownImages.find((page) => page.path === place.path)!.href}));
-    const refs = each.also ? [] : broken.get(file.path) ?? [];
-    const html = assembleFilePage({
-      title,
-      file: {path: file.path, status: file.status, ...(file.oldPath ? {oldPath: file.oldPath} : {}), ...(each.also ? {also: {embeds: embedsOf(body)}} : {}), body},
-      rail: railEntries.map((entry) => ({...entry, current: entry.path === file.path})),
-      ...(refs.length > 0 ? {brokenRefs: refs} : {}),
-      ...(appears.length > 0 ? {appears} : {}),
-      ...(own.length > 0 || notes.length > 0 ? {report: {own, notes}} : {}),
-    });
-    writeFile(outDir, outLabel, `${each.key}.html`, html);
-  }
-
-  const report = planned.map((each, index) => pageEntry(each, bodies[index]!));
-  const also = alsoPlanned.map((each, index) => pageEntry(each, alsoBodies[index]!));
-  if (all.length > 0) {
-    const entry = (page: RenderOutPage, body: PageBody): OverviewEntry => ({
-      path: page.path,
-      status: page.status,
-      href: page.file,
-      state: body.kind,
-      changes: changesOf(body),
-      ...(page.reason !== undefined ? {reason: page.reason} : {}),
-      ...(page.image ? {image: page.image} : {}),
-      ...(page.embeds ? {embeds: page.embeds} : {}),
-    });
-    const differences = new Map<DifferenceKind, number>();
-    for (const page of report) for (const difference of page.differences) differences.set(difference.kind, (differences.get(difference.kind) ?? 0) + difference.count);
-    const fileOf = (repoPath: string) => report.find((page) => page.path === repoPath)?.file ?? null;
-    writeFile(outDir, outLabel, OVERVIEW_FILE, assembleOverview({
-      title,
-      entries: report.map((page, index) => entry(page, bodies[index]!)),
-      differences: [...differences].map(([kind, count]) => ({kind, count})),
-      ...(also.length > 0 ? {also: also.map((page, index) => entry(page, alsoBodies[index]!))} : {}),
-      ...(findings.length > 0 ? {findings: findings.map((finding) => ({...finding, href: fileOf(finding.path)}))} : {}),
-    }));
-    writeFile(outDir, outLabel, LINKS_FILE, formatLinks(review, sources, findings));
-  }
-
-  return {version: 1, base: review.base, branch: review.branch, dir: outDir, pages: report, also, findings};
+  report.also = alsoPlanned.map((each, index) => ({...entry(each.file, review.files.length + index, each, alsoBodies[index]), embeds: embedsOf(alsoBodies[index]!)}));
+  return report;
 }
 
 /**
@@ -333,28 +347,27 @@ function reportState(body: PageBody): RenderOutState {
   return body.kind === 'rendered' ? 'markdown' : body.kind;
 }
 
-function changesOf(body: PageBody) {
-  return body.kind === 'rendered' ? body.fragment.changes : null;
-}
-
 const STATUS_LETTERS: Record<FileStatus, string> = {modified: 'M', added: 'A', deleted: 'D', renamed: 'R', untracked: 'U'};
 const STATUS_NOTES: Partial<Record<FileStatus, string>> = {added: 'new file', untracked: 'untracked', deleted: 'deleted', renamed: 'renamed'};
 const LATE_NOTE = 'git was slow · some links and images unchecked';
 const STATE_NOTES: Partial<Record<RenderOutState, string>> = {empty: 'empty', tooLarge: 'too large to show', notUtf8: 'not UTF-8 text', failed: "couldn't show"};
 
-// What a page's line in the summary says after its file name.
-function pageNote(page: RenderOutPage) {
-  const unchecked = page.late ? [LATE_NOTE] : [];
-  if (page.embeds) return ['text unchanged', `embeds ${page.embeds.map(escapeHiddenCharacters).join(', ')}`, ...unchecked].join(' · ');
-  const notes = [STATUS_NOTES[page.status], STATE_NOTES[page.state]].filter((note): note is string => Boolean(note));
-  if (page.image) {
-    const facts = describeImage(page.image);
+// What a file's line in the summary says after its card.
+function fileNote(file: RenderOutFile) {
+  const unchecked = file.late ? [LATE_NOTE] : [];
+  if (file.embeds) return ['text unchanged', `embeds ${file.embeds.map(escapeHiddenCharacters).join(', ')}`, ...unchecked].join(' · ');
+  const notes = [STATUS_NOTES[file.status], file.state && STATE_NOTES[file.state]].filter((note): note is string => Boolean(note));
+  if (file.image) {
+    const facts = describeImage(file.image);
     if (facts) notes.push(facts);
     return [...notes, ...unchecked].join(' · ');
   }
-  if (page.changes.changed > 0) notes.push(`${page.changes.changed} changed`);
-  if (page.changes.removed > 0) notes.push(`${page.changes.removed} removed`);
-  const differences = page.differences.reduce((sum, difference) => sum + difference.count, 0);
+  if (file.note) return [...notes, file.note].join(' · ');
+  if (file.state === undefined) return [...notes, `+${file.additions} −${file.deletions}`].join(' · ');
+  const changes = file.changes ?? {changed: 0, removed: 0};
+  if (changes.changed > 0) notes.push(`${changes.changed} changed`);
+  if (changes.removed > 0) notes.push(`${changes.removed} removed`);
+  const differences = (file.differences ?? []).reduce((sum, difference) => sum + difference.count, 0);
   if (differences > 0) notes.push(`${differences} difference${differences === 1 ? '' : 's'}`);
   notes.push(...unchecked);
   // Some changes leave nothing to mark, such as a new link definition.
@@ -362,19 +375,20 @@ function pageNote(page: RenderOutPage) {
 }
 
 /**
- * The plain-text report: one line per page with its status, its file in
- * the out dir and what changed. Repo paths pass through
- * escapeHiddenCharacters, as everywhere the tool prints them.
+ * The plain-text report: where the page went, then one line per file with
+ * its status, its card on the page and what changed. Repo paths pass
+ * through escapeHiddenCharacters, as everywhere the tool prints them.
  */
 export function formatRenderOutSummary(report: RenderOutReport, outLabel: string) {
-  if (report.pages.length === 0) return 'nothing to export · no markdown, images or SVG on this branch\n';
+  if (report.page === null) return 'nothing to export · no files changed on this branch\n';
   const dir = outLabel.endsWith('/') ? outLabel : `${outLabel}/`;
-  const all = [...report.pages, ...report.also];
-  const paths = all.map((page) => escapeHiddenCharacters(page.path));
+  const all = [...report.files, ...report.also];
+  const paths = all.map((file) => escapeHiddenCharacters(file.path));
   const width = Math.max(...paths.map((shown) => shown.length)) + 3;
-  const lines = all.map((page, index) => `  ${page.embeds ? '·' : STATUS_LETTERS[page.status]} ${paths[index]!.padEnd(width)}${dir}${page.file}  ${pageNote(page)}`);
-  const count = all.length;
-  return [`Wrote ${count} page${count === 1 ? '' : 's'} to ${dir} · nothing left this machine`, ...lines, ''].join('\n');
+  const cardWidth = Math.max(...all.map((file) => file.card.length - PAGE_FILE.length)) + 2;
+  const lines = all.map((file, index) => `  ${file.embeds ? '·' : STATUS_LETTERS[file.status]} ${paths[index]!.padEnd(width)}${file.card.slice(PAGE_FILE.length).padEnd(cardWidth)}${fileNote(file)}`);
+  const count = report.files.length;
+  return [`Wrote ${dir}${report.page} and ${dir}${LINKS_FILE} for ${count} file${count === 1 ? '' : 's'} · nothing left this machine`, ...lines, ''].join('\n');
 }
 
 /**

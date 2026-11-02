@@ -135,9 +135,10 @@ describe('the Review in browser page on a real branch', () => {
     git(cwd, 'push', '-q', '-u', 'origin', 'feature/docs-refresh');
     expect(await read()).toMatch(/rv-state-even">.*Up to date with origin</);
 
+    // The amend rewrote the commit origin has: each side has one the other lacks.
     git(cwd, 'commit', '-q', '--amend', '-m', 'docs: a renamed subject');
     const after = await read();
-    expect(after).toMatch(/rv-state-ahead">.*Ahead of origin by 1</);
+    expect(after).toMatch(/rv-state-diverged"[^>]*>.*Ahead 1, behind 1</);
     expect(after).toContain('<p class="rv-msg">docs: a renamed subject</p>');
     expect(after).not.toContain('docs: refresh the README and the hero image');
     service.dispose();

@@ -14,7 +14,7 @@ import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {FileStatus} from '../src/git.js';
 import {createMediaService, type MediaService} from '../src/media/service.js';
 import {createRenderedService, type RenderedService} from '../src/rendered/service.js';
-import type {FragmentSummary, PageRequest, RenderedBackend, ReviewRequest} from '../src/rendered/backend.js';
+import type {FragmentSummary, RenderedBackend, ReviewRequest} from '../src/rendered/backend.js';
 import {createRenderedSite} from '../src/rendered/site.js';
 import {createSurface} from '../src/rendered/surface.js';
 import type {RunResult} from '../src/rendered/run.js';
@@ -659,10 +659,6 @@ export function fakeRenderedService({
       return {ok: true, summary: answer};
     },
     prioritize: () => undefined,
-    async page(request: PageRequest) {
-      if (off) return {ok: false, state: 'unavailable', reason: off};
-      return {ok: true, html: `<!doctype html><title>${request.file.path}</title>`, summary: answer};
-    },
     // The Review in browser page, which `r` and `R` open.
     async review(request: ReviewRequest) {
       if (off) return {ok: false, state: 'unavailable', reason: off};

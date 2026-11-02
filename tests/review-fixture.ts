@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
-import type {FragmentResult, PageResult, RenderedBackend, ReviewResult} from '../src/rendered/backend.js';
+import type {FragmentResult, RenderedBackend, ReviewResult} from '../src/rendered/backend.js';
 import {createRenderedHandler} from '../src/rendered/worker/handler.js';
 import {commitAll, git, initRepo, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
@@ -49,7 +49,6 @@ export function inProcessBackend(): RenderedBackend & {handler: ReturnType<typeo
     handler,
     fragment: (request) => handler.handle({type: 'fragment', ...request}) as Promise<FragmentResult>,
     prioritize: () => undefined,
-    page: (request) => handler.handle({type: 'page', ...request}) as Promise<PageResult>,
     review: (request) => handler.handle({type: 'review', ...request}) as Promise<ReviewResult>,
     dispose: () => handler.dispose(),
     disabledReason: () => null,

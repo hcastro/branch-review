@@ -3,9 +3,10 @@ import type {WorkerFailure} from '../media/workerClient.js';
 import type {AssetSides} from './assets.js';
 import type {ChangeGroup} from './changes.js';
 import type {ImageFacts} from './image.js';
+import type {PageBody} from './page.js';
 import type {LinkAnswer, RenderedFragment} from './markdown.js';
-import type {PageBody, PageFile, PageInput, RailEntry} from './page.js';
 import type {ReviewPageCard, ReviewPageInput} from './review/page.js';
+import type {CardSpecial} from './review/special.js';
 import type {PageLayout} from './plan.js';
 import type {SourceSpec} from './source.js';
 import type {PageGeometry} from './tileGeometry.js';
@@ -14,12 +15,12 @@ import type {ChromeBinary} from './worker/chrome.js';
 // The jobs the UI process asks of the rendered worker, and their answers.
 // The UI side only sees this interface, so service tests can answer it in
 // process. The worker keeps each fragment's HTML; the UI holds what it needs
-// to name pages and label the rail.
+// to name the page and plan its cards.
 
-/** One file to render, from the side the review shows: markdown, or an image's own page. */
+/** One file to render, from the side the review shows: markdown, or an image's sides. */
 export type FragmentRequest = {
   cwd: string;
-  /** An image or SVG file's page; markdown when left out. */
+  /** An image's or an SVG's sides; markdown when left out. */
   kind?: 'raster' | 'svg';
   /** Markdown whose text the review didn't change, marked by the images it shows alone. */
   textUnchanged?: true;
@@ -59,19 +60,6 @@ export type FragmentSummary = {
 
 export type FragmentResult = {ok: true; summary: FragmentSummary} | WorkerFailure;
 
-/**
- * One whole page. Its body is the fragment the worker rendered for that
- * request (rendered again if the worker no longer holds it), or a body the
- * UI already knows, such as a file whose render kept timing out.
- */
-export type PageRequest = {
-  key: string;
-  title: PageInput['title'];
-  file: {path: string; status: FileStatus; oldPath?: string; also?: PageFile['also']};
-  rail: RailEntry[];
-  content: {fragment: FragmentRequest} | {body: PageBody};
-} & Pick<PageInput, 'brokenRefs' | 'appears' | 'report'>;
-
 /** A card's fragment as the page asks for it: the review's links and asset sides, which every fragment shares, ride once with the page. */
 export type ReviewFragmentRequest = Omit<FragmentRequest, 'links' | 'assets'>;
 
@@ -101,8 +89,10 @@ export type ReviewCardRequest = {
   renderFailure?: string;
   /** The rich view's links to a heading another file doesn't have, by their `ref` index, drawn broken. */
   brokenRefs?: readonly number[];
-  /** In place of a diff, why there is none. */
-  notice?: string;
+  /** In place of a diff, what the file is: a binary file, a submodule, a rename with no changes. */
+  special?: CardSpecial;
+  /** A mode change that came with changes to the text, which the card's header names. */
+  mode?: {from: string; to: string};
   /** A file the review doesn't list whose text is the same, which shows the changed images named here. */
   also?: string[];
 };
@@ -132,10 +122,6 @@ export type ReviewResult = {ok: true; html: string; partial?: true} | WorkerFail
 export type EmbeddersRequest = {cwd: string; assets: AssetSides; names: string[]; skip: string[]};
 
 export type EmbeddersResult = {ok: true; files: Array<{path: string; oid: string}>} | WorkerFailure;
-
-// `rerendered`: the page rendered its fragment again rather than use the one
-// held, so its summary can count differently from the fragment's answer.
-export type PageResult = {ok: true; html: string; summary: FragmentSummary; rerendered?: true} | WorkerFailure;
 
 /**
  * A page for the in-pane view: the fragment the tiles show, drawn in the
@@ -192,7 +178,6 @@ export interface RenderedBackend {
   fragment(request: FragmentRequest, signal: AbortSignal, priority?: number): Promise<FragmentResult>;
   // Moves a fragment still waiting for the worker, asked for with `signal`, to `priority`.
   prioritize(signal: AbortSignal, priority: number): void;
-  page(request: PageRequest, signal: AbortSignal): Promise<PageResult>;
   // The Review in browser page. A backend without it opens none.
   review?(request: ReviewRequest, signal: AbortSignal): Promise<ReviewResult>;
   // The review's markdown candidates for "also looks different". A backend
@@ -210,12 +195,11 @@ export interface RenderedBackend {
 
 export type RenderedJobs = {
   fragment: {request: FragmentRequest; result: FragmentResult};
-  page: {request: PageRequest; result: PageResult};
   review: {request: ReviewRequest; result: ReviewResult};
   embedders: {request: EmbeddersRequest; result: EmbeddersResult};
   layout: {request: LayoutRequest; result: LayoutResult};
   tile: {request: TileRequest; result: TileResult};
 };
 
-export type RenderedWorkerRequest = ({type: 'fragment'} & FragmentRequest) | ({type: 'page'} & PageRequest) | ({type: 'review'} & ReviewRequest) | ({type: 'embedders'} & EmbeddersRequest)
+export type RenderedWorkerRequest = ({type: 'fragment'} & FragmentRequest) | ({type: 'review'} & ReviewRequest) | ({type: 'embedders'} & EmbeddersRequest)
   | ({type: 'layout'} & LayoutRequest) | ({type: 'tile'} & TileRequest);

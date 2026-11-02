@@ -1,5 +1,6 @@
 import {describe, expect, it} from 'vitest';
-import {drawHunk, escapeText, markRange, pairedRanges, parseHunks, wordRange} from '../src/rendered/review/diff.js';
+import {drawHunk, escapeText, markRange, packHtml, pairedRanges, parseHunks, unpackHtml, wordRange} from '../src/rendered/review/diff.js';
+import {highlightLines} from '../src/rendered/review/highlight.js';
 import {diffFile} from './rendered-helpers.js';
 
 // The Review in browser page's diff model: hunks read from the review's
@@ -84,5 +85,24 @@ describe('word highlights', () => {
       {t: '-', o: 2, h: 'x = <span class="x">1</span>'},
       {t: '+', n: 2, h: '<span class="pl-v">x</span> = <span class="x">2</span>'},
     ]);
+  });
+});
+
+describe('packHtml', () => {
+  it('writes a line\'s HTML in a few bytes for the page\'s data, and reads back the same HTML', async () => {
+    const lines = (await highlightLines('const a = "x > y" && b < 2; // done\n/* one\ntwo */\n', 'src/a.ts'))!;
+    const marked = markRange(lines[0]!, 6, 11);
+    for (const html of [...lines, marked, escapeText('a < b && "c" > d'), '']) {
+      const packed = packHtml(html);
+      expect(packed).not.toMatch(/[<"]/);
+      expect(unpackHtml(packed)).toBe(html);
+    }
+    // A span's two tags, 26 characters, become five.
+    expect(packHtml('<span class="pl-k">const</span>')).toBe('>k>const>>');
+    expect(packHtml(marked).length).toBeLessThan(marked.length / 2);
+  });
+
+  it('keeps HTML it has no short form for as it is, and still reads it back', () => {
+    for (const html of ['<b>bold</b>', '<span class="other">a</span>', 'a > b']) expect(unpackHtml(packHtml(html))).toBe(html);
   });
 });

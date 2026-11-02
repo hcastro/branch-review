@@ -3,7 +3,8 @@ import {describe, expect, it} from 'vitest';
 import {REVIEW_CSS_HASH, REVIEW_HEAD_SCRIPT_HASH, REVIEW_SCRIPT, REVIEW_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
 import {changeGroups} from '../src/rendered/changes.js';
 import {renderMarkdown} from '../src/rendered/markdown.js';
-import {drawHunk, escapeText, parseHunks} from '../src/rendered/review/diff.js';
+import {drawHunk, escapeText, parseHunks, unpackHtml} from '../src/rendered/review/diff.js';
+import {icon} from '../src/rendered/review/icons.js';
 import {applyBudgets, assembleReviewPage, reviewPolicy, type ReviewPageCard, type ReviewPageInput} from '../src/rendered/review/page.js';
 import {diffFile} from './rendered-helpers.js';
 
@@ -47,6 +48,8 @@ async function input(cards: ReviewPageCard[], overrides: Partial<ReviewPageInput
 }
 
 const head = (html: string) => html.slice(html.indexOf('<head>'), html.indexOf('</head>'));
+// The page as drawn, without its data block and its script.
+const drawn = (html: string) => html.slice(html.indexOf('<body>'), html.indexOf('<script type="application/json"'));
 
 describe('assembleReviewPage', () => {
   it('opens with a policy that allows only our stylesheet and our two scripts, and loads nothing', async () => {
@@ -83,6 +86,8 @@ describe('assembleReviewPage', () => {
     expect(await pill({kind: 'unpushed'})).toBe('Not pushed');
     expect(await pill({kind: 'ahead', remote: 'origin', count: 3})).toBe('Ahead of origin by 3');
     expect(await pill({kind: 'even', remote: 'upstream'})).toBe('Up to date with upstream');
+    expect(await pill({kind: 'behind', remote: 'origin', count: 2})).toBe('Behind origin by 2');
+    expect(await pill({kind: 'diverged', remote: 'origin', ahead: 1, behind: 4})).toBe('Ahead 1, behind 4');
     // git didn't say in time: a quiet pill in the same place, never a gap.
     expect(await pill({kind: 'unknown'})).toBe('Branch state unavailable');
     expect(await pill(null)).toBeNull();
@@ -264,6 +269,119 @@ describe('assembleReviewPage', () => {
   it('draws a one-line card for a file with no diff to show', async () => {
     const html = assembleReviewPage(await input([{path: 'bin/tool', status: 'modified', additions: 0, deletions: 0, kind: 'text', viewKey: 'v', signature: 's', diff: null, notice: 'Binary file not shown.'}]));
     expect(html).toContain('<p class="rv-notice">Binary file not shown.</p>');
+  });
+
+  it('draws each file with no diff to show as GitHub\'s one line, with its icon and the words for its kind', async () => {
+    const special = (path: string, kind: ReviewPageCard['special'], overrides: Partial<ReviewPageCard> = {}): ReviewPageCard => ({path, status: 'modified', additions: 0, deletions: 0, kind: 'text', viewKey: path, signature: 's', diff: null, special: kind, ...overrides});
+    const html = assembleReviewPage(await input([
+      special('bin/tool', {kind: 'binary'}),
+      special('docs/new.md', {kind: 'renamed'}, {status: 'renamed', oldPath: 'docs/<old>.md'}),
+      special('bin/run', {kind: 'mode', from: '100644', to: '100755'}),
+      special('empty.txt', {kind: 'empty'}, {status: 'added'}),
+      special('gone.txt', {kind: 'empty'}, {status: 'deleted'}),
+      special('lib', {kind: 'submodule', before: '1'.repeat(40), after: '2'.repeat(40)}),
+      special('img/big.psd', {kind: 'lfs', bytes: 2_500_000}),
+      special('data/dump.sql', {kind: 'tooLarge', bytes: 5 * 1024 * 1024}),
+    ]));
+    const line = (kind: string) => new RegExp(`<div class="rv-special rv-special-${kind}"><svg class="ic"[^>]*>[\\s\\S]*?</svg><span>(.*?)</span>(?:<span class="rv-sp-note"><span aria-hidden="true">· </span>(.*?)</span>)?</div>`).exec(html)?.slice(1).filter(Boolean);
+    expect(line('binary')).toEqual(['Binary file not shown.']);
+    expect(line('renamed')).toEqual(['File renamed without changes.', 'renamed from <code>docs/&lt;old&gt;.md</code>']);
+    expect(line('mode')).toEqual(['File mode changed from 100644 to 100755.']);
+    expect(html).toContain('<span>Empty file added.</span>');
+    expect(html).toContain('<span>Empty file deleted.</span>');
+    expect(line('submodule')).toEqual(['Submodule updated from <code>1111111</code> to <code>2222222</code>.']);
+    expect(line('lfs')).toEqual(['Git LFS file not shown.', '2.4 MB']);
+    expect(line('tooLarge')).toEqual(['This diff is too large to show here. Open the file to see it.', '5.0 MB']);
+    expect(drawn(html)).not.toContain('<table');
+    // No line counts for a file with no lines to count.
+    expect(drawn(html)).not.toContain('rv-fh-stat');
+  });
+
+  it('counts no lines in the header of a submodule or a Git LFS pointer, whose lines are git\'s, and counts a diff too large to show', async () => {
+    const special = (path: string, kind: ReviewPageCard['special'], additions: number, deletions: number): ReviewPageCard => ({path, status: 'modified', additions, deletions, kind: 'text', viewKey: path, signature: 's', diff: null, special: kind});
+    const html = assembleReviewPage(await input([
+      special('lib', {kind: 'submodule', before: '1'.repeat(40), after: '2'.repeat(40)}, 1, 1),
+      special('img/big.psd', {kind: 'lfs', bytes: 2_500_000}, 2, 2),
+      special('data/dump.sql', {kind: 'tooLarge', bytes: 5 * 1024 * 1024}, 70_000, 3),
+    ]));
+    const header = (path: string) => new RegExp(`<section class="rv-card" id="file-\\d+"[^>]*aria-label="${path}">\\n<div class="rv-fh">([\\s\\S]*?)\\n<div class="rv-fb">`).exec(html)![1]!;
+    expect(header('lib')).not.toContain('rv-fh-stat');
+    expect(header('img/big.psd')).not.toContain('rv-fh-stat');
+    expect(header('data/dump.sql')).toContain('<span class="rv-a">+70000</span><span class="rv-d">−3</span>');
+  });
+
+  it('adds up in the Files changed total only the line counts the cards show', async () => {
+    const special = (path: string, kind: ReviewPageCard['special'], additions: number, deletions: number): ReviewPageCard => ({path, status: 'modified', additions, deletions, kind: 'text', viewKey: path, signature: 's', diff: null, special: kind});
+    const html = assembleReviewPage(await input([
+      textCard('src/a.ts', 'a\n', 'b\n'),
+      special('lib', {kind: 'submodule', after: '2'.repeat(40)}, 1, 0),
+      special('img/big.psd', {kind: 'lfs', bytes: 2_500_000}, 3, 0),
+      special('data/dump.sql', {kind: 'tooLarge', bytes: 5 * 1024 * 1024}, 70_000, 3),
+      special('vendor/old.js', {kind: 'deleted'}, 0, 600),
+    ]));
+    expect(html).toContain('<span class="rv-total"><span class="rv-a">+70001</span><span class="rv-d">−604</span>');
+  });
+
+  it('gives each one-line card the icon for its kind', async () => {
+    const special = (path: string, kind: NonNullable<ReviewPageCard['special']>, status: ReviewPageCard['status'] = 'modified'): ReviewPageCard => ({path, status, additions: 0, deletions: 0, kind: 'text', viewKey: path, signature: 's', diff: null, special: kind});
+    const kinds: Array<[NonNullable<ReviewPageCard['special']>, Parameters<typeof icon>[0]]> = [
+      [{kind: 'binary'}, 'binary'],
+      [{kind: 'empty'}, 'file'],
+      [{kind: 'renamed'}, 'arrowSq'],
+      [{kind: 'mode', from: '100644', to: '100755'}, 'mode'],
+      [{kind: 'submodule', after: '2'.repeat(40)}, 'submodule'],
+      [{kind: 'lfs'}, 'lfs'],
+      [{kind: 'tooLarge', bytes: 1}, 'alert'],
+      [{kind: 'noRoom', bytes: 1}, 'alert'],
+      [{kind: 'deleted'}, 'minusSq'],
+      [{kind: 'unreadable', reason: 'boom'}, 'alert'],
+      [{kind: 'none'}, 'file'],
+    ];
+    const html = assembleReviewPage(await input(kinds.map(([kind], index) => special(`f${index}`, kind, kind.kind === 'deleted' ? 'deleted' : 'modified'))));
+    for (const [kind, name] of kinds) expect(html, kind.kind).toContain(`<div class="rv-special rv-special-${kind.kind}">${icon(name)}<span>`);
+  });
+
+  it('says a folded diff the page has no room for is past its room, and a deleted file\'s that it was deleted, each keeping its counts', async () => {
+    const special = (path: string, kind: ReviewPageCard['special'], status: ReviewPageCard['status']): ReviewPageCard => ({path, status, additions: 0, deletions: 600, kind: 'text', viewKey: path, signature: 's', diff: null, special: kind});
+    const html = assembleReviewPage(await input([special('data/rows.csv', {kind: 'noRoom', bytes: 800 * 1024}, 'modified'), special('vendor/old.js', {kind: 'deleted'}, 'deleted')]));
+    expect(html).toContain('<span>This page has no room left for this diff. Open the file to see it.</span><span class="rv-sp-note"><span aria-hidden="true">· </span>800 KB</span>');
+    expect(html).toContain('<span>This file was deleted.</span></div>');
+    expect(drawn(html).match(/<span class="rv-d">−600<\/span>/g)).toHaveLength(2);
+  });
+
+  it('names a mode change that came with changes to the text in the card\'s header', async () => {
+    const html = assembleReviewPage(await input([textCard('bin/run', 'a\n', 'b\n', {mode: {from: '100644', to: '100755'}})]));
+    expect(html).toContain('<span class="rv-fh-mode" title="File mode changed">100644 → 100755</span>');
+  });
+
+  it('folds a long diff behind Load diff, drawing no table of it, its lines in the page\'s data', async () => {
+    const long = textCard('pnpm-lock.yaml', 'a\n', 'b\n');
+    const gone = textCard('old/dump.sql', 'a\n', null, {status: 'deleted'});
+    const html = assembleReviewPage(await input([{...long, diff: {...long.diff!, fold: true}}, {...gone, diff: {...gone.diff!, fold: true}}]));
+    expect(drawn(html)).not.toContain('<table');
+    expect(html).toContain('<div class="rv-tbl" hidden></div><div class="rv-special rv-load"><button type="button" class="rv-load-btn rv-js" data-act="load">Load diff</button><span>Large diffs are not rendered by default.</span></div>');
+    expect(html).toContain('data-act="load">Load diff</button><span>This file was deleted.</span>');
+    const data = JSON.parse(/<script type="application\/json" id="rv-data">([\s\S]*?)<\/script>/.exec(html)![1]!) as {cards: Array<{diff: {fold?: true; hunks: unknown[]}}>};
+    expect(data.cards.map((each) => [each.diff.fold, each.diff.hunks.length])).toEqual([[true, 1], [true, 1]]);
+  });
+
+  it('carries each line once: a drawn table\'s in the table, a folded diff\'s and the context in their short form in the data', async () => {
+    const colored = '<span class="pl-k">const</span> a = <span class="pl-c1">2</span>;';
+    const card = (fold: boolean) => {
+      const each = textCard('src/a.ts', 'const a = 1;\n', 'const a = 2;\n');
+      each.diff!.hunks[0]!.lines[1]!.h = colored;
+      each.diff!.context = [colored];
+      return {...each, diff: {...each.diff!, ...(fold ? {fold: true as const} : {})}};
+    };
+    const html = assembleReviewPage(await input([card(false), card(true)]));
+    expect(drawn(html)).toContain(`<span class="mk">+</span>${colored}`);
+    type Packed = {cards: Array<{diff: {hunks: Array<{lines: number | Array<{h: string}>}>; context: string[]}}>};
+    const [table, folded] = (JSON.parse(/<script type="application\/json" id="rv-data">([\s\S]*?)<\/script>/.exec(html)![1]!) as Packed).cards;
+    expect(table!.diff.hunks[0]!.lines).toBe(2);
+    expect(table!.diff.context[0]).toBe('>k>const>> a = >c1>2>>;');
+    const lines = folded!.diff.hunks[0]!.lines as Array<{h: string}>;
+    expect(lines[1]!.h).toBe('>k>const>> a = >c1>2>>;');
+    expect(unpackHtml(lines[1]!.h)).toBe(colored);
   });
 
   it('names a moved file by both paths', async () => {

@@ -69,9 +69,6 @@ function scriptedBackend(
       const asked = fragments.find((each) => each.signal === signal);
       if (asked) prioritized.push({path: asked.request.path, priority});
     },
-    async page() {
-      throw new Error('the TUI writes no file page');
-    },
     async review(request): Promise<ReviewResult> {
       reviews.push(request);
       if (off) return {ok: false, state: 'unavailable', reason: off};
@@ -437,7 +434,7 @@ describe('the rendered service', () => {
     expect(service.renderable('docs/hero.png')).toBe(true);
     await clock.advance(2_000);
     expect(fragments.find((each) => each.request.path === 'docs/hero.png')!.request).toMatchObject({kind: 'raster', groups: []});
-    expect(cardOf(reviews[0]!, 'docs/hero.png')).toMatchObject({kind: 'raster', fragment: {kind: 'raster'}, notice: 'Binary file not shown.'});
+    expect(cardOf(reviews[0]!, 'docs/hero.png')).toMatchObject({kind: 'raster', fragment: {kind: 'raster'}, special: {kind: 'binary'}});
   });
 });
 

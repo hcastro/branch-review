@@ -1,5 +1,5 @@
 import {readReviewHash} from '../hash.js';
-import {wordRange, type CardDiff} from '../review/diff.js';
+import {unpackDiff, wordRange, type CardDiff, type DrawnLine, type LineKind, type PackedDiff} from '../review/diff.js';
 import {readSession, readStore, STORE_KEYS, writeSession, writeStore} from '../review/store.js';
 import {expandGap, tableHtml} from '../review/table.js';
 import {relativeTime} from '../review/time.js';
@@ -8,14 +8,18 @@ import {relativeTime} from '../review/time.js';
 // what a reader does on it: the theme, Unified and Split, context to
 // expand, Source and Rich, collapsing and marking files viewed (kept in
 // this browser for this review), the file tree and its filter, the menu,
-// image compare modes, the keys, and the trip a press in the terminal
-// makes: a hash that names the card to open at, which a split that is
-// already open hears as a hashchange, or a live refresh's, which lands
-// where the reader was. Repo text only arrives here inside HTML the worker
+// image compare modes, a long diff loaded in place, the keys, and the trip
+// a press in the terminal makes: a hash that names the card to open at,
+// which a split that is already open hears as a hashchange, or a live
+// refresh's, which lands where the reader was, as they left each card,
+// and pulses the cards the edit changed. Repo text only arrives here inside HTML the worker
 // escaped and data this script reads as data.
 
-type PageData = {id: string; cards: Array<{diff: CardDiff | null}>};
-type CardState = {diff: CardDiff | null; shown: number[]; viewed: boolean; collapsed: boolean};
+type PageData = {id: string; cards: Array<{diff: PackedDiff | null}>};
+// `packed`: the diff as the data carries it, until its table is drawn
+// again; `diff` then. `loaded`: its table is drawn, which a folded diff
+// waits for the reader to ask.
+type CardState = {packed: PackedDiff | null; diff: CardDiff | null; loaded: boolean; shown: number[]; viewed: boolean; collapsed: boolean};
 
 const root = document.documentElement;
 root.classList.add('rv-live');
@@ -28,7 +32,10 @@ const narrowTree = matchMedia('(max-width: 900px)');
 
 const data = JSON.parse($('#rv-data')!.textContent ?? '{}') as PageData;
 const cards = $$<HTMLElement>('.rv-card');
-const states: CardState[] = cards.map((_, index) => ({diff: data.cards[index]?.diff ?? null, shown: [], viewed: false, collapsed: false}));
+const states: CardState[] = cards.map((_, index) => {
+  const packed = data.cards[index]?.diff ?? null;
+  return {packed, diff: null, loaded: !packed?.fold, shown: [], viewed: false, collapsed: false};
+});
 // Motion follows the trip that opened the page (`--no-animations` sends it
 // off) and the system's reduced-motion setting.
 let motion = readReviewHash(location.hash).m !== false;
@@ -66,11 +73,44 @@ const saveViewed = () => {
 };
 
 // ---------- Tables ----------
+const KIND_OF: Record<string, LineKind> = {add: '+', del: '-'};
+
+// The lines of the table the page arrived with, in order, as the diff
+// model holds them: each row's kind, its numbers and its HTML after the
+// marker. Only a table drawn unified with no context revealed reads so.
+function drawnLines(box: HTMLElement): DrawnLine[] {
+  return $$<HTMLTableRowElement>('tr:not(.hdr)', box).map((row) => {
+    const [old, now] = $$('td.ln', row).map((cell) => cell.dataset.n);
+    const code = $('td.cd', row)!.cloneNode(true) as HTMLElement;
+    code.querySelector(':scope > .mk')?.remove();
+    return {t: KIND_OF[row.className] ?? ' ', ...(old ? {o: Number(old)} : {}), ...(now ? {n: Number(now)} : {}), h: code.innerHTML};
+  });
+}
+
+// A card's diff, read the first time the script draws its table.
+function diffOf(index: number) {
+  const state = states[index]!;
+  if (!state.diff && state.packed) state.diff = unpackDiff(state.packed, state.packed.fold ? [] : drawnLines($('.rv-tbl', cards[index]!)!));
+  return state.diff;
+}
+
 function drawTable(index: number, fresh?: number) {
   const state = states[index]!;
   const box = $('.rv-tbl', cards[index]!);
-  if (!state.diff || !box) return;
-  box.innerHTML = tableHtml(state.diff, state.shown, drawnLayout(), fresh);
+  if (!state.packed || !box || !state.loaded) return;
+  box.innerHTML = tableHtml(diffOf(index)!, state.shown, drawnLayout(), fresh);
+}
+
+// A folded diff, drawn in place from the page's data.
+function loadDiff(index: number) {
+  const state = states[index]!;
+  const card = cards[index]!;
+  if (state.loaded || !state.packed) return;
+  state.loaded = true;
+  $('.rv-tbl', card)!.hidden = false;
+  $('.rv-load', card)?.remove();
+  drawTable(index);
+  rememberCard(index);
 }
 
 function setLayout(next: 'unified' | 'split', redraw = true) {
@@ -122,7 +162,10 @@ function setCurrent(index: number) {
   }
 }
 
+// A glow on the card a jump lands at, once. None with motion off
+// (`--no-animations`), which asks for the page's final state at once.
 function flash(card: HTMLElement) {
+  if (!motion) return;
   card.classList.remove('rv-flash');
   void card.offsetWidth;
   card.classList.add('rv-flash');
@@ -152,6 +195,7 @@ function setCollapsed(index: number, collapsed: boolean) {
   chevron.setAttribute('aria-label', `${collapsed ? 'Expand' : 'Collapse'} ${card.getAttribute('aria-label') ?? ''}`);
   // Folding a card whose header scrolled past keeps the reader at it.
   if (collapsed && above) card.scrollIntoView({block: 'start'});
+  rememberCard(index);
 }
 
 function updateProgress() {
@@ -183,6 +227,7 @@ function setView(index: number, view: string) {
   source.hidden = view !== 'source';
   rich.hidden = view !== 'rich';
   for (const button of $$('[data-act="view"]', card)) button.setAttribute('aria-pressed', String(button.dataset.v === view));
+  rememberCard(index);
 }
 
 // ---------- Tree, drawer, menu, keys ----------
@@ -414,15 +459,16 @@ function regroupRich() {
 
 // ---------- Events ----------
 // A link in a rich view that opens another file in the review names that
-// file's stable page name, `f-….html`, with any heading: it jumps to the
-// file's card, in its rich view. A link to a heading on the same file
-// lands in the same card, where that file's ids are.
-const PAGE_LINK = /^(f-[0-9a-f]{20})\.html(?:#(.*))?$/;
+// file's card and its rich view, `#file-<n>&v=rich`, with any heading as
+// `&h=<id>` (review/page.ts): it jumps to the file's card, in its rich
+// view. A link to a heading on the same file lands in the same card, where
+// that file's ids are.
+const CARD_LINK = /^#file-(\d{1,6})&v=rich(?:&h=(.*))?$/;
 function followLink(link: HTMLAnchorElement): boolean {
   const href = link.getAttribute('href') ?? '';
-  const page = PAGE_LINK.exec(href);
+  const page = CARD_LINK.exec(href);
   if (!page && !href.startsWith('#')) return false;
-  const index = page ? cards.findIndex((card) => card.dataset.alias === page[1]) : Number(link.closest<HTMLElement>('.rv-card')?.dataset.i);
+  const index = page ? Number(page[1]) : Number(link.closest<HTMLElement>('.rv-card')?.dataset.i);
   const into = cards[index];
   if (!into) return false;
   const id = page ? page[2] : href.slice(1);
@@ -545,11 +591,15 @@ document.addEventListener('click', (event) => {
       control.setAttribute('aria-expanded', String(box.open));
       break;
     }
+    case 'load':
+      loadDiff(index);
+      break;
     case 'expand': {
       const state = states[index]!;
-      if (!state.diff) break;
+      const diff = diffOf(index);
+      if (!diff) break;
       const gap = Number(control.dataset.g);
-      state.shown = expandGap(state.diff, state.shown, gap);
+      state.shown = expandGap(diff, state.shown, gap);
       drawTable(index, gap);
       break;
     }
@@ -625,10 +675,13 @@ function onScroll() {
   ticking = true;
   requestAnimationFrame(() => {
     ticking = false;
-    if (Date.now() < jumping || $('#panel-files')!.hidden) return;
+    if ($('#panel-files')!.hidden) return;
+    // A scroll during a jump still moves the reader's place, which a live
+    // refresh lands at; only the file the jump picked stays current.
+    savePlace();
+    if (Date.now() < jumping) return;
     const at = cardAtLine();
     if (at !== current) setCurrent(at);
-    savePlace();
   });
 }
 
@@ -666,6 +719,84 @@ narrowTree.addEventListener('change', () => {
   if (!narrowTree.matches) openDrawer(false);
 });
 
+// ---------- What a live refresh keeps ----------
+// What the reader did to each card in this tab, by its view key: the view
+// they switched to, whether they left it folded or open, whether they
+// loaded its diff. A live refresh draws the newer page the same way before
+// it scrolls back, so the reader lands where they were among cards that
+// look as they left them: a Viewed card they opened again stays open. A
+// card the edit changed opens again, as an edit clears its Viewed.
+type CardMemory = {v?: string; c?: 0 | 1; l?: 1};
+const cardsKey = STORE_KEYS.cards + data.id;
+const readMemory = (): Record<string, CardMemory> => {
+  try {
+    const parsed = JSON.parse(readSession(cardsKey) ?? '{}') as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, CardMemory> : {};
+  } catch {
+    return {};
+  }
+};
+// Off while the page sets its cards up from storage, which is no reader's doing.
+let remembering = false;
+function rememberCard(index: number) {
+  if (!remembering) return;
+  const card = cards[index]!;
+  const rich = $('.rv-v-rich', card);
+  const memory = readMemory();
+  const entry: CardMemory = {...(rich && !rich.hidden ? {v: 'rich'} : rich ? {v: 'source'} : {}), c: states[index]!.collapsed ? 1 : 0, ...(states[index]!.loaded && states[index]!.packed?.fold ? {l: 1 as const} : {})};
+  memory[card.dataset.vk!] = entry;
+  writeSession(cardsKey, JSON.stringify(memory));
+}
+
+// Each card's signature on the page this tab showed last, and the cards
+// whose signature differs here: those a live refresh pulses. A card new
+// to the review differs too.
+const signaturesKey = STORE_KEYS.signatures + data.id;
+const changed = (() => {
+  let before: Record<string, string> | null = null;
+  try {
+    const parsed = JSON.parse(readSession(signaturesKey) ?? 'null') as unknown;
+    if (parsed && typeof parsed === 'object') before = parsed as Record<string, string>;
+  } catch {
+    before = null;
+  }
+  writeSession(signaturesKey, JSON.stringify(Object.fromEntries(cards.map((card) => [card.dataset.vk!, card.dataset.sig!]))));
+  return new Set(before ? cards.flatMap((card, index) => (before![card.dataset.vk!] === card.dataset.sig ? [] : [index])) : []);
+})();
+
+function restoreCards() {
+  const memory = readMemory();
+  let reopened = false;
+  for (const [index, card] of cards.entries()) {
+    const entry = memory[card.dataset.vk!];
+    if (!entry) continue;
+    if (entry.v === 'rich' || entry.v === 'source') setView(index, entry.v);
+    if (entry.l) loadDiff(index);
+    // After the viewed marks, which fold their cards as the page loads.
+    if (entry.c === undefined) continue;
+    if (!changed.has(index)) {
+      setCollapsed(index, entry.c === 1);
+    } else if (entry.c === 1) {
+      // A changed card arrives open, and stays as the reader now sees it:
+      // the next refresh that leaves it alone keeps it open.
+      entry.c = 0;
+      reopened = true;
+    }
+  }
+  if (reopened) writeSession(cardsKey, JSON.stringify(memory));
+}
+
+// A soft wash of the accent over a card the edit changed, once. None
+// with motion off or reduced: the card's Viewed box and counts say it.
+function pulse() {
+  if (!motion || reduced.matches) return;
+  for (const index of changed) {
+    const card = cards[index]!;
+    card.classList.add('rv-pulse');
+    window.setTimeout(() => card.classList.remove('rv-pulse'), 700);
+  }
+}
+
 // ---------- Arrival ----------
 // A trip names the card to open at, which glows once; a trip with no card
 // opens the page at its top. A press on the same file again, to a split
@@ -675,10 +806,20 @@ function arrive(first = false) {
   const hash = readReviewHash(location.hash);
   if (hash.m !== undefined) motion = hash.m;
   setTab('files');
-  // A live refresh: back where the reader was, with no glow and no motion.
+  // A live refresh: back where the reader was, with each card as they left
+  // it, no glow and no motion but a pulse on what changed.
+  if (hash.l && first) {
+    restoreCards();
+    pulse();
+  } else if (first) {
+    // A press opens the page as it arrives: what the reader did before it
+    // is no longer theirs to come back to.
+    writeSession(cardsKey, '{}');
+  }
   const place = hash.l ? readPlace() : null;
+  // The card at the reader's place stays as they left it, folded or open,
+  // so the distance kept down it still lands on the same line.
   if (place && cards[place.i]) {
-    if (states[place.i]!.collapsed) setCollapsed(place.i, false);
     setCurrent(place.i);
     jumping = Date.now() + 900;
     scrollTo({top: cards[place.i]!.getBoundingClientRect().top + scrollY + place.dy, behavior: 'auto'});
@@ -723,3 +864,4 @@ updateProgress();
 setLayout(layout, drawnLayout() === 'split');
 refreshTimes();
 arrive(true);
+remembering = true;

@@ -2,7 +2,8 @@
 // its start (pid and TMPDIR) and every job it receives, with when it came. A
 // path starting with `answer` is answered at once, one starting with
 // `delay-<ms>-` that many milliseconds later; anything else is never
-// answered. Layout and tile jobs name their file in their source's fragment.
+// answered. Layout and tile jobs name their file in their source's
+// fragment, and the Review in browser page by its first card.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -15,14 +16,14 @@ const summary = {kind: 'rendered', changes: {changed: 0, removed: 0}, difference
 const layout = {heightCss: 100, blocks: [], removed: [], links: [], anchors: []};
 
 const answer = (message, file) => {
-  if (message.type === 'page') process.send({id: message.id, ok: true, html: `<p>${file}</p>`, summary});
+  if (message.type === 'review') process.send({id: message.id, ok: true, html: `<p>${file}</p>`});
   else if (message.type === 'layout') process.send({id: message.id, ok: true, layout, document: `doc-${file}`});
   else if (message.type === 'tile') process.send({id: message.id, ok: true, png: []});
   else process.send({id: message.id, ok: true, summary});
 };
 
 process.on('message', (message) => {
-  const file = message.path ?? message.file?.path ?? message.source?.fragment?.path ?? '';
+  const file = message.path ?? message.cards?.[0]?.path ?? message.source?.fragment?.path ?? '';
   write({event: 'job', id: message.id, type: message.type, path: file});
   const delay = /^delay-(\d+)-/.exec(file);
   if (delay) setTimeout(() => answer(message, file), Number(delay[1]));

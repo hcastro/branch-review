@@ -32,6 +32,11 @@ const PATHS = {
   minusSq: '<rect x="2" y="2" width="12" height="12" rx="2.5"/><path d="M5 8h6"/>',
   dotSq: '<rect x="2" y="2" width="12" height="12" rx="2.5"/><circle cx="8" cy="8" r="1.75" fill="currentColor" stroke="none"/>',
   arrowSq: '<rect x="2" y="2" width="12" height="12" rx="2.5"/><path d="M5 8h6M8.75 5.75L11 8l-2.25 2.25"/>',
+  binary: '<rect x="2.75" y="1.75" width="10.5" height="12.5" rx="1.5"/><path d="M6 5v2.5M10 8.5V11M5.25 9.25h1.5v2h-1.5zM9.25 5h1.5v2h-1.5z"/>',
+  submodule: '<path d="M1.75 3.25h4.5l1.5 1.5h6.5v8H1.75z"/><path d="M6.5 9h4M9 7.25L10.75 9 9 10.75"/>',
+  lfs: '<path d="M8 1.75l5.75 3v6.5L8 14.25l-5.75-3v-6.5z"/><path d="M2.25 4.75L8 7.75l5.75-3M8 7.75v6.5"/>',
+  mode: '<circle cx="5.5" cy="10.5" r="3"/><path d="M7.6 8.4l5.65-5.65M10.5 5.5l1.75 1.75M12 4l1.25 1.25"/>',
+  alert: '<path d="M8 1.75l6.5 11.5h-13z"/><path d="M8 6v3.5M8 11.5h.01"/>',
   grip: '<path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5"/>',
 } as const;
 

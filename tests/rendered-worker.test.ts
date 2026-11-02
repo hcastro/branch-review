@@ -7,7 +7,7 @@ import {afterEach, describe, expect, it} from 'vitest';
 import {createWorkerBackend} from '../src/media/workerClient.js';
 import type {MediaBackend} from '../src/media/backend.js';
 import type {SideRef} from '../src/media/types.js';
-import type {FragmentRequest, RenderedBackend, TileSource} from '../src/rendered/backend.js';
+import type {FragmentRequest, RenderedBackend, ReviewRequest, TileSource} from '../src/rendered/backend.js';
 import {tileGeometry} from '../src/rendered/tileGeometry.js';
 import {createRenderedBackend} from '../src/rendered/workerClient.js';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, writeExecutable, writeFiles} from './core-helpers.js';
@@ -58,6 +58,15 @@ function fragmentOf(cwd: string, file: string, overrides: Partial<FragmentReques
   };
 }
 
+// The Review in browser page for a review of one file, which the scripted
+// worker answers by that file's path.
+function reviewOf(cwd: string, file: string): ReviewRequest {
+  return {
+    key: `review-${file}`, cwd, refs: {base: 'main', branch: 'HEAD'}, title: {repo: 'r', base: 'main', branch: 'b', worktree: false}, reviewId: 'r', links: {}, assets: null, findings: [],
+    cards: [{path: file, status: 'modified', additions: 1, deletions: 1, kind: 'text', identity: '', blocks: [], sides: {}}],
+  };
+}
+
 const mediaSide = (file: string): SideRef => ({side: 'after', source: 'blob', path: file, abbrevId: 'abcdef1', key: `blob|${file}|abcdef1`});
 const inspectOf = (cwd: string, file: string) => ({cwd, side: mediaSide(file), kind: 'raster' as const, format: 'png' as const});
 
@@ -91,7 +100,7 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     expect(offReasons).toEqual(['timed out']);
     // Off: answered at once, with no fourth worker.
     expect(await rendered.fragment(fragmentOf(cwd, 'answer.md'), never)).toEqual({ok: false, state: 'unavailable', reason: 'Preview and Review in browser turned off: timed out'});
-    expect(await rendered.page({key: 'k', title: {repo: 'r', base: 'main', branch: 'b', worktree: false, renderedAt: 0}, file: {path: 'answer.md', status: 'modified'}, rail: [], content: {body: {kind: 'empty'}}}, never))
+    expect(await rendered.review!(reviewOf(cwd, 'answer.md'), never))
       .toEqual({ok: false, state: 'unavailable', reason: 'Preview and Review in browser turned off: timed out'});
     expect(renderedLog(tempDir).filter((entry) => entry.event === 'start')).toHaveLength(3);
 
@@ -211,7 +220,7 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     expect(await rendered.fragment(fragmentOf(cwd, 'answer.md'), never)).toMatchObject({ok: true});
   });
 
-  it('sends a page ahead of queued fragments', async () => {
+  it('sends the review page ahead of queued fragments', async () => {
     const cwd = initRepo();
     const tempDir = sessionDir();
     const rendered = renderedFor(tempDir, {modulePath: SCRIPTED_RENDERED, deadlinesMs: {fragment: 20_000}});
@@ -220,7 +229,7 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     const first = rendered.fragment(fragmentOf(cwd, 'answer-1.md'), never, 0);
     void rendered.fragment(fragmentOf(cwd, 'hang-2.md'), never, 0).then(ignore, ignore);
     void rendered.fragment(fragmentOf(cwd, 'hang-queued.md'), never, 0).then(ignore, ignore);
-    const page = rendered.page({key: 'k', title: {repo: 'r', base: 'main', branch: 'b', worktree: false, renderedAt: 0}, file: {path: 'answer-page.md', status: 'modified'}, rail: [], content: {body: {kind: 'empty'}}}, never);
+    const page = rendered.review!(reviewOf(cwd, 'answer-page.md'), never);
 
     await first;
     expect(await page).toMatchObject({ok: true, html: '<p>answer-page.md</p>'});

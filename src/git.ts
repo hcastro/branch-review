@@ -1408,19 +1408,22 @@ export function* branchCommitsOperation(cwd: string, base: string, branch: strin
 
 /**
  * Where a local branch stands against its upstream: none set, or how many
- * commits it has that the upstream doesn't, with the remote's name (the
- * upstream branch's own name when it is local). Null for a ref that is no
- * local branch. Reads only local refs: nothing is fetched.
+ * commits it has that the upstream doesn't (`ahead`) and, when there are
+ * any, how many the upstream has that it doesn't (`behind`), with the
+ * remote's name (the upstream branch's own name when it is local). Null
+ * for a ref that is no local branch. Reads only local refs: nothing is
+ * fetched, so `behind` counts what the last fetch brought.
  */
-export function* upstreamStateOperation(cwd: string, branch: string): GitOperation<{remote: string; ahead: number} | {remote: null} | null> {
+export function* upstreamStateOperation(cwd: string, branch: string): GitOperation<{remote: string; ahead: number; behind?: number} | {remote: null} | null> {
   const full = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', branch]);
   if (!full?.startsWith('refs/heads/')) return null;
   const name = full.slice('refs/heads/'.length);
   const upstream = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', `${name}@{upstream}`]);
   if (!upstream) return {remote: null};
   const remote = yield* tryGitOperation(cwd, ['config', '--get', `branch.${name}.remote`]);
-  const ahead = Number(yield* gitLineOperation(cwd, ['rev-list', '--count', `${upstream}..${full}`]));
-  return {remote: remote && remote !== '.' ? remote : upstream.replace(/^refs\/heads\//, ''), ahead};
+  // The upstream's own commits on the left, the branch's on the right.
+  const [behind, ahead] = (yield* gitLineOperation(cwd, ['rev-list', '--left-right', '--count', `${upstream}...${full}`])).split(/\s+/).map(Number);
+  return {remote: remote && remote !== '.' ? remote : upstream.replace(/^refs\/heads\//, ''), ahead: ahead!, ...(behind! > 0 ? {behind} : {})};
 }
 
 /**

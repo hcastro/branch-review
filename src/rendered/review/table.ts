@@ -99,16 +99,21 @@ export function tableRows(card: CardDiff, shown: readonly number[]): TableRow[] 
 const MARKS = {' ': ' ', '+': '+', '-': '-'} as const;
 const KINDS = {' ': '', '+': 'add', '-': 'del'} as const;
 
+const NO_MORE = 'Open the file to see more';
+
 function control(row: Extract<TableRow, {kind: 'hunk'}>) {
   if (row.disabled) {
-    const words = 'Open the file to see more';
-    return `<button type="button" class="exbtn" disabled aria-label="${words}" title="${words}">${icon(row.dir ?? 'unfold')}</button>`;
+    return `<button type="button" class="exbtn" disabled aria-label="${NO_MORE}" title="${NO_MORE}">${icon(row.dir ?? 'unfold')}</button>`;
   }
   if (!row.dir) return '';
   const count = Math.min(EXPAND_STEP, row.remaining);
   const words = row.dir === 'down' ? `Show ${count} more line${count === 1 ? '' : 's'} below` : row.dir === 'unfold' ? `Show the ${row.remaining} hidden line${row.remaining === 1 ? '' : 's'}` : `Show ${count} more line${count === 1 ? '' : 's'} above`;
   return `<button type="button" class="exbtn" data-act="expand" data-g="${row.gap}" aria-label="${words}" title="${words}">${icon(row.dir)}</button>`;
 }
+
+// A header's text, and beside an arrow that is off, why: a touch screen
+// has no tooltip to say it.
+const headerText = (row: Extract<TableRow, {kind: 'hunk'}>) => `${escapeText(row.text)}${row.disabled ? `<span class="hx-more${row.text ? ' hx-after' : ''}">${NO_MORE}</span>` : ''}`;
 
 const code = (line: DrawnLine) => `<span class="mk">${MARKS[line.t]}</span>${line.h}`;
 
@@ -125,7 +130,7 @@ export function tableHtml(card: CardDiff, shown: readonly number[], mode: 'unifi
     parts.push('<table class="diff uni"><colgroup><col class="c-ln"><col class="c-ln"><col></colgroup><tbody>');
     for (const row of rows) {
       if (row.kind === 'hunk') {
-        parts.push(`<tr class="hdr"><td class="ex" colspan="2">${control(row)}</td><td class="hx">${escapeText(row.text)}</td></tr>`);
+        parts.push(`<tr class="hdr"><td class="ex" colspan="2">${control(row)}</td><td class="hx">${headerText(row)}</td></tr>`);
         continue;
       }
       const {line} = row;
@@ -142,7 +147,7 @@ export function tableHtml(card: CardDiff, shown: readonly number[], mode: 'unifi
     for (let at = 0; at < rows.length;) {
       const row = rows[at]!;
       if (row.kind === 'hunk') {
-        parts.push(`<tr class="hdr"><td class="ex">${control(row)}</td><td class="hx" colspan="3">${escapeText(row.text)}</td></tr>`);
+        parts.push(`<tr class="hdr"><td class="ex">${control(row)}</td><td class="hx" colspan="3">${headerText(row)}</td></tr>`);
         at += 1;
         continue;
       }

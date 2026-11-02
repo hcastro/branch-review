@@ -5,7 +5,7 @@ import {afterEach, describe, expect, it} from 'vitest';
 import type {ReviewFile} from '../src/review/model.js';
 import {runOperationAsync} from '../src/git.js';
 import {createAssetResolver, LATE_IDENTITY, pageLookups, reviewAssetSides, type AssetResolver, type AssetSides, type AssetUse} from '../src/rendered/assets.js';
-import type {EmbeddersResult, FragmentRequest, FragmentResult, PageResult} from '../src/rendered/backend.js';
+import type {EmbeddersResult, FragmentRequest, FragmentResult, FragmentSummary, ReviewResult} from '../src/rendered/backend.js';
 import type {RunOperation} from '../src/rendered/tree.js';
 import {changeGroups, type ChangeGroup} from '../src/rendered/changes.js';
 import {renderMarkdown, repoPathFor, PAGE_INLINE_LIMIT, type AssetAnswer} from '../src/rendered/markdown.js';
@@ -568,12 +568,25 @@ describe('fragments in the rendered worker', () => {
     };
   }
 
-  const title = {repo: 'repo', base: 'main', branch: 'feature', worktree: false, renderedAt: 0};
+  type CardPage = {ok: true; html: string; summary: FragmentSummary} | {ok: false};
+
+  // A file's card on the Review in browser page the worker writes for it,
+  // and its fragment's summary: the page first, as `r` asks for it, then
+  // the fragment, held by then.
+  const pageOf = async (handler: ReturnType<typeof createRenderedHandler>, fragment: FragmentRequest): Promise<CardPage> => {
+    const {links, assets, ...own} = fragment;
+    const page = await handler.handle({
+      type: 'review', key: 'p', cwd: fragment.cwd, refs: {base: 'main', branch: 'HEAD'}, title: {repo: 'repo', base: 'main', branch: 'feature', worktree: false}, reviewId: 'r', links, assets, findings: [],
+      cards: [{path: fragment.path, ...(fragment.oldPath ? {oldPath: fragment.oldPath} : {}), status: fragment.status, additions: 0, deletions: 0, kind: 'markdown', identity: '', blocks: [], sides: {}, fragment: own}],
+    }) as ReviewResult;
+    const answer = await handler.handle({type: 'fragment', ...fragment}) as FragmentResult;
+    return page.ok && answer.ok ? {ok: true, html: page.html, summary: answer.summary} : {ok: false};
+  };
 
   it('renders a page with its images inlined and a card for a path that climbs out of the repo', async () => {
     const repo = readmeRepo();
     const handler = createRenderedHandler();
-    const page = await handler.handle({type: 'page', key: 'p', title, file: {path: 'README.md', status: 'modified'}, rail: [], content: {fragment: request(repo)}}) as PageResult;
+    const page = await pageOf(handler, request(repo));
     expect(page.ok).toBe(true);
     if (!page.ok) return;
     expect(page.html).toContain(dataUrl('image/png', RED));
@@ -589,21 +602,18 @@ describe('fragments in the rendered worker', () => {
       renders += 1;
       return renderMarkdown(input);
     }});
-    const pageOf = async (epoch: number) => {
-      const fragment = {...request(repo), assets: {...request(repo).assets, epoch}};
-      return await handler.handle({type: 'page', key: `p${epoch}`, title, file: {path: 'README.md', status: 'modified'}, rail: [], content: {fragment}}) as PageResult;
-    };
+    const pageAt = (epoch: number) => pageOf(handler, {...request(repo), assets: {...request(repo).assets, epoch}});
 
     expect(await handler.handle({type: 'fragment', ...request(repo)}) as FragmentResult).toMatchObject({ok: true});
     expect(renders).toBe(1);
     // The same key and the same images: the page comes from the fragment held.
-    expect(await pageOf(0)).toMatchObject({ok: true});
+    expect(await pageAt(0)).toMatchObject({ok: true});
     expect(renders).toBe(1);
 
     // Only the image moves on the branch: README.md's diff, and so its key, stay the same.
     writeBytes(repo, 'logo.png', BLUE);
     commitAll(repo, 'new logo');
-    const page = await pageOf(1);
+    const page = await pageAt(1);
     expect(renders).toBe(2);
     expect(page.ok && page.html).toContain(dataUrl('image/png', BLUE));
     expect(page.ok && page.html).not.toContain(dataUrl('image/png', RED));
@@ -684,7 +694,7 @@ describe('fragments in the rendered worker', () => {
       links: {},
       assets: refSides(),
     };
-    const page = await createRenderedHandler().handle({type: 'page', key: 'p', title, file: {path: 'guide/guide.md', status: 'renamed', oldPath: 'docs/guide.md'}, rail: [], content: {fragment: moved}}) as PageResult;
+    const page = await pageOf(createRenderedHandler(), moved);
     expect(page.ok).toBe(true);
     if (!page.ok) return;
     expect(page.summary.blocks.filter((block) => block.mark).map((block) => [block.lines, block.mark])).toEqual([[[3, 3], 'modified']]);
@@ -714,7 +724,7 @@ describe('fragments in the rendered worker', () => {
       links: {},
       assets: refSides(),
     };
-    const page = await createRenderedHandler().handle({type: 'page', key: 'p', title, file: {path: 'docs/old.md', status: 'deleted'}, rail: [], content: {fragment: deleted}}) as PageResult;
+    const page = await pageOf(createRenderedHandler(), deleted);
     expect(page.ok && page.html).toContain(dataUrl('image/png', RED));
     expect(page.ok && page.html).not.toContain('file not found');
   });
@@ -726,20 +736,17 @@ describe('fragments in the rendered worker', () => {
     const sides: AssetSides = {base: blobId(repo, 'main'), after: {worktree: [{path: 'locked.png', id, mode: 'regular'}]}, epoch: 0};
     const handler = createRenderedHandler();
     // The same request both times: only the image's readability moves.
-    const pageOf = async () => await handler.handle({
-      type: 'page', key: 'p', title, file: {path: 'README.md', status: 'modified'}, rail: [],
-      content: {fragment: {cwd: repo, key: 'locked', path: 'README.md', status: 'modified', source: {kind: 'blob', id: blobId(repo, 'HEAD:README.md')}, groups: [], links: {}, assets: sides}},
-    }) as PageResult;
+    const pageNow = () => pageOf(handler, {cwd: repo, key: 'locked', path: 'README.md', status: 'modified', source: {kind: 'blob', id: blobId(repo, 'HEAD:README.md')}, groups: [], links: {}, assets: sides});
 
     fs.chmodSync(path.join(repo, 'locked.png'), 0o000);
-    let first: PageResult;
+    let first: CardPage;
     try {
-      first = await pageOf();
+      first = await pageNow();
     } finally {
       fs.chmodSync(path.join(repo, 'locked.png'), 0o600);
     }
     expect(first.ok && first.html).toContain("can't read the file");
-    const page = await pageOf();
+    const page = await pageNow();
     expect(page.ok && page.html).toContain(dataUrl('image/png', BLUE));
     expect(page.ok && page.html).not.toContain("can't read the file");
   });
@@ -749,17 +756,14 @@ describe('fragments in the rendered worker', () => {
     writeBytes(repo, 'logo.png', BLUE);
     const id = git(repo, 'hash-object', 'logo.png').trim();
     const handler = createRenderedHandler();
-    const pageOf = async (epoch: number) => await handler.handle({
-      type: 'page', key: 'p', title, file: {path: 'README.md', status: 'modified'}, rail: [],
-      content: {fragment: {cwd: repo, key: 'logo', path: 'README.md', status: 'modified', source: {kind: 'blob', id: blobId(repo, 'HEAD:README.md')}, groups: [], links: {}, assets: {base: blobId(repo, 'main'), after: {worktree: [{path: 'logo.png', id, mode: 'regular'}]}, epoch}}},
-    }) as PageResult;
+    const pageAt = (epoch: number) => pageOf(handler, {cwd: repo, key: 'logo', path: 'README.md', status: 'modified', source: {kind: 'blob', id: blobId(repo, 'HEAD:README.md')}, groups: [], links: {}, assets: {base: blobId(repo, 'main'), after: {worktree: [{path: 'logo.png', id, mode: 'regular'}]}, epoch}});
 
     // An agent is rewriting the file: its bytes aren't the ones the review named.
     writeBytes(repo, 'logo.png', RED);
-    const first = await pageOf(0);
+    const first = await pageAt(0);
     expect(first.ok && first.html).toContain("doesn't match git");
     writeBytes(repo, 'logo.png', BLUE);
-    const page = await pageOf(1);
+    const page = await pageAt(1);
     expect(page.ok && page.html).toContain(dataUrl('image/png', BLUE));
     expect(page.ok && page.html).not.toContain("doesn't match git");
   });
@@ -800,17 +804,6 @@ describe('fragments in the rendered worker', () => {
     expect(uses.map((use) => use.identity)).toContain(LATE_IDENTITY);
     expect(summarize({kind: 'rendered', fragment}, uses)).toMatchObject({late: true});
     expect(summarize({kind: 'rendered', fragment}, [{kind: 'asset', side: 'after', path: 'logo.png', identity: 'blob:abc1234'}])).not.toHaveProperty('late');
-  });
-
-  it('says when a page rendered its fragment again rather than use the one held', async () => {
-    const repo = readmeRepo();
-    const handler = createRenderedHandler();
-    const pageOf = async (epoch: number) => await handler.handle({type: 'page', key: `p${epoch}`, title, file: {path: 'README.md', status: 'modified'}, rail: [], content: {fragment: {...request(repo), assets: {...request(repo).assets, epoch}}}}) as PageResult;
-    expect(await handler.handle({type: 'fragment', ...request(repo)}) as FragmentResult).toMatchObject({ok: true});
-    expect(await pageOf(0)).not.toHaveProperty('rerendered');
-    writeBytes(repo, 'logo.png', BLUE);
-    commitAll(repo, 'new logo');
-    expect(await pageOf(1)).toMatchObject({ok: true, rerendered: true});
   });
 
   it('answers a file that will not render with a page saying why, not a failed job', async () => {

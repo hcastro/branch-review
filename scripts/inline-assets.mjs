@@ -1,11 +1,11 @@
-// Inlines the rendered page's stylesheets and its script into
-// src/rendered/assets.generated.ts, each with the sha256 the page's
+// Inlines the pages' stylesheets and the Review in browser page's scripts
+// into src/rendered/assets.generated.ts, each with the sha256 the page's
 // Content-Security-Policy allows it by. The pages load nothing, so every
 // byte of style and script rides inside them, and the hashes are computed
-// here once rather than at every render. The file pages' scripts are
-// src/rendered/client/head.ts, which runs first in <head>, and
-// src/rendered/client/main.ts; the Review in browser page's are
-// client/reviewHead.ts and client/review.ts. Each is bundled by esbuild
+// here once rather than at every render. The in-pane view's tile document
+// takes the rendered article's sheet alone and runs no script; the Review
+// in browser page's scripts are src/rendered/client/reviewHead.ts, which
+// runs first in <head>, and client/review.ts. Each is bundled by esbuild
 // into one IIFE.
 //
 //   node scripts/inline-assets.mjs           write the module if it changed
@@ -88,9 +88,7 @@ function generate() {
   const chrome = read('src/rendered/assets/page.css');
   const css = [NOTICE, github, chrome, forcedThemes(github, chrome)].join('\n');
   if (css.includes('</style')) throw new Error('a stylesheet contains </style');
-  const head = script('head.ts');
-  const js = script('main.ts');
-  // The Review in browser page: the file pages' sheets for the rich views
+  // The Review in browser page: the article's sheets for the rich views
   // and their marks, then its own, and its own two scripts.
   const review = read('src/rendered/assets/review.css');
   const reviewCss = [NOTICE, github, chrome, review, forcedThemes(github, chrome), forcedReviewTheme(review)].join('\n');
@@ -106,16 +104,6 @@ function generate() {
     '',
     '/** The CSP source that allows PAGE_CSS: its sha256, base64. */',
     `export const PAGE_CSS_HASH = '${sha256(css)}';`,
-    '',
-    `export const HEAD_SCRIPT = ${JSON.stringify(head)};`,
-    '',
-    '/** The CSP source that allows HEAD_SCRIPT: its sha256, base64. */',
-    `export const HEAD_SCRIPT_HASH = '${sha256(head)}';`,
-    '',
-    `export const PAGE_SCRIPT = ${JSON.stringify(js)};`,
-    '',
-    '/** The CSP source that allows PAGE_SCRIPT: its sha256, base64. */',
-    `export const PAGE_SCRIPT_HASH = '${sha256(js)}';`,
     '',
     `export const REVIEW_CSS = ${JSON.stringify(reviewCss)};`,
     '',

@@ -65,22 +65,45 @@ function wrappedDelta(before: string) {
 // Every character controlChars.ts keeps off the terminal, as a test sees it.
 const HIDDEN = /[\u007F-\u009F\u00AD\u061C\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]/u;
 
+type ReportFile = {
+  path: string;
+  status: string;
+  card: string;
+  kind: string;
+  additions: number;
+  deletions: number;
+  note?: string;
+  state?: string;
+  changes?: {changed: number; removed: number};
+  differences?: Array<{kind: string; count: number}>;
+  embeds?: string[];
+  late?: true;
+  reason?: string;
+};
+
 type Report = {
   version: number;
   base: string;
   branch: string;
   dir: string;
-  pages: Array<{
-    path: string;
-    status: string;
-    file: string;
-    state: string;
-    changes: {changed: number; removed: number};
-    differences: Array<{kind: string; count: number}>;
-    embeds?: string[];
-    reason?: string;
-  }>;
+  page: string | null;
+  files: ReportFile[];
+  also: ReportFile[];
 };
+
+// The files with a rich view or sides: markdown, images and SVG.
+const rendered = (report: Pick<Report, 'files'>) => report.files.filter((file) => file.state !== undefined);
+
+// One file's card on the page the export wrote, as the page draws it.
+function cardOf(dir: string, file: ReportFile) {
+  const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
+  const id = file.card.slice(file.card.indexOf('#') + 1);
+  const start = new RegExp(`<section class="rv-card[^"]*" id="${id}"`).exec(html)!.index;
+  return html.slice(start, html.indexOf('</section>', start));
+}
+
+// The stable name a card's file goes by, which a link from another file's rich view names.
+const aliasOf = (dir: string, file: ReportFile) => /data-alias="(f-[0-9a-f]+)"/.exec(cardOf(dir, file))![1]!;
 
 // A branch that touches every kind of markdown change the report knows:
 // modified, added, deleted and renamed, plus files that aren't markdown.
@@ -113,7 +136,7 @@ describe('startup cost', () => {
 });
 
 describe('--export-html', () => {
-  it('writes one page per markdown file and prints a JSON report of them', () => {
+  it('writes the review page for the whole branch and prints a JSON report of its files', () => {
     const repo = featureRepo();
     const out = path.join(makeTempDir('branch-review-out-'), 'pages');
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
@@ -121,34 +144,34 @@ describe('--export-html', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report).toMatchObject({version: 1, base: 'main', branch: 'feature', dir: out});
-    expect(report.pages.map((page) => [page.path, page.status, page.state])).toEqual([
-      ['docs/guide.md', 'modified', 'markdown'],
-      ['docs/new.md', 'added', 'markdown'],
-      ['docs/old.md', 'deleted', 'markdown'],
-      ['docs/renamed.md', 'renamed', 'markdown'],
+    expect(report).toMatchObject({version: 2, base: 'main', branch: 'feature', dir: out, page: 'index.html'});
+    // Every changed file, code too, each at its card, in the review's order.
+    expect(report.files.map((file) => [file.path, file.status, file.kind, file.state ?? null, file.card])).toEqual([
+      ['docs/guide.md', 'modified', 'markdown', 'markdown', 'index.html#file-0'],
+      ['docs/new.md', 'added', 'markdown', 'markdown', 'index.html#file-1'],
+      ['docs/old.md', 'deleted', 'markdown', 'markdown', 'index.html#file-2'],
+      ['docs/renamed.md', 'renamed', 'markdown', 'markdown', 'index.html#file-3'],
+      ['src/app.ts', 'modified', 'text', null, 'index.html#file-4'],
     ]);
-    const guide = report.pages[0]!;
+    const guide = report.files[0]!;
     expect(guide.changes).toEqual({changed: 1, removed: 1});
-    expect(report.pages[1]!.differences).toEqual([{kind: 'remoteImage', count: 1}]);
+    expect(report.files[1]!.differences).toEqual([{kind: 'remoteImage', count: 1}]);
+    expect(report.files[4]).toMatchObject({additions: 1, deletions: 1});
 
-    // Content-addressed names, never repo text, and nothing else in the dir
-    // but the overview and the link report.
-    const files = fs.readdirSync(out).sort();
-    expect(files).toEqual([...report.pages.map((page) => page.file), 'links.json', 'overview.html'].sort());
-    for (const page of report.pages) expect(page.file).toMatch(/^[0-9a-f]{20}\.html$/);
-
-    const guideHtml = fs.readFileSync(path.join(out, guide.file), 'utf8');
-    expect(guideHtml).toMatch(/^<!doctype html>\n<html lang="en">\n<head>\n<meta http-equiv="Content-Security-Policy"/);
-    expect(guideHtml).toContain('data-mark="modified"');
-    expect(guideHtml).toContain('− 1 paragraph removed · show');
-    // The rail links every page by its relative file name.
-    for (const page of report.pages) expect(guideHtml).toContain(`href="${page.file}"`);
-    expect(fs.readFileSync(path.join(out, report.pages[2]!.file), 'utf8')).toContain('deleted on this branch · shown from main');
-    expect(fs.readFileSync(path.join(out, report.pages[3]!.file), 'utf8')).toContain('renamed from docs/moved.md');
+    // One page and the link report, named by us, never by repo text.
+    expect(fs.readdirSync(out).sort()).toEqual(['index.html', 'links.json']);
+    const html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    expect(html).toMatch(/^<!doctype html>\n<html lang="en" class="rv">\n<head>\n<meta http-equiv="Content-Security-Policy"/);
+    const guideCard = cardOf(out, guide);
+    expect(guideCard).toContain('data-mark="modified"');
+    expect(guideCard).toContain('− 1 paragraph removed · show');
+    expect(cardOf(out, report.files[2]!)).toContain('<b>Deleted file.</b> Shown as it was on the base branch.');
+    // The rename's content is the same: its card says so, and where it was.
+    expect(cardOf(out, report.files[3]!)).toContain('<span class="rv-from">docs/moved.md → </span>docs/<b>renamed.md</b>');
+    expect(cardOf(out, report.files[4]!)).toContain('<table class="diff uni">');
   });
 
-  it('links pages to each other and leaves links to files outside the review inert', () => {
+  it('links rich views to each other\'s cards and leaves links to files outside the review inert', () => {
     const repo = initRepo({'README.md': '# Readme\n', 'docs/a.md': '# A\n', 'src/app.ts': 'x\n'});
     git(repo, 'checkout', '-q', '-b', 'feature');
     writeFiles(repo, {
@@ -160,12 +183,23 @@ describe('--export-html', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    const file = (repoPath: string) => report.pages.find((page) => page.path === repoPath)!.file;
-    const readme = fs.readFileSync(path.join(out, file('README.md')), 'utf8');
-    expect(readme).toContain(`<a href="${file('docs/a.md')}#user-content-a">A</a>`);
+    const file = (repoPath: string) => report.files.find((each) => each.path === repoPath)!;
+    const readme = cardOf(out, file('README.md'));
+    // A link names the other file's card on this page, its rich view and the heading.
+    const cardId = (repoPath: string) => file(repoPath).card.slice('index.html#'.length);
+    expect(readme).toContain(`<a href="#${cardId('docs/a.md')}&amp;v=rich&amp;h=user-content-a">A</a>`);
     expect(readme).toContain('<a class="br-inert" title="not part of this review">the app</a>');
     expect(readme).toContain('<a class="br-inert br-broken" title="file not found">gone</a>');
-    expect(fs.readFileSync(path.join(out, file('docs/a.md')), 'utf8')).toContain(`<a href="${file('README.md')}">readme</a>`);
+    expect(cardOf(out, file('docs/a.md'))).toContain(`<a href="#${cardId('README.md')}&amp;v=rich">readme</a>`);
+    // The card keeps its stable name for the page script, and no link names a page the export didn't write.
+    expect(aliasOf(out, file('docs/a.md'))).toMatch(/^f-[0-9a-f]{20}$/);
+    const html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    const hrefs = [...html.matchAll(/<a [^>]*?href="([^"]*)"/g)].map((match) => match[1]!.replace(/&amp;/g, '&'));
+    expect(hrefs.length).toBeGreaterThan(0);
+    for (const href of hrefs) {
+      expect(href, href).toMatch(/^#/);
+      expect(html, href).toContain(`id="${href.slice(1).split('&')[0]}"`);
+    }
   });
 
   it('renders the work tree for HEAD, untracked markdown included, and writes nothing outside the out dir', () => {
@@ -183,8 +217,8 @@ describe('--export-html', () => {
     const report = JSON.parse(result.stdout) as Report;
     expect(report.branch).toBe('HEAD + worktree');
     // In the review's own order, which sorts by locale.
-    expect(report.pages.map((page) => [page.path, page.status])).toEqual([['notes/draft.md', 'untracked'], ['README.md', 'modified']]);
-    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toContain('untracked · not part of a push yet');
+    expect(report.files.map((file) => [file.path, file.status])).toEqual([['notes/draft.md', 'untracked'], ['README.md', 'modified']]);
+    expect(cardOf(out, report.files[0]!)).toContain('<b>Untracked file.</b> Everything below is new, and not part of a push yet.');
 
     // The repo, its index and the child's temp dir are as they were.
     expect(snapshotTree(repo)).toEqual(before);
@@ -206,7 +240,7 @@ describe('--export-html', () => {
     expect(report.dir).toBe(path.join(repo, 'docs', 'rendered'));
     const again = runCli(path.join(repo, 'docs'), ['--export-html', 'rendered', '--json']);
     expect(again.status).toBe(0);
-    expect(fs.readdirSync(path.join(repo, 'docs', 'rendered')).sort()).toEqual([report.pages[0]!.file, 'links.json', 'overview.html'].sort());
+    expect(fs.readdirSync(path.join(repo, 'docs', 'rendered')).sort()).toEqual(['index.html', 'links.json']);
   });
 
   it('prints a short summary without --json, with paths as given', () => {
@@ -215,28 +249,52 @@ describe('--export-html', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const lines = result.stdout.trimEnd().split('\n');
-    expect(lines[0]).toBe('Wrote 4 pages to out/ · nothing left this machine');
-    expect(lines.slice(1).map((line) => line.replace(/[0-9a-f]{20}/, 'KEY'))).toEqual([
-      '  M docs/guide.md     out/KEY.html  1 changed · 1 removed',
-      '  A docs/new.md       out/KEY.html  new file · 1 difference',
-      '  D docs/old.md       out/KEY.html  deleted',
-      '  R docs/renamed.md   out/KEY.html  renamed',
+    expect(lines[0]).toBe('Wrote out/index.html and out/links.json for 5 files · nothing left this machine');
+    expect(lines.slice(1)).toEqual([
+      '  M docs/guide.md     #file-0  1 changed · 1 removed',
+      '  A docs/new.md       #file-1  new file · 1 difference',
+      '  D docs/old.md       #file-2  deleted',
+      '  R docs/renamed.md   #file-3  renamed',
+      '  M src/app.ts        #file-4  +1 −1',
     ]);
     // No terminal codes: the output is for logs and agents.
     expect(result.stdout).not.toContain('\u001B');
   });
 
-  it('says there is nothing to export when no markdown changed', () => {
+  it('writes the page for a branch with nothing but code, and says there is nothing to export when nothing changed', () => {
     const repo = initRepo({'a.ts': 'x\n'});
     writeFiles(repo, {'a.ts': 'y\n'});
     const out = makeTempDir('branch-review-out-');
-    const text = runCli(repo, ['HEAD', 'main', '--export-html', out]);
+    const code = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
+    expect(code.status).toBe(0);
+    expect((JSON.parse(code.stdout) as Report).files.map((file) => [file.path, file.kind])).toEqual([['a.ts', 'text']]);
+    expect(fs.readdirSync(out).sort()).toEqual(['index.html', 'links.json']);
+
+    const clean = initRepo({'a.ts': 'x\n'});
+    const none = makeTempDir('branch-review-out-');
+    const text = runCli(clean, ['HEAD', 'main', '--export-html', none]);
     expect(text.status).toBe(0);
-    expect(text.stdout).toBe('nothing to export · no markdown, images or SVG on this branch\n');
-    const json = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
+    expect(text.stdout).toBe('nothing to export · no files changed on this branch\n');
+    const json = runCli(clean, ['HEAD', 'main', '--export-html', none, '--json']);
     expect(json.status).toBe(0);
-    expect((JSON.parse(json.stdout) as Report).pages).toEqual([]);
-    expect(fs.readdirSync(out)).toEqual([]);
+    expect(JSON.parse(json.stdout) as Report).toMatchObject({page: null, files: []});
+    expect(fs.readdirSync(none)).toEqual([]);
+  });
+
+  it('says in its report and summary that a diff the page has no room for is too large, as its card does', () => {
+    const repo = initRepo({'a.ts': 'x\n'});
+    git(repo, 'checkout', '-q', '-b', 'feature');
+    // About 2.4 MB of diff: past what the page carries of file text.
+    writeFiles(repo, {'huge.txt': `${Array.from({length: 40_000}, (_, line) => `row ${line} ${'x'.repeat(50)}`).join('\n')}\n`});
+    commitAll(repo, 'add a huge file');
+    const out = makeTempDir('branch-review-out-');
+    const json = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
+    expect(json.status).toBe(0);
+    const [huge] = (JSON.parse(json.stdout) as Report).files;
+    expect(huge).toMatchObject({path: 'huge.txt', note: 'This diff is too large to show here. Open the file to see it.'});
+    expect(cardOf(out, huge!)).toContain('rv-special-tooLarge');
+    const text = runCli(repo, ['feature', 'main', '--export-html', out]);
+    expect(text.stdout).toMatch(/A huge\.txt +#file-0 +new file · This diff is too large to show here\. Open the file to see it\.\n/);
   });
 
   it('shows a card, not a failure, for an empty, oversized or non-UTF-8 file', () => {
@@ -248,12 +306,12 @@ describe('--export-html', () => {
     const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state])).toEqual([['big.md', 'tooLarge'], ['empty.md', 'empty'], ['latin.md', 'notUtf8']]);
-    const big = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    expect(report.files.map((page) => [page.path, page.state])).toEqual([['big.md', 'tooLarge'], ['empty.md', 'empty'], ['latin.md', 'notUtf8']]);
+    const big = cardOf(out, report.files[0]!);
     expect(big).toContain('too large to show (2.1 MB)');
     expect(big).toContain('<pre class="br-raw"># Big');
-    for (const page of report.pages) {
-      expect(fs.readFileSync(path.join(out, page.file), 'utf8')).not.toMatch(/\/Users\/|\/home\/|\n {4}at /);
+    for (const page of report.files) {
+      expect(cardOf(out, page)).not.toMatch(/\/Users\/|\/home\/|\n {4}at /);
     }
   });
 
@@ -291,7 +349,7 @@ describe('--export-html', () => {
     expect(json.stderr).toBe('');
     expect(json.status).toBe(0);
     expect(Buffer.byteLength(json.stdout)).toBeGreaterThan(64 * 1024);
-    expect((JSON.parse(json.stdout) as Report).pages).toHaveLength(75);
+    expect((JSON.parse(json.stdout) as Report).files).toHaveLength(75);
 
     const text = await runCliIntoSlowPipe(repo, ['HEAD', 'main', '--export-html', out]);
     expect(text.status).toBe(0);
@@ -313,11 +371,11 @@ describe('--export-html', () => {
     expect(result.status).toBe(0);
     expect(Date.now() - started).toBeLessThan(30_000);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state, page.reason])).toEqual([
+    expect(report.files.map((page) => [page.path, page.state, page.reason])).toEqual([
       ['a-slow.md', 'failed', 'took too long to prepare'],
       ['b-fine.md', 'markdown', undefined],
     ]);
-    const slow = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    const slow = cardOf(out, report.files[0]!);
     expect(slow).toContain("couldn't show this file · took too long to prepare");
     expect(slow).toContain('<pre class="br-raw">*a*a*a');
   });
@@ -333,7 +391,7 @@ describe('--export-html', () => {
     expect(json.stdout).not.toMatch(HIDDEN);
     expect(json.stdout).not.toContain('\u001B');
     expect(json.stdout).toContain('evil\\u009b31m\\u202eDM\\u001b[2J.md');
-    expect((JSON.parse(json.stdout) as Report).pages.map((page) => page.path)).toEqual([name]);
+    expect((JSON.parse(json.stdout) as Report).files.map((page) => page.path)).toEqual([name]);
 
     const text = runCli(repo, ['HEAD', 'main', '--export-html', out]);
     expect(text.status).toBe(0);
@@ -352,17 +410,17 @@ describe('--export-html', () => {
 
     const worktree = runCli(repo, ['HEAD', 'main', '--export-html', makeTempDir('branch-review-out-'), '--json']);
     expect(worktree.status).toBe(0);
-    const pages = (JSON.parse(worktree.stdout) as Report).pages;
+    const pages = (JSON.parse(worktree.stdout) as Report).files;
     expect(pages.map((page) => [page.path, page.state])).toEqual([['committed.md', 'tooLarge'], ['huge.md', 'tooLarge']]);
-    const huge = fs.readFileSync(path.join((JSON.parse(worktree.stdout) as Report).dir, pages[1]!.file), 'utf8');
+    const huge = cardOf((JSON.parse(worktree.stdout) as Report).dir, pages[1]!);
     expect(huge).toContain('too large to show (17.2 MB)');
     expect(huge).toContain('<pre class="br-raw"># Huge');
 
     const atRef = runCli(repo, ['feature', 'main', '--export-html', makeTempDir('branch-review-out-'), '--json']);
     expect(atRef.status).toBe(0);
     const report = JSON.parse(atRef.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state])).toEqual([['committed.md', 'tooLarge']]);
-    const committed = fs.readFileSync(path.join(report.dir, report.pages[0]!.file), 'utf8');
+    expect(report.files.map((page) => [page.path, page.state])).toEqual([['committed.md', 'tooLarge']]);
+    const committed = cardOf(report.dir, report.files[0]!);
     expect(committed).toContain('too large to show (3.3 MB)');
     expect(committed).toContain('<pre class="br-raw"># Committed');
   });
@@ -385,7 +443,7 @@ describe('--export-html', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    const guide = fs.readFileSync(path.join(out, report.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
+    const guide = cardOf(out, report.files.find((page) => page.path === 'docs/guide.md')!);
     expect(guide).toContain('<a class="br-inert br-broken" title="file not found">old notes</a>');
   });
 
@@ -402,11 +460,11 @@ describe('--export-html', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.status, page.state, page.reason])).toEqual([
+    expect(report.files.map((page) => [page.path, page.status, page.state, page.reason])).toEqual([
       ['bigger.md', 'renamed', 'tooLarge', undefined],
       ['moved.md', 'renamed', 'notUtf8', undefined],
     ]);
-    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toContain('too large to show (2.1 MB)');
+    expect(cardOf(out, report.files[0]!)).toContain('too large to show (2.1 MB)');
   });
 
   it('marks only the edited block of a doc moved with its images', () => {
@@ -421,8 +479,10 @@ describe('--export-html', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.status, page.changes])).toEqual([['guide/guide.md', 'renamed', {changed: 1, removed: 0}]]);
-    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).not.toContain('file not found');
+    // Every changed file has a card: the logo moved with no change, and says so.
+    expect(report.files.map((page) => [page.path, page.status, page.changes])).toEqual([['guide/guide.md', 'renamed', {changed: 1, removed: 0}], ['guide/logo.png', 'renamed', undefined]]);
+    expect(report.files[1]!.note).toBe('File renamed without changes.');
+    expect(cardOf(out, report.files[0]!)).not.toContain('file not found');
   });
 
   it('renders a markdown file whose terminal diff failed, and lists it', () => {
@@ -433,11 +493,11 @@ describe('--export-html', () => {
     const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json'], {binDir});
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state, page.changes])).toEqual([
+    expect(report.files.map((page) => [page.path, page.state, page.changes])).toEqual([
       ['a.md', 'markdown', {changed: 1, removed: 0}],
       ['b.md', 'markdown', {changed: 1, removed: 0}],
     ]);
-    expect(fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8')).toMatch(/<p [^>]*data-mark="modified">BREAKDELTA here, edited\./);
+    expect(cardOf(out, report.files[0]!)).toMatch(/<p [^>]*data-mark="modified">BREAKDELTA here, edited\./);
 
     const summary = runCli(repo, ['HEAD', 'main', '--export-html', out], {binDir});
     expect(summary.stdout).toMatch(/^ {2}M a\.md /m);
@@ -450,10 +510,10 @@ describe('--export-html', () => {
     const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    const readme = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    const readme = cardOf(out, report.files[0]!);
     // None names a file git holds, so each is drawn broken.
     for (const text of ['a', 'b', 'c', 'd']) expect(readme).toContain(`<a class="br-inert br-broken" title="file not found">${text}</a>`);
-    expect(report.pages[0]!.differences).toEqual([]);
+    expect(report.files[0]!.differences).toEqual([]);
   });
 
   it('marks a work tree file only when its text is the text the diff was read from', () => {
@@ -468,11 +528,11 @@ describe('--export-html', () => {
     const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json'], {binDir});
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state, page.changes, page.reason])).toEqual([
+    expect(report.files.map((page) => [page.path, page.state, page.changes, page.reason])).toEqual([
       ['a.md', 'failed', {changed: 0, removed: 0}, "doesn't match the diff: changed since the review read it, or changed by a git filter"],
       ['b.md', 'markdown', {changed: 1, removed: 0}, undefined],
     ]);
-    const page = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
+    const page = cardOf(out, report.files[0]!);
     expect(page).not.toMatch(/<[a-z]+ [^>]*data-mark=/);
     expect(page).toContain('<pre class="br-raw"># A\n\nNew first.');
   });
@@ -494,8 +554,8 @@ describe('--export-html', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.stderr).toBe('');
     const report = JSON.parse(result.stdout) as Report;
-    const readme = report.pages.find((page) => page.path === 'README.md')!;
-    const html = fs.readFileSync(path.join(out, readme.file), 'utf8');
+    const readme = report.files.find((page) => page.path === 'README.md')!;
+    const html = cardOf(out, readme);
     const inlined = (bytes: Buffer) => `data:image/png;base64,${bytes.toString('base64')}`;
     // The page shows the branch's logo; its before view, the base's.
     expect(html).toContain(inlined(blue));
@@ -526,16 +586,16 @@ describe('--export-html', () => {
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Report;
-    expect(report.pages.map((page) => [page.path, page.state, page.reason])).toEqual([
+    expect(report.files.map((page) => [page.path, page.state, page.reason])).toEqual([
       ['a-slow.md', 'failed', 'took too long to prepare'],
       ['b-fine.md', 'markdown', undefined],
     ]);
-    expect(fs.readFileSync(path.join(out, report.pages[1]!.file), 'utf8')).toMatch(/<p data-block="[^"]+" data-lines="3-3">Text\.<\/p>/);
+    expect(cardOf(out, report.files[1]!)).toMatch(/<p data-block="[^"]+" data-lines="3-3">Text\.<\/p>/);
   });
 });
 
 describe('--export-html over the whole branch', () => {
-  type Whole = Report & {also: Report['pages']; findings: Array<{path: string; line: number; target: string; what: string; kind: string; reason: string}>};
+  type Whole = Report & {also: Report['files']; findings: Array<{path: string; line: number; target: string; what: string; kind: string; reason: string}>};
   type Links = {version: number; findings: Whole['findings']; links: Array<{path: string; line: number; href: string; status: string}>};
 
   // main has a README that shows the hero image and a guide; the branch
@@ -555,27 +615,27 @@ describe('--export-html over the whole branch', () => {
     return repo;
   }
 
-  it('shows the README that embeds a changed image under "also looks different", with the image\'s page saying where it appears', () => {
+  it('shows the README that embeds a changed image under "also looks different", after the image\'s card', () => {
     const repo = heroRepo();
     const out = makeTempDir('branch-review-out-');
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.stderr).toBe('');
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
-    expect(report.pages.map((page) => [page.path, page.state])).toEqual([['docs/hero.png', 'image']]);
+    expect(report.files.map((page) => [page.path, page.state])).toEqual([['docs/hero.png', 'image']]);
     // Its text didn't change; the image it shows did. A file that only
     // names the image in its text shows nothing that changed.
     expect(report.also.map((page) => [page.path, page.status, page.state, page.changes])).toEqual([['README.md', 'modified', 'markdown', {changed: 1, removed: 0}]]);
 
-    const overview = fs.readFileSync(path.join(out, 'overview.html'), 'utf8');
-    expect(overview).toContain('<h2 class="br-group-title">Also looks different</h2>');
-    expect(overview).toMatch(/<span class="br-row-path">README\.md<\/span><span class="br-row-note">text unchanged · embeds docs\/hero\.png<\/span>/);
-    const readme = fs.readFileSync(path.join(out, report.also[0]!.file), 'utf8');
+    const html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    expect(html).toContain('<h2 class="rv-also-h">Also looks different</h2>');
+    expect(report.also[0]!.card).toBe('index.html#file-1');
+    const readme = cardOf(out, report.also[0]!);
     expect(readme).toMatch(/<p [^>]*data-mark="modified"><img src="data:image\/png;base64,/);
-    expect(readme).toContain('text unchanged · embeds docs/hero.png');
-    const hero = fs.readFileSync(path.join(out, report.pages[0]!.file), 'utf8');
-    expect(hero).toContain(`<p class="br-appears">appears in <a href="${report.also[0]!.file}#at=L5&#x26;d=short">README.md:5</a></p>`);
-    expect(hero).toMatch(/<p class="br-summary">.*· 3×2 · \d+ B → 4×5 · \d+ B<\/p>/);
+    expect(readme).toContain('<b>Not changed on this branch.</b> It shows <code>docs/hero.png</code>, which this branch changed.');
+    const hero = cardOf(out, report.files[0]!);
+    expect(hero).toMatch(/<span class="rv-fh-size">\d+ B → \d+ B<\/span>/);
+    expect(hero).toMatch(/<p class="rv-img-meta">3 × 2 · \d+ B → 4 × 5 · \d+ B/);
   });
 
   it('renders a page whose lookups ran out of time once more, so a cold git leaves out no page and claims nothing', async () => {
@@ -603,7 +663,7 @@ describe('--export-html over the whole branch', () => {
     writeExecutable(path.join(bin, 'git'), ['#!/bin/sh', 'case "$*" in *ls-files*--others*) sleep 1 ;; esac', `exec '${realGit}' "$@"`, ''].join('\n'));
     const report = await withEnvAsync({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0, embeddersMs: 60_000}));
     expect(report.findings).toEqual([{path: 'docs/guide.md', line: 3, target: 'notes.md', what: 'link', kind: 'missing', reason: 'file not found'}]);
-    expect(report.pages.find((page) => page.path === 'docs/guide.md')).not.toHaveProperty('late');
+    expect(report.files.find((page) => page.path === 'docs/guide.md')).not.toHaveProperty('late');
   });
 
   it('waits no longer than a render\'s deadline for lookups that never answer, and keeps the page late', async () => {
@@ -617,7 +677,7 @@ describe('--export-html over the whole branch', () => {
     const report = await withEnvAsync({PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`}, () => renderToDirectory({cwd, range, review, outDir: out, outLabel: out, now: () => 0, lookupBudgetMs: 0, embeddersMs: 60_000}));
     // One render's deadline of waiting, 5 seconds, not the 15 git takes.
     expect(Date.now() - started).toBeLessThan(12_000);
-    expect(report.pages.find((page) => page.path === 'docs/guide.md')).toMatchObject({late: true});
+    expect(report.files.find((page) => page.path === 'docs/guide.md')).toMatchObject({late: true});
   });
 
   it('finds markdown that still shows a moved image by its old name', () => {
@@ -633,7 +693,7 @@ describe('--export-html over the whole branch', () => {
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
-    expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/new.svg', 'renamed']]);
+    expect(report.files.map((page) => [page.path, page.status])).toEqual([['docs/new.svg', 'renamed']]);
     // On GitHub the README now shows a broken image, where it showed the logo.
     expect(report.also.map((page) => [page.path, page.changes, page.embeds])).toEqual([['README.md', {changed: 1, removed: 0}, ['docs/old.svg']]]);
   });
@@ -649,7 +709,7 @@ describe('--export-html over the whole branch', () => {
     const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
     expect(result.status).toBe(0);
     const report = JSON.parse(result.stdout) as Whole;
-    expect(report.pages.map((page) => [page.path, page.status])).toEqual([['docs/hero.png', 'modified'], ['docs/new.md', 'renamed']]);
+    expect(report.files.map((page) => [page.path, page.status])).toEqual([['docs/hero.png', 'modified'], ['docs/new.md', 'renamed']]);
     // The file left alone that shows the hero is the one page outside the review.
     expect(report.also.map((page) => page.path)).toEqual(['CHANGES.md']);
   });
@@ -669,7 +729,7 @@ describe('--export-html over the whole branch', () => {
     expect(text.stdout).toContain('text unchanged · embeds docs/x<U+202E>gnp.<U+009B>31mexe.png');
   });
 
-  it('finds a planted bad anchor and a link to a file that isn\'t there, in links.json, the overview and the page', () => {
+  it('finds a planted bad anchor and a link to a file that isn\'t there, in links.json and on the page', () => {
     const repo = heroRepo({'docs/guide.md': '# Guide\n\n## Install\n\nRun it. Then [read the readme](../README.md#nope), the [install step](#install) and [the notes](notes.md).\n'});
     const out = makeTempDir('branch-review-out-');
     const result = runCli(repo, ['feature', 'main', '--export-html', out, '--json']);
@@ -695,14 +755,14 @@ describe('--export-html over the whole branch', () => {
     const again = makeTempDir('branch-review-out-');
     const second = JSON.parse(runCli(both, ['feature', 'main', '--export-html', again, '--json']).stdout) as Whole;
     expect(second.findings).toEqual([{path: 'docs/guide.md', line: 3, target: '../README.md#nope', what: 'link', kind: 'badAnchor', reason: 'anchor not found'}]);
-    const guide = fs.readFileSync(path.join(again, second.pages.find((page) => page.path === 'docs/guide.md')!.file), 'utf8');
-    const readmeFile = second.pages.find((page) => page.path === 'README.md')!.file;
-    expect(guide).toContain(`<a href="${readmeFile}#user-content-nope" class="br-broken" title="anchor not found">readme</a>`);
-    expect(guide).toContain(`<a href="${readmeFile}#user-content-project">its top</a>`);
-    expect(guide).toContain('1 broken link');
-    const overview = fs.readFileSync(path.join(again, 'overview.html'), 'utf8');
-    expect(overview).toContain("<h2 class=\"br-group-title\">Won't render on GitHub</h2>");
-    expect(overview).toContain('../README.md#nope · anchor not found');
+    const guide = cardOf(again, second.files.find((page) => page.path === 'docs/guide.md')!);
+    const readme = second.files.find((page) => page.path === 'README.md')!.card.split('#')[1];
+    expect(guide).toContain(`<a href="#${readme}&amp;v=rich&amp;h=user-content-nope" class="br-broken" title="anchor not found">readme</a>`);
+    expect(guide).toContain(`<a href="#${readme}&amp;v=rich&amp;h=user-content-project">its top</a>`);
+    // The page lists it above the files, its row jumping to the guide's card.
+    const page = fs.readFileSync(path.join(again, 'index.html'), 'utf8');
+    expect(page).toContain("Won't render on GitHub · 1 broken link");
+    expect(page).toMatch(new RegExp(`<a class="rv-row" href="#${second.files.find((each) => each.path === 'docs/guide.md')!.card.split('#')[1]}"[^>]*><code>docs/guide\\.md:3</code><span>\\.\\./README\\.md#nope · anchor not found</span></a>`));
     expect((JSON.parse(fs.readFileSync(path.join(again, 'links.json'), 'utf8')) as Links).links.map((link) => link.status)).toEqual(['badAnchor', 'ok']);
   });
 });

@@ -6,8 +6,9 @@ import {sizeText, type ImageBody, type ImageSide} from '../image.js';
 import {articleHtml, differenceNotes, findingsLabel, type PageBody} from '../page.js';
 import {PAGE_INLINE_LIMIT} from '../markdown.js';
 import {refusedCard} from '../words.js';
-import type {CardDiff} from './diff.js';
-import {icon} from './icons.js';
+import {packDiff, type CardDiff} from './diff.js';
+import {icon, type IconName} from './icons.js';
+import {countsText, specialParts, type CardSpecial, type SpecialPart} from './special.js';
 import {tableHtml} from './table.js';
 import {dayName, relativeTime} from './time.js';
 
@@ -23,7 +24,8 @@ import {dayName, relativeTime} from './time.js';
 // markdown view is the renderer's fragment, sanitized already.
 
 /** A side of the branch against its upstream, as the title's state says it. `unknown`: git didn't say in time. */
-export type BranchState = {kind: 'unpushed'} | {kind: 'ahead'; remote: string; count: number} | {kind: 'even'; remote: string} | {kind: 'unknown'};
+export type BranchState = {kind: 'unpushed'} | {kind: 'ahead'; remote: string; count: number} | {kind: 'behind'; remote: string; count: number}
+  | {kind: 'diverged'; remote: string; ahead: number; behind: number} | {kind: 'even'; remote: string} | {kind: 'unknown'};
 
 /** One commit on the branch that the base doesn't have. `time`: its commit time, in seconds. Never an author. */
 export type ReviewCommit = {hash: string; subject: string; time: number; files: number};
@@ -45,7 +47,11 @@ export type ReviewPageCard = {
   alias?: string;
   /** Its source diff, or null when it has none to show. */
   diff: CardDiff | null;
-  /** In place of the diff, one line saying why there is none (a binary file, a mode change). */
+  /** In place of the diff, what the file is, in GitHub's one line: a binary file, a submodule, a rename with no changes. */
+  special?: CardSpecial;
+  /** A mode change that came with changes to the text, named in the header. */
+  mode?: {from: string; to: string};
+  /** In place of the diff, one line saying why there is none, for a card with no special kind (an image that failed). */
   notice?: string;
   /** A markdown file's rich view: the page body its render made, with the links it draws broken. */
   rich?: {body: PageBody; brokenRefs?: readonly number[]};
@@ -87,30 +93,81 @@ export function reviewPolicy() {
   ].join('; ');
 }
 
-// The page's budgets for what it carries: the reviewed side's text, which
-// expanding context reveals, per file and for the whole page, counted in
-// the text's own UTF-8 bytes (the colored HTML the page carries it as runs
-// about four times that), and the images it inlines, counted in data URL
-// characters as the renderer counts a markdown page's.
+// The page's budgets for what it carries: the file text beyond the tables
+// it draws, which is each folded diff's lines and the reviewed side's text
+// that expanding context reveals, for the whole page and for one file's
+// context, counted in the text's own UTF-8 bytes (the colored HTML the
+// page carries it as runs about four times that), and the images it
+// inlines, counted in data URL characters as the renderer counts a
+// markdown page's.
 export const CONTEXT_FILE_LIMIT = 400 * 1024;
-export const CONTEXT_PAGE_LIMIT = 2 * 1024 * 1024;
+export const TEXT_PAGE_LIMIT = 2 * 1024 * 1024;
 export const IMAGE_PAGE_LIMIT = PAGE_INLINE_LIMIT;
 
 /**
- * The page's context budget, asked once per file in the review's order:
- * `take` says whether a reviewed side of `bytes` fits its file's budget
- * and what the page has left, and counts it when it does. A file it
- * refuses keeps its diff, and its controls say to open the file.
+ * The page's text budget. Each call says whether `bytes` more fit what the
+ * page has left, and counts them when they do: `diff` for a folded diff's
+ * lines, `context` for a reviewed side, which must also fit its file's
+ * limit. A file whose context it refuses keeps its diff, and its controls
+ * say to open the file.
  */
-export function contextBudget() {
+export function textBudget() {
   let used = 0;
-  return {
-    take(bytes: number) {
-      if (bytes > CONTEXT_FILE_LIMIT || used + bytes > CONTEXT_PAGE_LIMIT) return false;
-      used += bytes;
-      return true;
-    },
+  const take = (bytes: number) => {
+    if (used + bytes > TEXT_PAGE_LIMIT) return false;
+    used += bytes;
+    return true;
   };
+  return {
+    diff: take,
+    context: (bytes: number) => bytes <= CONTEXT_FILE_LIMIT && take(bytes),
+  };
+}
+
+export type TextBudget = ReturnType<typeof textBudget>;
+
+// A diff this long arrives folded, with Load diff, as GitHub folds one:
+// most readers skip a generated file or a lockfile, and a page that draws
+// every line of one is slow to open. A deleted file's diff arrives folded
+// too, as on GitHub. A folded diff's lines ride in the page's data, so
+// loading it is instant and needs nothing from the network.
+export const FOLD_LINES = 3_000;
+export const FOLD_BYTES = 1024 * 1024;
+
+/** The bytes of a diff's hunks, headers included. */
+export function diffBytes(blocks: ReadonlyArray<{rawDiff: string}>) {
+  return blocks.reduce((sum, block) => sum + Buffer.byteLength(block.rawDiff), 0);
+}
+
+function folds(card: {status: FileStatus; blocks: ReadonlyArray<{rawDiff: string}>}) {
+  if (card.status === 'deleted') return true;
+  let lines = 0;
+  for (const block of card.blocks) {
+    // Each line of the hunk, not its header.
+    for (let at = block.rawDiff.indexOf('\n'); at >= 0 && at < block.rawDiff.length - 1; at = block.rawDiff.indexOf('\n', at + 1)) lines += 1;
+  }
+  return lines > FOLD_LINES || diffBytes(card.blocks) > FOLD_BYTES;
+}
+
+/**
+ * How each card draws its diff, in the review's order: open, folded behind
+ * Load diff, or, for a folded diff the page can't carry, the one line that
+ * says why. Every folded diff takes its bytes from the page's text budget
+ * before any context does, since a diff matters more than the lines around
+ * it. A diff past the whole budget on its own is too large; one that would
+ * fit but for the diffs before it says the page has no room left, so a
+ * small file is never called too large. A deleted file's says only that it
+ * was deleted: the branch has no file to open. A card with a special kind
+ * draws no diff.
+ */
+export function diffFolds(cards: ReadonlyArray<{status: FileStatus; blocks: ReadonlyArray<{rawDiff: string}>; special?: CardSpecial}>, budget: TextBudget): Array<'open' | 'fold' | CardSpecial> {
+  return cards.map((card): 'open' | 'fold' | CardSpecial => {
+    if (card.special || card.blocks.length === 0 || !folds(card)) return 'open';
+    const bytes = diffBytes(card.blocks);
+    if (budget.diff(bytes)) return 'fold';
+    if (card.status === 'deleted') return {kind: 'deleted'};
+    return bytes > TEXT_PAGE_LIMIT ? {kind: 'tooLarge', bytes} : {kind: 'noRoom', bytes};
+  });
 }
 
 /** A card as the page carries it: a rich view's article drawn, its images within the page's budget. */
@@ -125,6 +182,7 @@ type CarriedCard = ReviewPageCard & {article?: string};
  * context budget is the builder's, which colors only what the page carries.
  */
 export function applyBudgets(cards: readonly ReviewPageCard[]): CarriedCard[] {
+  const places = new Map(cards.flatMap((each, index): Array<[string, number]> => (each.alias ? [[each.alias, index]] : [])));
   let images = 0;
   const take = (dataUrl: string) => {
     if (images + dataUrl.length > IMAGE_PAGE_LIMIT) return false;
@@ -139,8 +197,26 @@ export function applyBudgets(cards: readonly ReviewPageCard[]): CarriedCard[] {
     const body = card.rich?.body;
     if (card.kind !== 'markdown' || body?.kind !== 'rendered') return card;
     const article = articleHtml({path: card.path, status: card.status, ...(card.oldPath ? {oldPath: card.oldPath} : {}), body}, card.rich?.brokenRefs ?? []);
-    return {...card, article: inlineWithin(article, take)};
+    return {...card, article: inlineWithin(linkCards(article, places), take)};
   });
+}
+
+// A link's tag in a rich view's HTML, written as a picture's is.
+const LINK = /<a((?: [^\s"'>/=]+(?:="[^"]*")?)*)\s*>/g;
+const PAGE_HREF = / href="(f-[0-9a-f]{20})\.html(?:#([^"]*))?"/;
+
+// A rich view's link to another file in the review names that file's
+// stable page name, `f-….html`, which the Preview's pages go by and this
+// page has no file for. Here it names the file's card on this page, its
+// rich view and any heading in it, so a new tab, a copied link and the
+// status bar all lead to this page. Its `=` is one no repo link can carry
+// (the renderer makes such a link inert), so the page script follows only
+// links this page drew.
+function linkCards(article: string, places: ReadonlyMap<string, number>) {
+  return article.replace(LINK, (tag) => tag.replace(PAGE_HREF, (href, alias: string, anchor: string | undefined) => {
+    const index = places.get(alias);
+    return index === undefined ? href : ` href="#file-${index}&amp;v=rich${anchor ? `&amp;h=${anchor}` : ''}"`;
+  }));
 }
 
 // A picture's tag in a rich view's HTML, as rehype-stringify writes it:
@@ -256,13 +332,24 @@ const STATE_WORDS = {
   unknown: () => 'Branch state unavailable',
   unpushed: () => 'Not pushed',
   ahead: (state: Extract<BranchState, {kind: 'ahead'}>) => `Ahead of ${state.remote} by ${state.count}`,
+  behind: (state: Extract<BranchState, {kind: 'behind'}>) => `Behind ${state.remote} by ${state.count}`,
+  diverged: (state: Extract<BranchState, {kind: 'diverged'}>) => `Ahead ${state.ahead}, behind ${state.behind}`,
   even: (state: Extract<BranchState, {kind: 'even'}>) => `Up to date with ${state.remote}`,
+};
+
+// A pill whose words leave something out says it in its hover tip.
+const STATE_TIPS: Partial<Record<BranchState['kind'], (state: BranchState) => string>> = {
+  unknown: () => "git didn't say in time where this branch stands against its upstream",
+  diverged: (state) => {
+    const {remote, ahead, behind} = state as Extract<BranchState, {kind: 'diverged'}>;
+    return escapeHtml(`${plural(ahead, 'commit')} here that ${remote} doesn't have, and ${behind} there that this branch doesn't`);
+  },
 };
 
 function heading({title, state, commits, builtAt}: ReviewPageInput) {
   const words = state ? (STATE_WORDS[state.kind] as (state: BranchState) => string)(state) : null;
   const meta = [
-    ...(state ? [`<span class="rv-state rv-state-${state.kind}"${state.kind === 'unknown' ? ' title="git didn\'t say in time where this branch stands against its upstream"' : ''}>${icon('branch')}${escapeHtml(words!)}</span>`] : []),
+    ...(state ? [`<span class="rv-state rv-state-${state.kind}"${STATE_TIPS[state.kind] ? ` title="${STATE_TIPS[state.kind]!(state)}"` : ''}>${icon('branch')}${escapeHtml(words!)}</span>`] : []),
     ...(commits && commits.length > 0 ? [`<span>${plural(commits.length, 'commit')} on <span class="rv-ref">${escapeHtml(title.branch)}</span> that ${commits.length === 1 ? 'is' : 'are'} not on <span class="rv-ref">${escapeHtml(title.base)}</span></span>`] : []),
     ...(commits && commits.length > 0 ? [`<span class="rv-nowrap"><span aria-hidden="true">· </span>last commit ${timeTag(commits[0]!.time, builtAt)}</span>`] : []),
     ...(title.worktree ? ['<span class="rv-nowrap"><span aria-hidden="true">· </span>with uncommitted changes</span>'] : []),
@@ -300,9 +387,20 @@ export function diffstatBlocks(additions: number, deletions: number) {
 
 const stat = (additions: number, deletions: number) => `<span class="rv-a">+${additions}</span><span class="rv-d">−${deletions}</span>${diffstatBlocks(additions, deletions)}`;
 
+// The line counts a card's header shows, or null for a card that shows
+// none: an image with no text diff, which has no lines, and a one-line
+// card whose lines aren't the file's text, as on GitHub (a submodule's or
+// a pointer's lines are git's). The Files changed total adds these alone.
+function shownCounts(each: ReviewPageCard) {
+  if ((each.kind === 'raster' || each.kind === 'svg') && each.diff === null) return null;
+  if (each.special && !(countsText(each.special) && each.additions + each.deletions > 0)) return null;
+  return {additions: each.additions, deletions: each.deletions};
+}
+
 function tabs(cards: readonly ReviewPageCard[], commits: ReviewCommit[] | null) {
-  const additions = cards.reduce((sum, each) => sum + each.additions, 0);
-  const deletions = cards.reduce((sum, each) => sum + each.deletions, 0);
+  const counts = cards.map(shownCounts);
+  const additions = counts.reduce((sum, each) => sum + (each?.additions ?? 0), 0);
+  const deletions = counts.reduce((sum, each) => sum + (each?.deletions ?? 0), 0);
   return [
     '<nav class="rv-tabs" role="tablist" aria-label="Review sections">',
     `<button type="button" class="rv-tab" role="tab" id="tab-files" aria-selected="true" aria-controls="panel-files" data-tab="files">${icon('fileDiff')}Files changed<span class="rv-count">${cards.length}</span></button>`,
@@ -419,11 +517,11 @@ function card(each: CarriedCard, index: number) {
   const label = escapeHtml(each.path);
   const image = each.image ? imageSizes(each.image) : null;
   // An image with no text diff is counted by its sizes, and has none to
-  // say while its sides aren't in: no counts of lines it never had.
-  const pictures = each.kind === 'raster' || each.kind === 'svg';
+  // say while its sides aren't in.
+  const counts = shownCounts(each);
   const statHtml = each.also ? '<span class="rv-fh-size">text unchanged</span>'
     : image && each.diff === null ? `<span class="rv-fh-size">${image}</span>`
-      : pictures && each.diff === null ? '' : `<span class="rv-fh-stat">${stat(each.additions, each.deletions)}</span>`;
+      : counts ? `<span class="rv-fh-stat">${stat(counts.additions, counts.deletions)}</span>` : '';
   // A file that only looks different has nothing but its rich view.
   const views = !each.also && (each.kind === 'markdown' || (each.kind === 'svg' && each.diff !== null));
   // An SVG opens on its pictures, when the page has them to show.
@@ -434,7 +532,7 @@ function card(each: CarriedCard, index: number) {
     `<button type="button" data-act="view" data-v="rich" aria-pressed="${startsRich}" title="Rich diff">${icon('eye')}<span>Rich</span></button>`,
     '</div>',
   ].join('') : '';
-  const source = each.diff ? `<div class="rv-tbl">${tableHtml(each.diff, [], 'unified')}</div>` : `<p class="rv-notice">${escapeHtml(each.notice ?? 'No changes to show.')}</p>`;
+  const source = each.diff ? sourceDiff(each.diff, each.status) : each.special ? specialLine(each.special, each) : `<p class="rv-notice">${escapeHtml(each.notice ?? 'No changes to show.')}</p>`;
   const rich = each.kind === 'markdown' ? richView(each) : each.image ? imageView(each.image, each.status) : imageNote(each);
   // A card with both views switches between them; an image with no text
   // diff is its pictures alone.
@@ -447,11 +545,34 @@ function card(each: CarriedCard, index: number) {
     `<button type="button" class="rv-icon-btn rv-sm rv-chevron rv-js" data-act="collapse" aria-expanded="true" aria-label="Collapse ${label}">${icon('chevD')}</button>`,
     `<div class="rv-fh-path"><span class="rv-path">${moved}${escapeHtml(dir)}<b>${escapeHtml(name)}</b></span><button type="button" class="rv-icon-btn rv-sm rv-js" data-act="copy" aria-label="Copy file path" title="Copy file path">${icon('copy')}</button></div>`,
     statHtml,
+    each.mode ? `<span class="rv-fh-mode" title="File mode changed">${escapeHtml(`${each.mode.from} → ${each.mode.to}`)}</span>` : '',
     `<div class="rv-fh-act">${viewSwitch}${each.also ? '' : '<label class="rv-viewed-btn rv-js"><input type="checkbox" data-act="viewed"><span>Viewed</span></label>'}<button type="button" class="rv-icon-btn rv-js" data-act="menu" aria-label="More options for ${label}" aria-haspopup="menu" aria-expanded="false">${icon('kebab')}</button></div>`,
     '</div>',
     `<div class="rv-fb">${bodyHtml}</div>`,
     '</section>',
   ].join('\n');
+}
+
+// A card's source diff: its table, drawn unified, or for a long diff the
+// line that loads it, the table drawn in place from the page's data.
+function sourceDiff(diff: CardDiff, status: FileStatus) {
+  if (!diff.fold) return `<div class="rv-tbl">${tableHtml(diff, [], 'unified')}</div>`;
+  const why = status === 'deleted' ? 'This file was deleted.' : 'Large diffs are not rendered by default.';
+  return [
+    '<div class="rv-tbl" hidden></div>',
+    `<div class="rv-special rv-load"><button type="button" class="rv-load-btn rv-js" data-act="load">Load diff</button><span>${why}</span></div>`,
+  ].join('');
+}
+
+const SPECIAL_ICONS: Record<CardSpecial['kind'], IconName> = {binary: 'binary', empty: 'file', renamed: 'arrowSq', mode: 'mode', submodule: 'submodule', lfs: 'lfs', tooLarge: 'alert', noRoom: 'alert', deleted: 'minusSq', unreadable: 'alert', none: 'file'};
+
+const partHtml = (part: SpecialPart) => (typeof part === 'string' ? escapeHtml(part) : `<code>${escapeHtml(part.code)}</code>`);
+
+// GitHub's one line in place of a diff, with what follows it after a dot.
+function specialLine(special: CardSpecial, file: {status: FileStatus; oldPath?: string}) {
+  const {words, note} = specialParts(special, file);
+  const noteHtml = note ? `<span class="rv-sp-note"><span aria-hidden="true">· </span>${note.map(partHtml).join('')}</span>` : '';
+  return `<div class="rv-special rv-special-${special.kind}">${icon(SPECIAL_ICONS[special.kind])}<span>${words.map(partHtml).join('')}</span>${noteHtml}</div>`;
 }
 
 const BANNERS: Partial<Record<FileStatus, (oldPath?: string) => [string, Parameters<typeof icon>[0], string]>> = {
@@ -625,10 +746,12 @@ const KEYS = [
 
 /**
  * What the page script reads: the review's name for its viewed marks, and
- * each card's hunks and context. JSON in a data block runs nothing, and
+ * each card's hunks and context, packed (review/diff.ts). JSON in a data block runs nothing, and
  * with every `<` escaped no text in it can end the block.
  */
 function pageData(reviewId: string, cards: readonly ReviewPageCard[]) {
-  const data = {id: reviewId, cards: cards.map((each) => ({diff: each.diff}))};
+  // A drawn table's lines ride in the table alone; the rest of the HTML in
+  // its short form, which the script unpacks.
+  const data = {id: reviewId, cards: cards.map((each) => ({diff: each.diff && packDiff(each.diff, !each.diff.fold)}))};
   return JSON.stringify(data).replace(/</g, '\\u003c');
 }

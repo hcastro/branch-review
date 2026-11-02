@@ -4,11 +4,11 @@ import path from 'node:path';
 import {createLru} from '../../media/lru.js';
 import type {WorkerFailure} from '../../media/workerClient.js';
 import {createAssetResolver, LATE_IDENTITY, linkIdentity, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
-import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type PageResult, type RenderedWorkerRequest, type ReviewResult, type TileResult, type TileSource} from '../backend.js';
+import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type RenderedWorkerRequest, type ReviewResult, type TileResult, type TileSource} from '../backend.js';
 import {imageBody, imageFacts} from '../image.js';
 import {renderMarkdown, type RenderInput, type RenderedFragment} from '../markdown.js';
 import type {PageLayout} from '../plan.js';
-import {assembleFilePage, assembleTileDocument, type PageBody} from '../page.js';
+import {assembleTileDocument, type PageBody} from '../page.js';
 import {createSourceReader, oneLine, pageBody} from '../source.js';
 import {MAX_TILE_PNG_BYTES, tileRange} from '../tileGeometry.js';
 import {createBrowser, type Browser, type BrowserBudget, type TileDocument} from './browser.js';
@@ -18,9 +18,9 @@ import {createReviewBuilder} from '../review/build.js';
 
 // The rendered worker's jobs, with no process of its own, so tests can run
 // them in place. Repo text and images are read, rendered and assembled here;
-// the UI gets back counts and finished pages. Fragments are held by key, so
-// writing a page or a new rail costs no second render. An image's fragment
-// is its two sides, inlined.
+// the UI gets back counts and the finished page. Fragments are held by key,
+// so writing the page again costs no second render. An image's fragment is
+// its two sides, inlined.
 //
 // The in-pane view's jobs lay out and cut a page's tile document in a
 // headless Chromium, started on the first one and closed a minute after the
@@ -55,7 +55,7 @@ type Held = {body: PageBody; summary: FragmentSummary; uses: AssetUse[]; text?: 
 function heldBytes(held: Held) {
   const body = held.body;
   const image = body.kind === 'image' ? [body.image.before, body.image.after].reduce((sum, side) => sum + (side?.kind === 'shown' ? side.dataUrl.length : 0), 0) : 0;
-  const text = body.kind === 'rendered' ? body.fragment.html + (body.fragment.raw?.text ?? '') : body.kind === 'tooLarge' ? body.head : body.kind === 'failed' ? body.source : '';
+  const text = body.kind === 'rendered' ? body.fragment.html : body.kind === 'tooLarge' ? body.head : body.kind === 'failed' ? body.source : '';
   return (text.length + (held.text?.length ?? 0) + image) * 2 + 1024;
 }
 
@@ -130,8 +130,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     }
   };
 
-  // `fresh`: rendered now, not taken from the cache.
-  async function fragment(request: FragmentRequest): Promise<Held & {fresh?: true}> {
+  async function fragment(request: FragmentRequest): Promise<Held> {
     const known = held.get(request.key);
     if (known && await current(known, request.cwd, request.assets)) return known;
 
@@ -160,10 +159,10 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     // A failure can depend on the moment (a file mid-write), so it is
     // rendered again next time rather than held.
     if (body.kind !== 'failed') held.set(request.key, entry);
-    return {...entry, fresh: true};
+    return entry;
   }
 
-  // The Review in browser page, from the same fragments the pages hold.
+  // The Review in browser page, from the fragments held here.
   // Every changed file's sides, read by the ids the review's patches name,
   // none of them fetched.
   const review = createReviewBuilder({sources: createSourceReader({...(sleep ? {sleep} : {}), local: true}), fragment, now});
@@ -257,7 +256,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
   const budgetFor = (type: keyof typeof BROWSER_JOB_DEADLINES_MS, startedAt: number): BrowserBudget => ({deadline: startedAt + BROWSER_JOB_DEADLINES_MS[type] - BROWSER_MARGIN_MS});
 
   return {
-    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | PageResult | ReviewResult | EmbeddersResult | LayoutResult | TileResult> {
+    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | ReviewResult | EmbeddersResult | LayoutResult | TileResult> {
       // The job's deadline started when it was sent, a moment before this.
       const startedAt = Date.now();
       try {
@@ -300,13 +299,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
           const {html, partial} = await review.page(request);
           return {ok: true, html, ...(partial ? {partial: true as const} : {})};
         }
-        if (message.type === 'embedders') {
-          return {ok: true, files: await resolverFor(message.cwd).embedders(message.assets, message.names, new Set(message.skip))};
-        }
-        const {body, summary, fresh} = 'fragment' in message.content ? await fragment(message.content.fragment) : {body: message.content.body, summary: summarize(message.content.body), fresh: undefined};
-        const {brokenRefs, appears, report} = message;
-        const html = assembleFilePage({title: message.title, file: {...message.file, body}, rail: message.rail, ...(brokenRefs ? {brokenRefs} : {}), ...(appears ? {appears} : {}), ...(report ? {report} : {})});
-        return {ok: true, html, summary, ...(fresh ? {rerendered: true as const} : {})};
+        return {ok: true, files: await resolverFor(message.cwd).embedders(message.assets, message.names, new Set(message.skip))};
       } catch (error) {
         return {ok: false, state: 'error', reason: oneLine(error)} satisfies WorkerFailure;
       }

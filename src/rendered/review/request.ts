@@ -3,6 +3,7 @@ import {isBinaryPatch, patchObjectIds} from '../../media/classify.js';
 import type {ReviewFile} from '../../review/model.js';
 import type {ReviewCardRequest, ReviewFragmentRequest} from '../backend.js';
 import type {SourceSpec} from '../source.js';
+import {lfsPointerSize, type CardSpecial} from './special.js';
 
 // The Review in browser page's cards as the UI process plans them, from the
 // review the TUI already built: no git runs here, only the review's patches
@@ -12,7 +13,8 @@ import type {SourceSpec} from '../source.js';
 export type CardRender = {kind: 'markdown' | 'raster' | 'svg'; fragment: ReviewFragmentRequest | null; failure?: string; brokenRefs?: readonly number[]};
 
 export function reviewCardRequest(file: ReviewFile, range: Pick<DiffRange, 'branch' | 'includeWorktree'>, render: CardRender | null): ReviewCardRequest {
-  const notice = cardNotice(file);
+  const special = cardSpecial(file);
+  const mode = MODE_CHANGE.exec(file.rawDiff);
   const fragment = render?.fragment;
   return {
     path: file.path,
@@ -23,11 +25,14 @@ export function reviewCardRequest(file: ReviewFile, range: Pick<DiffRange, 'bran
     kind: render?.kind ?? 'text',
     identity: fileIdentity(file),
     blocks: file.blocks.map((block) => ({rawDiff: block.rawDiff})),
-    sides: file.blocks.length > 0 ? textSides(file, range) : {},
+    // A Git LFS pointer's side is read too: the worker checks that the whole
+    // file is the pointer its hunk shows.
+    sides: file.blocks.length > 0 && (!special || special.kind === 'lfs') ? textSides(file, range) : {},
     ...(fragment ? {fragment} : {}),
     ...(render?.failure !== undefined ? {renderFailure: render.failure} : {}),
     ...(render?.brokenRefs && render.brokenRefs.length > 0 ? {brokenRefs: render.brokenRefs} : {}),
-    ...(notice !== undefined ? {notice} : {}),
+    ...(special ? {special} : {}),
+    ...(mode && !special ? {mode: {from: mode[1]!, to: mode[2]!}} : {}),
   };
 }
 
@@ -35,11 +40,22 @@ export function reviewCardRequest(file: ReviewFile, range: Pick<DiffRange, 'bran
 // side of uncommitted work the file itself, checked against that id, as
 // the markdown pages read it. A side with no id has none to read.
 // A submodule's patch names commits of the submodule, which the repo
-// itself never holds: it has no text to read on either side.
-const GITLINK = /^(?:(?:new file |deleted file |old |new )mode 160000|index \S+ 160000)$/m;
+// itself never holds: it has no text to read on either side. Only git's
+// own header says so, the lines before the first hunk, split at newlines
+// alone: a hunk's line is the file's text, and a carriage return or a
+// Unicode line break in it could otherwise pass for a header line.
+const GITLINK = /^(?:(?:new file |deleted file |old |new )mode 160000|index \S+ 160000)$/;
+
+function isGitlink(rawDiff: string) {
+  for (const line of rawDiff.split('\n')) {
+    if (line.startsWith('@@ ')) return false;
+    if (GITLINK.test(line)) return true;
+  }
+  return false;
+}
 
 function textSides(file: ReviewFile, range: Pick<DiffRange, 'branch' | 'includeWorktree'>): ReviewCardRequest['sides'] {
-  if (file.pathError || GITLINK.test(file.rawDiff)) return {};
+  if (file.pathError || isGitlink(file.rawDiff)) return {};
   const ids = patchObjectIds(file.rawDiff) ?? {};
   const before: SourceSpec | undefined = ids.before && file.status !== 'added' && file.status !== 'untracked' ? {kind: 'blob', id: ids.before} : undefined;
   let after: SourceSpec | undefined;
@@ -61,15 +77,46 @@ function fileIdentity(file: ReviewFile) {
   return JSON.stringify([ids.before ?? null, ids.after ?? null, file.rawDiff.match(MODE_LINE) ?? [], file.oldPath ?? null]);
 }
 
-/** Why a file has no diff to show, in one line, or undefined when it has one. */
-export function cardNotice(file: ReviewFile): string | undefined {
+/**
+ * What a file shows in place of a diff, or undefined when its diff is the
+ * card: a submodule's commits and a Git LFS pointer's file have hunks, but
+ * the lines are no text of the file.
+ */
+export function cardSpecial(file: ReviewFile): CardSpecial | undefined {
+  if (isGitlink(file.rawDiff)) return submodule(file);
+  const lfs = lfsPointer(file);
+  if (lfs) return lfs;
   if (file.blocks.length > 0) return undefined;
-  if (file.rawDiff === '' && file.error) return `This file's diff couldn't be read: ${file.error}`;
-  if (isBinaryPatch(file.rawDiff)) return 'Binary file not shown.';
+  if (file.rawDiff === '' && file.error) return {kind: 'unreadable', reason: file.error};
+  if (isBinaryPatch(file.rawDiff)) return {kind: 'binary'};
   const mode = MODE_CHANGE.exec(file.rawDiff);
-  if (mode) return `File mode changed from ${mode[1]} to ${mode[2]}.`;
-  if (file.status === 'renamed') return 'File renamed without changes.';
-  if (file.status === 'added' || file.status === 'untracked') return 'Empty file added.';
-  if (file.status === 'deleted') return 'Empty file deleted.';
-  return 'No changes to show.';
+  if (mode) return {kind: 'mode', from: mode[1]!, to: mode[2]!};
+  if (file.status === 'renamed') return {kind: 'renamed'};
+  if (file.status === 'added' || file.status === 'untracked' || file.status === 'deleted') return {kind: 'empty'};
+  return {kind: 'none'};
+}
+
+// The lines a side of the patch holds: `-` for the base side, `+` for the
+// reviewed side, with the unchanged lines on both.
+function sideLines(file: ReviewFile, marker: '-' | '+') {
+  return file.blocks.flatMap((block) => block.rawDiff.split('\n').slice(1).filter((line) => line[0] === marker || line[0] === ' ').map((line) => line.slice(1)));
+}
+
+const SUBPROJECT = /^Subproject commit ([0-9a-f]{40,64})/;
+
+function submodule(file: ReviewFile): CardSpecial {
+  const commit = (marker: '-' | '+') => sideLines(file, marker).map((line) => SUBPROJECT.exec(line)?.[1]).find(Boolean);
+  const before = commit('-');
+  const after = commit('+');
+  return {kind: 'submodule', ...(before ? {before} : {}), ...(after ? {after} : {})};
+}
+
+// The side the review shows, or the base side of a deleted file, whose
+// lines in the patch must all be the pointer's. The patch shows only the
+// hunk, so a file that opens like a pointer could go on past it: the
+// worker reads the side to check (review/build.ts).
+function lfsPointer(file: ReviewFile): CardSpecial | undefined {
+  if (file.blocks.length !== 1) return undefined;
+  const bytes = lfsPointerSize(sideLines(file, file.status === 'deleted' ? '-' : '+'));
+  return bytes === undefined ? undefined : {kind: 'lfs', bytes};
 }
