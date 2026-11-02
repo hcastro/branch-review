@@ -121,6 +121,8 @@ describe('the rendered view\'s trip at startup', () => {
       proc,
       env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, CMUX_WORKSPACE_ID: 'workspace:test', SSH_CONNECTION: undefined, BRANCH_REVIEW_MOTION: undefined, BRANCH_REVIEW_TMPDIR: parent},
       opener: (command, args) => opened.push([command, args]),
+      // Longer than r's 10 s, as core-review-page gives it: this machine runs the suite under load.
+      openDeadlineMs: 60_000,
       stdout: {isTTY: true, columns: 120, write: () => true},
       stderr: {write: () => true},
       render: (element) => {
@@ -169,6 +171,8 @@ describe('the rendered view\'s trip at startup', () => {
       proc,
       env: {...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`, CMUX_WORKSPACE_ID: 'workspace:test', SSH_CONNECTION: undefined, BRANCH_REVIEW_MOTION: undefined, BRANCH_REVIEW_TMPDIR: parent},
       opener: (command, args) => opened.push([command, args]),
+      // Longer than r's 10 s, as core-review-page gives it: this machine runs the suite under load.
+      openDeadlineMs: 60_000,
       stdout: {isTTY: true, columns: 120, write: () => true},
       stderr: {write: () => true},
       render: (element) => {

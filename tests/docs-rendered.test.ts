@@ -17,6 +17,22 @@ describe('Preview and Review in browser in the docs', () => {
     for (const held of ['the pages that Review in browser opens', "the page worker's files", "Preview's Chromium profile"]) expect(howItWorks).toContain(held);
   });
 
+  it('lists the four settings that change the motion as one list, under the line that introduces them', () => {
+    const lines = raw('docs/preview-and-browser.md').split('\n');
+    const at = lines.indexOf('The following settings change the motion:');
+    expect(at).toBeGreaterThan(0);
+    expect(lines[at + 1]).toBe('');
+    expect(lines.slice(at + 2, at + 6).map((line) => /^- `([^`]+)`|^- With \*\*Reduce motion\*\*/.exec(line)?.[0])).toEqual(['- `--no-animations`', '- `NO_COLOR`', '- With **Reduce motion**', '- `BRANCH_REVIEW_MOTION`']);
+    expect(lines[at + 6]).toBe('');
+  });
+
+  it('says what an export replaces and that it refuses to write over anything else', () => {
+    const doc = read('docs/preview-and-browser.md');
+    expect(doc).toContain('It replaces only an `index.html` and a `links.json` that `branch-review` wrote before, and refuses to write over any other file');
+    expect(doc).not.toContain('writes nothing else in the directory and never deletes a file there');
+    expect(read('README.md')).toContain('refuses to write over any other file');
+  });
+
   it('lives in docs/preview-and-browser.md, and the README links there', () => {
     expect(fs.existsSync(path.join(ROOT, 'docs/rendered-view.md'))).toBe(false);
     expect(read('README.md')).toContain('(docs/preview-and-browser.md)');

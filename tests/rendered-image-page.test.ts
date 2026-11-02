@@ -137,8 +137,9 @@ describe('an image card in the worker', () => {
 
     const moved = await pageFor(repo, {path: 'docs/new.png', oldPath: 'docs/old.png', status: 'renamed', kind: 'raster', assets});
     expect(moved.summary).toMatchObject({ok: true, summary: {kind: 'image', image: {before: {width: 4, height: 5}, after: {width: 4, height: 5}}}});
-    // Each side in 2-up, swipe and onion skin.
-    expect(moved.html.split(`src="data:image/png;base64,${BLUE.toString('base64')}"`)).toHaveLength(7);
+    // Each side's data once, in 2-up; swipe and onion skin take it from there.
+    expect(moved.html.split(`src="data:image/png;base64,${BLUE.toString('base64')}"`)).toHaveLength(3);
+    expect(moved.html.match(/<img alt="(?:Before|After)" data-from="(?:before|after)"/g)).toHaveLength(4);
     expect(moved.html).not.toContain('rv-img-card');
   });
 });

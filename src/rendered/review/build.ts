@@ -1,12 +1,12 @@
 import {createHash} from 'node:crypto';
 import {isUtf8} from 'node:buffer';
-import {branchCommitsOperation, runOperationAsync, upstreamStateOperation} from '../../git.js';
+import {branchCommitCountOperation, branchCommitsOperation, COMMIT_LIST_LIMIT, runOperationAsync, upstreamStateOperation} from '../../git.js';
 import {createLru} from '../../media/lru.js';
 import type {FragmentRequest, ReviewCardRequest, ReviewRequest} from '../backend.js';
 import type {PageBody} from '../page.js';
 import {oneLine, type SourceReader, type SourceSpec} from '../source.js';
-import {drawHunk, escapeText, parseHunks, type CardDiff, type Hunk} from './diff.js';
-import {highlightLines} from './highlight.js';
+import {drawHunk, escapeText, markHidden, parseHunks, type CardDiff, type Hunk} from './diff.js';
+import {colorable, COLOR_MS_PER_UNIT, coloringCost, highlightLines} from './highlight.js';
 import {assembleReviewPage, CONTEXT_FILE_LIMIT, diffFolds, textBudget, type BranchState, type ReviewCommit, type ReviewPageCard} from './page.js';
 import {lfsPointerSize, type CardSpecial} from './special.js';
 
@@ -33,24 +33,51 @@ export const BUILD_BUDGET_MS = 4_000;
 // How long the commits and the branch's state may take: a cold git on a
 // loaded machine takes seconds. They start first, beside the cards.
 export const GIT_BUDGET_MS = 6_000;
+/**
+ * How long before the end of BUILD_BUDGET_MS every coloring should be done
+ * by: the page is assembled and sent after it.
+ */
+export const COLOR_MARGIN_MS = 500;
+/**
+ * How a build keeps its coloring to its time. A coloring started can't be
+ * stopped, and the grammars run on the worker's one thread, so the cards
+ * take turns: one card's sides color at a time, and each turn starts only
+ * when the time really left, less COLOR_MARGIN_MS, still holds what that
+ * card would take at the worst rate measured (review/highlight.ts). Each
+ * card is judged by the clock when its turn comes, so ordinary code, which
+ * colors faster than that rate, leaves the next card more time, and only
+ * the last card's worst case is held back. A card past it is drawn
+ * escaped, the page says it is partial, and the next build, which finds
+ * the colored cards kept, colors more. `buildColorCost` caps the units one
+ * build may color besides; none by default.
+ */
 
 type Read = {text: string; bytes: number} | {tooLarge: true} | null;
+// Waits for the build's coloring turn for `texts`, and says whether the
+// build may color them: null when not, else what to call once they are
+// colored, which hands the turn on.
+type Charge = (texts: readonly string[]) => Promise<(() => void) | null>;
 // What the page budget needs of a side, kept by the side's blob id, which
 // fixes its text: its size in UTF-8 bytes and its lines, or that it is too
 // large to read.
 type Size = {bytes: number; lines: number} | 'tooLarge';
 
-/** What git says of the branch: its commits, and where it stands against its upstream (null: no local branch). Undefined for what couldn't be read. */
-export type BranchReading = {commits?: ReviewCommit[]; upstream?: {remote: string; ahead: number; behind?: number} | {remote: null} | null};
+/**
+ * What git says of the branch: its newest commits, how many it has in all
+ * (`total`), and where it stands against its upstream (null: no local
+ * branch). Undefined for what couldn't be read.
+ */
+export type BranchReading = {commits?: ReviewCommit[]; total?: number; upstream?: {remote: string; ahead: number; behind?: number} | {remote: null} | null};
 
 export type ReadBranch = (cwd: string, refs: ReviewRequest['refs'], signal: AbortSignal) => Promise<BranchReading>;
 
 const readBranch: ReadBranch = async (cwd, refs, signal) => {
-  const [commits, upstream] = await Promise.all([
+  const [commits, total, upstream] = await Promise.all([
     runOperationAsync(branchCommitsOperation(cwd, refs.base, refs.branch), {signal}).catch(() => undefined),
+    runOperationAsync(branchCommitCountOperation(cwd, refs.base, refs.branch), {signal}).catch(() => undefined),
     runOperationAsync(upstreamStateOperation(cwd, refs.branch), {signal}).catch(() => undefined),
   ]);
-  return {...(commits ? {commits} : {}), ...(upstream !== undefined ? {upstream} : {})};
+  return {...(commits ? {commits} : {}), ...(total !== undefined ? {total} : {}), ...(upstream !== undefined ? {upstream} : {})};
 };
 
 // The reviewed side's lines with those a hunk shows left blank: the page
@@ -75,17 +102,23 @@ function stateAgainst({remote, ahead, behind = 0}: {remote: string; ahead: numbe
   return {kind: 'even', remote};
 }
 
-export function createReviewBuilder({sources, fragment, now = Date.now, highlight = highlightLines, branch = readBranch, gitBudgetMs = GIT_BUDGET_MS, buildBudgetMs = BUILD_BUDGET_MS}: {
+export function createReviewBuilder({sources, fragment, now = Date.now, highlight = highlightLines, colorCost, branch = readBranch, gitBudgetMs = GIT_BUDGET_MS, buildBudgetMs = BUILD_BUDGET_MS, buildColorCost = Infinity}: {
   sources: SourceReader;
   // The renderer's fragment for a request, held by the handler.
   fragment: (request: FragmentRequest) => Promise<{body: PageBody}>;
   now?: () => number;
   highlight?: (text: string, path: string) => Promise<string[] | null>;
+  // What coloring a text costs: the grammars' cost, or nothing for a
+  // highlighter given in their place, unless it says.
+  colorCost?: (text: string) => number;
   branch?: ReadBranch;
   gitBudgetMs?: number;
   // `--export-html`, which nobody waits on, gives the cards all the time they take.
   buildBudgetMs?: number;
+  // The most cost units one build colors, past its time: none by default.
+  buildColorCost?: number;
 }) {
+  const costOf = colorCost ?? (highlight === highlightLines ? coloringCost : () => 0);
   const diffs = createLru<CardDiff>(CARD_CACHE_BYTES, (diff) => JSON.stringify(diff).length * 2);
   const sizes = createLru<Size>(1024 * 1024, () => 64);
   // Whether a side is a whole Git LFS pointer, by the same key as its size.
@@ -108,23 +141,37 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
   // A side's size is fixed by its blob id: a side named by none (an
   // untracked file) is read each time.
   const sizeKey = (cwd: string, spec: SourceSpec | undefined) => (spec && 'id' in spec && spec.id ? JSON.stringify([cwd, spec]) : null);
-  const lineCount = (text: string) => text.split('\n').length - (text.endsWith('\n') ? 1 : 0);
+  const lineCount = (text: string) => (text === '' ? 0 : text.split('\n').length - (text.endsWith('\n') ? 1 : 0));
 
-  // A side's lines as HTML: colored when its grammar is known, escaped
-  // when not.
-  const drawSide = async (text: string, path: string) => {
+  // A side's lines as HTML: colored when its grammar is known and the
+  // build paid for it, escaped when not. `cut`: the build had no room left
+  // for it, which a later build may have. An empty side has no lines.
+  // `lineEnds`: a whole side as read, whose `\r` before a `\n` (or at its
+  // end) is the line's end, not its text, as parseHunks reads a hunk's
+  // lines: no line of a CRLF file draws a marker for it. A lone `\r` inside
+  // a line is its text. The hunks' own lines arrive without them.
+  const drawSide = async (text: string, path: string, paid: boolean, lineEnds = true) => {
+    if (text === '') return {lines: [], cut: false};
     await breathe();
-    const lines = text.split('\n');
-    if (text.endsWith('\n')) lines.pop();
-    return (await highlight(text, path).catch(() => null)) ?? lines.map(escapeText);
+    const own = lineEnds ? text.replace(/\r(?=\n|$)/g, '') : text;
+    const lines = own.split('\n');
+    if (own.endsWith('\n')) lines.pop();
+    if (!paid) return {lines: lines.map(escapeText), cut: true};
+    return {lines: (await highlight(own, path).catch(() => null)) ?? lines.map(escapeText), cut: false};
   };
 
   // One side of the hunks' own lines, colored together, for a side the
   // page doesn't color whole: by line number.
-  const hunkSide = async (hunks: readonly Hunk[], side: 'o' | 'n', path: string) => {
+  const hunkSide = async (hunks: readonly Hunk[], side: 'o' | 'n', path: string, charge: Charge) => {
     const lines = hunks.flatMap((hunk) => hunk.lines.filter((line) => line[side] !== undefined));
-    const drawn = await drawSide(lines.map((line) => line.text).join('\n'), path);
-    return new Map(lines.map((line, index) => [line[side]!, drawn[index] ?? escapeText(line.text)]));
+    const text = lines.map((line) => line.text).join('\n');
+    const paid = await charge([text]);
+    try {
+      const drawn = await drawSide(text, path, paid !== null, false);
+      return {html: new Map(lines.map((line, index) => [line[side]!, drawn.lines[index] ?? escapeText(line.text)])), cut: drawn.cut};
+    } finally {
+      paid?.();
+    }
   };
 
   /**
@@ -135,7 +182,7 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
    * the page carries them: only a side the page carries is colored whole,
    * with its base side, and the others color their hunks' lines alone.
    */
-  async function cardDiff(cwd: string, card: ReviewCardRequest, colors: boolean, carry: (bytes: number | null) => Promise<boolean>): Promise<{diff: CardDiff | null; plain: boolean}> {
+  async function cardDiff(cwd: string, card: ReviewCardRequest, colors: boolean, carry: (bytes: number | null) => Promise<boolean>, charge: Charge): Promise<{diff: CardDiff | null; plain: boolean}> {
     const hunks = parseHunks(card.blocks);
     if (hunks.length === 0 || !colors) {
       await carry(null);
@@ -157,31 +204,56 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
     const newText = carried && after && 'text' in after ? after.text : null;
     const before = newText === null ? null : await read(cwd, card.sides.before);
     const oldText = before && 'text' in before && before.bytes <= CONTEXT_FILE_LIMIT ? before.text : null;
-    let oldLines = oldText === null ? null : await drawSide(oldText, card.oldPath ?? card.path);
-    let newLines = newText === null ? null : await drawSide(newText, card.path);
+    // Whether the build left a side escaped for want of time.
+    let cut = false;
+    // Both whole sides in one turn, so a card is colored whole or not at
+    // all, and the next build has one card less to color.
+    const paid = await charge([oldText, newText].flatMap((text) => (text === null ? [] : [text])));
+    const whole = async (text: string | null, path: string) => {
+      if (text === null) return null;
+      const drawn = await drawSide(text, path, paid !== null);
+      cut ||= drawn.cut;
+      return drawn.lines;
+    };
+    const ownLines = async (side: 'o' | 'n', path: string) => {
+      const drawn = await hunkSide(hunks, side, path, charge);
+      cut ||= drawn.cut;
+      return drawn.html;
+    };
+    let oldLines: string[] | null;
+    let newLines: string[] | null;
+    try {
+      oldLines = await whole(oldText, card.oldPath ?? card.path);
+      newLines = await whole(newText, card.path);
+    } finally {
+      paid?.();
+    }
     // A side shorter than its hunks say isn't the text they were read from.
     const reach = (side: 'o' | 'n') => Math.max(0, ...hunks.flatMap((hunk) => hunk.lines.map((line) => line[side] ?? 0)));
     if (oldLines && oldLines.length < reach('o')) oldLines = null;
     if (newLines && newLines.length < reach('n')) newLines = null;
-    const oldHtml = oldLines ?? await hunkSide(hunks, 'o', card.oldPath ?? card.path);
-    const newHtml = newLines ?? await hunkSide(hunks, 'n', card.path);
+    const oldHtml = oldLines ?? await ownLines('o', card.oldPath ?? card.path);
+    const newHtml = newLines ?? await ownLines('n', card.path);
     const lookup = (html: string[] | Map<number, string>) => (line: number) => (Array.isArray(html) ? html[line - 1] : html.get(line));
     // A side the page leaves out, though it has one, is the reader's to open.
     const leftOut = newLines === null && size !== undefined;
     const total = size && size !== 'tooLarge' ? size.lines : undefined;
     const diff: CardDiff = {
       hunks: hunks.map((hunk) => drawHunk(hunk, {old: lookup(oldHtml), new: lookup(newHtml)})),
-      context: newLines && gapsOnly(newLines, hunks),
+      // The hunks' lines get their markers as they are drawn; the context's here.
+      context: newLines && gapsOnly(newLines, hunks).map(markHidden),
       ...(leftOut ? {contextNote: 'budget' as const} : {}),
       ...(total !== undefined ? {total} : {}),
     };
+    // A diff drawn in part escaped isn't kept: the next build colors it.
+    if (cut) return {diff, plain: true};
     diffs.set(key, diff);
     return {diff, plain: false};
   }
 
   // The commits and the branch's state, or null for what git didn't answer
   // in time: the page says so, and is partial.
-  async function branchFacts(request: ReviewRequest): Promise<{state: BranchState | null; commits: ReviewCommit[] | null; complete: boolean}> {
+  async function branchFacts(request: ReviewRequest): Promise<{state: BranchState | null; commits: ReviewCommit[] | null; commitTotal?: number; complete: boolean}> {
     const stop = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     // A git that answered while the loop was busy coloring is heard first:
@@ -195,7 +267,10 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
     stop.abort();
     const {upstream} = reading;
     const state: BranchState | null = upstream === undefined ? {kind: 'unknown'} : upstream === null ? null : upstream.remote === null ? {kind: 'unpushed'} : stateAgainst(upstream);
-    return {state, commits: reading.commits ?? null, complete: upstream !== undefined && reading.commits !== undefined};
+    const {commits, total} = reading;
+    // A full list whose count didn't come back can't say how many there are.
+    const counted = commits === undefined || total !== undefined || commits.length < COMMIT_LIST_LIMIT;
+    return {state, commits: commits ?? null, ...(total !== undefined ? {commitTotal: total} : {}), complete: upstream !== undefined && commits !== undefined && counted};
   }
 
   // A Git LFS pointer's card is one line only when its whole side reads as
@@ -249,6 +324,30 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
     async page(request: ReviewRequest): Promise<{html: string; partial: boolean; specials: Array<CardSpecial | undefined>}> {
       const startedAt = now();
       const inBudget = () => now() - startedAt < buildBudgetMs;
+      // The coloring turn, taken by one card at a time, all its sides or
+      // none. A side the grammars refuse anyway costs nothing: no later
+      // build could color it either. A turn whose coloring, at the worst
+      // rate, would end past the build's time less its margin, by the clock
+      // as the turn starts, is refused.
+      let colorLeft = buildColorCost;
+      let colorTurn = Promise.resolve();
+      const charge: Charge = async (texts) => {
+        // A card with no whole side to color waits for no turn.
+        if (texts.length === 0) return () => undefined;
+        const before = colorTurn;
+        let handOn!: () => void;
+        colorTurn = new Promise((resolve) => {
+          handOn = resolve;
+        });
+        await before;
+        const cost = texts.reduce((sum, text) => sum + (colorable(text) ? costOf(text) : 0), 0);
+        if (cost > colorLeft || now() - startedAt + cost * COLOR_MS_PER_UNIT > buildBudgetMs - COLOR_MARGIN_MS) {
+          handOn();
+          return null;
+        }
+        colorLeft -= cost;
+        return handOn;
+      };
       const facts = branchFacts(request);
       const budget = textBudget();
       // The fold decisions need each card's final kind, so the pointers are
@@ -265,10 +364,12 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
       const renderedOf = (card: ReviewCardRequest): Promise<PageBody | null> => {
         if (card.renderFailure !== undefined) return Promise.resolve({kind: 'failed', reason: card.renderFailure, source: ''});
         // A file the review hasn't rendered yet, or one the budget has no
-        // room left for, is on its way.
+        // room left for, is on its way. One the review left past its
+        // prerender limit isn't a reason to write the page again: a press
+        // renders it.
         if (!card.fragment || !inBudget()) {
           if (card.kind === 'text') return Promise.resolve(null);
-          partial = true;
+          if (card.fragment || !card.deferred) partial = true;
           return Promise.resolve({kind: 'pending'});
         }
         const whole: FragmentRequest = {...card.fragment, links: request.links, assets: request.assets!};
@@ -297,7 +398,7 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
           let drawn: Awaited<ReturnType<typeof cardDiff>>;
           let rendered: PageBody | null;
           try {
-            [drawn, rendered] = await Promise.all([special ? carry(null).then(() => ({diff: null, plain: false})) : cardDiff(request.cwd, card, inBudget(), carry), renderedOf(card)]);
+            [drawn, rendered] = await Promise.all([special ? carry(null).then(() => ({diff: null, plain: false})) : cardDiff(request.cwd, card, inBudget(), carry, charge), renderedOf(card)]);
           } finally {
             void before.then(release);
           }
@@ -330,8 +431,8 @@ export function createReviewBuilder({sources, fragment, now = Date.now, highligh
         }
       };
       await Promise.all(Array.from({length: CONCURRENCY}, work));
-      const {state, commits, complete} = await facts;
-      const html = assembleReviewPage({title: request.title, reviewId: request.reviewId, builtAt: now(), state, commits, cards, findings: request.findings});
+      const {state, commits, commitTotal, complete} = await facts;
+      const html = assembleReviewPage({title: request.title, reviewId: request.reviewId, builtAt: now(), state, commits, ...(commitTotal !== undefined ? {commitTotal} : {}), cards, findings: request.findings});
       return {html, partial: partial || !complete, specials: cards.map((each) => each.special)};
     },
   };

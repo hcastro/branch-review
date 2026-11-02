@@ -43,11 +43,11 @@ While the page opens, a shade band sweeps the diff toward the split, for about a
 
 A new split narrows the review as it opens, so a press that opens one plays the band first and opens the split after it. A press that goes to an open split opens the page while the band plays.
 
+A page that opens in a new tab or a new split starts at its card. A press that goes to a split that already shows the page scrolls it to the card.
+
 The following settings change the motion:
 
 - `--no-animations` turns the band off, along with the review's other motion. The page then scrolls to its card at once.
-
-A page that opens in a new tab or a new split starts at its card. A press that goes to a split that already shows the page scrolls it to the card.
 - `NO_COLOR` turns the band off.
 - With **Reduce motion** on in macOS's accessibility settings, the band gives way to one short flash of the **Review in browser ⇗** button. `branch-review` reads the setting once per session, and not over SSH. The page follows the system's setting too, and scrolls with no motion.
 - `BRANCH_REVIEW_MOTION` overrides the macOS setting for the band: `full`, `reduce`, or `off`.
@@ -70,7 +70,7 @@ A ref that isn't a local branch, such as a commit, gets no pill. `branch-review`
 The page has the following tabs:
 
 - **Files changed** lists every changed file, in the review's order, with the branch's added and removed lines summed at its right.
-- **Commits** lists the commits on the branch that the base doesn't have, by day, newest first. Each row shows the commit's subject, how long ago it was committed, how many files it changed, and its short hash. No author name or email is shown.
+- **Commits** lists the commits on the branch that the base doesn't have, by day, newest first. Each row shows the commit's subject, how long ago it was committed, how many files it changed, and its short hash. No author name or email is shown. The tab lists the newest 250 commits, and its count, the title and the toolbar give the full number, such as `Showing the newest 250 of 260 commits.` at the end of the list.
 
 Under the tabs, a toolbar stays at the top while you scroll. It says which changes the page shows, such as `Showing changes from all 2 commits`, or `and uncommitted changes` for a review of the working tree. Its ring counts the files you've marked viewed, such as `1 / 6 files viewed`. **Unified** and **Split** switch every diff between one column and two. The browser remembers the choice. A window narrower than 700 pixels shows unified diffs.
 
@@ -85,7 +85,7 @@ Each changed file gets a card. Its header shows the file's path with a copy butt
 A code or text file's card shows its diff the way GitHub draws one:
 
 - Each line has its number on the base and on the branch, and the code keeps the syntax colors of GitHub's own grammars. A comment or string that runs over several lines is colored on each of them. A file with a line longer than 4 KB, such as minified code or a one-line JSON file, shows without colors, as does more than 400 KB of text, so the page still opens in time.
-- A changed line paired with the line it replaced highlights the words that differ on both.
+- A changed line paired with the line it replaced highlights the words that differ on both. When the only change is the line's ending, from LF to CRLF or back, the line with the carriage return ends in a highlighted `^M`. A file whose lines all end in CRLF shows no `^M`.
 - Each hunk starts with its header, such as `@@ -28,11 +28,15 @@ program`, with the function name that Git printed for it.
 - The arrow at the left of a header shows 5 more unchanged lines above the hunk, and the rest of a gap of 5 lines or fewer at once. The arrow under the last hunk shows lines below it. The header's numbers count the lines it shows after each click.
 
@@ -244,7 +244,7 @@ Wrote ../pages/index.html and ../pages/links.json for 3 files · nothing left th
 
 A markdown file's line says how many blocks its rich view marks, and one whose changes left nothing to mark, such as a new link definition, reads `no blocks marked`. A code file's line gives its added and removed lines, an image's line gives its sizes, and a file with no diff to show gives the line its card shows, such as `Binary file not shown.`. A file that also looks different is listed after the changed files, with a `·` for its status. A file that Git was too slow to check in full, even when made a second time, adds `git was slow · some links and images unchecked`.
 
-Open `index.html` in a browser. `#file-2` at the end of its address opens it at that card. A run on the same branch writes the same two file names and replaces them. `branch-review` writes nothing else in the directory and never deletes a file there.
+Open `index.html` in a browser. `#file-2` at the end of its address opens it at that card. A run on the same branch writes the same two file names and replaces them. It replaces only an `index.html` and a `links.json` that `branch-review` wrote before, and refuses to write over any other file, such as a site's own `index.html`: the export then stops with nothing written and says which file is in the way.
 
 `--export-html` takes the same refs as the UI. For example, `branch-review my-feature main --export-html ../pages` writes the page of `my-feature`'s commits against `main`.
 

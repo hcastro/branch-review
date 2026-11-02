@@ -29,16 +29,41 @@ export async function scopeFor(repoPath: string): Promise<string | null> {
   return null;
 }
 
-// What the grammars are given at once. A grammar's time grows with the
-// square of a line's length (a minified file or a one-line JSON of 200 KB
-// holds the worker for minutes), and starry-night can't be stopped once it
-// starts, so a side with a longer line, or more text than the page carries
-// for a file, is drawn escaped, as GitHub draws long lines. Within these, a
-// side takes the worker about a second at most.
+// What the grammars are given at once. starry-night can't be stopped once
+// it starts, and its time grows with the square of each line's length, so
+// a side's cost is the sum of its lines' squared lengths. One 4,000-char
+// TypeScript comment line, 16M units, took 445 ms on the owner's machine,
+// the worst rate measured (COLOR_MS_PER_UNIT). Ordinary code colors three
+// to four times faster per unit: TypeScript of 400 KB in 80-char lines
+// (32M units), 390 KB in 95-char lines (37M) and 398 KB in 118-char lines
+// (47M) each took 0.25 to 0.35 s. A side past COLORED_SIDE_COST (400 KB
+// of 120-char lines, about 1.3 s at the worst rate), with a line past
+// COLORED_LINE_LIMIT, or with more text than the page carries for a file,
+// is drawn escaped, as GitHub draws long lines. The builder also keeps
+// every build's coloring to its time, in the same units (review/build.ts).
 export const COLORED_LINE_LIMIT = 4 * 1024;
 export const COLORED_TEXT_LIMIT = 400 * 1024;
+export const COLORED_SIDE_COST = 48_000_000;
+/** Milliseconds per cost unit at the worst rate measured: 445 ms for 16M units. */
+export const COLOR_MS_PER_UNIT = 445 / 16_000_000;
 
-const colorable = (text: string) => text.length <= COLORED_TEXT_LIMIT && text.split('\n').every((line) => line.length <= COLORED_LINE_LIMIT);
+/** What coloring `text` costs the grammars: the sum of its lines' squared lengths. */
+export function coloringCost(text: string) {
+  let cost = 0;
+  for (let start = 0; start <= text.length;) {
+    const end = text.indexOf('\n', start);
+    const length = (end < 0 ? text.length : end) - start;
+    cost += length * length;
+    if (end < 0) break;
+    start = end + 1;
+  }
+  return cost;
+}
+
+/** Whether the grammars are given `text` at all. */
+export function colorable(text: string) {
+  return text.length <= COLORED_TEXT_LIMIT && text.split('\n').every((line) => line.length <= COLORED_LINE_LIMIT) && coloringCost(text) <= COLORED_SIDE_COST;
+}
 
 /**
  * `text` as one piece of HTML per line, colored by the grammar for

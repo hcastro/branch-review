@@ -128,6 +128,23 @@ describe('the rendered worker client', {timeout: 60_000}, () => {
     expect(arrived('tile') - arrived('layout')).toBeGreaterThanOrEqual(750);
   });
 
+  it('gives the page its own turn beside two fragments, and still runs fragments two at a time and one page at a time', async () => {
+    const cwd = initRepo();
+    const tempDir = sessionDir();
+    const rendered = renderedFor(tempDir, {modulePath: SCRIPTED_RENDERED});
+    const sent = Date.now();
+    const fragments = ['delay-800-a.md', 'delay-800-b.md', 'delay-800-c.md'].map((file) => rendered.fragment(fragmentOf(cwd, file), never));
+    const pages = ['delay-800-first.ts', 'delay-800-second.ts'].map((file) => rendered.review!(reviewOf(cwd, file), never));
+    for (const answer of [...fragments, ...pages]) expect(await answer).toMatchObject({ok: true});
+    const jobs = renderedLog(tempDir).filter((entry) => entry.event === 'job');
+    const arrived = (file: string) => jobs.find((entry) => entry.path === file)!.at - sent;
+    // The first page went beside the first two fragments, at once.
+    expect(arrived('delay-800-first.ts')).toBeLessThan(700);
+    // The third fragment and the second page each waited for a turn of their own kind.
+    expect(arrived('delay-800-c.md') - arrived('delay-800-a.md')).toBeGreaterThanOrEqual(750);
+    expect(arrived('delay-800-second.ts') - arrived('delay-800-first.ts')).toBeGreaterThanOrEqual(750);
+  });
+
   it('sends a tile once the layout ahead of it ran out of time', async () => {
     const cwd = initRepo();
     const tempDir = sessionDir();

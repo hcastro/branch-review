@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import os from 'node:os';
 import {describe, expect, it} from 'vitest';
 import {REVIEW_CSS_HASH, REVIEW_HEAD_SCRIPT_HASH, REVIEW_SCRIPT, REVIEW_SCRIPT_HASH} from '../src/rendered/assets.generated.js';
@@ -5,7 +6,8 @@ import {changeGroups} from '../src/rendered/changes.js';
 import {renderMarkdown} from '../src/rendered/markdown.js';
 import {drawHunk, escapeText, parseHunks, unpackHtml} from '../src/rendered/review/diff.js';
 import {icon} from '../src/rendered/review/icons.js';
-import {applyBudgets, assembleReviewPage, reviewPolicy, type ReviewPageCard, type ReviewPageInput} from '../src/rendered/review/page.js';
+import {applyBudgets, assembleReviewPage, IMAGE_PAGE_LIMIT, reviewPolicy, rewriteTags, type ReviewPageCard, type ReviewPageInput} from '../src/rendered/review/page.js';
+import {dayName} from '../src/rendered/review/time.js';
 import {diffFile} from './rendered-helpers.js';
 
 // The Review in browser page as the worker writes it: one self-contained
@@ -36,11 +38,11 @@ async function input(cards: ReviewPageCard[], overrides: Partial<ReviewPageInput
   return {
     title: {repo: 'widget', base: 'main', branch: 'feature/docs-refresh', worktree: false},
     reviewId: 'r-0123456789abcdef',
-    builtAt: Date.UTC(2026, 10, 1, 12),
+    builtAt: Date.UTC(2026, 10, 1, 13),
     state: {kind: 'unpushed'},
     commits: [
-      {hash: '7be04d8', subject: 'feat(cli): add a preview command', time: Date.UTC(2026, 10, 1, 11) / 1000, files: 4},
-      {hash: 'a3f9c21', subject: 'docs: refresh the README', time: Date.UTC(2026, 10, 1, 11, 48) / 1000, files: 2},
+      {hash: '7be04d8', subject: 'feat(cli): add a preview command', time: Date.UTC(2026, 10, 1, 12) / 1000, files: 4},
+      {hash: 'a3f9c21', subject: 'docs: refresh the README', time: Date.UTC(2026, 10, 1, 12, 48) / 1000, files: 2},
     ],
     cards,
     ...overrides,
@@ -50,6 +52,9 @@ async function input(cards: ReviewPageCard[], overrides: Partial<ReviewPageInput
 const head = (html: string) => html.slice(html.indexOf('<head>'), html.indexOf('</head>'));
 // The page as drawn, without its data block and its script.
 const drawn = (html: string) => html.slice(html.indexOf('<body>'), html.indexOf('<script type="application/json"'));
+
+// String.prototype.isWellFormed (ES2024), which the project's lib doesn't name yet.
+const wellFormed = (text: string) => (text as unknown as {isWellFormed(): boolean}).isWellFormed();
 
 describe('assembleReviewPage', () => {
   it('opens with a policy that allows only our stylesheet and our two scripts, and loads nothing', async () => {
@@ -96,7 +101,8 @@ describe('assembleReviewPage', () => {
   it('lists the commits by day with subjects, short hashes and relative times, and never a name or an email', async () => {
     const html = assembleReviewPage(await input([]));
     const commits = html.slice(html.indexOf('id="panel-commits"'), html.indexOf('id="menu"'));
-    expect(commits).toContain('Commits on Nov 1, 2026');
+    // The day as the reader's time zone names it, as the page does.
+    expect(commits).toContain(`Commits on ${dayName(Date.UTC(2026, 10, 1, 12) / 1000)}`);
     expect(commits).toContain('<p class="rv-msg">feat(cli): add a preview command</p>');
     expect(commits).toContain('<code class="rv-sha">7be04d8</code>');
     expect(commits).toMatch(/Committed <time data-t="\d+" datetime="[^"]+">1 hour ago<\/time> · 4 files/);
@@ -148,6 +154,80 @@ describe('assembleReviewPage', () => {
     }));
     expect(html).not.toContain(evil);
     expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+  });
+
+  it('escapes git\'s function context in a hunk header, and keeps it inert in the data block', async () => {
+    const evil = 'function x() { </script><img src=x onerror=alert(1)> }';
+    const before = `${evil}\n  one\n  two\n  three\n  four\n  a\n`;
+    const file = diffFile(before, before.replace('  a\n', '  b\n'), 'src/x.js', ['--function-context', '-U1']);
+    const hunks = parseHunks(file.blocks);
+    // git printed the line as the hunk's function context, or the card sets it.
+    const card = textCard('src/x.js', 'a\n', 'b\n', {diff: {hunks: hunks.map((hunk) => ({...drawHunk(hunk), context: hunk.context || evil})), context: null}});
+    expect(card.diff!.hunks[0]!.context).toBe(evil);
+    const html = assembleReviewPage(await input([card]));
+    expect(html).not.toContain(evil);
+    const header = /<tr class="hdr">[\s\S]*?<\/tr>/.exec(drawn(html))![0];
+    expect(header).toContain('function x() { &lt;/script&gt;&lt;img src=x onerror=alert(1)&gt; }');
+    const start = html.indexOf('id="rv-data">') + 'id="rv-data">'.length;
+    const block = html.slice(start, html.indexOf('</script>', start));
+    expect(block).not.toContain('<');
+    expect((JSON.parse(block) as {cards: Array<{diff: {hunks: Array<{context: string}>}}>}).cards[0]!.diff.hunks[0]!.context).toBe(evil);
+  });
+
+  it('allows by its hash every inline style and script the page holds, and nothing else runs', async () => {
+    const html = assembleReviewPage(await input([textCard('src/a.ts', 'a\n', 'b\n')]));
+    const policy = /<meta http-equiv="Content-Security-Policy" content="([^"]+)">/.exec(html)![1]!;
+    const directive = (name: string) => policy.split('; ').find((each) => each.startsWith(`${name} `))!.split(' ').slice(1);
+    const hash = (body: string) => `'sha256-${createHash('sha256').update(body, 'utf8').digest('base64')}'`;
+    const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((match) => match[1]!);
+    const scripts = [...html.matchAll(/<script(?: ([^>]*))?>([\s\S]*?)<\/script>/g)].filter((match) => !/type="application\/json"/.test(match[1] ?? '')).map((match) => match[2]!);
+    expect(styles).toHaveLength(1);
+    expect(scripts).toHaveLength(2);
+    for (const body of styles) expect(directive('style-src')).toContain(hash(body));
+    for (const body of scripts) expect(directive('script-src')).toContain(hash(body));
+    expect(html).not.toMatch(/\son[a-z]+="/);
+  });
+
+  it('draws a changed emoji whole, so the page holds no lone surrogate', async () => {
+    const html = assembleReviewPage(await input([textCard('src/a.ts', 'x = "\u{1F600} a"\n', 'x = "\u{1F601} a"\n')]));
+    expect(wellFormed(html)).toBe(true);
+    expect(html).toContain('<span class="x">\u{1F601}</span>');
+  });
+
+  it('draws bidi and zero-width characters as markers, warns of the bidi ones, keeps a tab, and copies the exact path (Trojan Source)', async () => {
+    const trojan = 'let isAdmin = false;\n/*\u202E } \u2066if (isAdmin)\u2069 \u2066 begin admins only */\n\tconsole.log("x");\n';
+    const before = 'let isAdmin = false;\n\tconsole.log("x");\n';
+    const zw = 'src/zw\u200B.ts';
+    const card = textCard('src/trojan.ts', before, trojan);
+    card.diff!.hunks[0]!.context = 'function x(\u202E) {';
+    const html = assembleReviewPage(await input([card, textCard(zw, 'a\n', 'b\n')], {
+      title: {repo: 'wid\u200Bget', base: 'ma\u202Ein', branch: 'feat\u2066ure', worktree: false},
+      commits: [{hash: 'abc1234', subject: 'fix\u202E: it', time: 1, files: 1}],
+    }));
+    expect(html).not.toMatch(/[\u202A-\u202E\u2066-\u2069\u200B]/);
+    const trojanCard = html.slice(html.indexOf('aria-label="src/trojan.ts"'), html.indexOf('</section>', html.indexOf('aria-label="src/trojan.ts"')));
+    expect(trojanCard).toContain('/*<span class="rv-hc" title="U+202E">&lt;U+202E&gt;</span> } <span class="rv-hc" title="U+2066">&lt;U+2066&gt;</span>if (isAdmin)');
+    expect(trojanCard).toContain('function x(<span class="rv-hc" title="U+202E">&lt;U+202E&gt;</span>) {');
+    expect(trojanCard).toContain('<p class="rv-bidi" role="note">');
+    expect(trojanCard).toContain('This file contains bidirectional Unicode text that may read differently than it appears. Source shows each one as a marker.');
+    // A tab in a code line stays a tab.
+    expect(trojanCard).toContain('<span class="mk"> </span>\tconsole.log');
+    // A zero-width space alone warns of nothing.
+    const zwCard = html.slice(html.indexOf('aria-label="src/zw&lt;U+200B&gt;.ts"'));
+    expect(zwCard.slice(0, zwCard.indexOf('</section>'))).not.toContain('rv-bidi');
+    const tree = html.slice(html.indexOf('<ul class="rv-tree" id="tree"'), html.indexOf('</aside>'));
+    expect(tree.replace(/<[^>]+>/g, '')).toContain('zw&lt;U+200B&gt;.ts');
+    expect(html).toContain('<span class="rv-ref">feat<span class="rv-hc" title="U+2066">&lt;U+2066&gt;</span>ure</span>');
+    expect(html).toContain('<p class="rv-msg">fix<span class="rv-hc" title="U+202E">&lt;U+202E&gt;</span>: it</p>');
+    expect(html).toContain('<title>feat&lt;U+2066&gt;ure into ma&lt;U+202E&gt;in · branch-review</title>');
+    // The path to copy is exact, written as a character reference.
+    const decode = (value: string) => value.replace(/&#x([0-9A-F]+);/g, (_all, hex: string) => String.fromCodePoint(Number.parseInt(hex, 16))).replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    const copied = /<section class="rv-card" id="file-1"[^>]* data-path="([^"]*)"/.exec(html)![1]!;
+    expect(copied).toBe('src/zw&#x200B;.ts');
+    expect(decode(copied)).toBe(zw);
+    // The data block keeps the exact text, escaped.
+    const data = /<script type="application\/json" id="rv-data">([\s\S]*?)<\/script>/.exec(html)![1]!;
+    expect((JSON.parse(data) as {cards: Array<{diff: {hunks: Array<{context: string}>}}>}).cards[0]!.diff.hunks[0]!.context).toBe('function x(\u202E) {');
   });
 
   it('gives a markdown file a Source and a Rich view: the rich one is the rendered fragment with its marks and the fidelity note', async () => {
@@ -257,6 +337,36 @@ describe('assembleReviewPage', () => {
     // An image with no text diff is its pictures alone, shown, never behind a view switch.
     const cardHtml = html.slice(html.indexOf('<section class="rv-card"'), html.indexOf('</section>'));
     expect(cardHtml).not.toMatch(/rv-v-(src|rich)/);
+  });
+
+  it('carries each side\'s data once: the swipe and onion pictures take theirs from the 2-up ones', async () => {
+    const before = dataUrlOf(300, 'B');
+    const after = dataUrlOf(300, 'C');
+    const card: ReviewPageCard = {
+      path: 'img/hero.png', status: 'modified', additions: 0, deletions: 0, kind: 'raster', viewKey: 'v', signature: 's', diff: null,
+      image: {format: 'raster', before: {kind: 'shown', dataUrl: before, mime: 'image/png', bytes: 300, width: 600, height: 240}, after: {kind: 'shown', dataUrl: after, mime: 'image/png', bytes: 300, width: 600, height: 240}},
+    };
+    const html = assembleReviewPage(await input([card]));
+    expect(html.split(before).length - 1).toBe(1);
+    expect(html.split(after).length - 1).toBe(1);
+    for (const mode of ['swipe', 'onion']) {
+      const panel = html.slice(html.indexOf(`data-im-panel="${mode}"`), html.indexOf('</div>\n', html.indexOf(`data-im-panel="${mode}"`)));
+      expect(panel).toContain('<img alt="Before" data-from="before" width="600" height="240">');
+      expect(panel).toContain('<img alt="After" data-from="after" width="600" height="240">');
+    }
+  });
+
+  it('keeps a page of two image pairs of 10 MiB a side within its image budget', async () => {
+    const side = (digit: string) => ({kind: 'shown' as const, dataUrl: dataUrlOf(7.5 * 1024 * 1024, digit), mime: 'image/png', bytes: 7.5 * 1024 * 1024});
+    const pair = (path: string, digits: [string, string]): ReviewPageCard => ({path, status: 'modified', additions: 0, deletions: 0, kind: 'raster', viewKey: path, signature: 's', diff: null, image: {format: 'raster', before: side(digits[0]), after: side(digits[1])}});
+    const cards = [pair('img/a.png', ['B', 'C']), pair('img/b.png', ['D', 'E'])];
+    const html = assembleReviewPage(await input(cards));
+    const urls = cards.flatMap((card) => [card.image!.before, card.image!.after]).map((each) => (each as {dataUrl: string}).dataUrl);
+    expect(urls[0]!.length).toBeGreaterThan(10 * 1024 * 1024);
+    const imageBytes = urls.reduce((sum, url) => sum + (html.split(url).length - 1) * url.length, 0);
+    expect(imageBytes).toBeLessThanOrEqual(IMAGE_PAGE_LIMIT);
+    expect(html.length).toBeLessThanOrEqual(IMAGE_PAGE_LIMIT + (html.length - imageBytes));
+    expect(html.length).toBeLessThan(IMAGE_PAGE_LIMIT + 1024 * 1024);
   });
 
   it('shows a new image on its own, and a side the page leaves out as a card that says why', async () => {
@@ -431,6 +541,33 @@ describe('applyBudgets', () => {
     expect(html.includes(side.dataUrl)).toBe(false);
     expect(html.slice(html.indexOf('aria-label="img/hero.png"'))).toContain('image not inlined · page limit');
     expect(html.length).toBeLessThan(33 * 1024 * 1024);
+  });
+});
+
+describe('rich view tags', () => {
+  it('reads a rich view with a long hostile attribute value in linear time, and leaves the value as it is', async () => {
+    const fragment = await renderMarkdown({path: 'README.md', source: '# Readme\n', groups: [], asset: async () => ({kind: 'skipped'}), link: () => ({kind: 'outside'})});
+    const linkValue = '<img b'.repeat(40_000);
+    const imageValue = '<a b'.repeat(40_000);
+    const small = dataUrlOf(16);
+    const hostile = `<p><a title="${linkValue}">t</a></p>\n<p><img alt="${imageValue}" src="${small}"></p>`;
+    const card = textCard('README.md', 'a\n', 'b\n', {kind: 'markdown', rich: {body: {kind: 'rendered', fragment: {...fragment, html: hostile}}}});
+    const started = performance.now();
+    const [carried] = applyBudgets([card]);
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(carried!.article).toContain(`<a title="${linkValue}">t</a>`);
+    expect(carried!.article).toContain(`<img alt="${imageValue}" src="${small}">`);
+  });
+
+  it('copies a tag that is not well formed from its `<` and reads the next tag after it', () => {
+    const seen: string[] = [];
+    const html = '<p>a < b <img src="x"> <img src="y" alt="<b>"/> <img broken="c> <a href="z">';
+    const out = rewriteTags(html, new Set(['img']), (name, tag, attributes) => {
+      seen.push(`${name}|${attributes}`);
+      return tag.toUpperCase();
+    });
+    expect(seen).toEqual(['img| src="x"', 'img| src="y" alt="<b>"']);
+    expect(out).toBe('<p>a < b <IMG SRC="X"> <IMG SRC="Y" ALT="<B>"/> <img broken="c> <a href="z">');
   });
 });
 

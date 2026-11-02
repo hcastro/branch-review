@@ -14,7 +14,7 @@ import {MAX_TILE_PNG_BYTES, tileRange} from '../tileGeometry.js';
 import {createBrowser, type Browser, type BrowserBudget, type TileDocument} from './browser.js';
 import type {ChromeBinary} from './chrome.js';
 import {createTileFinisher} from './mosaic.js';
-import {createReviewBuilder} from '../review/build.js';
+import {createReviewBuilder, type ReadBranch} from '../review/build.js';
 
 // The rendered worker's jobs, with no process of its own, so tests can run
 // them in place. Repo text and images are read, rendered and assembled here;
@@ -83,12 +83,16 @@ type HandlerOptions = {
   // The browser the in-pane view draws with, for a binary.
   browser?: (binary: ChromeBinary) => Browser;
   now?: () => number;
+  // How the page reads the branch from git, and for how long: the real
+  // reads within GIT_BUDGET_MS unless a test says otherwise.
+  branch?: ReadBranch;
+  gitBudgetMs?: number;
 };
 
 // Chromium's profile goes in the session dir, removed at exit.
 const defaultBrowser = (binary: ChromeBinary) => createBrowser({binary, userDataDir: path.join(process.env.BRANCH_REVIEW_MEDIA_TMP ?? os.tmpdir(), 'chrome')});
 
-export function createRenderedHandler({render = renderMarkdown, sleep, lookupBudgetMs, browser: makeBrowser = defaultBrowser, now = Date.now}: HandlerOptions = {}) {
+export function createRenderedHandler({render = renderMarkdown, sleep, lookupBudgetMs, browser: makeBrowser = defaultBrowser, now = Date.now, branch, gitBudgetMs}: HandlerOptions = {}) {
   const sources = createSourceReader(sleep ? {sleep} : {});
   const resolvers = new Map<string, AssetResolver>();
   const held = createLru<Held>(FRAGMENT_CACHE_BYTES, heldBytes);
@@ -165,7 +169,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
   // The Review in browser page, from the fragments held here.
   // Every changed file's sides, read by the ids the review's patches name,
   // none of them fetched.
-  const review = createReviewBuilder({sources: createSourceReader({...(sleep ? {sleep} : {}), local: true}), fragment, now});
+  const review = createReviewBuilder({sources: createSourceReader({...(sleep ? {sleep} : {}), local: true}), fragment, now, ...(branch ? {branch} : {}), ...(gitBudgetMs !== undefined ? {gitBudgetMs} : {})});
 
   let browser: {binary: string; instance: Browser} | null = null;
   let idle: ReturnType<typeof setTimeout> | null = null;

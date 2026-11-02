@@ -3216,25 +3216,20 @@ function AppContent({
     if (notices.length > 0) showToast(notices.at(-1)!, undefined, 'info');
   }, [pages, renderedVersion, showToast]);
 
-  // r and R: the active file's page, or the overview. The crossing plays on
-  // the way, and the footer says where the page went once it ends. A file's
-  // page opens on the line the pane shows on top, at the same height.
+  // r opens the page at the active file's card; R opens it at the top. The
+  // crossing plays on the way, and the footer says where the page went
+  // once it ends.
   const openRendered = useCallback((target: 'file' | 'overview') => {
     if (!pages) return;
     const trip: Trip = {
       cross: (motion) => crossing.start(motion),
       waiting: (message) => showToast(message, undefined, 'info'),
     };
-    // On the page in the pane, the line the page shows at the top.
-    const pageRow = pane?.mode() === 'rendered' ? topPageRow(allDiffRows, diffOffset, visibleDiffRows, activeFileKey) : null;
-    const pageLine = pageRow === null ? null : pane!.lineAtRow(activeFileKey, pageRow);
-    const opening = target === 'overview'
-      ? pages.openOverview(trip)
-      : pages.open({fileKey: activeFileKey, ...(pageLine === null ? topSourceLine(allDiffRows, diffOffset, visibleDiffRows, activeFileKey) : {line: pageLine})}, trip);
+    const opening = target === 'overview' ? pages.openOverview(trip) : pages.open({fileKey: activeFileKey}, trip);
     void opening.then((outcome) => {
       if (outcome) showToast(outcome.message, undefined, outcome.kind);
     });
-  }, [activeFileKey, allDiffRows, crossing, diffOffset, pages, pane, showToast, visibleDiffRows]);
+  }, [activeFileKey, crossing, pages, showToast]);
 
   // `v` on a markdown file: the page in the pane, with its crossing, or
   // back to the diff in one frame. What the pane can't do is said in the

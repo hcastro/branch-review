@@ -57,6 +57,9 @@ export type ForkedWorkerSpec<Type extends string> = {
   // Job types that count as one toward their limit, by a shared name: the
   // rendered worker's layout and tile jobs take turns with one browser.
   limitGroups?: Partial<Record<Type, string>>;
+  // Job types the worker hears as another: a lane of the client's queue,
+  // with a limit of its own, for the same job.
+  sendAs?: Partial<Record<Type, string>>;
 };
 
 export type ForkedWorkerOptions<Type extends string> = {
@@ -82,6 +85,10 @@ export type ForkedWorker<Jobs extends JobMap> = {
   // Gives the queued job submitted with `signal` a new priority. A job
   // already sent to the worker keeps running as it is.
   prioritize(signal: AbortSignal, priority: number): void;
+  // Moves the queued job submitted with `signal` to the lane of `type`, a
+  // type the worker hears as the job's own (spec.sendAs), and says whether
+  // it did: false once the job was sent to the worker, or settled.
+  promote(signal: AbortSignal, type: keyof Jobs & string): boolean;
   // Ends the worker at once (exit hook): synchronous.
   dispose(): void;
   // Why the worker is off for the session, or null.
@@ -155,6 +162,7 @@ export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<k
   const limits: Partial<Record<string, number>> = spec.perTypeLimit ?? {};
   const groups: Partial<Record<string, string>> = spec.limitGroups ?? {};
   const groupOf = (type: string) => groups[type] ?? type;
+  const sendAs: Partial<Record<string, string>> = spec.sendAs ?? {};
   const queue: Job[] = [];
   const inFlight = new Map<number, Job>();
   let child: ChildProcess | null = null;
@@ -342,7 +350,7 @@ export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<k
       job.timer = setTimeout(() => onDeadline(job), deadlines[job.type]);
       job.timer.unref();
       try {
-        child.send({id: job.id, type: job.type, ...job.request});
+        child.send({id: job.id, type: sendAs[job.type] ?? job.type, ...job.request});
       } catch {
         // The worker is going away; its close event fails or re-queues this.
       }
@@ -384,6 +392,13 @@ export function createForkedWorker<Jobs extends JobMap>(spec: ForkedWorkerSpec<k
       if (!job) return;
       job.priority = priority;
       pump();
+    },
+    promote(signal, type) {
+      const job = queue.find((each) => each.signal === signal && !each.settled);
+      if (!job) return false;
+      job.type = type;
+      pump();
+      return true;
     },
     dispose() {
       if (disposed) return;

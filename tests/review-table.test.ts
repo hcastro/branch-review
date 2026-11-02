@@ -1,6 +1,6 @@
 import {describe, expect, it} from 'vitest';
 import {drawHunk, parseHunks, type CardDiff} from '../src/rendered/review/diff.js';
-import {EXPAND_STEP, expandGap, gapsOf, tableHtml, tableRows} from '../src/rendered/review/table.js';
+import {EXPAND_STEP, expandGap, gapsOf, keptShown, tableHtml, tableRows} from '../src/rendered/review/table.js';
 import {diffFile} from './rendered-helpers.js';
 
 // The diff table both sides draw: the page as it arrives (unified), and the
@@ -97,6 +97,26 @@ describe('tableHtml', () => {
     expect(html).toContain('<tr><td class="ln emp"></td><td class="cd emp"></td><td class="ln add" data-n="3"></td><td class="cd add"><span class="mk">+</span>new</td></tr>');
   });
 
+  it('escapes git\'s function context in the header, in both layouts', () => {
+    const evil = 'function x() { </script><img src=x onerror=alert(1)> }';
+    const card: CardDiff = {hunks: [{...drawHunk(parseHunks([{rawDiff: '@@ -1 +1 @@\n-a\n+b\n'}])[0]!), context: evil}], context: null};
+    for (const mode of ['unified', 'split'] as const) {
+      const html = tableHtml(card, [], mode);
+      expect(html).toContain('&lt;img');
+      expect(html).not.toContain(evil);
+      expect(html).not.toContain('<img');
+    }
+  });
+
+  it('draws the hidden characters in git\'s function context as markers, in both layouts', () => {
+    const card: CardDiff = {hunks: [{...drawHunk(parseHunks([{rawDiff: '@@ -1 +1 @@\n-a\n+b\n'}])[0]!), context: 'run(\u202E) {'}], context: null};
+    for (const mode of ['unified', 'split'] as const) {
+      const html = tableHtml(card, [], mode);
+      expect(html).toContain('run(<span class="rv-hc" title="U+202E">&lt;U+202E&gt;</span>) {');
+      expect(html).not.toContain('\u202E');
+    }
+  });
+
   it('draws a disabled control that says to open the file', () => {
     const {hunks, total} = card();
     const html = tableHtml({hunks, context: null, contextNote: 'budget', total}, [0, 0, 0], 'unified');
@@ -116,5 +136,30 @@ describe('tableHtml', () => {
     }
     // A control that works needs no words.
     expect(tableHtml({hunks, context: null, total}, [0, 0, 0], 'unified')).not.toContain('hx-more');
+  });
+});
+
+describe('counts kept from an earlier page of the same diff', () => {
+  it('opens no more of each gap than the page carries, and none of a gap whose lines it doesn\'t carry', () => {
+    const full = card();
+    const shown = [6, 13, 7];
+    // The same diff with its file left out, or with only its first 20 lines.
+    const none = card(false);
+    const short: CardDiff = {...full, context: full.context!.slice(0, 20)};
+    expect(keptShown(full, shown)).toEqual([6, 13, 7]);
+    expect(keptShown(full, [99, -3, 2.5])).toEqual([6, 0, 2]);
+    expect(keptShown(none, shown)).toEqual([0, 0, 0]);
+    expect(keptShown(short, shown)).toEqual([6, 0, 0]);
+  });
+
+  it('draws a table from counts past what the page carries with no line it lacks, in both layouts', () => {
+    const none = card(false);
+    const short: CardDiff = {...card(), context: card().context!.slice(0, 20)};
+    for (const layout of ['unified', 'split'] as const) {
+      expect(() => tableHtml(none, [6, 13, 7], layout)).not.toThrow();
+      expect(tableHtml(none, [6, 13, 7], layout)).toBe(tableHtml(none, [], layout));
+      expect(tableHtml(short, [6, 13, 7], layout)).not.toContain('undefined');
+      expect(tableRows(short, [6, 13, 7]).filter((row) => row.kind === 'line' && row.revealed).length).toBe(6);
+    }
   });
 });

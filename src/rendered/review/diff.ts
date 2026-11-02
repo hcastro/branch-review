@@ -4,13 +4,19 @@
 // the page script bundles it too, to draw the split view and the context a
 // reader expands from the same lines the page arrived with.
 
+import {HIDDEN_CHARACTERS, visibleMarker} from '../../controlChars.js';
+
 export type LineKind = ' ' | '+' | '-';
 
 /** One line of a hunk: its kind, its number on the base (`o`) and the reviewed (`n`) side, and its text. */
 export type HunkLine = {t: LineKind; o?: number; n?: number; text: string};
 
-/** One hunk: where it starts on each side, how many lines it covers there, and the function context git printed after its `@@`. */
-export type Hunk = {oldStart: number; oldLines: number; newStart: number; newLines: number; context: string; lines: HunkLine[]};
+/**
+ * One hunk: where it starts on each side, how many lines it covers there,
+ * and the function context git printed after its `@@`. `crEnds`: the
+ * indexes of its lines that ended in `\r` before their `\n`, when any did.
+ */
+export type Hunk = {oldStart: number; oldLines: number; newStart: number; newLines: number; context: string; lines: HunkLine[]; crEnds?: number[]};
 
 /** A line as the page draws it: `h` is its text as HTML, escaped, with syntax and word marks. */
 export type DrawnLine = {t: LineKind; o?: number; n?: number; h: string};
@@ -37,7 +43,7 @@ const HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@([^\n]*)$/;
  * `@@` header, then its lines. A `\ No newline at end of file` note is no
  * line of the file, and a bare empty line is a blank context line, as git
  * prints one with diff.suppressBlankEmpty. A line's `\r` before its `\n`
- * is the file's line end, not its text.
+ * is the file's line end, not its text: `crEnds` says which lines had one.
  */
 export function parseHunks(blocks: ReadonlyArray<{rawDiff: string}>): Hunk[] {
   const hunks: Hunk[] = [];
@@ -50,14 +56,17 @@ export function parseHunks(blocks: ReadonlyArray<{rawDiff: string}>): Hunk[] {
     const hunk: Hunk = {oldStart: Number(match[1]), oldLines: count(match[2]), newStart: Number(match[3]), newLines: count(match[4]), context: match[5]!.trim(), lines: []};
     let old = firstLine(hunk.oldStart, hunk.oldLines);
     let next = firstLine(hunk.newStart, hunk.newLines);
+    const crEnds: number[] = [];
     for (const raw of lines.slice(1)) {
       const marker = raw[0] ?? ' ';
       if (marker === '\\') continue;
+      if (raw.endsWith('\r')) crEnds.push(hunk.lines.length);
       const text = raw.slice(1).replace(/\r$/, '');
       if (marker === '+') hunk.lines.push({t: '+', n: next++, text});
       else if (marker === '-') hunk.lines.push({t: '-', o: old++, text});
       else hunk.lines.push({t: ' ', o: old++, n: next++, text});
     }
+    if (crEnds.length > 0) hunk.crEnds = crEnds;
     hunks.push(hunk);
   }
   return hunks;
@@ -82,8 +91,16 @@ export function wordRange(before: string, after: string): [[number, number], [nu
   if (before.trim() === '' || after.trim() === '') return null;
   let prefix = 0;
   while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix += 1;
+  // The offsets count UTF-16 code units, as the word mark and the page
+  // script's text nodes do: a shared part that ends inside a surrogate pair
+  // gives that pair back, so no mark cuts a character in two. Both lines
+  // share the part, so `before` alone says where it ends.
+  const high = (code: number) => code >= 0xD800 && code <= 0xDBFF;
+  const low = (code: number) => code >= 0xDC00 && code <= 0xDFFF;
+  if (prefix > 0 && high(before.charCodeAt(prefix - 1))) prefix -= 1;
   let suffix = 0;
   while (suffix < before.length - prefix && suffix < after.length - prefix && before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) suffix += 1;
+  if (suffix > 0 && low(before.charCodeAt(before.length - suffix))) suffix -= 1;
   if (prefix + suffix < Math.min(before.length, after.length) * 0.4) return null;
   if (prefix + suffix === before.length && prefix + suffix === after.length) return null;
   const word = (char: string | undefined) => char !== undefined && /\w/.test(char);
@@ -99,6 +116,19 @@ export function wordRange(before: string, after: string): [[number, number], [nu
  */
 export function pairedRanges(lines: readonly HunkLine[]): Map<number, [number, number]> {
   const ranges = new Map<number, [number, number]>();
+  for (const [removed, added] of linePairs(lines)) {
+    const range = wordRange(lines[removed]!.text, lines[added]!.text);
+    if (!range) continue;
+    ranges.set(removed, range[0]);
+    ranges.set(added, range[1]);
+  }
+  return ranges;
+}
+
+// A hunk's paired lines, by index, removed then added: each run of removed
+// lines with the run of added lines right after it, in order.
+function linePairs(lines: readonly HunkLine[]): Array<[number, number]> {
+  const pairs: Array<[number, number]> = [];
   for (let index = 0; index < lines.length;) {
     if (lines[index]!.t !== '-') {
       index += 1;
@@ -108,14 +138,48 @@ export function pairedRanges(lines: readonly HunkLine[]): Map<number, [number, n
     const added: number[] = [];
     while (index < lines.length && lines[index]!.t === '-') removed.push(index++);
     while (index < lines.length && lines[index]!.t === '+') added.push(index++);
-    for (let pair = 0; pair < Math.min(removed.length, added.length); pair += 1) {
-      const range = wordRange(lines[removed[pair]!]!.text, lines[added[pair]!]!.text);
-      if (!range) continue;
-      ranges.set(removed[pair]!, range[0]);
-      ranges.set(added[pair]!, range[1]);
-    }
+    for (let pair = 0; pair < Math.min(removed.length, added.length); pair += 1) pairs.push([removed[pair]!, added[pair]!]);
   }
-  return ranges;
+  return pairs;
+}
+
+/**
+ * The lines of a hunk whose `\r` line end is part of what changed: a
+ * paired line whose pair ends otherwise. A line end both sides share (a
+ * CRLF file's, or a pair that both end in `\r`) is no change, and draws
+ * nothing.
+ */
+function changedEnds(hunk: Hunk): Set<number> {
+  const ends = new Set(hunk.crEnds ?? []);
+  const changed = new Set<number>();
+  if (ends.size === 0) return changed;
+  for (const [removed, added] of linePairs(hunk.lines)) {
+    if (ends.has(removed) === ends.has(added)) continue;
+    changed.add(ends.has(removed) ? removed : added);
+  }
+  return changed;
+}
+
+// How many characters of text `html` holds: an entity is one, a tag none.
+function textLength(html: string) {
+  return html.replace(/<[^>]*>/g, '').replace(/&[^;]*;/g, '_').length;
+}
+
+/**
+ * `html` (a finished line or a string of the page's chrome, whose tags and
+ * attributes are ours and hold no hidden character) with each character
+ * that would hide or reorder the text around it drawn as the terminal's
+ * marker, `<U+202E>`, as a span with its code point in its tip: a bidi
+ * control can make code read differently than it runs (Trojan Source), and
+ * a zero-width one can make two paths look the same. A tab keeps its
+ * meaning. Run after the word marks, whose ranges count the raw text.
+ */
+export function markHidden(html: string) {
+  return html.replace(HIDDEN_CHARACTERS, (char) => {
+    if (char === '\t') return char;
+    const code = char.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0');
+    return `<span class="rv-hc" title="U+${code}">${escapeText(visibleMarker(char))}</span>`;
+  });
 }
 
 /** Text as HTML: the characters that would open a tag or an entity, or end an attribute, escaped. */
@@ -220,17 +284,26 @@ export function unpackDiff(packed: PackedDiff, drawnLines: readonly DrawnLine[] 
 /**
  * A hunk drawn: each line's HTML from the side it is on (`oldHtml` or
  * `newHtml`, by its number, when the whole side was highlighted; else its
- * own text, escaped), with the word mark where a paired line differs.
+ * own text, escaped), with the word mark where a paired line differs. A
+ * line whose `\r` line end its pair lacks ends in the `^M` marker, word
+ * marked: a change of line end alone would otherwise draw two lines that
+ * look the same.
  */
 export function drawHunk(hunk: Hunk, html: {old?: (line: number) => string | undefined; new?: (line: number) => string | undefined} = {}): DrawnHunk {
   const ranges = pairedRanges(hunk.lines);
-  const {lines, ...rest} = hunk;
+  const ends = changedEnds(hunk);
+  const {lines, crEnds: _crEnds, ...rest} = hunk;
   return {
     ...rest,
     lines: lines.map((line, index) => {
       const drawn = (line.t === '-' ? html.old?.(line.o!) : html.new?.(line.n!)) ?? escapeText(line.text);
       const range = ranges.get(index);
-      return {t: line.t, ...(line.o !== undefined ? {o: line.o} : {}), ...(line.n !== undefined ? {n: line.n} : {}), h: range ? markRange(drawn, range[0], range[1]) : drawn};
+      let marked = range ? markRange(drawn, range[0], range[1]) : drawn;
+      if (ends.has(index)) {
+        const at = textLength(marked);
+        marked = markRange(`${marked}\r`, at, at + 1);
+      }
+      return {t: line.t, ...(line.o !== undefined ? {o: line.o} : {}), ...(line.n !== undefined ? {n: line.n} : {}), h: markHidden(marked)};
     }),
   };
 }

@@ -17,6 +17,7 @@ import type {PageBody} from './page.js';
 import {linkReport, type Finding, type ReportSource} from './report.js';
 import {createRenderThread} from './renderThread.js';
 import {createReviewBuilder} from './review/build.js';
+import {GENERATOR} from './review/page.js';
 import {reviewCardRequest} from './review/request.js';
 import {specialText} from './review/special.js';
 import {writeErrorReason} from './site.js';
@@ -247,7 +248,9 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
   const builder = createReviewBuilder({
     sources: createSourceReader({sleep, local: true}),
     fragment: async (request) => ({body: byKey.get(request.key) ?? {kind: 'failed', reason: 'not rendered', source: ''}}),
+    // Nobody waits on an export: every side the grammars take is colored.
     buildBudgetMs: Infinity,
+    buildColorCost: Infinity,
     gitBudgetMs: EXPORT_GIT_BUDGET_MS,
   });
   const reviewId = createHash('sha256').update(JSON.stringify([cwd, range.base, review.branch])).digest('hex').slice(0, 16);
@@ -266,6 +269,8 @@ export async function renderToDirectory({cwd, range, review, outDir, outLabel, n
   });
 
   prepareDir(outDir, outLabel);
+  // Both are checked before either is written, so a refusal writes nothing.
+  for (const [name, ours] of [[PAGE_FILE, isOurPage], [LINKS_FILE, isOurLinks]] as const) refuseForeign(outDir, outLabel, name, ours);
   writeFile(outDir, outLabel, PAGE_FILE, html);
   writeFile(outDir, outLabel, LINKS_FILE, formatLinks(review, sources, findings));
 
@@ -328,6 +333,51 @@ function prepareDir(outDir: string, outLabel: string) {
   } catch (error) {
     throw writeFailure(outLabel, error);
   }
+}
+
+// What an earlier export wrote: a page that names us in its <head>, and a
+// link report with the keys formatLinks writes.
+const LINKS_KEYS = ['base', 'branch', 'findings', 'links', 'version'];
+const isOurPage = (file: string) => {
+  const head = Buffer.alloc(4096);
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    return head.subarray(0, fs.readSync(fd, head, 0, head.length, 0)).toString('utf8').includes(GENERATOR);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+const isOurLinks = (file: string) => {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(fd, 'utf8')) as unknown;
+  } finally {
+    fs.closeSync(fd);
+  }
+  return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).sort().join() === LINKS_KEYS.join();
+};
+const FOREIGN: Record<string, string> = {[PAGE_FILE]: "isn't a branch-review page", [LINKS_FILE]: "isn't a branch-review link report"};
+
+// An export replaces only its own last run: a name in the dir that holds
+// anything else (a tracked file, a symlink, a folder) stops it with nothing
+// written, so `--export-html site` never writes over a site's own page.
+function refuseForeign(outDir: string, outLabel: string, name: string, ours: (file: string) => boolean) {
+  const file = path.join(outDir, name);
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw writeFailure(outLabel, error);
+  }
+  let mine = false;
+  try {
+    mine = stat.isFile() && ours(file);
+  } catch {
+    mine = false;
+  }
+  if (!mine) throw new Error(`can't write the page to ${outLabel}: ${name} is already there and ${FOREIGN[name]}`);
 }
 
 // Temp name then rename, so a reader never sees half a file, and a rerun

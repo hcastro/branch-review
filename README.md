@@ -126,7 +126,7 @@ branch-review --export-html ../pages
 
 Pick a directory outside the repo. A page written inside it shows up as an untracked file in the next review.
 
-The directory gets the page as `index.html`, one HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. It also gets `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
+The directory gets the page as `index.html`, one HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. It also gets `links.json`, which lists every link with what it resolves to. A later run replaces only an `index.html` and a `links.json` that `branch-review` wrote before, and refuses to write over any other file. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
 
 ## Review untrusted changes safely
 

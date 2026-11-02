@@ -72,9 +72,13 @@ function setup({files = [PAGE, CODE, OTHER], preview = true, tips = true, animat
   const listeners = new Set<() => void>();
   let version = 0;
   const opened: string[] = [];
+  // What each `open` was asked, whole.
+  const asked: unknown[] = [];
   const pages: RenderedPages = {
     renderable: (key) => pageable.has(key),
-    open: async ({fileKey: key}): Promise<OpenOutcome> => {
+    open: async (request): Promise<OpenOutcome> => {
+      const {fileKey: key} = request;
+      asked.push(request);
       opened.push(key);
       return {kind: 'info', message: `⇗ ${key} opened in the browser split`};
     },
@@ -111,7 +115,7 @@ function setup({files = [PAGE, CODE, OTHER], preview = true, tips = true, animat
     />,
     size,
   );
-  return {instance, say, opened};
+  return {instance, say, opened, asked};
 }
 
 const settle = (times = 8) => flush(times);
@@ -123,6 +127,16 @@ async function press(instance: ReturnType<typeof setup>['instance'], key: string
   await settle();
 }
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('r', () => {
+  it('opens the page at the active file\'s card, asking for nothing but the file', async () => {
+    const {instance, asked} = setup({tips: false});
+    await settle();
+    await press(instance, 'r');
+    await settle();
+    expect(asked).toEqual([{fileKey: fileKey({path: PAGE.path})}]);
+  });
+});
 
 describe('the header buttons, in words', () => {
   it('shows Preview and Review in browser on a markdown file, and Diff in place of Preview while the Preview shows', async () => {

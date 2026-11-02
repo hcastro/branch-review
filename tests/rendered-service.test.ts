@@ -7,7 +7,8 @@ import {afterEach, describe, expect, it} from 'vitest';
 import type {DiffRange} from '../src/git.js';
 import type {ReviewFile, ReviewModel} from '../src/review/model.js';
 import type {EmbeddersRequest, FragmentRequest, FragmentResult, FragmentSummary, LayoutRequest, RenderedBackend, ReviewRequest, ReviewResult} from '../src/rendered/backend.js';
-import {GIT_BUDGET_MS} from '../src/rendered/review/build.js';
+import {createReviewBuilder, GIT_BUDGET_MS} from '../src/rendered/review/build.js';
+import type {SourceReader} from '../src/rendered/source.js';
 import {createRenderedService, OPEN_DEADLINE_MS, PRESS_WAIT_MS, REVIEW_ALIAS, startRenderedService, TIPS_BUDGET_MS} from '../src/rendered/service.js';
 import type {RunTool} from '../src/rendered/run.js';
 import {createSurface, type Surface} from '../src/rendered/surface.js';
@@ -116,6 +117,8 @@ function serviceWith(backend: RenderedBackend, clock = fakeTimers(), site?: Retu
   const service = createRenderedService({backend, site: usedSite, now: clock.now, setTimer: clock.setTimer});
   return {service, clock, dir: path.join(session, 'rendered')};
 }
+
+const SCRIPTED_RENDERED_WORKER = fileURLToPath(new URL('./fixtures/scripted-rendered-worker.mjs', import.meta.url));
 
 const pageFiles = (dir: string) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => /^[0-9a-f]{20}\.html$/.test(name)) : []);
 const cardOf = (request: ReviewRequest, file: string) => request.cards.find((card) => card.path === file)!;
@@ -614,6 +617,25 @@ describe('opening the page', () => {
     expect(surface.shown).toEqual([]);
   });
 
+  it('waits as long as the open deadline it was given', async () => {
+    const held = deferred<ReviewResult>();
+    const {backend} = scriptedBackend(undefined, () => held.promise);
+    const clock = fakeTimers();
+    const session = makeTempDir('branch-review-open-deadline-');
+    const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session, now: clock.now}), surface: recordingSurface(), now: clock.now, setTimer: clock.setTimer, openDeadlineMs: 20_000});
+    service.setReview(review([edited('docs/stuck.md')]), CTX);
+    let outcome: unknown;
+    void service.open({fileKey: 'docs/stuck.md'}, {cross: async () => undefined, waiting: () => undefined}).then((value) => {
+      outcome = value;
+    });
+    await clock.advance(OPEN_DEADLINE_MS + 1);
+    expect(outcome).toBeUndefined();
+    await clock.advance(20_000 - OPEN_DEADLINE_MS);
+    expect(outcome).toEqual({kind: 'error', message: 'stuck.md took too long to prepare'});
+    held.resolve({ok: true, html: '<p>late</p>'});
+    service.dispose();
+  });
+
   it('opens within the deadline when git and the refs never answer and the markdown renders slowly, saying the branch state is unknown', async () => {
     // The worker's build waits out git's budget, then answers with the page
     // that says git didn't say, as partial.
@@ -638,6 +660,190 @@ describe('opening the page', () => {
     expect(Math.max(PRESS_WAIT_MS, TIPS_BUDGET_MS) + GIT_BUDGET_MS + 1_000).toBeLessThanOrEqual(OPEN_DEADLINE_MS);
   });
 
+  it('starts the press\'s page at once in a real worker while two slow fragments hold the render turns, and opens it inside the deadline', async () => {
+    const session = makeTempDir('branch-review-open-slots-');
+    const backend = createRenderedBackend({tempDir: () => session, cwd: session, modulePath: SCRIPTED_RENDERED_WORKER});
+    try {
+      const surface = recordingSurface();
+      const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session}), surface, live: false});
+      // The page's first card names how long the scripted worker takes on it.
+      service.setReview(review([diffFile('a\n', 'b\n', 'delay-5800-app.ts'), edited('delay-4500-a.md'), edited('delay-4500-b.md')]), CTX);
+      const started = Date.now();
+      const outcome = await service.open({fileKey: 'delay-5800-app.ts'}, {cross: async () => undefined, waiting: () => undefined});
+      expect(outcome).toEqual({kind: 'info', message: '⇗ delay-5800-app.ts opened in the browser split'});
+      expect(Date.now() - started).toBeLessThan(OPEN_DEADLINE_MS);
+      const jobs = fs.readFileSync(path.join(session, 'rendered-scripted.log'), 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {event: string; type?: string; at: number});
+      const sent = (type: string) => jobs.filter((entry) => entry.type === type).map((entry) => entry.at);
+      // Both fragments were still in flight when the page went out.
+      expect(sent('fragment')).toHaveLength(2);
+      expect(sent('review')[0]! - Math.max(...sent('fragment'))).toBeLessThan(4_500);
+      service.dispose();
+    } finally {
+      backend.dispose();
+    }
+  }, 30_000);
+
+  it('opens a press inside the deadline in a real worker while a slow page an earlier pass asked for holds the background turn', async () => {
+    const session = makeTempDir('branch-review-open-behind-page-');
+    const backend = createRenderedBackend({tempDir: () => session, cwd: session, modulePath: SCRIPTED_RENDERED_WORKER});
+    try {
+      const surface = recordingSurface();
+      const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session}), surface, live: false});
+      const log = path.join(session, 'rendered-scripted.log');
+      const jobs = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {event: string; type?: string; path?: string; at: number}) : []);
+      // The prerender's page names its first card: the scripted worker takes 20 s on it.
+      service.setReview(review([diffFile('a\n', 'b\n', 'delay-20000-app.ts'), edited('answer-a.md')]), CTX);
+      for (let wait = 0; wait < 100 && !jobs().some((entry) => entry.type === 'review'); wait += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(jobs().filter((entry) => entry.type === 'review').map((entry) => entry.path)).toEqual(['delay-20000-app.ts']);
+      // An edit, then a press: a page under another name, while that one is still in the worker.
+      service.setReview(review([diffFile('a\n', 'c\n', 'answer-b.ts'), edited('answer-a.md')]), CTX);
+      const started = Date.now();
+      const outcome = await service.open({fileKey: 'answer-b.ts'}, {cross: async () => undefined, waiting: () => undefined});
+      expect(outcome).toEqual({kind: 'info', message: '⇗ answer-b.ts opened in the browser split'});
+      expect(Date.now() - started).toBeLessThan(OPEN_DEADLINE_MS);
+      const pages = jobs().filter((entry) => entry.type === 'review');
+      expect(pages.map((entry) => entry.path)).toEqual(['delay-20000-app.ts', 'answer-b.ts']);
+      // Sent while the slow one was still being built.
+      expect(pages[1]!.at - pages[0]!.at).toBeLessThan(20_000);
+      service.dispose();
+    } finally {
+      backend.dispose();
+    }
+  }, 40_000);
+
+  // A real forked worker running the scripted fixture, and its log of jobs.
+  const scriptedWorker = (prefix: string) => {
+    const session = makeTempDir(prefix);
+    const backend = createRenderedBackend({tempDir: () => session, cwd: session, modulePath: SCRIPTED_RENDERED_WORKER});
+    const log = path.join(session, 'rendered-scripted.log');
+    const jobs = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as {event: string; type?: string; path?: string; at: number}) : []);
+    const pages = () => jobs().filter((entry) => entry.type === 'review');
+    const until = async (done: () => boolean) => {
+      for (let wait = 0; wait < 100 && !done(); wait += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+    };
+    return {session, backend, jobs, pages, until};
+  };
+  const noTrip = {cross: async () => undefined, waiting: () => undefined};
+
+  it('opens a press that writes its own page, its pass still rendering at the end of its wait, inside the deadline in a real worker while a slow page holds the background turn', async () => {
+    const {session, backend, jobs, pages, until} = scriptedWorker('branch-review-open-own-write-');
+    try {
+      const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session}), surface: recordingSurface(), live: false});
+      // The prerender's page names its first card: the scripted worker takes 20 s on it.
+      service.setReview(review([diffFile('a\n', 'b\n', 'delay-20000-app.ts'), edited('answer-a.md')]), CTX);
+      await until(() => pages().length > 0);
+      expect(pages().map((entry) => entry.path)).toEqual(['delay-20000-app.ts']);
+      // An edit, then a press whose markdown takes 4 s to render: past the
+      // press's wait, so the press writes the page itself.
+      service.setReview(review([diffFile('a\n', 'c\n', 'answer-b.ts'), edited('delay-4000-doc.md')]), CTX);
+      const started = Date.now();
+      const outcome = await service.open({fileKey: 'answer-b.ts'}, noTrip);
+      const took = Date.now() - started;
+      expect(outcome).toEqual({kind: 'info', message: '⇗ answer-b.ts opened in the browser split'});
+      expect(took).toBeLessThan(OPEN_DEADLINE_MS);
+      // The press's own write, at the end of its wait, before the render was back.
+      const fragment = jobs().find((entry) => entry.type === 'fragment' && entry.path === 'delay-4000-doc.md')!;
+      const own = pages()[1]!;
+      expect(own.path).toBe('answer-b.ts');
+      expect(own.at - started).toBeGreaterThanOrEqual(PRESS_WAIT_MS - 100);
+      expect(own.at - fragment.at).toBeLessThan(4_000);
+      // The slow page was still in the worker.
+      expect(own.at - pages()[0]!.at).toBeLessThan(20_000);
+      service.dispose();
+    } finally {
+      backend.dispose();
+    }
+  }, 40_000);
+
+  it('joins, in a real worker, the page a pass is already building for the same review, sending one page job and opening when it ends', async () => {
+    const {session, backend, pages, until} = scriptedWorker('branch-review-open-join-');
+    try {
+      const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session}), surface: recordingSurface(), live: false});
+      // The page takes 6 s in the worker. A markdown file makes the review
+      // one the prerender renders, and writes the page for.
+      service.setReview(review([diffFile('a\n', 'b\n', 'delay-6000-app.ts'), edited('answer-a.md')]), CTX);
+      await until(() => pages().length > 0);
+      const building = pages()[0]!;
+      // The press comes 2 s into that build, for the same review.
+      await new Promise((resolve) => setTimeout(resolve, 2_000 - (Date.now() - building.at)));
+      const outcome = await service.open({fileKey: 'delay-6000-app.ts'}, noTrip);
+      const openedAt = Date.now();
+      expect(outcome).toEqual({kind: 'info', message: '⇗ delay-6000-app.ts opened in the browser split'});
+      expect(pages()).toHaveLength(1);
+      // No later than the build it joined, with room for the answer to arrive.
+      expect(openedAt - building.at).toBeLessThan(6_000 + 1_000);
+      service.dispose();
+    } finally {
+      backend.dispose();
+    }
+  }, 40_000);
+
+  it('moves, in a real worker, a page a pass wrote that still waits behind a slow page into the press\'s turn, sending it once', async () => {
+    const {session, backend, pages, until} = scriptedWorker('branch-review-open-promote-');
+    try {
+      const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => session}), surface: recordingSurface(), live: false});
+      service.setReview(review([diffFile('a\n', 'b\n', 'delay-20000-app.ts'), edited('answer-a.md')]), CTX);
+      await until(() => pages().length > 0);
+      // An edit whose pass writes its page in the background: it waits for the slow one.
+      service.setReview(review([diffFile('a\n', 'c\n', 'answer-b.ts'), edited('answer-a.md')]), CTX);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(pages()).toHaveLength(1);
+      const started = Date.now();
+      const outcome = await service.open({fileKey: 'answer-b.ts'}, noTrip);
+      expect(outcome).toEqual({kind: 'info', message: '⇗ answer-b.ts opened in the browser split'});
+      expect(Date.now() - started).toBeLessThan(OPEN_DEADLINE_MS);
+      expect(pages().map((entry) => entry.path)).toEqual(['delay-20000-app.ts', 'answer-b.ts']);
+      service.dispose();
+    } finally {
+      backend.dispose();
+    }
+  }, 40_000);
+
+  it('joins a page a pass is writing in the background when a press asks for the same page, moving it into the press\'s turn only while it still waits for one', async () => {
+    for (const queued of [true, false]) {
+      const calls: Array<{press: boolean | undefined; signal: AbortSignal}> = [];
+      const promoted: AbortSignal[] = [];
+      const {backend} = scriptedBackend();
+      let release: (() => void) | null = null;
+      backend.review = async (request, signal, press) => {
+        calls.push({press, signal});
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return {ok: true, html: `<p>${request.key}</p>`};
+      };
+      // `queued`: the job still waits for a worker turn; else the worker is building it.
+      backend.promote = (signal) => {
+        promoted.push(signal);
+        return queued;
+      };
+      const {service, clock, trip} = openingService(backend);
+      service.setReview(review([edited('README.md')]), CTX);
+      await clock.advance(2_000);
+      expect(calls.map((each) => each.press)).toEqual([false]);
+      const opening = service.open({fileKey: 'README.md'}, trip);
+      // A second press while the first one's page is on its way waits for it.
+      const again = service.open({fileKey: 'README.md'}, trip);
+      let outcome: Awaited<typeof again> | undefined;
+      void again.then((value) => {
+        outcome = value;
+      });
+      await clock.advance(3_000);
+      // No second build of the same page: the press asked for the job to move.
+      expect(calls).toHaveLength(1);
+      expect(promoted[0]).toBe(calls[0]!.signal);
+      expect(calls[0]!.signal.aborted).toBe(false);
+      // Moved once: a later press finds it in a press's turn already.
+      expect(promoted).toHaveLength(queued ? 1 : 2);
+      release!();
+      for (let at = 0; at < 3_000 && outcome === undefined; at += 100) await clock.advance(100);
+      expect(outcome).toEqual({kind: 'info', message: '⇗ README.md opened in the browser split'});
+      expect(await opening).toBeNull();
+      expect(calls).toHaveLength(1);
+      service.dispose();
+    }
+  });
+
   it('names the card by its place on the page the press wrote, though a file came into the review while it waited', async () => {
     const held = deferred<FragmentResult>();
     const {backend} = scriptedBackend(() => held.promise);
@@ -654,6 +860,25 @@ describe('opening the page', () => {
     for (let at = 0; at < OPEN_DEADLINE_MS - 500 && outcome === undefined; at += 100) await clock.advance(100);
     expect(outcome).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
     expect(hashOf(surface.shown[0]!)).toBe('file-2&m=1&n=1');
+  });
+
+  it('names the card by its place on the page the press wrote, though a file came into the review while the crossing played', async () => {
+    const {backend, reviews} = scriptedBackend();
+    const {service, clock, surface} = openingService(backend, {surface: recordingSurface({opensSplit: () => true})});
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    const crossing = deferred<void>();
+    const opening = service.open({fileKey: 'docs/guide.md'}, {cross: () => crossing.promise, waiting: () => undefined});
+    for (let at = 0; at < 3_000 && reviews.length === 0; at += 100) await clock.advance(100);
+    await clock.advance(0);
+    expect(reviews).toHaveLength(1);
+    expect(surface.shown).toEqual([]);
+    // An agent adds a file that sorts first while the crossing still plays.
+    service.setReview(review([edited('CHANGELOG.md'), edited('README.md'), edited('docs/guide.md')]), CTX);
+    crossing.resolve();
+    expect(await opening).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
+    // The page shown is the press's own, where the guide is the second card.
+    expect(surface.shown[0]!.split('#')[0]).toContain(reviews[0]!.key);
+    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1');
   });
 
   it('says why a page could not be written, and why the surface refused it', async () => {
@@ -961,6 +1186,117 @@ describe('the page on disk and the refs it is read from', () => {
   });
 });
 
+describe('the prerender limit', () => {
+  const docs = (count: number, edits: Record<number, string> = {}) => review(Array.from({length: count}, (_, at) => edited(`docs/doc-${String(at).padStart(2, '0')}.md`, 'One.\n', edits[at] ?? 'One, edited.\n')));
+
+  it('renders an edited far file once a live split shows the page, so the refresh draws its rich view', async () => {
+    const {backend, reviews, fragments} = scriptedBackend();
+    const {service, clock, trip} = openingService(backend);
+    service.setReview(docs(50), CTX);
+    await service.open({fileKey: 'docs/doc-00.md'}, trip);
+    await clock.advance(3_000);
+    // The agent edits a file far past the first 40.
+    service.setReview(docs(50, {45: 'One, edited by the agent.\n'}), CTX);
+    await clock.advance(3_000);
+    expect(fragments.some((each) => each.request.path === 'docs/doc-45.md' && each.request.key === cardOf(reviews.at(-1)!, 'docs/doc-45.md').fragment?.key)).toBe(true);
+    expect(cardOf(reviews.at(-1)!, 'docs/doc-45.md').fragment).toBeDefined();
+  });
+
+  it('asks a live split\'s pass past the limit only for the far file an edit changed, keeping the answers the press had for the rest', async () => {
+    const {backend, reviews, fragments} = scriptedBackend();
+    const {service, clock, trip} = openingService(backend);
+    service.setReview(docs(50), CTX);
+    await service.open({fileKey: 'docs/doc-00.md'}, trip);
+    await clock.advance(3_000);
+    // The press asked for every file.
+    expect(new Set(fragments.map((each) => each.request.path)).size).toBe(50);
+    const asked = fragments.length;
+    service.setReview(docs(50, {45: 'One, edited by the agent.\n'}), CTX);
+    await clock.advance(3_000);
+    const pass = fragments.slice(asked).map((each) => each.request.path);
+    const far = (file: string) => Number(/doc-(\d+)/.exec(file)![1]) >= 40;
+    expect(pass.filter(far)).toEqual(['docs/doc-45.md']);
+    // The first forty, as every pass asks them, and the edited one.
+    expect(pass).toHaveLength(41);
+    const last = reviews.at(-1)!;
+    expect(cardOf(last, 'docs/doc-45.md').fragment?.key).toBe(fragments.slice(asked).find((each) => each.request.path === 'docs/doc-45.md')!.request.key);
+    for (const file of ['docs/doc-40.md', 'docs/doc-46.md', 'docs/doc-49.md']) {
+      expect(cardOf(last, file).fragment).not.toBeNull();
+      expect(cardOf(last, file).deferred).toBeUndefined();
+    }
+  });
+
+  it('asks a live split\'s far file again when an image it embeds changes, so the next page\'s report and card say what the image is now', async () => {
+    // docs/doc-45.md, past the limit, shows docs/hero.png, which the agent
+    // turns into a Git LFS pointer: the image's status stays modified.
+    let hero: 'embed' | 'lfs' = 'embed';
+    const {backend, reviews, fragments} = scriptedBackend((request) => ({ok: true, summary: summary(request.path === 'docs/doc-45.md' ? {images: [{path: 'docs/hero.png', url: 'hero.png', line: 3, status: hero}]} : {})}));
+    const {service, clock, trip} = openingService(backend);
+    const withHero = (after: string) => review([...docs(50).files, diffFile('one\n', after, 'docs/hero.png')]);
+    service.setReview(withHero('two\n'), CTX);
+    await service.open({fileKey: 'docs/doc-00.md'}, trip);
+    await clock.advance(3_000);
+    expect(reviews.at(-1)!.findings).toEqual([]);
+    const asked = fragments.length;
+    hero = 'lfs';
+    service.setReview(withHero('version https://git-lfs.github.com/spec/v1\n'), CTX);
+    await clock.advance(3_000);
+    const far = fragments.slice(asked).map((each) => each.request.path).filter((file) => Number(/doc-(\d+)/.exec(file)?.[1] ?? -1) >= 40);
+    expect(far).toEqual(['docs/doc-45.md']);
+    const last = reviews.at(-1)!;
+    expect(last.findings!.map((finding) => [finding.path, finding.line, finding.kind])).toEqual([['docs/doc-45.md', 3, 'lfs']]);
+    // A far file whose images stayed the same keeps its answer.
+    expect(cardOf(last, 'docs/doc-46.md').fragment).not.toBeNull();
+    // Once asked, its answer names the image as it is now: the next edit
+    // to another file asks it no more.
+    const again = fragments.length;
+    service.setReview(review([...docs(50, {3: 'One, edited again.\n'}).files, diffFile('one\n', 'version https://git-lfs.github.com/spec/v1\n', 'docs/hero.png')]), CTX);
+    await clock.advance(3_000);
+    expect(fragments.slice(again).some((each) => each.request.path === 'docs/doc-45.md')).toBe(false);
+    expect(reviews.at(-1)!.findings!.map((finding) => finding.kind)).toEqual(['lfs']);
+  });
+
+  it('keeps the limit on an edit after a press that opened the page in the browser, which no refresh follows', async () => {
+    const {backend, reviews, fragments} = scriptedBackend();
+    const {service, clock, trip} = openingService(backend, {surface: recordingSurface({kind: 'browser', answer: {where: 'browser', message: 'opened in your browser'}})});
+    service.setReview(docs(50), CTX);
+    await service.open({fileKey: 'docs/doc-00.md'}, trip);
+    await clock.advance(3_000);
+    const asked = fragments.length;
+    service.setReview(docs(50, {45: 'One, edited by the agent.\n'}), CTX);
+    await clock.advance(3_000);
+    expect(fragments.slice(asked).some((each) => each.request.path === 'docs/doc-45.md')).toBe(false);
+    expect(cardOf(reviews.at(-1)!, 'docs/doc-45.md')).toMatchObject({deferred: true});
+  });
+
+  it('keeps the limit before any press, writing one whole page for a 45-file branch with no follow-up for the files past it', async () => {
+    const builder = createReviewBuilder({
+      sources: {read: async () => ({kind: 'unavailable', reason: 'none'})} as unknown as SourceReader,
+      fragment: async () => ({body: {kind: 'empty'}}),
+      branch: async () => ({commits: [], upstream: {remote: null}}),
+    });
+    const {backend, reviews, fragments} = scriptedBackend(undefined, async (request) => {
+      const {html, partial} = await builder.page(request);
+      return {ok: true, html, ...(partial ? {partial: true as const} : {})};
+    });
+    const {service, clock, dir} = openingService(backend);
+    service.setReview(docs(45), CTX);
+    await clock.advance(2_000);
+    // The builder runs on the real loop: wait for its page, then well past
+    // the follow-up a partial page would get.
+    for (let turn = 0; turn < 200 && pageFiles(dir).length === 0; turn += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    for (let step = 0; step < 10; step += 1) {
+      await clock.advance(1_000);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(new Set(fragments.map((each) => each.request.path)).size).toBe(40);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]!.cards.filter((card) => card.deferred).map((card) => card.path)).toEqual(['docs/doc-40.md', 'docs/doc-41.md', 'docs/doc-42.md', 'docs/doc-43.md', 'docs/doc-44.md']);
+    expect(pageFiles(dir)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(dir, pageFiles(dir)[0]!), 'utf8')).toContain('Still being prepared');
+  });
+});
+
 describe('live refreshes of the split', () => {
   it('sends the split the newest page at the card the press opened, with no glow, when an edit writes one, at most once a second', async () => {
     const {backend, reviews} = scriptedBackend();
@@ -992,6 +1328,27 @@ describe('live refreshes of the split', () => {
     expect(fs.readFileSync(new URL(surface.refreshed[1]!.split('#')[0]!).pathname, 'utf8')).toBe(`<p>${reviews.at(-1)!.key}</p>`);
     await clock.advance(5_000);
     expect(surface.refreshed).toHaveLength(2);
+  });
+
+  it('moves no split for a page with the same bytes under a new name, as when the refs were read in time only the second time', async () => {
+    let html = '<p>the same page</p>';
+    const {backend, reviews} = scriptedBackend(undefined, () => ({ok: true, html}));
+    let tips: string | null = null;
+    const {service, clock, surface, trip} = openingService(backend, {tips: () => tips});
+    service.setReview(review([edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    tips = 'abc123 def456 -';
+    // A watch event that changed nothing the page shows: only the refs read now differ.
+    service.setReview(review([edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    expect(new Set(reviews.map((each) => each.key)).size).toBe(2);
+    expect(surface.refreshed).toEqual([]);
+    // A page that does differ still goes.
+    html = '<p>an edited page</p>';
+    service.setReview(review([edited('docs/guide.md', 'One.\n', 'One, edited again.\n')]), CTX);
+    await clock.advance(2_000);
+    expect(surface.refreshed.map(hashOf)).toEqual(['file-0&m=1&n=2&l=1']);
   });
 
   it('refreshes the page R opened at its top, and a code-only review\'s page too', async () => {

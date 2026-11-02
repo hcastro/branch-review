@@ -10,6 +10,9 @@ import {diffFile} from './rendered-helpers.js';
 const BEFORE = ['import a from "a";', 'const version = "0.4.2";', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'export default a;', ''].join('\n');
 const AFTER = BEFORE.replace('"0.4.2"', '"0.5.0"').replace('export default a;', 'export default a;\nexport const b = 1;');
 
+// String.prototype.isWellFormed (ES2024), which the project's lib doesn't name yet.
+const wellFormed = (text: string) => (text as unknown as {isWellFormed(): boolean}).isWellFormed();
+
 describe('parseHunks', () => {
   it('numbers each line on the side it is on, from the hunk headers git printed', () => {
     const hunks = parseHunks(diffFile(BEFORE, AFTER, 'src/a.ts').blocks);
@@ -68,6 +71,20 @@ describe('word highlights', () => {
   it('pairs each run of removed lines with the added run right after it, in order', () => {
     const lines = parseHunks([{rawDiff: '@@ -1,3 +1,3 @@\n-let a = 1;\n-let b = 2;\n+let a = 10;\n+let b = 20;\n same\n'}])[0]!.lines;
     expect([...pairedRanges(lines).keys()]).toEqual([0, 2, 1, 3]);
+  });
+
+  it('never cuts a surrogate pair: a changed emoji is marked whole on both lines', () => {
+    const before = 'x = "\u{1F600} a"';
+    const after = 'x = "\u{1F601} a"';
+    expect(wordRange(before, after)).toEqual([[5, 7], [5, 7]]);
+    // The two share a low surrogate and differ in the high one.
+    expect(wordRange('a = "\u{10000} b"', 'a = "\u{10400} b"')).toEqual([[5, 7], [5, 7]]);
+    const [hunk] = parseHunks([{rawDiff: `@@ -1 +1 @@\n-${before}\n+${after}\n`}]);
+    const drawn = drawHunk(hunk!);
+    for (const line of drawn.lines) {
+      expect(wellFormed(line.h)).toBe(true);
+      expect(line.h).toContain('<span class="x">');
+    }
   });
 
   it('wraps the range in the word mark, closing it around each syntax span it crosses', () => {

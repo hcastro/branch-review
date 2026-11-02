@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import type {DiffRange} from '../src/git.js';
 import type {ReviewFile} from '../src/review/model.js';
 import {parseUnifiedDiffBlocks} from '../src/blocks/parse.js';
+import {patchObjectIds} from '../src/media/classify.js';
 import {cardSpecial, reviewCardRequest} from '../src/rendered/review/request.js';
 import {specialText} from '../src/rendered/review/special.js';
 import {diffFile} from './rendered-helpers.js';
@@ -38,7 +39,9 @@ describe('reviewCardRequest', () => {
     const deleted = reviewCardRequest(diffFile('a\n', null, 'old.ts'), RANGE, null);
     expect(deleted.sides.after).toBeUndefined();
     expect(deleted.sides.before).toMatchObject({kind: 'blob'});
-    expect(reviewCardRequest(diffFile('a\n', 'b\n', 'src/a.ts'), WORKTREE, null).sides.after).toMatchObject({kind: 'worktree', path: 'src/a.ts'});
+    const changed = diffFile('a\n', 'b\n', 'src/a.ts');
+    // Checked against the blob id the patch names, so a file rewritten since is never read as its diff.
+    expect(reviewCardRequest(changed, WORKTREE, null).sides.after).toEqual({kind: 'worktree', path: 'src/a.ts', id: patchObjectIds(changed.rawDiff)!.after});
   });
 
   it('reads no side of a submodule, whose patch names the submodule\'s commits, which the repo never holds', () => {

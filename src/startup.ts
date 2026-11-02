@@ -89,6 +89,8 @@ export type CliIo = {
   // What opens a file or page outside the terminal: a player, a viewer, the
   // default browser. Tests record it in place of opening anything.
   opener?: Opener;
+  // How long `r` waits for its page. Tests on a loaded machine give it longer.
+  openDeadlineMs?: number;
 };
 
 const SIGNAL_EXIT_CODES: Record<string, number> = {SIGHUP: 129, SIGINT: 130, SIGTERM: 143};
@@ -187,7 +189,7 @@ async function writeRenderedPages({cwd, startDir, range, review, outLabel, json,
  * index copy, and the UI is never mounted.
  */
 export async function runCli(io: CliIo) {
-  const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env, opener = defaultOpener} = io;
+  const {argv, cwd: startDir, proc, stdin, stdout, stderr, render, env = process.env, opener = defaultOpener, openDeadlineMs} = io;
   let options: CliOptions;
   try {
     options = parseCliArgs(argv, {interactive: Boolean(stdout.isTTY)});
@@ -293,7 +295,7 @@ export async function runCli(io: CliIo) {
   const rendered = renderedModule?.startRenderedService({tempDir: () => {
     sweepOnce();
     return tempDir.get();
-  }, env, cwd, animations: options.animations, opener, ...(pane ? {pane} : {}), live: options.watch});
+  }, env, cwd, animations: options.animations, opener, ...(pane ? {pane} : {}), live: options.watch, ...(openDeadlineMs !== undefined ? {openDeadlineMs} : {})});
   proc.on('exit', () => rendered?.dispose());
   proc.on('exit', tempDir.remove);
   const media = started?.media;

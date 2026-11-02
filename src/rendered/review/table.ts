@@ -1,4 +1,4 @@
-import {escapeText, firstLine, type CardDiff, type DrawnLine} from './diff.js';
+import {escapeText, firstLine, markHidden, type CardDiff, type DrawnLine} from './diff.js';
 import {icon} from './icons.js';
 
 // A card's source diff as a table, unified or split, with the unchanged
@@ -52,6 +52,16 @@ export function expandGap(card: CardDiff, shown: readonly number[], index: numbe
   return next;
 }
 
+/**
+ * `shown` as `card` can show it: each gap's count no more than its size,
+ * and 0 for a gap whose lines the page doesn't carry, by the rule
+ * expandGap opens gaps by. A page written again for an unchanged diff may
+ * carry less context than the one the counts were kept on.
+ */
+export function keptShown(card: CardDiff, shown: readonly number[]): number[] {
+  return gapsOf(card).map((gap, index) => (carries(card, gap) ? Math.min(Math.max(0, Math.floor(shown[index] ?? 0) || 0), size(gap)) : 0));
+}
+
 export type TableRow =
   | {kind: 'line'; line: DrawnLine; gap?: number; revealed?: true}
   // A hunk's header, with the control that reveals gap `gap` above it (or
@@ -65,9 +75,10 @@ export function tableRows(card: CardDiff, shown: readonly number[]): TableRow[] 
   const contextLine = (gap: Gap, index: number, n: number): TableRow => ({kind: 'line', line: {t: ' ', o: n + gap.delta, n, h: card.context![n - 1]!}, gap: index, revealed: true});
   for (const [index, gap] of gaps.entries()) {
     const length = size(gap);
-    const open = Math.min(shown[index] ?? 0, length);
-    const left = length - open;
     const can = carries(card, gap);
+    // Only lines the page carries open.
+    const open = can ? Math.min(shown[index] ?? 0, length) : 0;
+    const left = length - open;
     const disabled = !can && card.contextNote === 'budget' ? {disabled: true as const} : {};
     if (gap.trailing) {
       for (let n = gap.from; n < gap.from + open; n += 1) rows.push(contextLine(gap, index, n));
@@ -111,9 +122,10 @@ function control(row: Extract<TableRow, {kind: 'hunk'}>) {
   return `<button type="button" class="exbtn" data-act="expand" data-g="${row.gap}" aria-label="${words}" title="${words}">${icon(row.dir)}</button>`;
 }
 
-// A header's text, and beside an arrow that is off, why: a touch screen
-// has no tooltip to say it.
-const headerText = (row: Extract<TableRow, {kind: 'hunk'}>) => `${escapeText(row.text)}${row.disabled ? `<span class="hx-more${row.text ? ' hx-after' : ''}">${NO_MORE}</span>` : ''}`;
+// A header's text, with git's function context escaped and its hidden
+// characters drawn as markers, and beside an arrow that is off, why: a
+// touch screen has no tooltip to say it.
+const headerText = (row: Extract<TableRow, {kind: 'hunk'}>) => `${markHidden(escapeText(row.text))}${row.disabled ? `<span class="hx-more${row.text ? ' hx-after' : ''}">${NO_MORE}</span>` : ''}`;
 
 const code = (line: DrawnLine) => `<span class="mk">${MARKS[line.t]}</span>${line.h}`;
 

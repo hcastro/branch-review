@@ -2,12 +2,13 @@
    per changed file. A full-width app bar, the title block, a sticky
    toolbar, then a sticky file tree beside the column of cards. System UI
    for the chrome and system mono for code, so nothing is fetched. Every
-   rule here sits under the page's own root class, so the file pages that
-   share this stylesheet never see it; a rich markdown view inside a card
-   keeps GitHub's article styles and the file pages' change marks.
+   rule here sits under `:root.rv`, so it never reaches the rich view's
+   GitHub article styles or the in-pane tile document, which takes
+   page.css only; a rich markdown view inside a card keeps GitHub's
+   article styles and the rich view's change marks (page.css).
 
    The palette is GitHub's review palette, light and dark. Tokens carry an
-   `rv-` prefix so they can't meet GitHub's or the file pages' own. */
+   `rv-` prefix so they can't meet GitHub's or page.css's own. */
 
 :root.rv {
   --rv-bg: #ffffff;
@@ -37,6 +38,9 @@
   --rv-attention-bar: #d4a72c;
   --rv-attention-subtle: #fff8c5;
   --rv-attention-border: #e7cf6f;
+  /* A hidden character's marker in a line or a path, as the TUI draws it. */
+  --rv-hc-fg: #59636e;
+  --rv-hc-bg: rgba(212, 167, 44, 0.18);
   --rv-done: #8250df;
   --rv-add-line: #e6ffec;
   --rv-add-num: #ccffd8;
@@ -98,6 +102,8 @@
     --rv-attention-bar: #bb8009;
     --rv-attention-subtle: #272115;
     --rv-attention-border: #6b5014;
+    --rv-hc-fg: #9198a1;
+    --rv-hc-bg: rgba(187, 128, 9, 0.22);
     --rv-done: #ab7df8;
     --rv-add-line: rgba(46, 160, 67, 0.15);
     --rv-add-num: rgba(63, 185, 80, 0.3);
@@ -378,8 +384,8 @@
 .rv-banner.rv-banner-deleted .ic { color: var(--rv-danger); }
 .rv-banner.rv-banner-renamed { border-color: var(--rv-border); background: var(--rv-bg-subtle); }
 .rv-banner.rv-banner-renamed .ic { color: var(--rv-fg-muted); }
-/* GitHub's article, inside the card: the file pages' change bars sit in
-   its left padding. */
+/* GitHub's article, inside the card: the rich view's change bars
+   (page.css) sit in its left padding. */
 .rv-rich { --br-bar-x: -24px; }
 .rv-rich .markdown-body { position: relative; max-width: 980px; padding: 24px 40px 32px 52px; background: transparent; font-size: 16px; }
 /* A deleted file's rich view dims its pictures and cards only: its text
@@ -552,3 +558,10 @@
   .rv-toolbar, .rv-sidebar, .rv-fh-act, .rv-note, .rv-tabs { display: none; }
   .rv-layout { display: block; }
 }
+
+/* A hidden character (a bidi control, a zero-width space) drawn as its
+   marker, muted on a faint warning tint, and the warning above a diff
+   that holds a bidi control. */
+.rv-hc { color: var(--rv-hc-fg); background: var(--rv-hc-bg); border-radius: 3px; }
+.rv-bidi { display: flex; align-items: center; gap: 8px; margin: 0; padding: 8px 16px; border-bottom: 1px solid var(--rv-attention-border); background: var(--rv-attention-subtle); color: var(--rv-fg); font-size: 13px; }
+.rv-bidi .ic { color: var(--rv-attention); flex: none; }

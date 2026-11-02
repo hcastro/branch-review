@@ -64,9 +64,10 @@ const NEIGHBORS = 3;
 export const OPEN_DEADLINE_MS = 10_000;
 // How long a press gives the files it renders before the page is written
 // with what is in: the rest say they are on their way. The refs are read
-// beside that wait, so a press's page is asked for by the end of it, and
-// the worker's build, which gives git at most its own budget, ends inside
-// the deadline.
+// beside that wait, so a press's page is asked for by the end of it. The
+// page job never waits for a worker turn behind fragments (it has one of
+// its own, workerClient.ts), and the worker's build, which gives git at
+// most its own budget, ends inside the deadline.
 export const PRESS_WAIT_MS = 2_500;
 // How long the commits' and the branch state's refs may take to read.
 export const TIPS_BUDGET_MS = 2_000;
@@ -156,7 +157,7 @@ type Asking = {epoch: number; fileKey: string; priority: number; controller: Abo
 // set it.
 type InSplit = {key: string; file?: string; seq: number};
 
-export function createRenderedService({backend, site, surface, motion, animations = true, now = Date.now, setTimer = defaultTimer, pane: paneOptions, live = false, tips}: {
+export function createRenderedService({backend, site, surface, motion, animations = true, now = Date.now, setTimer = defaultTimer, pane: paneOptions, live = false, tips, openDeadlineMs = OPEN_DEADLINE_MS}: {
   backend: RenderedBackend;
   site: RenderedSite;
   /** Where pages open. Without one, the service only renders. */
@@ -177,6 +178,8 @@ export function createRenderedService({backend, site, surface, motion, animation
    * changes only with the review.
    */
   tips?: ReadTips;
+  /** How long `r` waits for its page: OPEN_DEADLINE_MS, longer only in a test on a loaded machine. */
+  openDeadlineMs?: number;
 }) {
   let plan = new Map<string, Planned>();
   // Markdown outside the review that shows an image the review changed, by
@@ -192,8 +195,13 @@ export function createRenderedService({backend, site, surface, motion, animation
   let cancelTimer: (() => void) | null = null;
   let focused: string | null = null;
   let disposed = false;
-  // By fragment key: the newest answer, and the review it was asked for.
-  const answers = new Map<string, {epoch: number; answer: Answer}>();
+  // By fragment key: the newest answer, the review it was asked for, and
+  // the images it names as that review had them (embedsOf).
+  const answers = new Map<string, {epoch: number; answer: Answer; embeds: string}>();
+  // The review's files by every path they go by, for what an answer's
+  // images were when it was asked: a fragment's key covers the file's own
+  // text, not the images it embeds.
+  let reviewed = new Map<string, ReviewFile>();
   const asking = new Map<string, Asking>();
   const notices: string[] = [];
   let saidOff = false;
@@ -201,7 +209,10 @@ export function createRenderedService({backend, site, surface, motion, animation
   let version = 0;
   // The page's writes on their way, by key, and the newest two written:
   // the one before stays a while for a split that still shows it.
-  const writing = new Map<string, Promise<Written>>();
+  // `press`: a write in a press's turn. `signal` names its job to the
+  // backend.
+  type Writing = {done: Promise<Written>; press: boolean; signal: AbortSignal};
+  const writing = new Map<string, Writing>();
   let latest: {key: string; epoch: number; files: readonly string[]} | null = null;
   let previous: string | null = null;
   // Pages written while something they show wasn't ready, which are never
@@ -212,11 +223,17 @@ export function createRenderedService({backend, site, surface, motion, animation
   // Each page's own key, before attempts: a page written again under the
   // next name shows the same review and refs.
   const bases = new Map<string, string>();
+  // Each page's HTML, by a digest, as it was written: a page written under
+  // a new name with the same bytes (the refs read in time once and not the
+  // next) moves no split.
+  const digests = new Map<string, string>();
   let followUps = {epoch: -1, count: 0};
   let cancelFollowUp: (() => void) | null = null;
   // The review a press asked for every file of, which passes then render
   // past the prerender limit.
   let wideAt = -1;
+  // The files the newest pass left out by the prerender limit, by file key.
+  let capped = new Set<string>();
   let motionAsked: Promise<Motion> | null = null;
   // Counts `r` and `R` presses: only the newest one's page is shown.
   let presses = 0;
@@ -280,6 +297,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       return running.done;
     }
     const askedAt = epoch;
+    const filesAt = reviewed;
     const controller = new AbortController();
     const send = () => backend.fragment(fragmentRequest(planned), controller.signal, priority);
     // A render whose image lookups ran out of time (a cold git) marks less
@@ -293,7 +311,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     }).then((answer) => {
       const known = answers.get(request.key);
       if (!known || known.epoch <= askedAt) {
-        answers.set(request.key, {epoch: askedAt, answer});
+        answers.set(request.key, {epoch: askedAt, answer, embeds: imagesAt(answer, filesAt)});
         answersChanged += 1;
       }
       // The link report grew, and a page in the pane may draw a link broken now.
@@ -304,6 +322,33 @@ export function createRenderedService({backend, site, surface, motion, animation
     });
     asking.set(request.key, {epoch: askedAt, fileKey: planned.fileKey, priority, controller, done});
     return done;
+  };
+
+  // The images an answer names, each with what the review said of it:
+  // its status, where it moved from and the blobs its patch names (its
+  // whole diff when it names none), or nothing for an image the review
+  // doesn't list. An image whose side changed changes this,
+  // though the answer's own key stays the same.
+  const fileIds = new WeakMap<ReviewFile, string>();
+  const imagesAt = (answer: Answer, files: ReadonlyMap<string, ReviewFile>) => {
+    if (!('summary' in answer)) return '';
+    const named = [...new Set((answer.summary.images ?? []).map((image) => image.path))].sort();
+    return JSON.stringify(named.map((imagePath) => {
+      const file = files.get(imagePath);
+      if (!file) return [imagePath, null];
+      let id = fileIds.get(file);
+      if (id === undefined) {
+        id = createHash('sha256').update(JSON.stringify([file.status, file.oldPath ?? null, patchObjectIds(file.rawDiff) ?? file.rawDiff])).digest('hex').slice(0, 20);
+        fileIds.set(file, id);
+      }
+      return [imagePath, id];
+    }));
+  };
+
+  // Whether an answer names an image whose side changed since it was asked.
+  const embedsMoved = (key: string) => {
+    const known = answers.get(key);
+    return known !== undefined && known.embeds !== imagesAt(known.answer, reviewed);
   };
 
   // Active file 0, its neighbors 1, the rest 2.
@@ -392,6 +437,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         kind: planned.kind,
         fragment,
         ...(failure !== undefined ? {failure} : {}),
+        ...(fragment === null && failure === undefined && capped.has(planned.fileKey) ? {deferred: true as const} : {}),
         ...(broken.has(planned.file.path) ? {brokenRefs: broken.get(planned.file.path)!} : {}),
       };
     };
@@ -440,6 +486,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     // is on its way.
     const kept = new Set([latest.key, previous, inSplit?.key, ...[...sending].map((each) => each.key), ...writing.keys()]);
     for (const key of bases.keys()) if (!kept.has(key)) bases.delete(key);
+    for (const key of digests.keys()) if (!kept.has(key)) digests.delete(key);
   };
 
   // A page written partial is written again a moment later by a pass that
@@ -457,8 +504,10 @@ export function createRenderedService({backend, site, surface, motion, animation
 
   // Writes the review's page unless it is on disk already, and names it
   // the newest. Showing it is the caller's business. `tipsAt`: the refs a
-  // press began reading as it was made.
-  async function writeReview(tipsAt?: Promise<string | null>): Promise<Written> {
+  // press began reading as it was made. `press`: a press waits for it, and
+  // its job has a worker turn of its own, so it never queues behind a page
+  // a pass is writing in the background.
+  async function writeReview(tipsAt?: Promise<string | null>, press = false): Promise<Written> {
     const off = offReason();
     if (off) return {ok: false, reason: off};
     if (!backend.review) return {ok: false, reason: 'pages open only in the full app'};
@@ -492,14 +541,23 @@ export function createRenderedService({backend, site, surface, motion, animation
       }
     }
     let pending = writing.get(key);
+    // A press joins the same page on its way in the background. While that
+    // job still waits for a worker turn, maybe behind another page, it
+    // moves into the press's own; once the worker is building it, it is
+    // the soonest way to the page, and a second build beside it would only
+    // slow both.
+    if (pending && press && !pending.press && backend.promote?.(pending.signal)) pending.press = true;
     if (!pending) {
-      pending = backend.review({...request, key}, new AbortController().signal).then((result): Written => {
+      const signal = new AbortController().signal;
+      const entry = {press, signal} as Writing;
+      entry.done = backend.review({...request, key}, signal, press).then<Written, Written>((result) => {
         if (!result.ok) {
           offReason();
           return {ok: false, reason: oneLine(result.reason)};
         }
         try {
           site.write(key, result.html);
+          digests.set(key, createHash('sha256').update(result.html).digest('hex'));
           if (result.partial) partial.add(key);
           const written = done();
           if (result.partial && askedAt === epoch) followUp();
@@ -507,10 +565,13 @@ export function createRenderedService({backend, site, surface, motion, animation
         } catch (error) {
           return {ok: false, reason: oneLine(error)};
         }
-      }).finally(() => writing.delete(key));
-      writing.set(key, pending);
+      }, (error: unknown) => ({ok: false, reason: oneLine(error)})).finally(() => {
+        if (writing.get(key) === entry) writing.delete(key);
+      });
+      writing.set(key, entry);
+      pending = entry;
     }
-    return pending;
+    return pending.done;
   }
 
   // Renders the review's markdown, images and SVG, nearest the active file
@@ -525,18 +586,31 @@ export function createRenderedService({backend, site, surface, motion, animation
   }
 
   // The page the pass wrote, or null when it stopped short of writing one.
-  async function renderPass(pass: number): Promise<Written | null> {
-    const limit = wideAt === pass ? Infinity : MAX_PRERENDER;
-    const chosen = [...plan.values()].sort((left, right) => priorityOf(left) - priorityOf(right) || left.order - right.order).slice(0, limit);
+  // `pressed`: whether the press that started the pass still waits for
+  // its page, which then has a worker turn of its own.
+  async function renderPass(pass: number, pressed: () => boolean = () => false): Promise<Written | null> {
+    // Every file once a press asked for the whole page. Before any press,
+    // and in the browser, the limit. While a live split shows a page of
+    // this review, past the limit only a file with no answer for what it
+    // is now, or whose answer names an image that changed since: an edit
+    // to a far file, or to an image it shows, renders it, and the other far
+    // files an earlier pass rendered keep that answer rather than each
+    // being asked again on every pass.
+    const wide = wideAt === pass;
+    const sorted = [...plan.values()].sort((left, right) => priorityOf(left) - priorityOf(right) || left.order - right.order);
+    const chosen = sorted.slice(0, wide ? Infinity : MAX_PRERENDER);
+    const far = wide || !live || inSplit === null ? [] : sorted.slice(chosen.length).filter((each) => each.request && (!answers.has(each.request.key) || embedsMoved(each.request.key)));
+    const asked = new Set([...chosen, ...far]);
+    capped = new Set(sorted.filter((each) => !asked.has(each)).map((each) => each.fileKey));
     const unanswered = (each: Planned) => each.request && !failedBefore(each) && answers.get(each.request.key)?.epoch !== pass;
-    await Promise.all(chosen.filter(unanswered).map((planned) => ask(planned, priorityOf(planned))));
+    await Promise.all([...asked].filter(unanswered).map((planned) => ask(planned, priorityOf(planned))));
     if (disposed || pass !== epoch || offReason()) return null;
     // Then the markdown outside the review that may show its images.
     await searchAlso(MAX_PRERENDER - Math.min(plan.size, MAX_PRERENDER));
     if (disposed || pass !== epoch) return null;
     await Promise.all([...also.values()].filter(unanswered).map((planned) => ask(planned, 2)));
     if (disposed || pass !== epoch || offReason()) return null;
-    const written = await writeReview();
+    const written = await writeReview(undefined, pressed());
     if (disposed || pass !== epoch) return null;
     if (written.ok) refreshSplit();
     return written;
@@ -599,14 +673,16 @@ export function createRenderedService({backend, site, surface, motion, animation
       started = true;
       cancelTimer = null;
     }
-    const pass = renderPass(epoch);
+    let waiting = true;
+    const pass = renderPass(epoch, () => waiting);
     let stop = () => {};
     const passed = await Promise.race([pass, new Promise<null>((resolve) => {
       stop = setTimer(() => resolve(null), PRESS_WAIT_MS);
     })]);
     stop();
+    waiting = false;
     // A pass done in time wrote the page itself.
-    return passed ?? writeReview(tipsAt);
+    return passed ?? writeReview(tipsAt, true);
   }
 
   // The split shows the page, and a pass wrote a newer one: it goes to the
@@ -615,8 +691,9 @@ export function createRenderedService({backend, site, surface, motion, animation
   // and the newest page goes then. The split goes only while it still
   // shows a page the last press or refresh sent it, by that page's name or
   // the stable one: the reader may have moved on inside it, and the next
-  // change tries again. A page written again for what it left out (the
-  // same review and refs) moves no split: a reload would undo what the
+  // change tries again. A page with the same bytes as the one the split
+  // shows moves no split, nor does a page written again for what it left
+  // out (the same review and refs): a reload would undo what the
   // reader did on it, and their next press gets the whole page. A split
   // that is gone ends live refreshes until the next press opens one.
   function refreshSplit() {
@@ -631,6 +708,8 @@ export function createRenderedService({backend, site, surface, motion, animation
     const newest = sent.at(-1) ?? confirmed;
     const key = latest?.key;
     if (!key || key === newest.key || bases.get(key) === bases.get(newest.key)) return;
+    const digest = digests.get(key);
+    if (digest !== undefined && digest === digests.get(newest.key)) return;
     const wait = lastLive + LIVE_GAP_MS - now();
     if (wait > 0) {
       cancelLive = setTimer(() => {
@@ -686,7 +765,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       cancelDeadline = setTimer(() => {
         gaveUp = true;
         resolve('late');
-      }, OPEN_DEADLINE_MS);
+      }, openDeadlineMs);
     });
     const shownOn = pressPage().then<ShowResult | {error: string} | null>((written) => {
       ready = true;
@@ -772,6 +851,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       let assets: AssetSides | null = null;
       const sides = () => (assets ??= reviewAssetSides(review, range, reviewEpoch));
       shown = {review, cwd, range, title, reviewId, links, sides};
+      reviewed = new Map(review.files.flatMap((file) => [...reviewPaths([file])].map((each): [string, ReviewFile] => [each, file])));
 
       const next = new Map<string, Planned>();
       for (const [order, {file, kind, failure}] of files.entries()) {
@@ -794,6 +874,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         next.set(key, {file, fileKey: key, alias: fileAlias(key), order, kind, request, sides, ...(failure !== undefined ? {failure} : {})});
       }
       plan = next;
+      capped = new Set();
       also = new Map();
       alsoSearch = files.some(({kind}) => kind !== 'markdown') ? {cwd, links, linkSignature, sides, done: null} : null;
       cancelFollowUp?.();
@@ -840,7 +921,7 @@ export function createRenderedService({backend, site, surface, motion, animation
      * the way, at the top when the review has no such file. Null when a
      * newer press took this one's place.
      */
-    async open({fileKey: key}: {fileKey: string; line?: number; fraction?: number}, trip?: Trip): Promise<OpenOutcome | null> {
+    async open({fileKey: key}: {fileKey: string}, trip?: Trip): Promise<OpenOutcome | null> {
       const off = offReason();
       if (off) return {kind: 'error', message: off};
       const files = shown?.review.files ?? [];
@@ -917,7 +998,7 @@ export type RenderedPages = Pick<RenderedService, 'renderable' | 'open' | 'openO
  * the surface they open on. `live`: watch mode, where an open split
  * follows the edits.
  */
-export function startRenderedService({tempDir, env, cwd, animations = true, opener, pane, live = false}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; pane?: {registry: ImageRegistry; caps: GraphicsCaps}; live?: boolean}) {
+export function startRenderedService({tempDir, env, cwd, animations = true, opener, pane, live = false, openDeadlineMs}: {tempDir: () => string; env: NodeJS.ProcessEnv; cwd: string; animations?: boolean; opener: Opener; pane?: {registry: ImageRegistry; caps: GraphicsCaps}; live?: boolean; openDeadlineMs?: number}) {
   const platform = process.platform;
   // Looked up the first time `v` asks, and fixed for the session.
   let chrome: ChromeBinary | null | undefined;
@@ -935,6 +1016,7 @@ export function startRenderedService({tempDir, env, cwd, animations = true, open
     animations,
     live,
     tips: readTips,
+    ...(openDeadlineMs !== undefined ? {openDeadlineMs} : {}),
   });
   return service;
 }

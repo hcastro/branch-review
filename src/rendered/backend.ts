@@ -85,6 +85,12 @@ export type ReviewCardRequest = {
   sides: {before?: SourceSpec; after?: SourceSpec};
   /** Sent only once the review rendered the file: one that hasn't yet is drawn as on its way. */
   fragment?: ReviewFragmentRequest;
+  /**
+   * A file past the prerender limit that no pass asked to render: drawn as
+   * on its way, but no reason for the page to be written again, since a
+   * rerun of the same pass wouldn't render it either. A press renders it.
+   */
+  deferred?: true;
   /** Why the file's render failed, when it did: the card says so, and nothing renders it again. */
   renderFailure?: string;
   /** The rich view's links to a heading another file doesn't have, by their `ref` index, drawn broken. */
@@ -179,7 +185,13 @@ export interface RenderedBackend {
   // Moves a fragment still waiting for the worker, asked for with `signal`, to `priority`.
   prioritize(signal: AbortSignal, priority: number): void;
   // The Review in browser page. A backend without it opens none.
-  review?(request: ReviewRequest, signal: AbortSignal): Promise<ReviewResult>;
+  // `press`: a press waits for this page, which then never waits for a
+  // worker turn behind a page written in the background.
+  review?(request: ReviewRequest, signal: AbortSignal, press?: boolean): Promise<ReviewResult>;
+  // Moves a page written in the background, asked for with `signal`, into
+  // a press's turn while it still waits for one, and says whether it did:
+  // false once the worker is building it. A backend without it moves none.
+  promote?(signal: AbortSignal): boolean;
   // The review's markdown candidates for "also looks different". A backend
   // without it finds none.
   embedders?(request: EmbeddersRequest, signal: AbortSignal): Promise<EmbeddersResult>;
@@ -196,6 +208,8 @@ export interface RenderedBackend {
 export type RenderedJobs = {
   fragment: {request: FragmentRequest; result: FragmentResult};
   review: {request: ReviewRequest; result: ReviewResult};
+  // The same job, in a press's own lane: the worker hears it as `review`.
+  pressReview: {request: ReviewRequest; result: ReviewResult};
   embedders: {request: EmbeddersRequest; result: EmbeddersResult};
   layout: {request: LayoutRequest; result: LayoutResult};
   tile: {request: TileRequest; result: TileResult};

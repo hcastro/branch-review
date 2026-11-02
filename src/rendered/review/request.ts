@@ -10,7 +10,7 @@ import {lfsPointerSize, type CardSpecial} from './special.js';
 // are read. The worker reads each side's text, colors it and draws the page.
 
 /** What the review renders of a file besides its diff: a markdown file's rich view, or an image's sides. */
-export type CardRender = {kind: 'markdown' | 'raster' | 'svg'; fragment: ReviewFragmentRequest | null; failure?: string; brokenRefs?: readonly number[]};
+export type CardRender = {kind: 'markdown' | 'raster' | 'svg'; fragment: ReviewFragmentRequest | null; failure?: string; brokenRefs?: readonly number[]; deferred?: true};
 
 export function reviewCardRequest(file: ReviewFile, range: Pick<DiffRange, 'branch' | 'includeWorktree'>, render: CardRender | null): ReviewCardRequest {
   const special = cardSpecial(file);
@@ -29,6 +29,7 @@ export function reviewCardRequest(file: ReviewFile, range: Pick<DiffRange, 'bran
     // file is the pointer its hunk shows.
     sides: file.blocks.length > 0 && (!special || special.kind === 'lfs') ? textSides(file, range) : {},
     ...(fragment ? {fragment} : {}),
+    ...(!fragment && render?.deferred ? {deferred: true as const} : {}),
     ...(render?.failure !== undefined ? {renderFailure: render.failure} : {}),
     ...(render?.brokenRefs && render.brokenRefs.length > 0 ? {brokenRefs: render.brokenRefs} : {}),
     ...(special ? {special} : {}),

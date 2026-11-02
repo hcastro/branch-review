@@ -22,7 +22,12 @@ const HIDDEN_RANGES = [
   '\\u{10EEEE}',
 ].join('');
 
-const HIDDEN_CHARACTERS = new RegExp(`[${HIDDEN_RANGES}]`, 'gu');
+/**
+ * Matches each hidden character. Global: use it with `replace`, whose
+ * matching never reads or leaves `lastIndex`. The Review in browser page
+ * draws its markers from it too.
+ */
+export const HIDDEN_CHARACTERS = new RegExp(`[${HIDDEN_RANGES}]`, 'gu');
 
 /**
  * The visible stand-in for one hidden character: caret notation for C0

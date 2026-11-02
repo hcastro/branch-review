@@ -1,12 +1,13 @@
 import path from 'node:path';
-import type {FileStatus} from '../../git.js';
+import {COMMIT_LIST_LIMIT, type FileStatus} from '../../git.js';
 import type {Finding} from '../report.js';
 import {REVIEW_CSS, REVIEW_CSS_HASH, REVIEW_HEAD_SCRIPT, REVIEW_HEAD_SCRIPT_HASH, REVIEW_SCRIPT, REVIEW_SCRIPT_HASH} from '../assets.generated.js';
 import {sizeText, type ImageBody, type ImageSide} from '../image.js';
 import {articleHtml, differenceNotes, findingsLabel, type PageBody} from '../page.js';
 import {PAGE_INLINE_LIMIT} from '../markdown.js';
 import {refusedCard} from '../words.js';
-import {packDiff, type CardDiff} from './diff.js';
+import {escapeHiddenCharacters, escapeHiddenCharactersInJson, HIDDEN_CHARACTERS, visibleMarker} from '../../controlChars.js';
+import {markHidden, packDiff, type CardDiff} from './diff.js';
 import {icon, type IconName} from './icons.js';
 import {countsText, specialParts, type CardSpecial, type SpecialPart} from './special.js';
 import {tableHtml} from './table.js';
@@ -72,12 +73,17 @@ export type ReviewPageInput = {
   /** When the page was made, ms: the relative times it says start there. */
   builtAt: number;
   state: BranchState | null;
-  /** The branch's commits, newest first, or null when they couldn't be read. */
+  /** The branch's newest commits, newest first, at most COMMIT_LIST_LIMIT, or null when they couldn't be read. */
   commits: ReviewCommit[] | null;
+  /** How many commits the branch has in all, when git said. */
+  commitTotal?: number;
   cards: ReviewPageCard[];
   /** What won't render on GitHub: the link and asset report, by file and line. */
   findings?: readonly Finding[];
 };
+
+/** Names the page as ours, early in its <head>: `--export-html` replaces only a page that carries it. */
+export const GENERATOR = '<meta name="generator" content="branch-review">';
 
 /** The page's whole policy: nothing loads, and only our own style and scripts apply. */
 export function reviewPolicy() {
@@ -201,9 +207,71 @@ export function applyBudgets(cards: readonly ReviewPageCard[]): CarriedCard[] {
   });
 }
 
-// A link's tag in a rich view's HTML, written as a picture's is.
-const LINK = /<a((?: [^\s"'>/=]+(?:="[^"]*")?)*)\s*>/g;
 const PAGE_HREF = / href="(f-[0-9a-f]{20})\.html(?:#([^"]*))?"/;
+
+/**
+ * `html` with each opening tag named in `names` replaced by what `rewrite`
+ * makes of it, in one pass. Outside a tag it jumps to the next `<`; at one
+ * it reads a tag name, then attributes as rehype-stringify writes them (a
+ * name, and a value in double quotes, read to the next `"`, since a value
+ * holds none unescaped, though it may hold a `<` or `>`), up to `>` or
+ * `/>`. A well-formed tag is copied or rewritten whole, so no tag is ever
+ * looked for inside a value; anything else is copied from its `<`, and the
+ * scan goes on right after that `<`. Linear in the length of `html`, where
+ * a global regex over it would start a match at each `<` inside a long
+ * value and scan to its end.
+ */
+export function rewriteTags(html: string, names: ReadonlySet<string>, rewrite: (name: string, tag: string, attributes: string) => string): string {
+  const parts: string[] = [];
+  let at = 0;
+  for (let open = html.indexOf('<'); open >= 0; open = html.indexOf('<', at)) {
+    parts.push(html.slice(at, open));
+    const tag = readTag(html, open);
+    if (!tag) {
+      parts.push('<');
+      at = open + 1;
+      continue;
+    }
+    const whole = html.slice(open, tag.end);
+    parts.push(names.has(tag.name) ? rewrite(tag.name, whole, tag.attributes) : whole);
+    at = tag.end;
+  }
+  parts.push(html.slice(at));
+  return parts.join('');
+}
+
+const isSpace = (char: string | undefined) => char === ' ' || char === '\t' || char === '\n' || char === '\r' || char === '\f';
+const isNameStart = (char: string | undefined) => char !== undefined && /[A-Za-z]/.test(char);
+const isNameChar = (char: string | undefined) => char !== undefined && /[A-Za-z0-9-]/.test(char);
+// An attribute name: anything but space, a quote, `<`, `>`, `/` or `=`.
+const isAttributeChar = (char: string | undefined) => char !== undefined && !isSpace(char) && !'"\'<>/='.includes(char);
+
+// The opening tag at `open`: its name, its attributes as written (each
+// with the space before it), and where it ends; null for one that isn't
+// well formed.
+function readTag(html: string, open: number): {name: string; attributes: string; end: number} | null {
+  let at = open + 1;
+  if (!isNameStart(html[at])) return null;
+  while (isNameChar(html[at])) at += 1;
+  const name = html.slice(open + 1, at);
+  const attributesFrom = at;
+  let attributesTo = at;
+  for (;;) {
+    const spaced = isSpace(html[at]);
+    while (isSpace(html[at])) at += 1;
+    if (html[at] === '>') return {name, attributes: html.slice(attributesFrom, attributesTo), end: at + 1};
+    if (html[at] === '/' && html[at + 1] === '>') return {name, attributes: html.slice(attributesFrom, attributesTo), end: at + 2};
+    if (!spaced || !isAttributeChar(html[at])) return null;
+    while (isAttributeChar(html[at])) at += 1;
+    if (html[at] === '=') {
+      if (html[at + 1] !== '"') return null;
+      const close = html.indexOf('"', at + 2);
+      if (close < 0) return null;
+      at = close + 1;
+    }
+    attributesTo = at;
+  }
+}
 
 // A rich view's link to another file in the review names that file's
 // stable page name, `f-….html`, which the Preview's pages go by and this
@@ -213,22 +281,20 @@ const PAGE_HREF = / href="(f-[0-9a-f]{20})\.html(?:#([^"]*))?"/;
 // (the renderer makes such a link inert), so the page script follows only
 // links this page drew.
 function linkCards(article: string, places: ReadonlyMap<string, number>) {
-  return article.replace(LINK, (tag) => tag.replace(PAGE_HREF, (href, alias: string, anchor: string | undefined) => {
+  return rewriteTags(article, LINKS, (_name, tag) => tag.replace(PAGE_HREF, (href, alias: string, anchor: string | undefined) => {
     const index = places.get(alias);
     return index === undefined ? href : ` href="#file-${index}&amp;v=rich${anchor ? `&amp;h=${anchor}` : ''}"`;
   }));
 }
 
-// A picture's tag in a rich view's HTML, as rehype-stringify writes it:
-// each attribute value in double quotes, which a value never holds, though
-// it may hold a `<` or `>`.
-const PICTURE = /<(img|source)((?: [^\s"'>/=]+(?:="[^"]*")?)*)\s*\/?>/g;
+const LINKS: ReadonlySet<string> = new Set(['a']);
+const PICTURES: ReadonlySet<string> = new Set(['img', 'source']);
 
 // The rich view with each picture the page has no room for left out: an
 // image becomes the renderer's own card for one past the page's limit, and
 // a `<source>` goes, leaving its `<img>` to stand for the picture.
 function inlineWithin(article: string, take: (dataUrl: string) => boolean) {
-  return article.replace(PICTURE, (tag, name: string, attributes: string) => {
+  return rewriteTags(article, PICTURES, (name, tag, attributes) => {
     // A value as the renderer wrote it, its `&` and `"` escaped already; a
     // `<` or `>` in it is escaped here for the text.
     const attribute = (key: string) => new RegExp(` ${key}="([^"]*)"`).exec(attributes)?.[1]?.replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -247,6 +313,24 @@ function escapeHtml(text: string) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// A repo string as the page draws it: escaped, each hidden character a
+// marker, as the TUI shows it (a bidi control or a zero-width space in a
+// path or a subject would otherwise read as something it isn't).
+const shown = (text: string) => markHidden(escapeHtml(text));
+// For an attribute people read (aria-label, title), which holds no markup:
+// the marker as text.
+const spoken = (text: string) => escapeHtml(escapeHiddenCharacters(text));
+// For an attribute a test or a selector finds a card or a tree row by:
+// each hidden character as a character reference, which the browser reads
+// back as itself, so no raw one is in the file. The browser reads NUL and
+// the C1 controls back as other characters (U+0085 as U+2026), so those
+// are their markers. Copy path and the tree's filter read the exact path
+// from the page's data, never from here.
+const exact = (text: string) => escapeHtml(text).replace(HIDDEN_CHARACTERS, (char) => {
+  const code = char.codePointAt(0)!;
+  return code === 0 || (code >= 0x80 && code <= 0x9F) ? escapeHtml(visibleMarker(char)) : `&#x${code.toString(16).toUpperCase()};`;
+});
+
 const plural = (count: number, word: string) => `${count} ${word}${count === 1 ? '' : 's'}`;
 
 export function assembleReviewPage(input: ReviewPageInput): string {
@@ -260,11 +344,12 @@ export function assembleReviewPage(input: ReviewPageInput): string {
     '<head>',
     `<meta http-equiv="Content-Security-Policy" content="${reviewPolicy()}">`,
     '<meta charset="utf-8">',
+    GENERATOR,
     '<meta name="color-scheme" content="light dark">',
     `<script>${REVIEW_HEAD_SCRIPT}</script>`,
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
     '<meta name="referrer" content="no-referrer">',
-    `<title>${escapeHtml(`${title.branch} into ${title.base}`)} · branch-review</title>`,
+    `<title>${spoken(`${title.branch} into ${title.base}`)} · branch-review</title>`,
     `<style>${REVIEW_CSS}</style>`,
     '</head>',
     '<body>',
@@ -273,17 +358,17 @@ export function assembleReviewPage(input: ReviewPageInput): string {
     '<div class="rv-wrap">',
     note(),
     heading(input),
-    tabs(changed, input.commits),
+    tabs(changed, input.commits, commitCount(input)),
     '</div>',
     '</main>',
-    toolbar(changed.length, input.commits, title.worktree),
+    toolbar(changed.length, input.commits, commitCount(input), title.worktree),
     '<div class="rv-gut">',
     '<div class="rv-wrap">',
     '<div class="rv-layout" id="panel-files" role="tabpanel" aria-labelledby="tab-files">',
     sidebar(cards),
     `<div class="rv-files" id="files">\n${[report(input.findings ?? [], cards), ...cards.map((each, index) => (each.also && !cards[index - 1]?.also ? `<h2 class="rv-also-h">Also looks different</h2>\n${card(each, index)}` : card(each, index)))].join('\n')}\n</div>`,
     '</div>',
-    commitList(input.commits, input.builtAt),
+    commitList(input.commits, commitCount(input), input.builtAt),
     '</div>',
     '</div>',
     '<div class="rv-drawer-back" id="drawer-back" data-act="drawer-close"></div>',
@@ -304,7 +389,7 @@ function appBar(repo: string) {
     '<div class="rv-wrap rv-appbar-in">',
     `<span class="rv-wordmark"><span class="rv-glyph">${icon('branch')}</span>branch-review</span>`,
     '<span class="rv-crumb-sep" aria-hidden="true">/</span>',
-    `<span class="rv-repo">${icon('repo')}<span>${escapeHtml(repo)}</span></span>`,
+    `<span class="rv-repo">${icon('repo')}<span>${shown(repo)}</span></span>`,
     '<span class="rv-spacer"></span>',
     '<span class="rv-local" title="Built from your diff on this machine. Nothing on this page was sent anywhere."><i></i>On this machine</span>',
     '<div class="rv-seg rv-icons rv-theme rv-js" role="group" aria-label="Theme">',
@@ -342,21 +427,32 @@ const STATE_TIPS: Partial<Record<BranchState['kind'], (state: BranchState) => st
   unknown: () => "git didn't say in time where this branch stands against its upstream",
   diverged: (state) => {
     const {remote, ahead, behind} = state as Extract<BranchState, {kind: 'diverged'}>;
-    return escapeHtml(`${plural(ahead, 'commit')} here that ${remote} doesn't have, and ${behind} there that this branch doesn't`);
+    return spoken(`${plural(ahead, 'commit')} here that ${remote} doesn't have, and ${behind} there that this branch doesn't`);
   },
 };
 
-function heading({title, state, commits, builtAt}: ReviewPageInput) {
+// How many commits the branch has: git's count, or the list's length when
+// the list isn't full, else unknown (null), which the page says as `250+`.
+function commitCount({commits, commitTotal}: ReviewPageInput): number | null {
+  if (commitTotal !== undefined) return commitTotal;
+  return commits && commits.length < COMMIT_LIST_LIMIT ? commits.length : null;
+}
+
+const countWords = (count: number | null) => (count === null ? `${COMMIT_LIST_LIMIT}+ commits` : plural(count, 'commit'));
+
+function heading(input: ReviewPageInput) {
+  const {title, state, commits, builtAt} = input;
+  const count = commitCount(input);
   const words = state ? (STATE_WORDS[state.kind] as (state: BranchState) => string)(state) : null;
   const meta = [
-    ...(state ? [`<span class="rv-state rv-state-${state.kind}"${STATE_TIPS[state.kind] ? ` title="${STATE_TIPS[state.kind]!(state)}"` : ''}>${icon('branch')}${escapeHtml(words!)}</span>`] : []),
-    ...(commits && commits.length > 0 ? [`<span>${plural(commits.length, 'commit')} on <span class="rv-ref">${escapeHtml(title.branch)}</span> that ${commits.length === 1 ? 'is' : 'are'} not on <span class="rv-ref">${escapeHtml(title.base)}</span></span>`] : []),
+    ...(state ? [`<span class="rv-state rv-state-${state.kind}"${STATE_TIPS[state.kind] ? ` title="${STATE_TIPS[state.kind]!(state)}"` : ''}>${icon('branch')}${shown(words!)}</span>`] : []),
+    ...(commits && commits.length > 0 ? [`<span>${countWords(count)} on <span class="rv-ref">${shown(title.branch)}</span> that ${count === 1 ? 'is' : 'are'} not on <span class="rv-ref">${shown(title.base)}</span></span>`] : []),
     ...(commits && commits.length > 0 ? [`<span class="rv-nowrap"><span aria-hidden="true">· </span>last commit ${timeTag(commits[0]!.time, builtAt)}</span>`] : []),
     ...(title.worktree ? ['<span class="rv-nowrap"><span aria-hidden="true">· </span>with uncommitted changes</span>'] : []),
   ];
   return [
     '<div class="rv-head">',
-    `<h1><span>${escapeHtml(title.branch)}</span><span class="rv-into">into ${escapeHtml(title.base)}</span></h1>`,
+    `<h1><span>${shown(title.branch)}</span><span class="rv-into">into ${shown(title.base)}</span></h1>`,
     `<div class="rv-meta">${meta.join('')}</div>`,
     '</div>',
   ].join('\n');
@@ -397,22 +493,21 @@ function shownCounts(each: ReviewPageCard) {
   return {additions: each.additions, deletions: each.deletions};
 }
 
-function tabs(cards: readonly ReviewPageCard[], commits: ReviewCommit[] | null) {
+function tabs(cards: readonly ReviewPageCard[], commits: ReviewCommit[] | null, count: number | null) {
   const counts = cards.map(shownCounts);
   const additions = counts.reduce((sum, each) => sum + (each?.additions ?? 0), 0);
   const deletions = counts.reduce((sum, each) => sum + (each?.deletions ?? 0), 0);
   return [
     '<nav class="rv-tabs" role="tablist" aria-label="Review sections">',
     `<button type="button" class="rv-tab" role="tab" id="tab-files" aria-selected="true" aria-controls="panel-files" data-tab="files">${icon('fileDiff')}Files changed<span class="rv-count">${cards.length}</span></button>`,
-    `<button type="button" class="rv-tab rv-js" role="tab" id="tab-commits" aria-selected="false" aria-controls="panel-commits" data-tab="commits">${icon('commit')}Commits<span class="rv-count">${commits ? commits.length : '?'}</span></button>`,
+    `<button type="button" class="rv-tab rv-js" role="tab" id="tab-commits" aria-selected="false" aria-controls="panel-commits" data-tab="commits">${icon('commit')}Commits<span class="rv-count">${commits ? count ?? `${COMMIT_LIST_LIMIT}+` : '?'}</span></button>`,
     `<span class="rv-total">${stat(additions, deletions)}</span>`,
     '</nav>',
   ].join('\n');
 }
 
-function toolbar(files: number, commits: ReviewCommit[] | null, worktree: boolean) {
-  const count = commits?.length ?? 0;
-  const from = count > 0 ? `changes from <b>all ${plural(count, 'commit')}</b>` : '';
+function toolbar(files: number, commits: ReviewCommit[] | null, total: number | null, worktree: boolean) {
+  const from = commits && commits.length > 0 ? `changes from <b>all ${countWords(total)}</b>` : '';
   const shown = worktree ? (from ? `${from} and <b>uncommitted changes</b>` : '<b>uncommitted changes</b>') : from || 'the changes on this branch';
   const ring = 2 * Math.PI * 8;
   return [
@@ -462,8 +557,8 @@ function sidebar(cards: readonly ReviewPageCard[]) {
   const fileRow = (index: number) => {
     const each = cards[index]!;
     return [
-      `<li role="treeitem" data-path="${escapeHtml(each.path)}">`,
-      `<a class="rv-row rv-file" href="#file-${index}" data-act="goto" data-i="${index}">${icon('file')}<span class="rv-nm">${escapeHtml(path.posix.basename(each.path))}</span>`,
+      `<li role="treeitem" data-path="${exact(each.path)}">`,
+      `<a class="rv-row rv-file" href="#file-${index}" data-act="goto" data-i="${index}">${icon('file')}<span class="rv-nm">${shown(path.posix.basename(each.path))}</span>`,
       `<span class="rv-vchk" title="Viewed">${icon('check')}</span>`,
       each.also ? `<span class="rv-st rv-st-also" title="Looks different">${icon('dotSq')}</span>` : `<span class="rv-st rv-st-${each.status}" title="${STATUS_WORD[each.status]}">${icon(STATUS_ICON[each.status])}</span>`,
       '</a></li>',
@@ -479,7 +574,7 @@ function sidebar(cards: readonly ReviewPageCard[]) {
       label = `${label}/${next}`;
       inner = inner.dirs.get(next)!;
     }
-    return `<li class="rv-dir" role="treeitem" aria-expanded="true"><button type="button" class="rv-row" data-act="dir">${icon('chevD', 'rv-chev')}${icon('folder')}<span class="rv-nm">${escapeHtml(label)}</span></button><ul role="group">${walk(inner)}</ul></li>`;
+    return `<li class="rv-dir" role="treeitem" aria-expanded="true"><button type="button" class="rv-row" data-act="dir">${icon('chevD', 'rv-chev')}${icon('folder')}<span class="rv-nm">${shown(label)}</span></button><ul role="group">${walk(inner)}</ul></li>`;
   }).join('');
   return [
     '<aside class="rv-sidebar" id="sidebar" aria-label="Changed files">',
@@ -499,12 +594,12 @@ function report(findings: readonly Finding[], cards: readonly ReviewPageCard[]) 
   if (findings.length === 0) return '';
   const rows = findings.map((finding) => {
     const index = cards.findIndex((each) => each.path === finding.path);
-    const text = `<code>${escapeHtml(`${finding.path}:${finding.line}`)}</code><span>${escapeHtml(`${finding.target} · ${finding.reason}`)}</span>`;
+    const text = `<code>${shown(`${finding.path}:${finding.line}`)}</code><span>${shown(`${finding.target} · ${finding.reason}`)}</span>`;
     return index < 0 ? `<li><span class="rv-row">${text}</span></li>` : `<li><a class="rv-row" href="#file-${index}" data-act="goto" data-i="${index}">${text}</a></li>`;
   });
   return [
     '<section class="rv-report" id="report" aria-labelledby="report-h">',
-    `<div class="rv-report-h">${icon('info')}<h2 id="report-h">Won't render on GitHub · ${escapeHtml(findingsLabel(findings)!)}</h2><button type="button" class="rv-icon-btn rv-sm rv-js" data-act="report-close" aria-label="Dismiss this list">${icon('x')}</button></div>`,
+    `<div class="rv-report-h">${icon('info')}<h2 id="report-h">Won't render on GitHub · ${shown(findingsLabel(findings)!)}</h2><button type="button" class="rv-icon-btn rv-sm rv-js" data-act="report-close" aria-label="Dismiss this list">${icon('x')}</button></div>`,
     `<ul>${rows.join('')}</ul>`,
     '</section>',
   ].join('\n');
@@ -513,8 +608,8 @@ function report(findings: readonly Finding[], cards: readonly ReviewPageCard[]) 
 function card(each: CarriedCard, index: number) {
   const name = path.posix.basename(each.path);
   const dir = each.path.slice(0, each.path.length - name.length);
-  const moved = each.oldPath ? `<span class="rv-from">${escapeHtml(each.oldPath)} → </span>` : '';
-  const label = escapeHtml(each.path);
+  const moved = each.oldPath ? `<span class="rv-from">${shown(each.oldPath)} → </span>` : '';
+  const label = spoken(each.path);
   const image = each.image ? imageSizes(each.image) : null;
   // An image with no text diff is counted by its sizes, and has none to
   // say while its sides aren't in.
@@ -532,23 +627,26 @@ function card(each: CarriedCard, index: number) {
     `<button type="button" data-act="view" data-v="rich" aria-pressed="${startsRich}" title="Rich diff">${icon('eye')}<span>Rich</span></button>`,
     '</div>',
   ].join('') : '';
-  const source = each.diff ? sourceDiff(each.diff, each.status) : each.special ? specialLine(each.special, each) : `<p class="rv-notice">${escapeHtml(each.notice ?? 'No changes to show.')}</p>`;
+  const source = each.diff ? sourceDiff(each.diff, each.status) : each.special ? specialLine(each.special, each) : `<p class="rv-notice">${shown(each.notice ?? 'No changes to show.')}</p>`;
   const rich = each.kind === 'markdown' ? richView(each) : each.image ? imageView(each.image, each.status) : imageNote(each);
   // A card with both views switches between them; an image with no text
   // diff is its pictures alone.
   const bodyHtml = views
     ? `<div class="rv-v-src"${startsRich ? ' hidden' : ''}>${source}</div><div class="rv-v-rich"${startsRich ? '' : ' hidden'}>${rich}</div>`
     : rich || source;
+  // Code that may read differently than it runs says so above both views.
+  const bidi = each.diff && (each.kind === 'text' || each.kind === 'markdown') && each.diff.hunks.some((hunk) => hunk.lines.some((line) => BIDI_MARKER.test(line.h)))
+    ? `<p class="rv-bidi" role="note">${icon('alert')}<span>${BIDI_WARNING}</span></p>` : '';
   return [
-    `<section class="rv-card${each.also ? ' rv-also' : ''}" id="file-${index}" data-i="${index}" data-vk="${escapeHtml(each.viewKey)}" data-sig="${escapeHtml(each.signature)}"${each.alias ? ` data-alias="${escapeHtml(each.alias)}"` : ''} aria-label="${label}">`,
+    `<section class="rv-card${each.also ? ' rv-also' : ''}" id="file-${index}" data-i="${index}" data-vk="${escapeHtml(each.viewKey)}" data-sig="${escapeHtml(each.signature)}"${each.alias ? ` data-alias="${escapeHtml(each.alias)}"` : ''} data-path="${exact(each.path)}" aria-label="${label}">`,
     '<div class="rv-fh">',
     `<button type="button" class="rv-icon-btn rv-sm rv-chevron rv-js" data-act="collapse" aria-expanded="true" aria-label="Collapse ${label}">${icon('chevD')}</button>`,
-    `<div class="rv-fh-path"><span class="rv-path">${moved}${escapeHtml(dir)}<b>${escapeHtml(name)}</b></span><button type="button" class="rv-icon-btn rv-sm rv-js" data-act="copy" aria-label="Copy file path" title="Copy file path">${icon('copy')}</button></div>`,
+    `<div class="rv-fh-path"><span class="rv-path">${moved}${shown(dir)}<b>${shown(name)}</b></span><button type="button" class="rv-icon-btn rv-sm rv-js" data-act="copy" aria-label="Copy file path" title="Copy file path">${icon('copy')}</button></div>`,
     statHtml,
     each.mode ? `<span class="rv-fh-mode" title="File mode changed">${escapeHtml(`${each.mode.from} → ${each.mode.to}`)}</span>` : '',
     `<div class="rv-fh-act">${viewSwitch}${each.also ? '' : '<label class="rv-viewed-btn rv-js"><input type="checkbox" data-act="viewed"><span>Viewed</span></label>'}<button type="button" class="rv-icon-btn rv-js" data-act="menu" aria-label="More options for ${label}" aria-haspopup="menu" aria-expanded="false">${icon('kebab')}</button></div>`,
     '</div>',
-    `<div class="rv-fb">${bodyHtml}</div>`,
+    `<div class="rv-fb">${bidi}${bodyHtml}</div>`,
     '</section>',
   ].join('\n');
 }
@@ -566,7 +664,7 @@ function sourceDiff(diff: CardDiff, status: FileStatus) {
 
 const SPECIAL_ICONS: Record<CardSpecial['kind'], IconName> = {binary: 'binary', empty: 'file', renamed: 'arrowSq', mode: 'mode', submodule: 'submodule', lfs: 'lfs', tooLarge: 'alert', noRoom: 'alert', deleted: 'minusSq', unreadable: 'alert', none: 'file'};
 
-const partHtml = (part: SpecialPart) => (typeof part === 'string' ? escapeHtml(part) : `<code>${escapeHtml(part.code)}</code>`);
+const partHtml = (part: SpecialPart) => (typeof part === 'string' ? shown(part) : `<code>${shown(part.code)}</code>`);
 
 // GitHub's one line in place of a diff, with what follows it after a dot.
 function specialLine(special: CardSpecial, file: {status: FileStatus; oldPath?: string}) {
@@ -579,11 +677,11 @@ const BANNERS: Partial<Record<FileStatus, (oldPath?: string) => [string, Paramet
   added: () => ['added', 'plusSq', '<b>New file.</b> Everything below is added in this branch.'],
   untracked: () => ['added', 'plusSq', '<b>Untracked file.</b> Everything below is new, and not part of a push yet.'],
   deleted: () => ['deleted', 'minusSq', '<b>Deleted file.</b> Shown as it was on the base branch.'],
-  renamed: (oldPath) => ['renamed', 'arrowSq', `<b>Renamed</b> from ${escapeHtml(oldPath ?? '')}.`],
+  renamed: (oldPath) => ['renamed', 'arrowSq', `<b>Renamed</b> from ${shown(oldPath ?? '')}.`],
 };
 
-// A markdown file as GitHub draws it, with the file pages' change marks:
-// bars, before chips and removed markers.
+// A markdown file as GitHub draws it, with the rich view's change marks
+// (page.css): bars, before chips and removed markers.
 function richView(each: CarriedCard) {
   const body = each.rich?.body ?? {kind: 'pending'};
   const differences = body.kind === 'rendered' ? body.fragment.differences : [];
@@ -599,7 +697,7 @@ function richView(each: CarriedCard) {
     ...(allAdded ? ['<span class="rv-legend"><i class="rv-l-add"></i>Added</span>'] : []),
     '<details class="rv-fid">',
     `<summary title="Drawn on this machine with GitHub's rules, so small differences are possible">${icon('info')}≈ GitHub rendering${notes.length > 0 ? ` · ${plural(notes.length, 'difference')}` : ''}</summary>`,
-    `<div class="rv-pop"><p>Drawn on this machine with GitHub's parser rules, sanitizer and stylesheet.</p>${notes.length > 0 ? `<ul>${notes.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>` : '<p>No known differences in this file.</p>'}</div>`,
+    `<div class="rv-pop"><p>Drawn on this machine with GitHub's parser rules, sanitizer and stylesheet.</p>${notes.length > 0 ? `<ul>${notes.map((line) => `<li>${shown(line)}</li>`).join('')}</ul>` : '<p>No known differences in this file.</p>'}</div>`,
     '</details>',
     '</div>',
     ...(banner && (each.status !== 'renamed' || each.oldPath) ? [`<div class="rv-banner rv-banner-${banner[0]}">${icon(banner[1])}<span>${banner[2]}</span></div>`] : []),
@@ -608,16 +706,20 @@ function richView(each: CarriedCard) {
   ].join('');
 }
 
+// A bidi control among a card's diff lines, as the lines draw it.
+const BIDI_MARKER = /<span class="rv-hc" title="U\+(?:202[A-E]|206[6-9])">/;
+const BIDI_WARNING = 'This file contains bidirectional Unicode text that may read differently than it appears. Source shows each one as a marker.';
+
 // A card whose render isn't back yet: the page is written again once it is.
 const ON_ITS_WAY = 'Still being prepared. Press r in branch-review again in a moment to see it.';
 
 function alsoBanner(images: readonly string[]): [string, Parameters<typeof icon>[0], string] {
-  return ['renamed', 'dotSq', `<b>Not changed on this branch.</b> It shows ${images.map((image) => `<code>${escapeHtml(image)}</code>`).join(', ')}, which this branch changed.`];
+  return ['renamed', 'dotSq', `<b>Not changed on this branch.</b> It shows ${images.map((image) => `<code>${shown(image)}</code>`).join(', ')}, which this branch changed.`];
 }
 
 // An image or SVG card with no pictures to show: why, in one line.
 function imageNote(each: ReviewPageCard) {
-  if (each.imageFailure !== undefined) return `<p class="rv-notice">${escapeHtml(each.imageFailure)}</p>`;
+  if (each.imageFailure !== undefined) return `<p class="rv-notice">${shown(each.imageFailure)}</p>`;
   if (each.pending) return `<p class="rv-notice">${ON_ITS_WAY}</p>`;
   return '';
 }
@@ -638,11 +740,18 @@ function imageSizes(image: ImageBody) {
 function picture(side: ImageSide, which: 'before' | 'after') {
   if (side.kind !== 'shown') {
     const {text} = refusedCard(side.reason, side.hint);
-    return `<div class="rv-img-card">${escapeHtml(text)}</div>`;
+    return `<div class="rv-img-card">${shown(text)}</div>`;
   }
-  const size = side.width && side.height ? ` width="${side.width}" height="${side.height}"` : '';
-  return `<img alt="${which === 'before' ? 'Before' : 'After'}" src="${side.dataUrl}"${size}>`;
+  return `<img alt="${which === 'before' ? 'Before' : 'After'}" src="${side.dataUrl}"${pictureSize(side)}>`;
 }
+
+const pictureSize = (side: Extract<ImageSide, {kind: 'shown'}>) => (side.width && side.height ? ` width="${side.width}" height="${side.height}"` : '');
+
+// A side in the swipe or onion stage: the same picture as the 2-up one,
+// with no data of its own, which the page script gives it from the 2-up
+// one the first time the reader picks the mode, so the page carries each
+// side's data once, as its budget counts it.
+const stagePicture = (side: Extract<ImageSide, {kind: 'shown'}>, which: 'before' | 'after') => `<img alt="${which === 'before' ? 'Before' : 'After'}" data-from="${which}"${pictureSize(side)}>`;
 
 // An image's sides: 2-up, swipe and onion skin for a picture on each, as
 // GitHub compares them; a lone side, or a side the page left out, alone.
@@ -674,16 +783,16 @@ function imageView(image: ImageBody, status: FileStatus) {
     '</div>',
     '<div class="rv-im" data-im-panel="swipe" hidden>',
     '<div class="rv-stage rv-swipe rv-frame">',
-    `<div class="rv-layer">${picture(before, 'before')}</div>`,
-    `<div class="rv-layer rv-after">${picture(after, 'after')}</div>`,
+    `<div class="rv-layer">${stagePicture(before, 'before')}</div>`,
+    `<div class="rv-layer rv-after">${stagePicture(after, 'after')}</div>`,
     '<div class="rv-stage-tags"><span class="rv-tag rv-tag-b">Before</span><span class="rv-tag rv-tag-a">After</span></div>',
     `<div class="rv-handle" role="slider" tabindex="0" aria-label="Swipe position" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="rv-grip">${icon('grip')}</span></div>`,
     '</div>',
     '</div>',
     '<div class="rv-im" data-im-panel="onion" hidden>',
     '<div class="rv-stage rv-onion rv-frame">',
-    `<div class="rv-layer">${picture(before, 'before')}</div>`,
-    `<div class="rv-layer rv-after">${picture(after, 'after')}</div>`,
+    `<div class="rv-layer">${stagePicture(before, 'before')}</div>`,
+    `<div class="rv-layer rv-after">${stagePicture(after, 'after')}</div>`,
     '</div>',
     '<label class="rv-onion-ctl"><span>Before</span><input type="range" min="0" max="100" value="50" aria-label="Opacity of the after image"><span>After</span></label>',
     '</div>',
@@ -692,9 +801,9 @@ function imageView(image: ImageBody, status: FileStatus) {
   ].join('');
 }
 
-// The Commits tab: the branch's commits by day, newest first, each with its
-// subject, how long ago and how many files, and its short hash.
-function commitList(commits: ReviewCommit[] | null, builtAt: number) {
+// The Commits tab: the branch's newest commits by day, newest first, each
+// with its subject, how long ago and how many files, and its short hash.
+function commitList(commits: ReviewCommit[] | null, count: number | null, builtAt: number) {
   const parts = ['<div class="rv-commits" id="panel-commits" role="tabpanel" aria-labelledby="tab-commits" hidden>'];
   if (commits === null) {
     parts.push("<p class=\"rv-none\">Couldn't read the commits on this branch.</p>");
@@ -707,11 +816,15 @@ function commitList(commits: ReviewCommit[] | null, builtAt: number) {
       days.set(day, [...(days.get(day) ?? []), commit]);
     }
     for (const [day, list] of days) {
-      parts.push(`<h3>${icon('commit')}Commits on ${escapeHtml(day)}</h3>`, '<ol>');
+      parts.push(`<h3>${icon('commit')}Commits on ${shown(day)}</h3>`, '<ol>');
       for (const commit of list) {
-        parts.push(`<li><div><p class="rv-msg">${escapeHtml(commit.subject)}</p><p class="rv-cmeta">Committed ${timeTag(commit.time, builtAt)} · ${plural(commit.files, 'file')}</p></div><code class="rv-sha">${escapeHtml(commit.hash)}</code></li>`);
+        parts.push(`<li><div><p class="rv-msg">${shown(commit.subject)}</p><p class="rv-cmeta">Committed ${timeTag(commit.time, builtAt)} · ${plural(commit.files, 'file')}</p></div><code class="rv-sha">${shown(commit.hash)}</code></li>`);
       }
       parts.push('</ol>');
+    }
+    // A list cut at its limit says so, with the full count when git gave it.
+    if (count === null ? commits.length >= COMMIT_LIST_LIMIT : commits.length < count) {
+      parts.push(`<p class="rv-none rv-more-commits">${count === null ? `Showing the newest ${commits.length} commits.` : `Showing the newest ${commits.length} of ${count} commits.`}</p>`);
     }
   }
   parts.push('</div>');
@@ -746,12 +859,14 @@ const KEYS = [
 
 /**
  * What the page script reads: the review's name for its viewed marks, and
- * each card's hunks and context, packed (review/diff.ts). JSON in a data block runs nothing, and
- * with every `<` escaped no text in it can end the block.
+ * each card's exact path, which Copy path and the tree's filter read, and
+ * its hunks and context, packed (review/diff.ts). JSON in a data block
+ * runs nothing, with every `<` escaped no text in it can end the block,
+ * and each hidden character is a `\uXXXX` escape, read back as itself.
  */
 function pageData(reviewId: string, cards: readonly ReviewPageCard[]) {
   // A drawn table's lines ride in the table alone; the rest of the HTML in
   // its short form, which the script unpacks.
-  const data = {id: reviewId, cards: cards.map((each) => ({diff: each.diff && packDiff(each.diff, !each.diff.fold)}))};
-  return JSON.stringify(data).replace(/</g, '\\u003c');
+  const data = {id: reviewId, cards: cards.map((each) => ({path: each.path, diff: each.diff && packDiff(each.diff, !each.diff.fold)}))};
+  return escapeHiddenCharactersInJson(JSON.stringify(data)).replace(/</g, '\\u003c');
 }

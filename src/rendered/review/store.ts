@@ -2,7 +2,8 @@
 // there: the theme, the diff layout, a dismissed note, and each review's
 // viewed marks; and for the tab alone, where the reader was on the page
 // and what they did to its cards, which a live refresh in watch mode lands
-// at, and the cards' signatures, by which it tells what changed. Each read and write is
+// at, what they did to the page itself, and the cards' signatures, by
+// which it tells what changed. Each read and write is
 // wrapped, since storage can be off (a private window, blocked site data)
 // and the page must work without it. Pure apart from Web Storage: both
 // page scripts share it.
@@ -20,6 +21,10 @@ export const STORE_KEYS = {
   // did to each card (its view, folded, loaded), which a live refresh keeps.
   signatures: 'branch-review:signatures:',
   cards: 'branch-review:cards:',
+  // In this tab's session storage, followed by the review's id: the tab
+  // the reader left the page on, the Commits scroll, a closed report and a
+  // hidden tree, which a live refresh keeps.
+  page: 'branch-review:page:',
 } as const;
 
 export function readStore(key: string): string | null {

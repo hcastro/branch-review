@@ -1380,6 +1380,9 @@ export function* grepTreeFilesOperation(cwd: string, treeOid: string, words: rea
   });
 }
 
+/** The most commits the Review in browser page lists: the newest, with the full count beside them. */
+export const COMMIT_LIST_LIMIT = 250;
+
 /** One commit the branch has that the base doesn't: short hash, commit time in seconds, subject, and how many files it changed. */
 export type BranchCommit = {hash: string; time: number; subject: string; files: number};
 
@@ -1390,7 +1393,7 @@ export type BranchCommit = {hash: string; time: number; subject: string; files: 
  * nothing is fetched. No signature is checked, whatever log.showSignature
  * says.
  */
-export function* branchCommitsOperation(cwd: string, base: string, branch: string, limit = 250): GitOperation<BranchCommit[]> {
+export function* branchCommitsOperation(cwd: string, base: string, branch: string, limit = COMMIT_LIST_LIMIT): GitOperation<BranchCommit[]> {
   const output = yield* gitOperation(cwd, ['log', '--no-color', '--no-renames', '--no-show-signature', `--max-count=${limit}`, '--format=%x1e%h%x1f%ct%x1f%s', '--name-only', `${base}..${branch}`, '--'], {local: true});
   // Read by line: a record starts on a line that starts with the separator
   // and a hash, and runs to the end of that line, so a subject (which holds
@@ -1406,37 +1409,120 @@ export function* branchCommitsOperation(cwd: string, base: string, branch: strin
   return commits;
 }
 
+/** How many commits `branch` has that `base` doesn't, all of them. Local refs only. */
+export function* branchCommitCountOperation(cwd: string, base: string, branch: string): GitOperation<number> {
+  const count = Number((yield* gitOperation(cwd, ['rev-list', '--count', `${base}..${branch}`, '--'], {local: true})).trim());
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error('git rev-list --count printed no count');
+  return count;
+}
+
 /**
  * Where a local branch stands against its upstream: none set, or how many
  * commits it has that the upstream doesn't (`ahead`) and, when there are
  * any, how many the upstream has that it doesn't (`behind`), with the
- * remote's name (the upstream branch's own name when it is local). Null
- * for a ref that is no local branch. Reads only local refs: nothing is
- * fetched, so `behind` counts what the last fetch brought.
+ * remote's name (the upstream branch's own name when it is local). A
+ * branch with no upstream, or one whose upstream ref is gone, is compared
+ * with the branch of its name on the remote it would push to, when that
+ * ref exists: a push without `-u` is still a push. Null for a ref that is
+ * no local branch. Reads only local refs: nothing is fetched, so `behind`
+ * counts what the last fetch brought.
  */
 export function* upstreamStateOperation(cwd: string, branch: string): GitOperation<{remote: string; ahead: number; behind?: number} | {remote: null} | null> {
   const full = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', branch]);
   if (!full?.startsWith('refs/heads/')) return null;
   const name = full.slice('refs/heads/'.length);
   const upstream = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', `${name}@{upstream}`]);
-  if (!upstream) return {remote: null};
-  const remote = yield* tryGitOperation(cwd, ['config', '--get', `branch.${name}.remote`]);
+  const configured = upstream && (yield* hasRefOperation(cwd, upstream)) ? upstream : null;
+  let remote: string;
+  let against: string;
+  if (configured) {
+    const named = yield* tryGitOperation(cwd, ['config', '--get', `branch.${name}.remote`]);
+    remote = named && named !== '.' ? named : configured.replace(/^refs\/heads\//, '');
+    against = configured;
+  } else {
+    const pushed = yield* pushedRefOperation(cwd, name, yield* pushSettingsOperation(cwd));
+    if (!pushed) return {remote: null};
+    ({remote, ref: against} = pushed);
+  }
   // The upstream's own commits on the left, the branch's on the right.
-  const [behind, ahead] = (yield* gitLineOperation(cwd, ['rev-list', '--left-right', '--count', `${upstream}...${full}`])).split(/\s+/).map(Number);
-  return {remote: remote && remote !== '.' ? remote : upstream.replace(/^refs\/heads\//, ''), ahead: ahead!, ...(behind! > 0 ? {behind} : {})};
+  const [behind, ahead] = (yield* gitLineOperation(cwd, ['rev-list', '--left-right', '--count', `${against}...${full}`])).split(/\s+/).map(Number);
+  return {remote, ahead: ahead!, ...(behind! > 0 ? {behind} : {})};
+}
+
+// What says where a branch with no upstream would push: every branch's
+// pushRemote and remote, remote.pushDefault, and the remotes, from one
+// read of the config. Keys come back with their section and name in lower
+// case and a branch's or remote's own name as it is.
+type PushSettings = {values: Map<string, string>; remotes: string[]};
+
+function* pushSettingsOperation(cwd: string): GitOperation<PushSettings> {
+  // git exits 1 when no key matches: no remote, and nothing set.
+  const output = (yield* tryGitOperation(cwd, ['config', '-z', '--get-regexp', '^(branch\\..*\\.(pushremote|remote)|remote\\.pushdefault|remote\\..*\\.url)$'])) ?? '';
+  const values = new Map<string, string>();
+  const remotes = new Set<string>();
+  // Each entry is its key, a newline and its value, ended by a NUL. git
+  // lists the system, global, repo and worktree files in that order, each
+  // in its own order: the last value of a key is the one `git config --get`
+  // and a push take.
+  for (const entry of output.split('\0')) {
+    const at = entry.indexOf('\n');
+    if (at <= 0) continue;
+    const key = entry.slice(0, at);
+    values.set(key, entry.slice(at + 1));
+    const url = /^remote\.(.+)\.url$/.exec(key);
+    if (url) remotes.add(url[1]!);
+  }
+  return {values, remotes: [...remotes]};
+}
+
+/**
+ * The branch of `name`'s name on the remote a push would go to, with the
+ * commit it names, when the repo has that ref: the branch's pushRemote,
+ * then remote.pushDefault, then the branch's remote, then the repo's only
+ * remote. Null when there is no such remote or no such ref. One process
+ * past the config read, and none for a repo with no remote.
+ */
+function* pushedRefOperation(cwd: string, name: string, settings: PushSettings): GitOperation<{remote: string; ref: string; tip: string} | null> {
+  if (settings.remotes.length === 0) return null;
+  const setting = (key: string) => {
+    const value = settings.values.get(key);
+    return value && value !== '.' ? value : null;
+  };
+  const remote = setting(`branch.${name}.pushremote`) ?? setting('remote.pushdefault') ?? setting(`branch.${name}.remote`) ?? (settings.remotes.length === 1 ? settings.remotes[0]! : null);
+  if (!remote) return null;
+  const ref = `refs/remotes/${remote}/${name}`;
+  // A pattern also matches the refs under it, as a folder: only the ref
+  // itself counts, and a tag's commit stands for the tag.
+  const listed = (yield* tryGitOperation(cwd, ['for-each-ref', '--format=%(refname)%00%(objecttype)%00%(objectname)%00%(*objectname)', ref])) ?? '';
+  for (const line of listed.split('\n')) {
+    const [refname, type, object, peeled] = line.split('\0');
+    if (refname !== ref) continue;
+    const tip = type === 'commit' ? object : type === 'tag' ? peeled : undefined;
+    return tip && /^[0-9a-f]{40,64}$/.test(tip) ? {remote, ref, tip} : null;
+  }
+  return null;
 }
 
 /**
  * What the commits and the branch's state are read from, in one line: the
  * commit each of `base`, `branch` and the branch's upstream names, `-` for
- * one that names none. A push, an amend or a moved base changes it. Local
- * refs only.
+ * one that names none. A branch with no upstream names the ref its state
+ * is read against in its place (upstreamStateOperation), so a push without
+ * `-u` changes it too: three more processes, one for a repo with no
+ * remote. A push, an amend or a moved base changes it. Local refs only.
  */
 export function* branchTipsOperation(cwd: string, base: string, branch: string): GitOperation<string> {
   const tip = function* (ref: string) {
     return (yield* tryGitOperation(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])) ?? '-';
   };
-  return [yield* tip(base), yield* tip(branch), yield* tip(`${branch}@{upstream}`)].join(' ');
+  const tips = [yield* tip(base), yield* tip(branch), yield* tip(`${branch}@{upstream}`)];
+  if (tips[2] === '-') {
+    const settings = yield* pushSettingsOperation(cwd);
+    const full = settings.remotes.length > 0 ? yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', branch]) : null;
+    const pushed = full?.startsWith('refs/heads/') ? yield* pushedRefOperation(cwd, full.slice('refs/heads/'.length), settings) : null;
+    if (pushed) tips[2] = pushed.tip;
+  }
+  return tips.join(' ');
 }
 
 /** A blob's full id and size, by its (abbreviated) id. `local`: in a partial clone, one the clone lacks fails rather than being fetched. */

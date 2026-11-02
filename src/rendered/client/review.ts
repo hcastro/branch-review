@@ -1,7 +1,7 @@
 import {readReviewHash} from '../hash.js';
 import {unpackDiff, wordRange, type CardDiff, type DrawnLine, type LineKind, type PackedDiff} from '../review/diff.js';
 import {readSession, readStore, STORE_KEYS, writeSession, writeStore} from '../review/store.js';
-import {expandGap, tableHtml} from '../review/table.js';
+import {expandGap, keptShown, tableHtml} from '../review/table.js';
 import {relativeTime} from '../review/time.js';
 
 // The Review in browser page's script. The page arrives drawn; this adds
@@ -15,7 +15,7 @@ import {relativeTime} from '../review/time.js';
 // and pulses the cards the edit changed. Repo text only arrives here inside HTML the worker
 // escaped and data this script reads as data.
 
-type PageData = {id: string; cards: Array<{diff: PackedDiff | null}>};
+type PageData = {id: string; cards: Array<{path?: string; diff: PackedDiff | null}>};
 // `packed`: the diff as the data carries it, until its table is drawn
 // again; `diff` then. `loaded`: its table is drawn, which a folded diff
 // waits for the reader to ask.
@@ -32,6 +32,11 @@ const narrowTree = matchMedia('(max-width: 900px)');
 
 const data = JSON.parse($('#rv-data')!.textContent ?? '{}') as PageData;
 const cards = $$<HTMLElement>('.rv-card');
+// A card's path exactly as the repo names it.
+const pathOf = (index: number) => {
+  const path = data.cards[index]?.path;
+  return typeof path === 'string' ? path : undefined;
+};
 const states: CardState[] = cards.map((_, index) => {
   const packed = data.cards[index]?.diff ?? null;
   return {packed, diff: null, loaded: !packed?.fold, shown: [], viewed: false, collapsed: false};
@@ -61,14 +66,15 @@ const readViewed = (): Record<string, string> => {
     return {};
   }
 };
-const saveViewed = () => {
+// Writes the one card's mark into the marks as stored now, so a mark made
+// in another tab, or on a newer page of this review, stays as it is.
+const saveViewed = (index: number) => {
+  if (!reviewable(index)) return;
   const marks = readViewed();
-  for (const [index, card] of cards.entries()) {
-    if (!reviewable(index)) continue;
-    const key = card.dataset.vk!;
-    if (states[index]!.viewed) marks[key] = card.dataset.sig!;
-    else delete marks[key];
-  }
+  const card = cards[index]!;
+  const key = card.dataset.vk!;
+  if (states[index]!.viewed) marks[key] = card.dataset.sig!;
+  else delete marks[key];
   writeStore(viewedKey, JSON.stringify(marks));
 };
 
@@ -139,11 +145,15 @@ function toast(message: string) {
   }, 1800);
 }
 
+// The clipboard gets the exact path, from the page's data; the toast says
+// it as the page shows it, each hidden character a marker.
 function copyPath(index: number) {
-  const text = cards[index]!.getAttribute('aria-label') ?? '';
+  const card = cards[index]!;
+  const text = card.getAttribute('aria-label') ?? '';
+  const path = pathOf(index) ?? text;
   const fallback = () => toast(`Path: ${text}`);
   try {
-    const writing = navigator.clipboard?.writeText(text);
+    const writing = navigator.clipboard?.writeText(path);
     if (writing) writing.then(() => toast(`Copied ${text}`), fallback);
     else fallback();
   } catch {
@@ -185,9 +195,12 @@ function goTo(index: number, highlight = true, instant = false) {
 
 const headerAbove = (index: number) => cards[index]!.getBoundingClientRect().top < $('#toolbar')!.getBoundingClientRect().bottom;
 
-function setCollapsed(index: number, collapsed: boolean) {
+// `keepPlace`: folding a card whose header scrolled past brings it back
+// under the toolbar; folding them all keeps the reader's place by the card
+// they folded from.
+function setCollapsed(index: number, collapsed: boolean, {keepPlace = true}: {keepPlace?: boolean} = {}) {
   const card = cards[index]!;
-  const above = headerAbove(index);
+  const above = keepPlace && headerAbove(index);
   states[index]!.collapsed = collapsed;
   card.classList.toggle('rv-collapsed', collapsed);
   const chevron = $('[data-act="collapse"]', card)!;
@@ -216,7 +229,7 @@ function setViewed(index: number, viewed: boolean, save = true) {
   $(`.rv-file[data-i="${index}"]`)?.classList.toggle('rv-is-viewed', viewed);
   setCollapsed(index, viewed);
   updateProgress();
-  if (save) saveViewed();
+  if (save) saveViewed(index);
 }
 
 function setView(index: number, view: string) {
@@ -244,8 +257,13 @@ function toggleTree() {
     openDrawer(!sidebar.classList.contains('rv-open'));
     return;
   }
+  hideTree(!$('#panel-files')!.classList.contains('rv-no-tree'));
+}
+
+// The wide layout's tree, hidden or shown, as page memory keeps it.
+function hideTree(hide: boolean) {
   const panel = $('#panel-files')!;
-  const hide = !panel.classList.contains('rv-no-tree');
+  writePage({tree: hide ? 0 : undefined});
   panel.classList.toggle('rv-no-tree', hide);
   const button = $('.rv-tree-btn')!;
   button.setAttribute('aria-expanded', String(!hide));
@@ -290,8 +308,10 @@ function closeKeys() {
   if (keysReturn instanceof HTMLElement) keysReturn.focus();
 }
 
-function setTab(tab: string) {
+// `remember`: the reader's own switch, which a live refresh keeps.
+function setTab(tab: string, remember = false) {
   const files = tab === 'files';
+  if (remember) writePage({tab: files ? 'files' : 'commits', ...(files ? {} : {cy: Math.round(scrollY)})});
   for (const button of $$('[data-tab]')) button.setAttribute('aria-selected', String(button.dataset.tab === tab));
   $('#panel-files')!.hidden = !files;
   $('#panel-commits')!.hidden = files;
@@ -299,9 +319,15 @@ function setTab(tab: string) {
 }
 
 // ---------- Images ----------
+// The swipe and onion stages' pictures carry no data of their own: each
+// takes its side's from the 2-up picture the first time its mode shows.
 function setImageMode(card: HTMLElement, mode: string) {
   for (const button of $$('[data-act="imode"]', card)) button.setAttribute('aria-pressed', String(button.dataset.im === mode));
   for (const panel of $$('[data-im-panel]', card)) panel.hidden = panel.dataset.imPanel !== mode;
+  for (const image of $$<HTMLImageElement>(`[data-im-panel="${mode}"] img[data-from]:not([src])`, card)) {
+    const from = $<HTMLImageElement>(`.rv-two-up .rv-${image.dataset.from === 'before' ? 'before' : 'after'} img`, card)?.getAttribute('src');
+    if (from?.startsWith('data:')) image.setAttribute('src', from);
+  }
 }
 
 function setSwipe(stage: HTMLElement, percent: number) {
@@ -513,11 +539,15 @@ document.addEventListener('click', (event) => {
         break;
       }
       case 'collapse-all':
-        for (const each of cards.keys()) setCollapsed(each, true);
+      case 'expand-all': {
+        // The reader stays at the card whose menu they used.
+        const fold = item.dataset.menu === 'collapse-all';
+        for (const each of cards.keys()) setCollapsed(each, fold, {keepPlace: false});
+        setCurrent(index);
+        jumping = Date.now() + 900;
+        cards[index]!.scrollIntoView({behavior: 'auto', block: 'start'});
         break;
-      case 'expand-all':
-        for (const each of cards.keys()) setCollapsed(each, false);
-        break;
+      }
     }
     return;
   }
@@ -529,7 +559,7 @@ document.addEventListener('click', (event) => {
     return;
   }
   if (control.dataset.tab) {
-    setTab(control.dataset.tab);
+    setTab(control.dataset.tab, true);
     return;
   }
   const card = control.closest<HTMLElement>('.rv-card');
@@ -583,6 +613,7 @@ document.addEventListener('click', (event) => {
       break;
     case 'report-close':
       $('#report')!.hidden = true;
+      writePage({report: 0});
       break;
     case 'before': {
       const box = befores.get(control);
@@ -601,6 +632,7 @@ document.addEventListener('click', (event) => {
       const gap = Number(control.dataset.g);
       state.shown = expandGap(diff, state.shown, gap);
       drawTable(index, gap);
+      rememberCard(index);
       break;
     }
   }
@@ -619,7 +651,7 @@ $<HTMLInputElement>('#file-filter')?.addEventListener('input', (event) => {
   const query = (event.target as HTMLInputElement).value.trim().toLowerCase();
   let any = false;
   for (const item of $$<HTMLElement>('#tree li[data-path]')) {
-    const hit = !query || (item.dataset.path ?? '').toLowerCase().includes(query);
+    const hit = !query || (pathOf(Number($<HTMLElement>('.rv-file', item)?.dataset.i)) ?? '').toLowerCase().includes(query);
     item.hidden = !hit;
     any ||= hit;
   }
@@ -675,7 +707,10 @@ function onScroll() {
   ticking = true;
   requestAnimationFrame(() => {
     ticking = false;
-    if ($('#panel-files')!.hidden) return;
+    if ($('#panel-files')!.hidden) {
+      savePlace();
+      return;
+    }
     // A scroll during a jump still moves the reader's place, which a live
     // refresh lands at; only the file the jump picked stays current.
     savePlace();
@@ -696,8 +731,12 @@ function cardAtLine() {
 // Where the reader is: the card at the line, and how far down it the top
 // of the window is, kept for this tab, which a live refresh lands at.
 const placeKey = STORE_KEYS.place + data.id;
+// While Commits shows, its scroll is kept, and the Files place as it was.
 function savePlace() {
-  if ($('#panel-files')!.hidden) return;
+  if ($('#panel-files')!.hidden) {
+    writePage({tab: 'commits', cy: Math.round(scrollY)});
+    return;
+  }
   const at = cardAtLine();
   const card = cards[at];
   // By the file's view key, which a newer page with a file added above it
@@ -720,13 +759,31 @@ narrowTree.addEventListener('change', () => {
 });
 
 // ---------- What a live refresh keeps ----------
+// What the reader did to the page in this tab: the tab they left it on
+// and how far down Commits they were, a report they closed, a tree they
+// hid. A press starts the page afresh.
+type PageMemory = {tab?: 'files' | 'commits'; cy?: number; report?: 0; tree?: 0};
+const pageKey = STORE_KEYS.page + data.id;
+function readPage(): PageMemory {
+  try {
+    const parsed = JSON.parse(readSession(pageKey) ?? '{}') as unknown;
+    return parsed && typeof parsed === 'object' ? parsed as PageMemory : {};
+  } catch {
+    return {};
+  }
+}
+// Merges `update` into what is kept; a field set to undefined goes.
+function writePage(update: {[K in keyof PageMemory]?: PageMemory[K] | undefined}) {
+  writeSession(pageKey, JSON.stringify({...readPage(), ...update}));
+}
+
 // What the reader did to each card in this tab, by its view key: the view
 // they switched to, whether they left it folded or open, whether they
 // loaded its diff. A live refresh draws the newer page the same way before
 // it scrolls back, so the reader lands where they were among cards that
 // look as they left them: a Viewed card they opened again stays open. A
 // card the edit changed opens again, as an edit clears its Viewed.
-type CardMemory = {v?: string; c?: 0 | 1; l?: 1};
+type CardMemory = {v?: string; c?: 0 | 1; l?: 1; s?: number[]};
 const cardsKey = STORE_KEYS.cards + data.id;
 const readMemory = (): Record<string, CardMemory> => {
   try {
@@ -736,14 +793,23 @@ const readMemory = (): Record<string, CardMemory> => {
     return {};
   }
 };
-// Off while the page sets its cards up from storage, which is no reader's doing.
+// Off while the page sets its cards up from storage, which is no reader's
+// doing. `force`: a press's own doing as the page loads, which a refresh
+// keeps (a Viewed card the press opened stays open).
 let remembering = false;
-function rememberCard(index: number) {
-  if (!remembering) return;
+function rememberCard(index: number, force = false) {
+  if (!remembering && !force) return;
   const card = cards[index]!;
   const rich = $('.rv-v-rich', card);
   const memory = readMemory();
-  const entry: CardMemory = {...(rich && !rich.hidden ? {v: 'rich'} : rich ? {v: 'source'} : {}), c: states[index]!.collapsed ? 1 : 0, ...(states[index]!.loaded && states[index]!.packed?.fold ? {l: 1 as const} : {})};
+  const state = states[index]!;
+  const entry: CardMemory = {
+    ...(rich && !rich.hidden ? {v: 'rich'} : rich ? {v: 'source'} : {}),
+    c: state.collapsed ? 1 : 0,
+    ...(state.loaded && state.packed?.fold ? {l: 1 as const} : {}),
+    // A gap never opened is a hole in the array: kept as 0.
+    ...(state.shown.some((count) => count > 0) ? {s: Array.from(state.shown, (count) => count ?? 0)} : {}),
+  };
   memory[card.dataset.vk!] = entry;
   writeSession(cardsKey, JSON.stringify(memory));
 }
@@ -772,6 +838,22 @@ function restoreCards() {
     if (!entry) continue;
     if (entry.v === 'rich' || entry.v === 'source') setView(index, entry.v);
     if (entry.l) loadDiff(index);
+    // The context the reader opened, on a card the edit left as it was, as
+    // far as this page carries it: the same diff can arrive with less of
+    // its file. A card that can't be drawn so stays as it arrived, and the
+    // rest of the page still lands.
+    const shown = entry.s;
+    if (!changed.has(index) && Array.isArray(shown) && shown.length <= 10_000 && shown.every((count) => Number.isInteger(count) && count >= 0)) {
+      try {
+        const diff = diffOf(index);
+        if (diff) {
+          states[index]!.shown = keptShown(diff, shown);
+          drawTable(index);
+        }
+      } catch {
+        states[index]!.shown = [];
+      }
+    }
     // After the viewed marks, which fold their cards as the page loads.
     if (entry.c === undefined) continue;
     if (!changed.has(index)) {
@@ -797,6 +879,20 @@ function pulse() {
   }
 }
 
+// What a press on the open page puts back: the tree, the report, and each
+// card's context closed. A card's view, fold and loaded diff stay.
+function resetPage() {
+  if ($('#panel-files')!.classList.contains('rv-no-tree')) hideTree(false);
+  const report = $('#report');
+  if (report) report.hidden = false;
+  for (const [index, state] of states.entries()) {
+    if (!state.shown.some((count) => count > 0)) continue;
+    state.shown = [];
+    drawTable(index);
+    rememberCard(index, true);
+  }
+}
+
 // ---------- Arrival ----------
 // A trip names the card to open at, which glows once; a trip with no card
 // opens the page at its top. A press on the same file again, to a split
@@ -805,17 +901,31 @@ function pulse() {
 function arrive(first = false) {
   const hash = readReviewHash(location.hash);
   if (hash.m !== undefined) motion = hash.m;
-  setTab('files');
-  // A live refresh: back where the reader was, with each card as they left
-  // it, no glow and no motion but a pulse on what changed.
+  // A live refresh: back where the reader was, with the page and each card
+  // as they left them, no glow and no motion but a pulse on what changed.
   if (hash.l && first) {
+    const kept = readPage();
+    // The tree first: it changes how wide every card is.
+    if (kept.tree === 0 && !narrowTree.matches && !$('#panel-files')!.classList.contains('rv-no-tree')) toggleTree();
+    if (kept.report === 0 && $('#report')) $('#report')!.hidden = true;
     restoreCards();
     pulse();
-  } else if (first) {
+    if (kept.tab === 'commits') {
+      setTab('commits');
+      scrollTo({top: typeof kept.cy === 'number' ? kept.cy : 0, behavior: 'auto'});
+      return;
+    }
+  } else {
     // A press opens the page as it arrives: what the reader did before it
-    // is no longer theirs to come back to.
-    writeSession(cardsKey, '{}');
+    // is no longer theirs to come back to. On the page already open, the
+    // tree, the report and the context come back as a new page shows them,
+    // so the next live refresh, which reads what is kept, finds the page
+    // as the reader sees it.
+    if (first) writeSession(cardsKey, '{}');
+    else resetPage();
+    writeSession(pageKey, '{}');
   }
+  setTab('files');
   const place = hash.l ? readPlace() : null;
   // The card at the reader's place stays as they left it, folded or open,
   // so the distance kept down it still lands on the same line.
@@ -832,7 +942,11 @@ function arrive(first = false) {
     return;
   }
   if (hash.file !== undefined && cards[hash.file]) {
-    if (states[hash.file]!.collapsed) setCollapsed(hash.file, false);
+    if (states[hash.file]!.collapsed) {
+      setCollapsed(hash.file, false);
+      // Kept, so a live refresh doesn't fold it again from its Viewed mark.
+      rememberCard(hash.file, true);
+    }
     goTo(hash.file, true, first);
   } else {
     jumping = Date.now() + 900;
@@ -857,8 +971,8 @@ const marks = readViewed();
 for (const [index, card] of cards.entries()) {
   if (marks[card.dataset.vk!] === card.dataset.sig) setViewed(index, true, false);
 }
-// A mark whose file changed since is dropped.
-saveViewed();
+// A mark made on another diff of a file isn't applied here, and stays
+// stored: it may be the mark of a newer page of this review.
 updateProgress();
 // The page arrives drawn unified: only a split layout draws again.
 setLayout(layout, drawnLayout() === 'split');

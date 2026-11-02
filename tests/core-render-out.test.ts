@@ -4,6 +4,7 @@ import {spawn, spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {renderToDirectory} from '../src/rendered/renderOut.js';
+import {OPEN_DEADLINE_MS} from '../src/rendered/service.js';
 import {prepareStartup} from '../src/startup.js';
 import {cleanupTempDirs, commitAll, git, initRepo, makeTempDir, snapshotTree, withEnvAsync, writeExecutable, writeFiles} from './core-helpers.js';
 import {pngFixture} from './media-helpers.js';
@@ -326,6 +327,44 @@ describe('--export-html', () => {
     expect(result.stderr).toMatch(/^branch-review: can't write the pages to .*taken: not a directory\n$/);
   });
 
+  it('never writes over an index.html or links.json it didn\'t write, and replaces its own', () => {
+    const repo = initRepo({'a.md': '# A\n', 'site/index.html': '<!doctype html><title>The site</title>\n'});
+    writeFiles(repo, {'a.md': '# A\n\nB.\n'});
+    const site = path.join(repo, 'site');
+    const refused = runCli(repo, ['HEAD', 'main', '--export-html', 'site']);
+    expect(refused.status).toBe(1);
+    expect(refused.stdout).toBe('');
+    expect(refused.stderr).toBe("branch-review: can't write the page to site: index.html is already there and isn't a branch-review page\n");
+    expect(fs.readFileSync(path.join(site, 'index.html'), 'utf8')).toBe('<!doctype html><title>The site</title>\n');
+    expect(fs.readdirSync(site)).toEqual(['index.html']);
+    expect(git(repo, 'status', '--porcelain', '--', 'site')).toBe('');
+
+    // Its own last run, it replaces.
+    const out = makeTempDir('branch-review-out-');
+    expect(runCli(repo, ['HEAD', 'main', '--export-html', out]).status).toBe(0);
+    const again = runCli(repo, ['HEAD', 'main', '--export-html', out]);
+    expect(again.stderr).toBe('');
+    expect(again.status).toBe(0);
+    expect(fs.readdirSync(out).sort()).toEqual(['index.html', 'links.json']);
+
+    // A links.json of someone else's stops it before the page is written.
+    const other = makeTempDir('branch-review-out-');
+    fs.writeFileSync(path.join(other, 'links.json'), '{"links": []}\n');
+    const links = runCli(repo, ['HEAD', 'main', '--export-html', other]);
+    expect(links.status).toBe(1);
+    expect(links.stderr).toContain("links.json is already there and isn't a branch-review link report");
+    expect(fs.readdirSync(other)).toEqual(['links.json']);
+
+    // Nor through a symlink, even to a page of its own.
+    const linked = makeTempDir('branch-review-out-');
+    fs.symlinkSync(path.join(out, 'index.html'), path.join(linked, 'index.html'));
+    const symlink = runCli(repo, ['HEAD', 'main', '--export-html', linked]);
+    expect(symlink.status).toBe(1);
+    expect(symlink.stderr).toContain("index.html is already there and isn't a branch-review page");
+    expect(fs.lstatSync(path.join(linked, 'index.html')).isSymbolicLink()).toBe(true);
+    expect(fs.readdirSync(linked)).toEqual(['index.html']);
+  });
+
   it('refuses a missing directory and a lone --json with a usage line', () => {
     const repo = initRepo({'a.md': '# A\n'});
     const missing = runCli(repo, ['--export-html']);
@@ -398,6 +437,40 @@ describe('--export-html', () => {
     expect(text.stdout).not.toMatch(HIDDEN);
     expect(text.stdout).not.toContain('\u001B');
     expect(text.stdout).toContain('evil<U+009B>31m<U+202E>DM␛[2J.md');
+  });
+
+  it('draws bidi and zero-width characters on the page as markers, outside the rich views, with the bidi warning (Trojan Source)', () => {
+    const repo = initRepo({'src/auth.ts': 'let isAdmin = false;\n\tconsole.log(1);\n'});
+    writeFiles(repo, {
+      'src/auth.ts': 'let isAdmin = false;\n/*\u202E } \u2066if (isAdmin)\u2069 \u2066 begin admins only */\n\tconsole.log(1);\n',
+      'zw\u200B.ts': 'export {};\n',
+    });
+    const out = makeTempDir('branch-review-out-');
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    const html = fs.readFileSync(path.join(out, 'index.html'), 'utf8');
+    const outside = html.replace(/<article class="markdown-body">[\s\S]*?<\/article>/g, '');
+    expect(outside).not.toMatch(/[\u202A-\u202E\u2066-\u2069\u200B]/);
+    expect(html).toContain('&lt;U+202E&gt;');
+    expect(html).toContain('This file contains bidirectional Unicode text that may read differently than it appears.');
+    expect(html).toContain('<span class="mk"> </span>\t');
+    const tree = html.slice(html.indexOf('<ul class="rv-tree" id="tree"'), html.indexOf('</aside>'));
+    expect(tree.replace(/<[^>]+>/g, '')).toContain('zw&lt;U+200B&gt;.ts');
+    expect(html).toContain('data-path="zw&#x200B;.ts"');
+  });
+
+  it('exports a README whose link holds a long hostile attribute value well inside the time r waits for a page', () => {
+    const repo = initRepo({'README.md': '# Readme\n'});
+    writeFiles(repo, {'README.md': `# Readme\n\n<a title="${'<img b'.repeat(40_000)}">t</a>\n`});
+    const out = makeTempDir('branch-review-out-');
+    const started = Date.now();
+    const result = runCli(repo, ['HEAD', 'main', '--export-html', out, '--json']);
+    const took = Date.now() - started;
+    expect(result.stderr).toBe('');
+    expect(result.status).toBe(0);
+    expect(took).toBeLessThan(OPEN_DEADLINE_MS);
+    expect(fs.readFileSync(path.join(out, 'index.html'), 'utf8')).toContain('<img b<img b');
   });
 
   it('shows a file far over the render limit as too large, with its first text, in the work tree and at a ref', () => {
