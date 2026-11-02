@@ -90,6 +90,9 @@ type AppProps = {
   // When given, App keeps the width it wraps the diff at here, so a caller
   // can wrap a new review ahead of its render (prewrapSections).
   wrapWidthRef?: {current: number | null};
+  // When given, App keeps its wrap cache here, so a caller wraps ahead only
+  // the sections the render would not find in it (sectionsToPrewrap).
+  wrapCacheRef?: {current: ReadonlyMap<string, WrappedSectionCacheEntry> | null};
 };
 
 const SCROLL_STEP = 3;
@@ -237,7 +240,7 @@ type ArrivalSnapshot = {
   }>;
 };
 
-type WrappedSectionCacheEntry = {
+export type WrappedSectionCacheEntry = {
   lines: string[];
   rows: SectionRow[];
 };
@@ -396,15 +399,36 @@ const prewrapped = new WeakMap<string[], {maxWidth: number; entry: WrappedSectio
  * error row. Resolves once done, or early when `signal` aborts.
  */
 export async function prewrapSections(sections: DiffSection[], maxWidth: number, signal?: AbortSignal) {
+  // One slice clock for the whole review: a file that wraps in less than a
+  // slice never yields by itself, so without it a review of many small files
+  // would wrap in a single turn of the event loop.
+  const slice = {start: performance.now()};
   for (const section of sections) {
     if (signal?.aborted) return;
     try {
-      const [wrapped] = await wrapSectionsInSlices([section], maxWidth, {plusMinusMarkers: plainDiffMode}, {signal});
+      const [wrapped] = await wrapSectionsInSlices([section], maxWidth, {plusMinusMarkers: plainDiffMode}, {signal, slice});
       if (wrapped) prewrapped.set(section.lines, {maxWidth, entry: {lines: wrapped.lines, rows: wrapped.rows ?? []}});
     } catch {
       // Aborted, or this section fails to wrap: the render deals with it.
     }
   }
+}
+
+/**
+ * The sections of a new review that its render at `maxWidth` would wrap
+ * itself: those missing from the render's wrap cache `cache`. A section the
+ * render shows with an error row gets new lines, so wrapping it ahead would
+ * never be used; it is left out too.
+ */
+export function sectionsToPrewrap(
+  sections: DiffSection[],
+  review: ReviewModel,
+  maxWidth: number,
+  cache: ReadonlyMap<string, unknown>,
+): DiffSection[] {
+  const displayed = addFileErrorRows(keySections(sections, review));
+  return sections.filter((section, index) => displayed[index]!.lines === section.lines
+    && !cache.has(sectionWrapCacheKey(displayed[index]!, maxWidth)));
 }
 
 // Wraps one section; a section that fails to wrap becomes a single error row
@@ -2458,6 +2482,7 @@ function AppContent({
   rendered,
   tips = true,
   wrapWidthRef,
+  wrapCacheRef,
 }: AppProps) {
   const {exit} = useApp();
   const {stdout} = useStdout();
@@ -2494,7 +2519,10 @@ function AppContent({
   const wrapWidth = useSettledValue(diffContentWidth, WRAP_SETTLE_MS);
   useEffect(() => {
     if (wrapWidthRef) wrapWidthRef.current = wrapWidth;
-  }, [wrapWidth, wrapWidthRef]);
+    // The render updates this map in place, so the caller always sees what
+    // the latest render wrapped.
+    if (wrapCacheRef) wrapCacheRef.current = wrappedSectionCacheRef.current;
+  }, [wrapWidth, wrapWidthRef, wrapCacheRef]);
   const wrappedSections = useMemo(
     () => wrapSectionsWithCache(displaySections, wrapWidth, wrappedSectionCacheRef.current),
     [displaySections, wrapWidth],

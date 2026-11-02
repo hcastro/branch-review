@@ -8,7 +8,7 @@ import type {ClipboardWriter} from '../commands/execute.js';
 import {createRepoWatcher, type CreateRepoWatcherOptions, type RepoWatcher} from '../watch/repoWatcher.js';
 import {refreshReviewInWorker} from '../review/workerRefresh.js';
 import {debounce} from '../watch/debounce.js';
-import {App, prewrapSections} from './App.js';
+import {App, prewrapSections, sectionsToPrewrap, type WrappedSectionCacheEntry} from './App.js';
 import type {DiffSection} from '../sections.js';
 import type {GraphicsCaps} from '../media/types.js';
 import type {MediaService} from '../media/service.js';
@@ -116,17 +116,29 @@ export function formatWatchFooterStatus(status: WatchState, now = Date.now()) {
   return `updated ${seconds === 0 ? 'now' : `${seconds}s ago`}`;
 }
 
-// Wraps a large review at the diff pane's width before it is shown. If the
+// Wraps a large review at the diff pane's width before it is shown, leaving
+// out the sections the render will find in its wrap cache. When what is left
+// is under the limit, the render wraps it, as for a small review. If the
 // pane's width settles on another value meanwhile, it wraps again at that
 // one, so the render finds the width it uses.
-async function prewrapLargeReview(sections: DiffSection[], wrapWidthRef: {current: number | null}, signal: AbortSignal) {
+async function prewrapLargeReview(
+  review: ReviewModel,
+  sections: DiffSection[],
+  wrapWidthRef: {current: number | null},
+  wrapCacheRef: {current: ReadonlyMap<string, unknown> | null},
+  signal: AbortSignal,
+) {
   let lineCount = 0;
   for (const section of sections) lineCount += section.lines.length;
   if (lineCount < PREWRAP_MIN_LINES) return;
 
   let width = wrapWidthRef.current;
   while (width !== null && !signal.aborted) {
-    await prewrapSections(sections, width, signal);
+    const misses = sectionsToPrewrap(sections, review, width, wrapCacheRef.current ?? new Map());
+    let missedLines = 0;
+    for (const section of misses) missedLines += section.lines.length;
+    if (missedLines < PREWRAP_MIN_LINES) return;
+    await prewrapSections(misses, width, signal);
     if (wrapWidthRef.current === width) return;
     width = wrapWidthRef.current;
   }
@@ -171,10 +183,11 @@ export function ReviewController({
   const refreshPendingRef = useRef(false);
   const refreshAbortRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(true);
-  // The width App wraps the diff at, and the sections built for each
-  // refreshed review, so App renders exactly the sections that were wrapped
-  // ahead.
+  // The width App wraps the diff at, its wrap cache, and the sections built
+  // for each refreshed review, so App renders exactly the sections that were
+  // wrapped ahead and nothing it already has is wrapped again.
   const wrapWidthRef = useRef<number | null>(null);
+  const wrapCacheRef = useRef<ReadonlyMap<string, WrappedSectionCacheEntry> | null>(null);
   const reviewSectionsRef = useRef(new WeakMap<ReviewModel, DiffSection[]>());
   // Read through a ref so a resize or a new callback prop does not recreate
   // the watcher, which would drop changes it had not reported yet.
@@ -248,7 +261,7 @@ export function ReviewController({
           if (!mountedRef.current) return;
           const nextSections = buildReviewSections(nextReview);
           reviewSectionsRef.current.set(nextReview, nextSections);
-          await prewrapLargeReview(nextSections, wrapWidthRef, abort.signal);
+          await prewrapLargeReview(nextReview, nextSections, wrapWidthRef, wrapCacheRef, abort.signal);
           if (!mountedRef.current) return;
           setReview(nextReview);
           setActiveRange(nextRange);
@@ -366,6 +379,7 @@ export function ReviewController({
       media={media}
       rendered={rendered}
       wrapWidthRef={wrapWidthRef}
+      wrapCacheRef={wrapCacheRef}
     />
   );
 }

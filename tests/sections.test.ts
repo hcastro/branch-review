@@ -1,3 +1,5 @@
+import v8 from 'node:v8';
+import {runInNewContext} from 'node:vm';
 import {describe, expect, it} from 'vitest';
 import stringWidth from 'string-width';
 import stripAnsi from 'strip-ansi';
@@ -9,6 +11,8 @@ import {
   getSectionForLine,
   getSectionIndexForLine,
   getContinuationPrefix,
+  NORMALIZED_SGR_LIMIT,
+  normalizedSgrCacheSize,
   padToWidth,
   truncateAnsi,
   visibleWidth,
@@ -382,5 +386,75 @@ describe('wrapping in slices', () => {
     const wrapping = wrapSectionsInSlices([deltaSection('src/big.ts', 20_000)], 120, {}, {sliceMs: 0, signal: abort.signal});
     abort.abort(new Error('stop'));
     await expect(wrapping).rejects.toThrow('stop');
+  });
+});
+
+describe('the cache of normalized escapes', () => {
+  // Builds and wraps one section of a ~20 MB diff whose 24-bit colors no other
+  // test uses, so each is new to the cache, and drops all of it.
+  function wrapLargeDiffOnce(escape: (index: number) => string = (index) => `\x1B[38;2;201;202;${index % 4}m`) {
+    const rows: string[] = [];
+    for (let index = 0; index < 240_000; index += 1) {
+      rows.push(`${escape(index)}  ${String(index).padStart(6)} │ const value${index} = 'some text to pad the row out';\x1B[0m`);
+    }
+    const diff = rows.join('\n');
+    const [section] = buildDiffSections([{path: 'src/huge.ts', metrics: {path: 'src/huge.ts', additions: rows.length, deletions: 0, changedLines: rows.length}, diff}]);
+    const [wrapped] = wrapSections([section!], 120);
+    return {diffLength: diff.length, rows: wrapped!.lines.length};
+  }
+
+  it('does not keep the diff it read an escape from alive', () => {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    gc();
+    gc();
+    const baseline = process.memoryUsage().heapUsed;
+
+    const {diffLength, rows} = wrapLargeDiffOnce();
+    expect(diffLength).toBeGreaterThan(18_000_000);
+    expect(rows).toBeGreaterThanOrEqual(240_000);
+
+    gc();
+    gc();
+    // A key that is a slice of the diff holds all ~20 MB of it.
+    expect(process.memoryUsage().heapUsed - baseline).toBeLessThan(5_000_000);
+  }, 120_000);
+
+  it('does not keep the diff alive through an escape with a long parameter', () => {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = runInNewContext('gc') as () => void;
+    gc();
+    gc();
+    const baseline = process.memoryUsage().heapUsed;
+
+    // A lone parameter of 13 or more characters is passed through as is, so
+    // the normalized escape is built from a slice of the diff.
+    const escape = (index: number) => `\x1B[000000000000000020${index % 4}m`;
+    expect(escape(0).slice(2, -1).length).toBeGreaterThanOrEqual(13);
+    const {diffLength, rows} = wrapLargeDiffOnce(escape);
+    expect(diffLength).toBeGreaterThan(18_000_000);
+    expect(rows).toBeGreaterThanOrEqual(240_000);
+
+    gc();
+    gc();
+    // A cached escape that holds a slice of the diff holds all ~20 MB of it.
+    expect(process.memoryUsage().heapUsed - baseline).toBeLessThan(5_000_000);
+  }, 120_000);
+
+  it('stays within its limit, and gives the same output after it is cleared', () => {
+    const lineWith = (token: string) => `${token}const\x1B[1;38;2;10;20;30m value\x1B[0m = 1;`;
+    const tokenA = '\x1B[1;38;2;7;8;9m';
+    expect(NORMALIZED_SGR_LIMIT).toBeGreaterThan(0);
+    const first = truncateAnsi(lineWith(tokenA), 120);
+    let largest = 0;
+    for (let index = 0; index < NORMALIZED_SGR_LIMIT + 100; index += 1) {
+      truncateAnsi(lineWith(`\x1B[38;2;${(index >> 16) & 255};${(index >> 8) & 255};${index & 255}m`), 120);
+      const size = normalizedSgrCacheSize();
+      expect(size).toBeLessThanOrEqual(NORMALIZED_SGR_LIMIT);
+      largest = Math.max(largest, size);
+    }
+    // It filled up to the limit, so it was cleared on the way past it.
+    expect(largest).toBe(NORMALIZED_SGR_LIMIT);
+    expect(truncateAnsi(lineWith(tokenA), 120)).toBe(first);
   });
 });

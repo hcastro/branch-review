@@ -223,15 +223,24 @@ function normalizeSgrToken(token: string): string {
 
 // A diff repeats a few dozen distinct escapes on every row, so each is
 // normalized once; on a large diff this was most of the cost of wrapping.
-const NORMALIZED_SGR_LIMIT = 4096;
+export const NORMALIZED_SGR_LIMIT = 4096;
 const normalizedSgr = new Map<string, string>();
+
+// For tests: how many escapes the cache holds.
+export function normalizedSgrCacheSize(): number {
+  return normalizedSgr.size;
+}
 
 function normalizeSgrTokenOnce(token: string): string {
   let normalized = normalizedSgr.get(token);
   if (normalized === undefined) {
     if (normalizedSgr.size >= NORMALIZED_SGR_LIMIT) normalizedSgr.clear();
-    normalized = normalizeSgrToken(token);
-    normalizedSgr.set(token, normalized);
+    // The match can be a slice that points into the whole diff it came from,
+    // and so can the normalized escape built from its parameters. Cached, either
+    // would keep that diff alive, so both are stored as flat copies. The escape
+    // is ASCII, so latin1 copies it exactly.
+    normalized = Buffer.from(normalizeSgrToken(token), 'latin1').toString('latin1');
+    normalizedSgr.set(Buffer.from(token, 'latin1').toString('latin1'), normalized);
   }
   return normalized;
 }
@@ -595,6 +604,11 @@ export type WrapSliceOptions = {
   // Stops the wrap at the next slice boundary; the promise rejects with the
   // signal's reason.
   signal?: AbortSignal;
+  // When the current slice started. A caller that wraps one section per call
+  // passes the same object to every call, so the slice runs on across
+  // sections instead of starting over with each one. Without it, each call
+  // starts a slice of its own.
+  slice?: {start: number};
 };
 
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -608,18 +622,17 @@ export async function wrapSectionsInSlices(
   sections: DiffSection[],
   maxWidth: number,
   options: WrapOptions = {},
-  {sliceMs = 8, signal}: WrapSliceOptions = {},
+  {sliceMs = 8, signal, slice = {start: performance.now()}}: WrapSliceOptions = {},
 ): Promise<DiffSection[]> {
   const result: DiffSection[] = [];
   let cursor = 0;
-  let sliceStart = performance.now();
   for (const section of sections) {
     const wrap: SectionWrap = {lines: [], rows: [], block: -1};
     for (const line of section.lines) {
-      if (performance.now() - sliceStart >= sliceMs) {
+      if (performance.now() - slice.start >= sliceMs) {
         await yieldToEventLoop();
         signal?.throwIfAborted();
-        sliceStart = performance.now();
+        slice.start = performance.now();
       }
       wrapSectionLine(wrap, line, section.path, maxWidth, options);
     }
