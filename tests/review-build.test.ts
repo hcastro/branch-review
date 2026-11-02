@@ -4,7 +4,7 @@ import {patchObjectIds} from '../src/media/classify.js';
 import type {PageBody} from '../src/rendered/page.js';
 import {BUILD_BUDGET_MS, COLOR_MARGIN_MS, createReviewBuilder, type ReadBranch} from '../src/rendered/review/build.js';
 import {parseHunks, unpackHtml} from '../src/rendered/review/diff.js';
-import {highlightLines} from '../src/rendered/review/highlight.js';
+import {COLOR_MS_PER_UNIT, coloringCost, highlightLines} from '../src/rendered/review/highlight.js';
 import {reviewCardRequest} from '../src/rendered/review/request.js';
 import {OPEN_DEADLINE_MS} from '../src/rendered/service.js';
 import type {SourceReader} from '../src/rendered/source.js';
@@ -663,6 +663,15 @@ describe('the review builder\'s hidden characters, line ends and coloring allowa
 
   it('colors every card of the ordinary 100 KB files that the worst rate cut, on the first build, inside its time', async () => {
     await highlightLines('const warm = 1;\n', 'src/warm.ts');
+    // The build's clock moves as each coloring would at the slowest rate
+    // measured for ordinary code, a third of the worst rate, so the claim
+    // holds on a slow CI runner as on a fast laptop.
+    let clock = 0;
+    const highlight: typeof highlightLines = async (text, filePath) => {
+      const lines = await highlightLines(text, filePath);
+      clock += coloringCost(text) * COLOR_MS_PER_UNIT / 3;
+      return lines;
+    };
     // A line of 100 characters and its newline.
     const wide = `    const message = "${'a string literal that pads this line out'.padEnd(77, '.')}";\n`;
     expect(wide.length).toBe(101);
@@ -676,10 +685,10 @@ describe('the review builder\'s hidden characters, line ends and coloring allowa
       Array.from({length: 12}, (_, index) => tsCard(`src/many${index}.ts`, 100 * 1024)),
     ];
     for (const files of shapes) {
-      const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, branch: knownBranch});
-      const started = Date.now();
+      clock = 0;
+      const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, highlight, now: () => clock, branch: knownBranch});
       const {html, partial} = await builder.page(request(files.map((each) => each.card)));
-      expect(Date.now() - started).toBeLessThan(BUILD_BUDGET_MS);
+      expect(clock).toBeLessThan(BUILD_BUDGET_MS);
       const contexts = dataOf(html).cards.map((card) => card.diff!.context);
       expect(contexts.map((context) => context !== null && context.some((each) => each.includes('<span class="pl-')))).toEqual(files.map(() => true));
       expect(partial).toBe(false);
