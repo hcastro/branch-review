@@ -30,7 +30,14 @@ describe('the beam with NO_COLOR', () => {
     const instance = renderFixture({...fixture, rendered: service}, {columns: 120, rows: 30});
     await flush();
     const from = instance.frames.length;
-    instance.stdin.write('r');
+    // On a loaded runner the app can start listening for keys after its
+    // first frame, and the test's stdin drops a key sent before that, so r
+    // is sent again while the page hasn't been asked for. One call is still
+    // asserted below.
+    for (let attempt = 0; attempt < 10 && calls.length === 0; attempt += 1) {
+      instance.stdin.write('r');
+      await vi.waitFor(() => expect(calls.length).toBeGreaterThan(0), {timeout: 1_000, interval: 20}).catch(() => undefined);
+    }
     // The wait is long for a loaded CI runner: this test is about color, not speed.
     await vi.waitFor(() => expect(stripAnsi(instance.lastFrame() ?? '')).toContain('⇗ guide.md opened in the browser split'), {timeout: 15_000});
     expect(calls).toHaveLength(1);
