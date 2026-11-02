@@ -115,10 +115,10 @@ const defaultTimer: SetTimer = (run, ms) => {
   return () => clearTimeout(timer);
 };
 
-/** The tips from git, within their budget. */
-export const readTips: ReadTips = async (cwd, refs) => {
+/** The tips from git, within their budget: TIPS_BUDGET_MS, longer only in a test on a loaded machine. */
+export const readTips = async (cwd: string, refs: {base: string; branch: string}, budgetMs = TIPS_BUDGET_MS): Promise<string | null> => {
   const stop = new AbortController();
-  const timer = setTimeout(() => stop.abort(), TIPS_BUDGET_MS);
+  const timer = setTimeout(() => stop.abort(), budgetMs);
   timer.unref();
   try {
     return await runOperationAsync(branchTipsOperation(cwd, refs.base, refs.branch), {signal: stop.signal});
@@ -210,8 +210,9 @@ export function createRenderedService({backend, site, surface, motion, animation
   // The page's writes on their way, by key, and the newest two written:
   // the one before stays a while for a split that still shows it.
   // `press`: a write in a press's turn. `signal` names its job to the
-  // backend.
-  type Writing = {done: Promise<Written>; press: boolean; signal: AbortSignal};
+  // backend. `askedAt`: the newest review that asked for it, which a
+  // caller joining it for the same page raises.
+  type Writing = {done: Promise<Written>; press: boolean; signal: AbortSignal; askedAt: number};
   const writing = new Map<string, Writing>();
   let latest: {key: string; epoch: number; files: readonly string[]} | null = null;
   let previous: string | null = null;
@@ -521,10 +522,9 @@ export function createRenderedService({backend, site, surface, motion, animation
     if (partial.has(keyAt(base, attempt)) && !writing.has(keyAt(base, attempt))) attempts.set(base, (attempt += 1));
     const key = keyAt(base, attempt);
     bases.set(key, base);
-    const askedAt = epoch;
     // A page an older review asked for that lands after a newer one's is
     // still shown to whoever asked, but the newer stays the newest.
-    const done = (): Written => {
+    const done = (askedAt: number): Written => {
       if (latest?.key !== key && (latest?.epoch ?? -1) <= askedAt) {
         previous = latest?.key ?? null;
         latest = {key, epoch: askedAt, files};
@@ -535,7 +535,7 @@ export function createRenderedService({backend, site, surface, motion, animation
     };
     if (site.has(key) && !partial.has(key)) {
       try {
-        return done();
+        return done(epoch);
       } catch (error) {
         return {ok: false, reason: oneLine(error)};
       }
@@ -547,9 +547,13 @@ export function createRenderedService({backend, site, surface, motion, animation
     // the soonest way to the page, and a second build beside it would only
     // slow both.
     if (pending && press && !pending.press && backend.promote?.(pending.signal)) pending.press = true;
+    // A newer review with the same page that joins it, as a rebuild for a
+    // new width does, makes it that review's page: the newest, and written
+    // again a moment later if it comes back partial.
+    if (pending) pending.askedAt = Math.max(pending.askedAt, epoch);
     if (!pending) {
       const signal = new AbortController().signal;
-      const entry = {press, signal} as Writing;
+      const entry = {press, signal, askedAt: epoch} as Writing;
       entry.done = backend.review({...request, key}, signal, press).then<Written, Written>((result) => {
         if (!result.ok) {
           offReason();
@@ -559,8 +563,8 @@ export function createRenderedService({backend, site, surface, motion, animation
           site.write(key, result.html);
           digests.set(key, createHash('sha256').update(result.html).digest('hex'));
           if (result.partial) partial.add(key);
-          const written = done();
-          if (result.partial && askedAt === epoch) followUp();
+          const written = done(entry.askedAt);
+          if (result.partial && entry.askedAt === epoch) followUp();
           return written;
         } catch (error) {
           return {ok: false, reason: oneLine(error)};

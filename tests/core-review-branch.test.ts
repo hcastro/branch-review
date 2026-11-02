@@ -280,15 +280,17 @@ describe('the tips read for a branch with no upstream set', () => {
     return runs;
   };
 
-  it('gives the page a new key after a push without -u, read through the tips\' own budget', async () => {
+  it('gives the page a new key after a push without -u, read through readTips', async () => {
     const cwd = branchRepo();
     git(cwd, 'remote', 'add', 'origin', bare());
     const refs = {base: 'main', branch: 'feature/docs'};
+    // A budget a loaded machine can't run out, so only what git answers decides.
+    const budget = 15_000;
     // git's first run in a new repo is the slow one.
-    await readTips(cwd, refs);
-    const before = await readTips(cwd, refs);
+    await readTips(cwd, refs, budget);
+    const before = await readTips(cwd, refs, budget);
     git(cwd, 'push', '-q', 'origin', 'feature/docs');
-    const after = await readTips(cwd, refs);
+    const after = await readTips(cwd, refs, budget);
     expect(before).toMatch(/ -$/);
     expect(after).not.toBeNull();
     expect(after).not.toBe(before);

@@ -844,6 +844,98 @@ describe('opening the page', () => {
     }
   });
 
+  it('makes a background page a press joins for a newer review of the same page that review\'s: it is the newest, and a partial one is written again', async () => {
+    for (const promotes of [true, false]) {
+      const held: Array<Deferred<ReviewResult>> = [];
+      const {backend, reviews} = scriptedBackend(undefined, () => {
+        const answer = deferred<ReviewResult>();
+        held.push(answer);
+        return answer.promise;
+      });
+      backend.promote = () => promotes;
+      const {service, clock, trip, surface, dir} = openingService(backend);
+      const files = [edited('README.md')];
+      service.setReview(review(files), CTX);
+      await clock.advance(2_000);
+      expect(reviews).toHaveLength(1);
+      const joined = reviews[0]!.key;
+      // The same review again, as a new terminal width rebuilds it: the
+      // page's key stays, and the press joins the write on its way.
+      service.setReview(review(files), CTX);
+      const opening = service.open({fileKey: 'README.md'}, trip);
+      await clock.advance(0);
+      expect(reviews).toHaveLength(1);
+      held[0]!.resolve({ok: true, html: `<p>${joined}</p>`, partial: true});
+      expect(await opening).toEqual({kind: 'info', message: '⇗ README.md opened in the browser split'});
+      expect(path.basename(new URL(surface.shown[0]!).pathname)).toBe(`${joined}.html`);
+      expect(fs.readFileSync(path.join(dir, `${REVIEW_ALIAS}.html`), 'utf8')).toBe(`<p>${joined}</p>`);
+      // A moment later the page is written again with what it waited for.
+      await clock.advance(1_000);
+      expect(reviews).toHaveLength(2);
+      const again = reviews[1]!.key;
+      expect(again).not.toBe(joined);
+      held[1]!.resolve({ok: true, html: `<p>${again}</p>`});
+      await clock.advance(0);
+      expect(fs.readFileSync(path.join(dir, `${REVIEW_ALIAS}.html`), 'utf8')).toBe(`<p>${again}</p>`);
+      service.dispose();
+    }
+  });
+
+  // Review A's background page is held while review B's is written, the
+  // newest, and then A comes back with the same page.
+  async function aAfterB() {
+    const held: Array<Deferred<ReviewResult>> = [];
+    const {backend, reviews} = scriptedBackend(undefined, () => {
+      const answer = deferred<ReviewResult>();
+      held.push(answer);
+      return answer.promise;
+    });
+    const opened = openingService(backend);
+    const {service, clock, dir} = opened;
+    const a = [edited('README.md')];
+    service.setReview(review(a), CTX);
+    await clock.advance(2_000);
+    expect(reviews).toHaveLength(1);
+    service.setReview(review([edited('README.md', 'One.\n', 'Two.\n')]), CTX);
+    await clock.advance(250);
+    expect(reviews).toHaveLength(2);
+    const [pageA, pageB] = reviews.map((each) => each.key);
+    held[1]!.resolve({ok: true, html: `<p>${pageB}</p>`});
+    await clock.advance(0);
+    const alias = () => fs.readFileSync(path.join(dir, `${REVIEW_ALIAS}.html`), 'utf8');
+    expect(alias()).toBe(`<p>${pageB}</p>`);
+    service.setReview(review(a), CTX);
+    return {...opened, held, reviews, pageA: pageA!, alias};
+  }
+
+  it('makes a held page a press joins for a newer review its newest, over a page written after it was asked for, and writes it again when partial', async () => {
+    const {service, clock, trip, held, reviews, pageA, alias} = await aAfterB();
+    const opening = service.open({fileKey: 'README.md'}, trip);
+    await clock.advance(0);
+    expect(reviews).toHaveLength(2);
+    held[0]!.resolve({ok: true, html: `<p>${pageA}</p>`, partial: true});
+    expect(await opening).toEqual({kind: 'info', message: '⇗ README.md opened in the browser split'});
+    expect(alias()).toBe(`<p>${pageA}</p>`);
+    await clock.advance(1_000);
+    expect(reviews).toHaveLength(3);
+    expect(reviews[2]!.key).not.toBe(pageA);
+    service.dispose();
+  });
+
+  it('makes a held page a background pass joins for a newer review its newest too, and writes it again when partial', async () => {
+    const {service, clock, held, reviews, pageA, alias} = await aAfterB();
+    await clock.advance(250);
+    // The pass joined the held page: no second job for it.
+    expect(reviews).toHaveLength(2);
+    held[0]!.resolve({ok: true, html: `<p>${pageA}</p>`, partial: true});
+    await clock.advance(0);
+    expect(alias()).toBe(`<p>${pageA}</p>`);
+    await clock.advance(1_000);
+    expect(reviews).toHaveLength(3);
+    expect(reviews[2]!.key).not.toBe(pageA);
+    service.dispose();
+  });
+
   it('names the card by its place on the page the press wrote, though a file came into the review while it waited', async () => {
     const held = deferred<FragmentResult>();
     const {backend} = scriptedBackend(() => held.promise);
