@@ -220,6 +220,9 @@ const NARROW_COLUMNS = 60;
 // Short budgets for the tests of the wait helper itself.
 const STUCK_WAIT: WaitTiming = {timeoutMs: 10_000, waitBudgetMs: 1_000};
 const SLOW_WAIT: WaitTiming = {timeoutMs: 10_000, waitBudgetMs: 4_000};
+// Twice this budget runs past the 5 s margin, so two waits that each got a
+// fresh budget would fail the test.
+const TWO_STUCK_WAITS: WaitTiming = {timeoutMs: 10_000, waitBudgetMs: 3_000};
 
 describe('the wait helper', () => {
   it('gives up a wait that never holds before the test times out, so the test unmounts the controller', async () => {
@@ -236,6 +239,22 @@ describe('the wait helper', () => {
     await flush(50);
     expect(controller.ticks.length).toBe(ticks);
   }, STUCK_WAIT.timeoutMs);
+
+  it('shares one budget across the waits of a test, so two stuck waits still end before the timeout', async () => {
+    const startedAt = Date.now();
+    const controller = await mountController(TWO_STUCK_WAITS);
+    try {
+      await controller.until(() => false);
+      await controller.until(() => false);
+      expect(Date.now() - startedAt).toBeLessThan(TWO_STUCK_WAITS.timeoutMs - 5_000);
+    } finally {
+      controller.unmount();
+    }
+    // The ticker stopped: the controller was unmounted.
+    const ticks = controller.ticks.length;
+    await flush(50);
+    expect(controller.ticks.length).toBe(ticks);
+  }, TWO_STUCK_WAITS.timeoutMs);
 
   it('still waits out a condition that holds inside the budget', async () => {
     const controller = await mountController(SLOW_WAIT);
