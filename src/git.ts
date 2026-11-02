@@ -1130,10 +1130,10 @@ const OBJECT_ID = /^[0-9a-f]{7,64}$/;
  * reads only the object store: no index, no lock, no filter. An id that
  * names a commit or tree as well as a blob resolves to the blob.
  */
-export function* catFileBlobOperation(cwd: string, abbrevId: string, limit: number, displayPath = abbrevId): GitOperation<Buffer> {
+export function* catFileBlobOperation(cwd: string, abbrevId: string, limit: number, displayPath = abbrevId, options: Pick<RunGitOptions, 'local'> = {}): GitOperation<Buffer> {
   if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
   try {
-    const result = yield* gitResultOperation(cwd, ['-c', 'core.disambiguate=blob', 'cat-file', 'blob', abbrevId], {maxBuffer: limit, decode: false});
+    const result = yield* gitResultOperation(cwd, ['-c', 'core.disambiguate=blob', 'cat-file', 'blob', abbrevId], {maxBuffer: limit, decode: false, ...options});
     return result.stdoutBytes;
   } catch (error) {
     if (error instanceof OutputTooLargeError) throw new Error(`${displayPath} is larger than ${Math.floor(limit / MIB)} MB`);
@@ -1380,11 +1380,70 @@ export function* grepTreeFilesOperation(cwd: string, treeOid: string, words: rea
   });
 }
 
-/** A blob's full id and size, by its (abbreviated) id. */
-export function* blobFactsOperation(cwd: string, abbrevId: string): GitOperation<{oid: string; size: number}> {
+/** One commit the branch has that the base doesn't: short hash, commit time in seconds, subject, and how many files it changed. */
+export type BranchCommit = {hash: string; time: number; subject: string; files: number};
+
+/**
+ * The commits on `branch` that `base` doesn't have, newest first, at most
+ * `limit`. No author is read. Renames aren't followed and the files are
+ * counted from the trees, so no blob is read, and in a partial clone
+ * nothing is fetched. No signature is checked, whatever log.showSignature
+ * says.
+ */
+export function* branchCommitsOperation(cwd: string, base: string, branch: string, limit = 250): GitOperation<BranchCommit[]> {
+  const output = yield* gitOperation(cwd, ['log', '--no-color', '--no-renames', '--no-show-signature', `--max-count=${limit}`, '--format=%x1e%h%x1f%ct%x1f%s', '--name-only', `${base}..${branch}`, '--'], {local: true});
+  // Read by line: a record starts on a line that starts with the separator
+  // and a hash, and runs to the end of that line, so a subject (which holds
+  // no newline, but may hold either separator) stays its own text. The
+  // names under it are quoted by git when they hold a control character,
+  // so none of them starts a record.
+  const commits: BranchCommit[] = [];
+  for (const line of output.split('\n')) {
+    const head = /^\x1e([0-9a-f]{4,64})\x1f(\d{1,15})\x1f(.*)$/.exec(line);
+    if (head) commits.push({hash: head[1]!, time: Number(head[2]), subject: head[3]!, files: 0});
+    else if (line !== '' && commits.length > 0) commits.at(-1)!.files += 1;
+  }
+  return commits;
+}
+
+/**
+ * Where a local branch stands against its upstream: none set, or how many
+ * commits it has that the upstream doesn't, with the remote's name (the
+ * upstream branch's own name when it is local). Null for a ref that is no
+ * local branch. Reads only local refs: nothing is fetched.
+ */
+export function* upstreamStateOperation(cwd: string, branch: string): GitOperation<{remote: string; ahead: number} | {remote: null} | null> {
+  const full = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', branch]);
+  if (!full?.startsWith('refs/heads/')) return null;
+  const name = full.slice('refs/heads/'.length);
+  const upstream = yield* tryGitOperation(cwd, ['rev-parse', '--symbolic-full-name', `${name}@{upstream}`]);
+  if (!upstream) return {remote: null};
+  const remote = yield* tryGitOperation(cwd, ['config', '--get', `branch.${name}.remote`]);
+  const ahead = Number(yield* gitLineOperation(cwd, ['rev-list', '--count', `${upstream}..${full}`]));
+  return {remote: remote && remote !== '.' ? remote : upstream.replace(/^refs\/heads\//, ''), ahead};
+}
+
+/**
+ * What the commits and the branch's state are read from, in one line: the
+ * commit each of `base`, `branch` and the branch's upstream names, `-` for
+ * one that names none. A push, an amend or a moved base changes it. Local
+ * refs only.
+ */
+export function* branchTipsOperation(cwd: string, base: string, branch: string): GitOperation<string> {
+  const tip = function* (ref: string) {
+    return (yield* tryGitOperation(cwd, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])) ?? '-';
+  };
+  return [yield* tip(base), yield* tip(branch), yield* tip(`${branch}@{upstream}`)].join(' ');
+}
+
+/** A blob's full id and size, by its (abbreviated) id. `local`: in a partial clone, one the clone lacks fails rather than being fetched. */
+export function* blobFactsOperation(cwd: string, abbrevId: string, options: Pick<RunGitOptions, 'local'> = {}): GitOperation<{oid: string; size: number}> {
   if (!OBJECT_ID.test(abbrevId)) throw new Error(`not an object id: ${abbrevId}`);
-  const oid = yield* gitLineOperation(cwd, ['-c', 'core.disambiguate=blob', 'rev-parse', '--verify', `${abbrevId}^{blob}`]);
-  const size = Number(yield* gitLineOperation(cwd, ['cat-file', '-s', oid]));
+  const line = function* (args: string[]) {
+    return (yield* gitOperation(cwd, args, options)).replace(/\r?\n$/, '');
+  };
+  const oid = yield* line(['-c', 'core.disambiguate=blob', 'rev-parse', '--verify', `${abbrevId}^{blob}`]);
+  const size = Number(yield* line(['cat-file', '-s', oid]));
   if (!/^[0-9a-f]{40,64}$/.test(oid) || !Number.isSafeInteger(size) || size < 0) throw new Error(`not a blob: ${abbrevId}`);
   return {oid, size};
 }

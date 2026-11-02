@@ -1,0 +1,45 @@
+import { Command } from "commander";
+import { watchQueue } from "./queue";
+import { streamLogs } from "./logs";
+import { loadConfig } from "./config";
+import { createPreview, type PreviewOptions } from "./preview";
+
+const program = new Command();
+
+program
+  .name("widget")
+  .description("Watch your build queue from the terminal")
+  .version("0.5.0");
+
+program
+  .command("watch")
+  .description("Follow the queue and refresh every 2 seconds")
+  .option("-i, --interval <seconds>", "refresh interval", "2")
+  .action(async (opts) => {
+    const config = await loadConfig();
+    await watchQueue({ ...config, interval: Number(opts.interval) });
+  });
+
+program
+  .command("logs <job>")
+  .description("Stream the logs of a job")
+  .action(async (job: string) => {
+    await streamLogs(job);
+  });
+
+program
+  .command("preview <job>")
+  .description("Render a job's output in a side panel")
+  .option("-f, --follow", "keep streaming new output", false)
+  .option("--width <columns>", "panel width in columns", "60")
+  .action(async (job: string, opts: { follow: boolean; width: string }) => {
+    const options: PreviewOptions = { job, follow: opts.follow, width: Number(opts.width) };
+    const preview = createPreview(options);
+    preview.on("line", (line: string) => process.stdout.write(`${line}\n`));
+    await preview.done;
+  });
+
+program.parseAsync(process.argv).catch((error: Error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});

@@ -1,0 +1,40 @@
+import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { renderAnsi } from "./render";
+
+export interface PreviewOptions {
+  /** The job to follow, for example "build-142". */
+  job: string;
+  /** Keep streaming new output after the first screen. */
+  follow?: boolean;
+  /** Panel width in terminal columns. */
+  width?: number;
+}
+
+export interface Preview extends EventEmitter {
+  done: Promise<void>;
+}
+
+const DEFAULT_WIDTH = 60;
+
+export function createPreview({ job, follow = false, width = DEFAULT_WIDTH }: PreviewOptions): Preview {
+  const preview = new EventEmitter() as Preview;
+  const args = ["logs", job, ...(follow ? ["--follow"] : [])];
+  const child = spawn("widget-agent", args, { stdio: ["ignore", "pipe", "inherit"] });
+
+  let buffer = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    buffer += chunk;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) preview.emit("line", renderAnsi(line, width));
+  });
+
+  preview.done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`preview exited with ${code}`))));
+  });
+
+  return preview;
+}

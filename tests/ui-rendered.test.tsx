@@ -159,8 +159,8 @@ describe('r and R', () => {
     expect(calls[0]!.command).toBe('/fake/bin/cmux');
     const url = calls[0]!.args[3]!;
     expect(calls[0]!.args).toEqual(SPLIT_ARGS(url));
-    // The page, with the trip's hash: the line on top of the pane, a first visit.
-    expect(url).toMatch(/^file:\/\/.+\/rendered\/[0-9a-f]{20}\.html#at=L1&f=0\.\d+&d=full&m=1&n=1$/);
+    // The page, with the trip's hash: the active file's card.
+    expect(url).toMatch(/^file:\/\/.+\/rendered\/[0-9a-f]{20}\.html#file-0&m=1&n=1$/);
     expect(fs.existsSync(new URL(url).pathname)).toBe(true);
 
     // The next file, and r again: the same split goes there.
@@ -172,61 +172,52 @@ describe('r and R', () => {
     await waitForFrame(instance, '⇗ README.md opened in the browser split');
     expect(stripAnsi(instance.lastFrame() ?? '')).not.toContain('nothing left this machine');
     expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
-    expect(calls[1]!.args[4]).not.toBe(url);
+    expect(calls[1]!.args[4]).toBe(`${url.split('#')[0]}#file-2&m=1&n=2`);
     expect(opened).toEqual([]);
     instance.unmount();
   });
 
-  it('opens the page at the line on top of the pane, as far down the page as it is down the pane', async () => {
+  it('opens the page at the active file\'s card, wherever the pane is scrolled', async () => {
     const lines = Array.from({length: 60}, (_, index) => `Line ${index + 1} of a long page.`);
     const fixture = buildFixture([markdownFile('docs/long.md', lines)]);
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    const rows = diffRows(instance.lastFrame());
-    // At the top the block's framed header comes first: line 1 is a few rows down.
-    const first = rows.findIndex((row) => row.includes('Line 1 of'));
-    expect(first).toBeGreaterThan(0);
     instance.stdin.write('r');
     await waitForFrame(instance, '⇗ long.md opened in the browser split');
-    // The pane's view: its rows under the file head, down to its bottom border.
-    const pane = frameLines(instance.lastFrame()).findIndex((line, index) => index > 6 && line.startsWith('╰')) - 6;
-    expect(new URL(calls[0]!.args[3]!).hash).toBe(`#at=L1&f=${Math.round((first / pane) * 100) / 100}&d=full&m=1&n=1`);
+    expect(new URL(calls[0]!.args[3]!).hash).toBe('#file-0&m=1&n=1');
 
-    // Scrolled down, the top row is a later line, right at the top.
     for (let press = 0; press < 12; press += 1) instance.stdin.write('j');
     await flush(3);
-    const top = /\s(\d+) │Line/.exec(diffRows(instance.lastFrame())[0]!)?.[1];
-    expect(top).toBeDefined();
     instance.stdin.write('r');
     await vi.waitFor(() => expect(calls).toHaveLength(2));
-    expect(new URL(calls[1]!.args[4]!).hash).toBe(`#at=L${top}&f=0&d=short&m=1&n=2`);
+    expect(new URL(calls[1]!.args[4]!).hash).toBe('#file-0&m=1&n=2');
     instance.unmount();
   });
 
-  it('opens the first rendered file when the active file has no page', async () => {
+  it('opens a code file at its own card', async () => {
     const fixture = docs();
-    const {service} = fakeRenderedService({review: fixture.review, motion: 'off'});
+    const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('\u001B[B');
     await flush(2);
     instance.stdin.write('r');
-    await waitForFrame(instance, '⇗ docs/guide.md opened in the browser split · the first file with a page');
+    await waitForFrame(instance, '⇗ app.ts opened in the browser split');
+    expect(new URL(calls[0]!.args[3]!).hash).toBe('#file-1&m=1&n=1');
     instance.unmount();
   });
 
-  it('opens the overview on R', async () => {
+  it('opens the whole branch at its top on R', async () => {
     const fixture = docs();
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     instance.stdin.write('R');
     await waitForFrame(instance, '⇗ all files opened in the browser split');
-    const html = fs.readFileSync(new URL(calls[0]!.args[3]!).pathname, 'utf8');
-    expect(html).toContain('<title>All files · branch-review</title>');
-    expect(html).toContain('docs/guide.md');
-    expect(html).toContain('README.md');
+    expect(new URL(calls[0]!.args[3]!).hash).toBe('#top&m=1&n=1');
+    // One page for the whole branch: a card for each of its three files.
+    expect(fs.readFileSync(new URL(calls[0]!.args[3]!).pathname, 'utf8')).toContain('<title>3 files</title>');
     instance.unmount();
   });
 
@@ -239,7 +230,7 @@ describe('r and R', () => {
     await waitForFrame(instance, "⇗ guide.md opened in your browser · cmux didn't answer");
     expect(opened).toHaveLength(1);
     expect(opened[0]![0]).toBe('/usr/bin/open');
-    expect(opened[0]![1]).toEqual([expect.stringMatching(/^file:\/\/.+\.html#at=L1&f=0\.\d+&d=full&m=1&n=1$/)]);
+    expect(opened[0]![1]).toEqual([expect.stringMatching(/^file:\/\/.+\.html#file-0&m=1&n=1$/)]);
     instance.unmount();
   });
 
@@ -281,16 +272,15 @@ describe('r and R', () => {
     instance.unmount();
   });
 
-  it('says when nothing on the branch renders', async () => {
+  it('opens a branch with nothing but code too, though its header and footer stay as they were', async () => {
     const fixture = buildFixture([{path: 'src/app.ts', rawDiff: '@@ -1 +1 @@\n-a\n+b', rendered: ['• src/app.ts:1: ', `${gutter(1)}b`]}]);
-    const {service, calls} = fakeRenderedService({review: fixture.review});
+    const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
+    expect(frameLines(instance.lastFrame())[4]!).not.toContain('Review in browser');
     instance.stdin.write('r');
-    await waitForFrame(instance, 'nothing to open in the browser · no markdown, images or SVG on this branch');
-    instance.stdin.write('R');
-    await flush(2);
-    expect(calls).toEqual([]);
+    await waitForFrame(instance, '⇗ app.ts opened in the browser split');
+    expect(calls).toHaveLength(1);
     instance.unmount();
   });
 

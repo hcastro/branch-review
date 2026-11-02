@@ -1,0 +1,41 @@
+import { Command } from "commander";
+import { watchQueue } from "./queue";
+import { streamLogs } from "./logs";
+import { loadConfig } from "./config";
+import { openInEditor } from "./editor";
+
+const program = new Command();
+
+program
+  .name("widget")
+  .description("Watch your build queue from the terminal")
+  .version("0.4.2");
+
+program
+  .command("watch")
+  .description("Follow the queue and refresh every 2 seconds")
+  .option("-i, --interval <seconds>", "refresh interval", "2")
+  .action(async (opts) => {
+    const config = await loadConfig();
+    await watchQueue({ ...config, interval: Number(opts.interval) });
+  });
+
+program
+  .command("logs <job>")
+  .description("Stream the logs of a job")
+  .action(async (job: string) => {
+    await streamLogs(job);
+  });
+
+program
+  .command("open")
+  .description("Open the config in your editor")
+  .action(async () => {
+    const config = await loadConfig();
+    await openInEditor(config.path);
+  });
+
+program.parseAsync(process.argv).catch((error: Error) => {
+  console.error(error.message);
+  process.exitCode = 1;
+});

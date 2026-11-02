@@ -110,17 +110,15 @@ For more information about terminal support, tmux setup, compare modes, and open
 
 ## Preview markdown and review it in the browser
 
-To read a changed markdown file the way GitHub shows it, press `v`, and **Preview** draws its page right in the review, with a bar in the margin beside each block the branch added or changed. To open the file's changes in a browser, press `r`, and **Review in browser** opens the same page in a browser split beside the review in cmux, or in your default browser in other terminals. To open a page that lists every changed markdown, image, and SVG file, press `R` for **All files in browser**. To list every key, press `?`.
+To read a changed markdown file the way GitHub shows it, press `v`, and **Preview** draws its page right in the review, with a bar in the margin beside each block the branch added or changed. To review the whole branch in a browser, press `r`, and **Review in browser** opens one page laid out like a pull request on GitHub, at the card of the file in view, in a browser split beside the review in cmux, or in your default browser in other terminals. To open that page at its top, press `R` for **All files in browser**. To list every key, press `?`.
 
 The first time a file can use them, the footer says so in one line, such as `Tip: press v to preview this file as GitHub shows it, or r to open its changes in the browser`. The file header has the same actions as buttons: **Preview**, which reads **Diff** while the Preview shows, and **Review in browser ⇗**.
 
 Preview needs Ghostty, cmux, or Kitty, and a headless Chromium already on disk. Where either is missing, the footer leaves `v` out, and `r` still works. When Preview can't draw a page, the diff comes back where you were reading, and the footer says why. To turn Preview off, set `BRANCH_REVIEW_PREVIEW=off`.
 
-A page in the browser opens on the block you were reading. On a file's first visit it starts as the diff's text in your terminal's colors and develops into the page, with the diff's tints shrinking into the margin bars. In watch mode inside cmux, the split follows the file as an agent edits it and glows the blocks that are new.
+The page has a card for every changed file, in the review's order, with a file tree and a filter beside them. A code file's card shows its diff with GitHub's syntax colors and word highlights, unified or split, and expands the unchanged lines around each hunk. A markdown file's card switches between its diff and its rich view, the file as GitHub draws it with each added or changed block marked. An image's card compares its versions in 2-up, swipe, and onion skin. Mark a file **Viewed** to fold it, and the browser remembers it for this review. The **Commits** tab lists the branch's commits, and the title says whether the branch is pushed. A rich view draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading.
 
-On a changed image or SVG, `r` opens a page that compares its versions side by side, by flipping, or as a difference, on the same `1`, `2`, and `3` keys as the diff, and names the lines of the review's markdown that show it. A markdown file the branch didn't touch gets a page too when it shows an image the branch changed, since it will look different on GitHub. Each page draws a link that won't resolve on GitHub with a red wavy line, such as one to a missing file or heading, and the page of all files lists them all.
-
-To write the pages to a directory without opening the UI, pass `--export-html`:
+To write a page for each changed markdown, image, and SVG file to a directory without opening the UI, pass `--export-html`:
 
 ```sh
 branch-review --export-html ../pages
@@ -128,7 +126,7 @@ branch-review --export-html ../pages
 
 Pick a directory outside the repo. Pages written inside it show up as untracked files in the next review.
 
-Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets the page of all files, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
+Each page is a single HTML file whose only scripts are its own. Images from the repo travel inside it, and nothing on it loads from the network. The directory also gets a page that lists them all, `overview.html`, and `links.json`, which lists every link with what it resolves to. To get a report that an agent or a CI job can read, add `--json`. For more information about where pages open, the marks, Preview, how close a page is to GitHub, and the report, see [Preview and Review in browser](docs/preview-and-browser.md).
 
 ## Review untrusted changes safely
 
@@ -221,7 +219,7 @@ branch-review my-feature release/2026.04
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
-| `--export-html DIR` | Write the pages that Review in browser opens, one for each changed markdown, image, and SVG file, to `DIR`, with the page of all files, `overview.html`, and `links.json`. Then print a summary and exit without opening the UI. |
+| `--export-html DIR` | Write a page for each changed markdown, image, and SVG file to `DIR`, with a page that lists them all, `overview.html`, and `links.json`. Then print a summary and exit without opening the UI. |
 | `--json` | With `--export-html`, print the report as JSON. |
 
 For `--animations` and `--images`, the last flag of each pair wins.
@@ -257,8 +255,8 @@ The following table lists the keys for moving through a review:
 | `Enter` / `Space` | Collapse or expand the focused block |
 | `t` | Show or hide the file tree |
 | `v` | Preview: on a markdown file, in a terminal that draws Kitty images, show the file as GitHub shows it, in place of its diff, and back. In a Preview, `[` and `]` move between changes and `c` copies the markdown of the block at the top. |
-| `r` | Review in browser: open the changes of the markdown, image, or SVG file in view as a page in a browser split or your browser, or the review's first such file |
-| `R` | All files in browser: open a page that lists every changed markdown, image, and SVG file |
+| `r` | Review in browser: open the branch's changes as one page in a browser split or your browser, at the file in view |
+| `R` | All files in browser: open the branch's page at its top |
 | `?` | List every key, in a review with a file to preview or open. `Esc` or `?` closes the list. |
 | `q` / `Esc` / `Control+C` | Quit |
 
@@ -284,7 +282,7 @@ You can also do most of this with the mouse:
 | Click a block header | Collapse or expand that diff block |
 | Click **Preview** in a file header | Show the file's Preview, like `v` |
 | Click **Diff** in a file header | Go back from the Preview to the diff, like `v` |
-| Click **Review in browser ⇗** in a file header | Open that file's changes in the browser, like `r` |
+| Click **Review in browser ⇗** in a file header | Open the branch's page in the browser at that file, like `r` |
 | Click a link in a Preview | Scroll to a heading on the page, open another file of the review, or copy a web address |
 | Drag across code | Select lines and copy them |
 | Drag the tree's right border | Resize the file tree. Dragging it to its minimum width collapses it to a rail. |
@@ -293,7 +291,16 @@ You can also do most of this with the mouse:
 
 To see what a button, badge, or label does, hold the pointer over it. A short hint appears in the top bar, such as `copies block with file and line context`.
 
-A page in the browser has keys of its own, which work after you click into the page:
+The branch's page in the browser has keys of its own, which work after you click into the page:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Scroll to the next or previous file's card |
+| `v` | Mark the current file as viewed and move to the next, or unmark it |
+| `?` | Show the page's keys |
+| `Esc` | Close the keys, a menu, or the file list |
+
+A page that `--export-html` writes has these keys:
 
 | Key | Action |
 | --- | --- |

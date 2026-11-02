@@ -71,7 +71,7 @@ describe('the rendered view at startup', () => {
     expect(props.media).toBeUndefined();
     const rendered = props.rendered as RenderedService;
     rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
-    const outcome = await rendered.page('README.md');
+    const outcome = await rendered.page();
     expect(outcome).toMatchObject({ok: true});
     const file = new URL((outcome as {url: string}).url).pathname;
     expect(file.startsWith(fs.realpathSync(parent))).toBe(true);
@@ -140,8 +140,8 @@ describe('the rendered view\'s trip at startup', () => {
     expect(outcome).toEqual({kind: 'info', message: '⇗ README.md opened in the browser split'});
     expect(crossings).toEqual(['off']);
     const [call] = fs.readFileSync(log, 'utf8').trim().split('\n');
-    // With --no-animations the page arrives final: m=0.
-    expect(call).toMatch(/^--json browser open-split file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#d=full&m=0&n=1 --workspace workspace:test --focus false$/);
+    // With --no-animations the page arrives with no motion: m=0, at README's card.
+    expect(call).toMatch(/^--json browser open-split file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#file-0&m=0&n=1 --workspace workspace:test --focus false$/);
     expect(call!.startsWith(`--json browser open-split ${new URL(`file://${fs.realpathSync(parent)}`).href}`)).toBe(true);
     expect(opened).toEqual([]);
     proc.emit('exit', 0);
@@ -182,7 +182,7 @@ describe('the rendered view\'s trip at startup', () => {
     const rendered = props.rendered as RenderedService;
     rendered.setReview(props.initialReview as Parameters<RenderedService['setReview']>[0], {cwd, range: props.range as Parameters<RenderedService['setReview']>[1]['range']});
     const outcome = await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
-    const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#d=full&m=0&n=1$/;
+    const page = /^file:\/\/\S+\/rendered\/[0-9a-f]{20}\.html#file-0&m=0&n=1$/;
     if (process.platform === 'darwin') {
       expect(outcome).toEqual({kind: 'info', message: "⇗ README.md opened in your browser · cmux didn't answer"});
       expect(opened).toEqual([['/usr/bin/open', [expect.stringMatching(page)]]]);
@@ -213,7 +213,7 @@ describe('the review controller', () => {
 });
 
 describe('the terminal\'s colors', () => {
-  it('reach the page a trip opens, from the terminal\'s answer at startup', async () => {
+  it('are read at startup, and stay out of the Review in browser page, which draws in its own palette', async () => {
     const cwd = initRepo({'README.md': '# Readme\n\nOne.\n'});
     writeFiles(cwd, {'README.md': '# Readme\n\nOne, edited.\n'});
     const parent = makeTempDir('branch-review-session-parent-');
@@ -258,7 +258,7 @@ describe('the terminal\'s colors', () => {
     await rendered.open({fileKey: 'README.md'}, {cross: async () => undefined, waiting: () => undefined});
     if (process.platform === 'darwin') {
       expect(opened).toHaveLength(1);
-      expect(new URL(opened[0]![1][0]!).hash).toBe('#d=full&m=1&bg=1e2026&fg=d0d4d8&n=1');
+      expect(new URL(opened[0]![1][0]!).hash).toBe('#file-0&m=1&n=1');
     }
     proc.emit('exit', 0);
   }, 60_000);

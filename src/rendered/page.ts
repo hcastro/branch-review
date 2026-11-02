@@ -252,7 +252,7 @@ export function assembleTileDocument({file, scheme, bg, cssWidth, base = 'the ba
     '<body>',
     banners(file, {repo: '', base, branch: '', worktree: false, renderedAt: 0}),
     // The raw source rides only in a file page, for its first frame.
-    content.replace(/<template class="br-raw-source">[\s\S]*?<\/template>/, ''),
+    content.replace(RAW_TEMPLATE, ''),
     '</body>',
     '</html>',
     '',
@@ -463,6 +463,21 @@ const BODY_STATE: Record<Exclude<PageBody['kind'], 'rendered' | 'image'>, string
   failed: "couldn't show",
   pending: 'not ready yet',
 };
+
+/**
+ * A file's article as its page draws it, without the raw source only a
+ * trip's first frame reads: the Review in browser page's rich view.
+ */
+export function articleHtml(file: PageFile, brokenRefs: readonly number[] = []) {
+  return body(file, brokenRefs).replace(RAW_TEMPLATE, '');
+}
+
+const RAW_TEMPLATE = /<template class="br-raw-source">[\s\S]*?<\/template>/;
+
+/** Where a page differs from github.com, a line for each kind. */
+export function differenceNotes(differences: RenderedFragment['differences']) {
+  return differences.map((difference) => DIFFERENCE_TEXT[difference.kind](difference.count));
+}
 
 function body(file: PageFile, brokenRefs: readonly number[]) {
   if (file.body.kind === 'image') return '';

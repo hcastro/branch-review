@@ -57,7 +57,13 @@ type SourceRead =
   | {kind: 'tooLarge'; bytes: number; head: Buffer}
   | {kind: 'mismatch'; bytes: Buffer; reason: string};
 
-export function createSourceReader({sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))}: {sleep?: (ms: number) => Promise<void>} = {}) {
+/**
+ * `local`: a blob the repo lacks (in a partial clone) fails to read rather
+ * than being fetched from its promisor remote. The Review in browser page
+ * reads every changed file's sides by the ids its patch names, where a
+ * fetch would be a network trip the page must never cause.
+ */
+export function createSourceReader({sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), local = false}: {sleep?: (ms: number) => Promise<void>; local?: boolean} = {}) {
   const formats = new Map<string, Promise<ObjectFormat>>();
   const formatFor = (cwd: string) => {
     let format = formats.get(cwd);
@@ -97,11 +103,11 @@ export function createSourceReader({sleep = (ms) => new Promise((resolve) => set
     read(cwd: string, spec: SourceSpec): Promise<SourceRead> {
       switch (spec.kind) {
         case 'blob':
-          return readBlob(cwd, spec.id, spec.id);
+          return readBlob(cwd, spec.id, spec.id, local);
         case 'worktree':
           return readCheckedWorktree(cwd, spec.path, spec.id);
         case 'atRef':
-          return runOperationAsync(objectAtRefOperation(cwd, spec.ref, spec.path)).then((id) => readBlob(cwd, id, spec.path));
+          return runOperationAsync(objectAtRefOperation(cwd, spec.ref, spec.path)).then((id) => readBlob(cwd, id, spec.path, local));
         case 'none':
           return Promise.reject(new Error(spec.reason));
       }
@@ -111,10 +117,12 @@ export function createSourceReader({sleep = (ms) => new Promise((resolve) => set
 
 export type SourceReader = ReturnType<typeof createSourceReader>;
 
-async function readBlob(cwd: string, abbrevId: string, displayPath: string): Promise<SourceRead> {
-  const facts = await runOperationAsync(blobFactsOperation(cwd, abbrevId));
+async function readBlob(cwd: string, abbrevId: string, displayPath: string, local: boolean): Promise<SourceRead> {
+  const options = local ? {local: true as const} : {};
+  // The facts prove the blob is in the repo, so its head reads with no fetch.
+  const facts = await runOperationAsync(blobFactsOperation(cwd, abbrevId, options));
   if (facts.size > RENDER_LIMIT) return {kind: 'tooLarge', bytes: facts.size, head: await readBlobHead(cwd, facts.oid, RAW_HEAD_BYTES)};
-  return {kind: 'text', bytes: await runOperationAsync(catFileBlobOperation(cwd, facts.oid, RENDER_LIMIT, displayPath))};
+  return {kind: 'text', bytes: await runOperationAsync(catFileBlobOperation(cwd, facts.oid, RENDER_LIMIT, displayPath, options))};
 }
 
 // Opened the way the review opens work tree files: no symlinks, nothing

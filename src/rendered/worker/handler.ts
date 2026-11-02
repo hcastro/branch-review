@@ -4,7 +4,7 @@ import path from 'node:path';
 import {createLru} from '../../media/lru.js';
 import type {WorkerFailure} from '../../media/workerClient.js';
 import {createAssetResolver, LATE_IDENTITY, linkIdentity, pageLookups, type AssetResolver, type AssetSides, type AssetUse} from '../assets.js';
-import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type PageResult, type RenderedWorkerRequest, type TileResult, type TileSource} from '../backend.js';
+import {BROWSER_JOB_DEADLINES_MS, type EmbeddersResult, type FragmentRequest, type FragmentResult, type FragmentSummary, type LayoutResult, type PageResult, type RenderedWorkerRequest, type ReviewResult, type TileResult, type TileSource} from '../backend.js';
 import {imageBody, imageFacts} from '../image.js';
 import {renderMarkdown, type RenderInput, type RenderedFragment} from '../markdown.js';
 import type {PageLayout} from '../plan.js';
@@ -14,6 +14,7 @@ import {MAX_TILE_PNG_BYTES, tileRange} from '../tileGeometry.js';
 import {createBrowser, type Browser, type BrowserBudget, type TileDocument} from './browser.js';
 import type {ChromeBinary} from './chrome.js';
 import {createTileFinisher} from './mosaic.js';
+import {createReviewBuilder} from '../review/build.js';
 
 // The rendered worker's jobs, with no process of its own, so tests can run
 // them in place. Repo text and images are read, rendered and assembled here;
@@ -162,6 +163,11 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
     return {...entry, fresh: true};
   }
 
+  // The Review in browser page, from the same fragments the pages hold.
+  // Every changed file's sides, read by the ids the review's patches name,
+  // none of them fetched.
+  const review = createReviewBuilder({sources: createSourceReader({...(sleep ? {sleep} : {}), local: true}), fragment, now});
+
   let browser: {binary: string; instance: Browser} | null = null;
   let idle: ReturnType<typeof setTimeout> | null = null;
   let browserFailures: number[] = [];
@@ -251,7 +257,7 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
   const budgetFor = (type: keyof typeof BROWSER_JOB_DEADLINES_MS, startedAt: number): BrowserBudget => ({deadline: startedAt + BROWSER_JOB_DEADLINES_MS[type] - BROWSER_MARGIN_MS});
 
   return {
-    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | PageResult | EmbeddersResult | LayoutResult | TileResult> {
+    async handle(message: RenderedWorkerRequest): Promise<FragmentResult | PageResult | ReviewResult | EmbeddersResult | LayoutResult | TileResult> {
       // The job's deadline started when it was sent, a moment before this.
       const startedAt = Date.now();
       try {
@@ -288,6 +294,11 @@ export function createRenderedHandler({render = renderMarkdown, sleep, lookupBud
         if (message.type === 'fragment') {
           const {type: _type, ...request} = message;
           return {ok: true, summary: (await fragment(request)).summary};
+        }
+        if (message.type === 'review') {
+          const {type: _type, ...request} = message;
+          const {html, partial} = await review.page(request);
+          return {ok: true, html, ...(partial ? {partial: true as const} : {})};
         }
         if (message.type === 'embedders') {
           return {ok: true, files: await resolverFor(message.cwd).embedders(message.assets, message.names, new Set(message.skip))};

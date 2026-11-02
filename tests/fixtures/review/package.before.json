@@ -1,0 +1,20 @@
+{
+  "name": "widget",
+  "version": "0.4.2",
+  "description": "A tiny terminal dashboard for your build queue",
+  "type": "module",
+  "bin": {
+    "widget": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}

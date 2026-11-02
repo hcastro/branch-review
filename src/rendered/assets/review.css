@@ -1,0 +1,514 @@
+/* The Review in browser page: the whole branch as a code review, one card
+   per changed file. A full-width app bar, the title block, a sticky
+   toolbar, then a sticky file tree beside the column of cards. System UI
+   for the chrome and system mono for code, so nothing is fetched. Every
+   rule here sits under the page's own root class, so the file pages that
+   share this stylesheet never see it; a rich markdown view inside a card
+   keeps GitHub's article styles and the file pages' change marks.
+
+   The palette is GitHub's review palette, light and dark. Tokens carry an
+   `rv-` prefix so they can't meet GitHub's or the file pages' own. */
+
+:root.rv {
+  --rv-bg: #ffffff;
+  --rv-bg-subtle: #f6f8fa;
+  --rv-bg-inset: #eef1f4;
+  --rv-bg-hover: #eef1f4;
+  --rv-seg-on: #ffffff;
+  --rv-border: #d1d9e0;
+  --rv-border-muted: #e3e8ee;
+  --rv-fg: #1f2328;
+  --rv-fg-muted: #59636e;
+  --rv-accent: #0969da;
+  --rv-accent-subtle: #ddf4ff;
+  --rv-accent-border: #9dd0fb;
+  --rv-on-accent: #ffffff;
+  --rv-success: #1a7f37;
+  --rv-success-emph: #1f883d;
+  /* The state pill's green, which white text sits on at 4.5:1 or more. */
+  --rv-state-bg: #1f883d;
+  --rv-success-subtle: #dafbe1;
+  --rv-danger: #d1242f;
+  --rv-danger-subtle: #ffebe9;
+  --rv-danger-border: #ffb8b4;
+  --rv-attention: #9a6700;
+  --rv-attention-bar: #d4a72c;
+  --rv-attention-subtle: #fff8c5;
+  --rv-attention-border: #e7cf6f;
+  --rv-done: #8250df;
+  --rv-add-line: #e6ffec;
+  --rv-add-num: #ccffd8;
+  --rv-add-word: #abf2bc;
+  --rv-del-line: #ffebe9;
+  --rv-del-num: #ffd7d5;
+  --rv-del-word: #ffb8b4;
+  --rv-hunk-bg: #ddf4ff;
+  --rv-hunk-num: #b6e3ff;
+  --rv-empty-cell: #f3f5f7;
+  --rv-checker-a: #e9edf1;
+  --rv-checker-b: #ffffff;
+  --rv-backdrop: rgba(31, 35, 40, 0.45);
+  --rv-shadow: rgba(31, 35, 40, 0.14);
+  --rv-flash: rgba(9, 105, 218, 0.35);
+  --rv-syn-k: #cf222e;
+  --rv-syn-s: #0a3069;
+  --rv-syn-cm: #59636e;
+  --rv-syn-f: #8250df;
+  --rv-syn-t: #953800;
+  --rv-syn-n: #0550ae;
+  --rv-syn-h: #0550ae;
+  --rv-syn-tag: #0550ae;
+  --rv-syn-list: #3b2300;
+  --rv-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  --rv-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --rv-bar-h: 52px;
+  --rv-maxw: 1680px;
+}
+
+/* The dark palette, for a system in dark mode. The theme switch forces it
+   with a copy scripts/inline-assets.mjs derives from this block. */
+@media (prefers-color-scheme: dark) {
+  :root.rv:not([data-theme="light"]) {
+    color-scheme: dark;
+    --rv-bg: #0d1117;
+    --rv-bg-subtle: #151b23;
+    --rv-bg-inset: #010409;
+    --rv-bg-hover: #1d242e;
+    --rv-seg-on: #262c36;
+    --rv-border: #3d444d;
+    --rv-border-muted: #2a3038;
+    --rv-fg: #e6edf3;
+    --rv-fg-muted: #9198a1;
+    --rv-accent: #4493f8;
+    --rv-accent-subtle: #121d2f;
+    --rv-accent-border: #1f4a85;
+    --rv-on-accent: #ffffff;
+    --rv-success: #3fb950;
+    --rv-success-emph: #2ea043;
+    --rv-state-bg: #238636;
+    --rv-success-subtle: #12261e;
+    --rv-danger: #f85149;
+    --rv-danger-subtle: #25171c;
+    --rv-danger-border: #6e2b2b;
+    --rv-attention: #d29922;
+    --rv-attention-bar: #bb8009;
+    --rv-attention-subtle: #272115;
+    --rv-attention-border: #6b5014;
+    --rv-done: #ab7df8;
+    --rv-add-line: rgba(46, 160, 67, 0.15);
+    --rv-add-num: rgba(63, 185, 80, 0.3);
+    --rv-add-word: rgba(46, 160, 67, 0.42);
+    --rv-del-line: rgba(248, 81, 73, 0.1);
+    --rv-del-num: rgba(248, 81, 73, 0.3);
+    --rv-del-word: rgba(248, 81, 73, 0.42);
+    --rv-hunk-bg: rgba(56, 139, 253, 0.1);
+    --rv-hunk-num: rgba(56, 139, 253, 0.28);
+    --rv-empty-cell: #151b23;
+    --rv-checker-a: #1b212a;
+    --rv-checker-b: #11161d;
+    --rv-backdrop: rgba(1, 4, 9, 0.7);
+    --rv-shadow: rgba(1, 4, 9, 0.6);
+    --rv-flash: rgba(68, 147, 248, 0.45);
+    --rv-syn-k: #ff7b72;
+    --rv-syn-s: #a5d6ff;
+    --rv-syn-cm: #9198a1;
+    --rv-syn-f: #d2a8ff;
+    --rv-syn-t: #ffa657;
+    --rv-syn-n: #79c0ff;
+    --rv-syn-h: #79c0ff;
+    --rv-syn-tag: #7ee787;
+    --rv-syn-list: #f2cc60;
+  }
+}
+
+/* A jump stops below the sticky toolbar: a card's top just under it, and a
+   heading in a rich view under its card's sticky header as well. */
+:root.rv { scroll-padding-top: calc(var(--rv-bar-h) + 12px); }
+.rv-rich .markdown-body :is([id], [name]) { scroll-margin-top: 58px; }
+:root.rv, .rv body { margin: 0; background: var(--rv-bg); color: var(--rv-fg); font: 14px/1.5 var(--rv-sans); }
+/* Resets at no specificity, so every rule below wins over them. */
+:where(.rv) :is(button, input) { font: inherit; color: inherit; }
+:where(.rv) button { background: none; border: 0; padding: 0; cursor: pointer; }
+:where(.rv) button:disabled { cursor: default; }
+.rv :focus-visible { outline: 2px solid var(--rv-accent); outline-offset: 1px; border-radius: 4px; }
+.rv code, .rv kbd, .rv pre { font-family: var(--rv-mono); }
+.rv svg.ic { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; display: block; }
+.rv [hidden] { display: none !important; }
+.rv-gut { padding-left: 16px; padding-right: 16px; }
+.rv-wrap { max-width: var(--rv-maxw); margin-inline: auto; }
+.rv-spacer { flex: 1 1 auto; }
+.rv-nowrap { white-space: nowrap; }
+.rv-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+/* The controls that need the page script stay hidden until it runs. */
+.rv:not(.rv-live) .rv-js { display: none !important; }
+
+/* ---------- App bar ---------- */
+.rv-appbar { background: var(--rv-bg-subtle); border-bottom: 1px solid var(--rv-border); }
+.rv-appbar-in { display: flex; align-items: center; gap: 12px; min-height: 56px; }
+.rv-wordmark { display: inline-flex; align-items: center; gap: 8px; font: 700 14px/1 var(--rv-mono); letter-spacing: -0.01em; color: var(--rv-fg); white-space: nowrap; }
+.rv-wordmark .rv-glyph { width: 26px; height: 26px; border-radius: 7px; background: var(--rv-fg); color: var(--rv-bg); display: grid; place-items: center; }
+.rv-crumb-sep { color: var(--rv-border); font-size: 20px; font-weight: 300; }
+.rv-repo { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; color: var(--rv-fg); }
+.rv-repo .ic { color: var(--rv-fg-muted); }
+.rv-repo span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-local { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--rv-fg-muted); padding: 2px 10px; border: 1px solid var(--rv-border); border-radius: 999px; background: var(--rv-bg); white-space: nowrap; }
+.rv-local i { width: 7px; height: 7px; border-radius: 50%; background: var(--rv-success); }
+
+.rv-seg { display: inline-flex; align-items: center; gap: 2px; padding: 2px; background: var(--rv-bg-inset); border: 1px solid var(--rv-border); border-radius: 7px; }
+.rv-seg button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 5px; font-size: 12px; font-weight: 500; color: var(--rv-fg-muted); white-space: nowrap; }
+.rv-seg button:hover { color: var(--rv-fg); }
+.rv-seg button[aria-pressed="true"] { background: var(--rv-seg-on); color: var(--rv-fg); box-shadow: 0 0 0 1px var(--rv-border), 0 1px 2px var(--rv-shadow); }
+.rv-seg.rv-icons button { width: 30px; padding: 0; }
+.rv-seg.rv-sm button { height: 22px; padding: 0 8px; }
+.rv-icon-btn { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 6px; color: var(--rv-fg-muted); }
+.rv-icon-btn:hover { background: var(--rv-bg-hover); color: var(--rv-fg); }
+.rv-icon-btn.rv-sm { width: 24px; height: 24px; }
+
+/* ---------- Note and title ---------- */
+.rv-note { display: flex; align-items: center; gap: 10px; margin-top: 16px; padding: 10px 12px 10px 16px; background: var(--rv-accent-subtle); border: 1px solid var(--rv-accent-border); border-radius: 6px; }
+.rv-note > .ic { color: var(--rv-accent); }
+.rv-note p { margin: 0; flex: 1; min-width: 0; }
+.rv-head { padding-block: 16px 0; }
+.rv-head h1 { margin: 0; font-size: 26px; line-height: 1.25; font-weight: 600; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; text-wrap: balance; overflow-wrap: anywhere; }
+.rv-head h1 .rv-into { color: var(--rv-fg-muted); font-weight: 300; }
+.rv-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 10px; color: var(--rv-fg-muted); }
+.rv-state { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; height: 30px; border-radius: 999px; background: var(--rv-state-bg); color: var(--rv-on-accent); font-weight: 500; white-space: nowrap; }
+.rv-state.rv-state-ahead { background: var(--rv-attention-bar); color: #1f2328; }
+.rv-state.rv-state-even { background: var(--rv-done); }
+/* git didn't say in time: a quiet pill in the same place, so the title
+   keeps its shape from one page to the next. */
+.rv-state.rv-state-unknown { background: var(--rv-bg-inset); color: var(--rv-fg-muted); border: 1px solid var(--rv-border); }
+.rv-ref { font: 12px/1.6 var(--rv-mono); padding: 1px 6px; border-radius: 6px; background: var(--rv-accent-subtle); color: var(--rv-accent); white-space: nowrap; }
+.rv-tabs { display: flex; align-items: flex-end; gap: 4px; margin-top: 16px; border-bottom: 1px solid var(--rv-border); overflow-x: auto; }
+.rv-tab { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px 9px; border-bottom: 2px solid transparent; color: var(--rv-fg-muted); white-space: nowrap; margin-bottom: -1px; }
+.rv-tab:hover { color: var(--rv-fg); }
+.rv-tab[aria-selected="true"] { color: var(--rv-fg); font-weight: 600; border-bottom-color: var(--rv-attention-bar); }
+.rv-tab .rv-count { font-size: 12px; font-weight: 500; line-height: 18px; padding: 0 6px; border-radius: 999px; background: var(--rv-bg-inset); color: var(--rv-fg); }
+.rv-tabs .rv-total { margin-left: auto; padding: 8px 0 9px 12px; font: 12px/1 var(--rv-mono); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.rv .rv-a { color: var(--rv-success); font-weight: 600; }
+.rv .rv-d { color: var(--rv-danger); font-weight: 600; }
+.rv-blocks { display: inline-flex; gap: 1px; }
+.rv-blocks i { width: 8px; height: 8px; border-radius: 1px; background: var(--rv-border); }
+.rv-blocks i.g { background: var(--rv-success-emph); }
+.rv-blocks i.r { background: var(--rv-danger); }
+
+/* ---------- Toolbar ---------- */
+.rv-toolbar { position: sticky; top: 0; z-index: 20; background: var(--rv-bg); border-bottom: 1px solid var(--rv-border-muted); }
+.rv-toolbar-in { display: flex; align-items: center; gap: 12px; min-height: var(--rv-bar-h); }
+.rv-tree-btn .rv-lbl { display: none; }
+.rv-tb-note { color: var(--rv-fg-muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.rv-tb-note b { color: var(--rv-fg); font-weight: 600; }
+.rv-progress { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--rv-fg-muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rv-progress b { color: var(--rv-fg); font-weight: 600; }
+.rv-progress svg { width: 18px; height: 18px; transform: rotate(-90deg); }
+.rv-progress .rv-trk { stroke: var(--rv-border); }
+.rv-progress .rv-val { stroke: var(--rv-success-emph); transition: stroke-dashoffset 0.3s; }
+
+/* ---------- Layout ---------- */
+.rv-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 24px; padding-block: 16px 64px; }
+.rv-layout.rv-no-tree { grid-template-columns: minmax(0, 1fr); }
+.rv-layout.rv-no-tree .rv-sidebar { display: none; }
+.rv-sidebar { position: sticky; top: calc(var(--rv-bar-h) + 16px); align-self: start; max-height: calc(100vh - var(--rv-bar-h) - 32px); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.rv-side-head { display: none; align-items: center; justify-content: space-between; }
+.rv-side-head h2 { font-size: 14px; margin: 0; }
+.rv-filter { position: relative; }
+.rv-filter .ic { position: absolute; left: 9px; top: 8px; color: var(--rv-fg-muted); pointer-events: none; }
+.rv-filter input { width: 100%; height: 32px; padding: 0 10px 0 32px; border: 1px solid var(--rv-border); border-radius: 6px; background: var(--rv-bg); font-size: 13px; }
+.rv-filter input:focus { outline: 2px solid var(--rv-accent); outline-offset: -1px; border-color: var(--rv-accent); }
+.rv-tree { list-style: none; margin: 0; padding: 0; overflow-y: auto; min-height: 0; font-size: 13px; }
+.rv-tree ul { list-style: none; margin: 0; padding: 0 0 0 16px; }
+.rv-tree li { margin: 0; }
+.rv-row { display: flex; align-items: center; gap: 6px; width: 100%; height: 30px; padding: 0 8px; border-radius: 6px; text-align: left; color: var(--rv-fg); position: relative; text-decoration: none; }
+.rv-row:hover { background: var(--rv-bg-hover); }
+.rv-row .ic { color: var(--rv-fg-muted); }
+.rv-row .rv-nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rv-dir .ic.rv-chev { transition: transform 0.15s; }
+.rv-dir.rv-shut .ic.rv-chev { transform: rotate(-90deg); }
+.rv-dir.rv-shut > ul { display: none; }
+.rv-file.rv-on { background: var(--rv-bg-hover); font-weight: 600; }
+.rv-file.rv-on::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 4px; border-radius: 2px; background: var(--rv-accent); }
+.rv-file.rv-is-viewed .rv-nm { color: var(--rv-fg-muted); }
+.rv-st { display: inline-grid; place-items: center; }
+.rv-row .rv-st .ic, .rv-row .rv-vchk .ic { color: inherit; }
+.rv-st-added, .rv-st-untracked { color: var(--rv-success); }
+.rv-st-modified { color: var(--rv-attention); }
+.rv-st-deleted { color: var(--rv-danger); }
+.rv-st-renamed, .rv-st-also { color: var(--rv-fg-muted); }
+.rv-tree-title { margin: 12px 0 4px; padding: 0 8px; font-size: 12px; font-weight: 600; color: var(--rv-fg-muted); }
+.rv-vchk { color: var(--rv-success); display: none; }
+.rv-file.rv-is-viewed .rv-vchk { display: block; }
+.rv-tree-empty { color: var(--rv-fg-muted); font-size: 13px; padding: 8px; margin: 0; }
+.rv-drawer-back { display: none; }
+.rv-files { min-width: 0; }
+/* What won't resolve on GitHub, above the cards. */
+.rv-report { margin-bottom: 16px; border: 1px solid var(--rv-attention-border); border-radius: 6px; background: var(--rv-attention-subtle); }
+.rv-report[hidden] { display: none; }
+.rv-report-h { display: flex; align-items: center; gap: 8px; padding: 8px 8px 8px 12px; color: var(--rv-attention); }
+.rv-report-h h2 { flex: 1; min-width: 0; margin: 0; font-size: 13px; font-weight: 600; color: var(--rv-fg); }
+.rv-report ul { list-style: none; margin: 0; padding: 0 0 6px; }
+/* A row that wraps grows with its text: none of a tree row's fixed height. */
+.rv-report .rv-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; height: auto; padding: 4px 12px; border-radius: 0; color: var(--rv-fg); font-size: 13px; text-decoration: none; overflow-wrap: anywhere; }
+.rv-report a.rv-row:hover { background: var(--rv-bg-hover); }
+.rv-report .rv-row code { font: 12px/1.6 var(--rv-mono); }
+.rv-report .rv-row span { color: var(--rv-fg-muted); }
+.rv-also-h { margin: 24px 0 12px; font-size: 14px; font-weight: 600; color: var(--rv-fg-muted); }
+
+/* ---------- File cards ---------- */
+.rv-card { border: 1px solid var(--rv-border); border-radius: 6px; margin-bottom: 16px; background: var(--rv-bg); transition: box-shadow 0.4s; }
+.rv-card.rv-flash { box-shadow: 0 0 0 3px var(--rv-flash); }
+.rv-fh { position: sticky; top: var(--rv-bar-h); z-index: 5; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; min-height: 46px; padding: 6px 8px 6px 6px; background: var(--rv-bg-subtle); border-bottom: 1px solid var(--rv-border); border-radius: 6px 6px 0 0; }
+.rv-card.rv-collapsed .rv-fh { border-bottom-color: transparent; border-radius: 6px; }
+.rv-card.rv-collapsed .rv-fb { display: none; }
+.rv-chevron .ic { transition: transform 0.15s; }
+.rv-card.rv-collapsed .rv-chevron .ic { transform: rotate(-90deg); }
+.rv-fh-path { display: flex; align-items: center; gap: 2px; min-width: 0; flex: 0 1 auto; }
+.rv-path { font: 12.5px/1.4 var(--rv-mono); color: var(--rv-fg-muted); overflow-wrap: anywhere; }
+.rv-path b { color: var(--rv-fg); font-weight: 600; }
+.rv-path .rv-from { color: var(--rv-fg-muted); }
+.rv-fh-stat { display: inline-flex; align-items: center; gap: 6px; font: 12px/1 var(--rv-mono); white-space: nowrap; }
+.rv-fh-size { font: 12px/1 var(--rv-mono); color: var(--rv-fg-muted); white-space: nowrap; }
+.rv-fh-act { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.rv-viewed-btn { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px 0 8px; border: 1px solid var(--rv-border); border-radius: 6px; background: var(--rv-bg); font-size: 12px; cursor: pointer; user-select: none; white-space: nowrap; }
+.rv-viewed-btn:hover { background: var(--rv-bg-hover); }
+.rv-viewed-btn input { margin: 0; width: 14px; height: 14px; accent-color: var(--rv-accent); cursor: pointer; }
+.rv-card.rv-is-viewed .rv-viewed-btn { background: var(--rv-accent-subtle); border-color: var(--rv-accent-border); }
+.rv-card.rv-is-viewed .rv-path b { color: var(--rv-fg-muted); }
+.rv-fb { border-radius: 0 0 6px 6px; overflow: hidden; }
+.rv-notice { margin: 0; padding: 16px; color: var(--rv-fg-muted); text-align: center; font-size: 13px; }
+
+/* ---------- Diff tables ---------- */
+.rv-tbl { overflow-x: auto; }
+.rv table.diff { border-collapse: collapse; font: 12px/20px var(--rv-mono); tab-size: 4; }
+.rv table.diff.uni { width: max-content; min-width: 100%; }
+.rv table.diff.split { width: 100%; table-layout: fixed; }
+.rv .diff col.c-ln { width: 52px; }
+.rv .diff td { padding: 0; vertical-align: top; height: 20px; border: 0; }
+.rv .diff td.ln { min-width: 52px; width: 52px; padding: 0 10px 0 8px; text-align: right; color: var(--rv-fg-muted); user-select: none; white-space: nowrap; }
+.rv .diff td.ln::before { content: attr(data-n); }
+.rv .diff td.cd { padding-right: 16px; white-space: pre; color: var(--rv-fg); }
+.rv .diff.split td.cd { white-space: pre-wrap; overflow-wrap: anywhere; }
+.rv .diff.split td.cd + td.ln { border-left: 1px solid var(--rv-border-muted); }
+.rv .diff .mk { display: inline-block; width: 24px; padding-left: 8px; user-select: none; color: var(--rv-fg-muted); }
+.rv .diff .add .mk, .rv .diff td.add .mk { color: var(--rv-success); }
+.rv .diff .del .mk, .rv .diff td.del .mk { color: var(--rv-danger); }
+.rv .diff tr.add td.cd, .rv .diff td.cd.add { background: var(--rv-add-line); }
+.rv .diff tr.add td.ln, .rv .diff td.ln.add { background: var(--rv-add-num); color: var(--rv-fg); }
+.rv .diff tr.del td.cd, .rv .diff td.cd.del { background: var(--rv-del-line); }
+.rv .diff tr.del td.ln, .rv .diff td.ln.del { background: var(--rv-del-num); color: var(--rv-fg); }
+.rv .diff td.emp { background: var(--rv-empty-cell); }
+.rv .diff :is(tr.add, td.add) .x { background: var(--rv-add-word); border-radius: 2px; }
+.rv .diff :is(tr.del, td.del) .x { background: var(--rv-del-word); border-radius: 2px; }
+.rv .diff tr.hdr td { background: var(--rv-hunk-bg); color: var(--rv-fg-muted); height: 32px; vertical-align: middle; }
+.rv .diff tr.hdr td.ex { background: var(--rv-hunk-num); padding: 0; }
+.rv .diff tr.hdr td.hx { padding: 0 10px; white-space: pre; }
+.rv .exbtn { display: grid; place-items: center; width: 100%; height: 32px; color: var(--rv-fg-muted); }
+.rv .exbtn:not(:disabled):hover { background: var(--rv-accent); color: var(--rv-on-accent); }
+.rv .exbtn:disabled { opacity: 0.45; }
+.rv .exbtn:focus-visible { outline-offset: -2px; }
+.rv tr.revealed td { animation: rv-reveal 0.6s ease-out; }
+@keyframes rv-reveal { from { background: var(--rv-hunk-bg); } }
+
+/* Syntax colors: GitHub's classes from its own grammars, in the review
+   palette, light and dark. */
+.rv .diff .pl-c { color: var(--rv-syn-cm); }
+.rv .diff :is(.pl-c1, .pl-s .pl-v) { color: var(--rv-syn-n); }
+.rv .diff :is(.pl-e, .pl-en) { color: var(--rv-syn-f); }
+.rv .diff :is(.pl-smi, .pl-s .pl-s1) { color: var(--rv-fg); }
+.rv .diff .pl-ent { color: var(--rv-syn-tag); }
+.rv .diff .pl-k { color: var(--rv-syn-k); }
+.rv .diff :is(.pl-s, .pl-pds, .pl-sr) { color: var(--rv-syn-s); }
+.rv .diff .pl-sr .pl-cce { color: var(--rv-syn-tag); font-weight: 700; }
+.rv .diff :is(.pl-v, .pl-smw) { color: var(--rv-syn-t); }
+.rv .diff :is(.pl-bu, .pl-ii) { color: var(--rv-danger); }
+.rv .diff .pl-ml { color: var(--rv-syn-list); }
+.rv .diff :is(.pl-mh, .pl-mh .pl-en, .pl-ms) { color: var(--rv-syn-h); font-weight: 700; }
+.rv .diff .pl-mi { font-style: italic; }
+.rv .diff .pl-mb { font-weight: 700; }
+.rv .diff :is(.pl-md) { color: var(--rv-danger); }
+.rv .diff :is(.pl-mi1) { color: var(--rv-success); }
+.rv .diff :is(.pl-mc, .pl-mdr) { color: var(--rv-syn-f); }
+.rv .diff .pl-corl { color: var(--rv-syn-s); text-decoration: underline; }
+.rv .diff .pl-ba, .rv .diff .pl-sg { color: var(--rv-fg-muted); }
+
+/* ---------- Rich view ---------- */
+.rv-rich-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 8px 16px; border-bottom: 1px solid var(--rv-border-muted); font-size: 12px; color: var(--rv-fg-muted); }
+.rv-legend { display: inline-flex; align-items: center; gap: 6px; }
+.rv-legend i { width: 4px; height: 12px; border-radius: 2px; }
+.rv-legend .rv-l-add { background: var(--rv-success-emph); }
+.rv-legend .rv-l-mod { background: var(--rv-attention-bar); }
+.rv-legend .rv-l-del { background: var(--rv-danger); }
+.rv-fid { margin-left: auto; position: relative; }
+.rv-fid > summary { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; list-style: none; }
+.rv-fid > summary::-webkit-details-marker { display: none; }
+.rv-fid .rv-pop { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: min(340px, 80vw); padding: 10px 12px; border: 1px solid var(--rv-border); border-radius: 8px; background: var(--rv-bg); color: var(--rv-fg); box-shadow: 0 8px 24px var(--rv-shadow); font-size: 12px; }
+.rv-fid .rv-pop p { margin: 0 0 6px; }
+.rv-fid .rv-pop ul { margin: 0; padding-left: 18px; }
+.rv-banner { display: flex; align-items: center; gap: 8px; margin: 16px 16px 0; padding: 8px 12px; border: 1px solid var(--rv-success); border-radius: 6px; background: var(--rv-success-subtle); color: var(--rv-fg); font-size: 13px; }
+.rv-banner .ic { color: var(--rv-success); }
+.rv-banner.rv-banner-deleted { border-color: var(--rv-danger); background: var(--rv-danger-subtle); }
+.rv-banner.rv-banner-deleted .ic { color: var(--rv-danger); }
+.rv-banner.rv-banner-renamed { border-color: var(--rv-border); background: var(--rv-bg-subtle); }
+.rv-banner.rv-banner-renamed .ic { color: var(--rv-fg-muted); }
+/* GitHub's article, inside the card: the file pages' change bars sit in
+   its left padding. */
+.rv-rich { --br-bar-x: -24px; }
+.rv-rich .markdown-body { position: relative; max-width: 980px; padding: 24px 40px 32px 52px; background: transparent; font-size: 16px; }
+.rv-rich .br-body { padding: 16px; }
+/* A new file is added from top to bottom: one bar along its article. */
+.rv-rich.rv-all-add { position: relative; }
+.rv-rich.rv-all-add::before { content: ""; position: absolute; left: 28px; top: 24px; bottom: 32px; width: 4px; border-radius: 2px; background: var(--rv-success-emph); }
+
+/* A changed table is one block, as GitHub's rich diff draws it: one bar
+   beside the table (green when every row is new), added rows tinted green
+   and changed ones amber, removed rows' markers where they were, and one
+   before chip under the table that opens the old table. The page script
+   gathers each row's before view into that one (scripting off, each row
+   keeps its own). */
+.rv-live .rv-rich .markdown-body tr[data-mark] > :first-child::before { content: none; }
+.rv-live .rv-rich .markdown-body table.rv-tchanged { position: relative; }
+.rv-live .rv-rich .markdown-body table.rv-tchanged::before { content: ""; position: absolute; left: 0; top: 2px; bottom: 2px; width: 3px; border-radius: 2px; background: var(--br-modified); }
+.rv-live .rv-rich .markdown-body table.rv-tchanged.rv-tadded::before { background: var(--br-added); }
+.rv-live .rv-rich .markdown-body tr[data-mark="added"] > :is(td, th) { background: var(--rv-add-line); }
+.rv-live .rv-rich .markdown-body tr[data-mark="modified"] > :is(td, th) { background: var(--rv-attention-subtle); }
+.rv-live .rv-rich .markdown-body details.br-before.rv-tbefore { position: static; transform: none; margin: -8px 0 16px; }
+.rv-live .rv-rich .markdown-body details.br-before.rv-tbefore > summary { position: static; transform: none; }
+.rv-live .rv-rich .markdown-body details.br-before.rv-tbefore > .br-before-body { margin-top: 8px; }
+
+/* The words a changed paragraph, heading or quote gained, as a changed
+   source line marks them. */
+.rv-rich .markdown-body ins.rv-word { text-decoration: none; background: var(--rv-add-word); border-radius: 3px; padding: 0 1px; }
+
+/* The before chip, in GitHub's attention colors with a chevron that flips
+   open. The page script moves it to the end of its block's last line of
+   text, or the top right corner of a block with no line of text (code, a
+   picture), where it takes no room; its old view opens under the block. */
+.rv-rich .markdown-body details.br-before > summary,
+.rv-chip-before { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--rv-attention-border); background: var(--rv-attention-subtle); color: var(--rv-attention); font: 500 11.5px/1 var(--rv-sans); cursor: pointer; }
+.rv-rich .markdown-body details.br-before > summary:hover,
+.rv-rich .markdown-body details.br-before[open] > summary,
+.rv-chip-before:hover { border-color: var(--rv-attention-bar); color: var(--rv-attention); }
+.rv-rich .markdown-body details.br-before > summary::after,
+.rv-chip-before::after { content: ""; width: 5px; height: 5px; margin: -3px 0 0 2px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); transition: transform 0.15s; }
+.rv-rich .markdown-body details.br-before[open] > summary::after,
+.rv-chip-before[aria-expanded="true"]::after { margin-top: 3px; transform: rotate(225deg); }
+.rv-chip-before { margin-left: 6px; vertical-align: 2px; }
+.rv-chip-before.rv-corner { position: absolute; top: 8px; right: 8px; z-index: 1; margin: 0; }
+.rv-live .rv-rich .markdown-body details.br-before.rv-moved > summary { display: none; }
+.rv-live .rv-rich .markdown-body details.br-before.rv-moved:not([open]) { display: none; }
+.rv-live .rv-rich .markdown-body details.br-before.rv-moved[open] { position: static; transform: none; margin: 8px 0 16px; }
+.rv-live .rv-rich .markdown-body :is([data-mark="modified"], li > p):has(+ details.br-before.rv-moved) { padding-block-end: 0; }
+.rv-rich .markdown-body .br-before-body { border: 1px solid var(--rv-danger-border); border-radius: 6px; background: var(--rv-del-line); padding: 8px 12px; font-size: 15px; }
+.rv-rich .markdown-body .br-before-body::before { content: "Before"; display: block; margin-bottom: 2px; font: 600 11px/1.4 var(--rv-sans); letter-spacing: 0.06em; text-transform: uppercase; color: var(--rv-danger); }
+
+/* ---------- Image diff ---------- */
+.rv-img { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.rv-frame { background: repeating-conic-gradient(var(--rv-checker-a) 0 25%, var(--rv-checker-b) 0 50%) 0 0 / 16px 16px; }
+.rv-frame img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.rv-im { width: 100%; }
+.rv-two-up { display: flex; justify-content: center; align-items: flex-start; gap: 20px; }
+/* Each side as wide as its picture, the two sharing the card's width when
+   they are wider: the frame, its border and its checkerboard hug the
+   picture, never the column around it. */
+.rv-two-up figure { margin: 0; flex: 0 1 auto; min-width: 0; max-width: 600px; display: flex; flex-direction: column; gap: 8px; }
+.rv-two-up .rv-frame { width: fit-content; max-width: 100%; align-self: center; border: 1px solid var(--rv-danger); border-radius: 2px; }
+.rv-two-up .rv-after .rv-frame { border-color: var(--rv-success); }
+.rv-two-up figcaption { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--rv-fg-muted); font-variant-numeric: tabular-nums; }
+.rv-two-up figcaption b { color: var(--rv-danger); font-weight: 600; }
+.rv-two-up .rv-after figcaption b { color: var(--rv-success); }
+/* As wide as its picture, never wider than the card: a small picture
+   stays at its own size, as on GitHub. */
+.rv-stage { position: relative; width: fit-content; max-width: min(600px, 100%); margin-inline: auto; }
+/* The first layer sizes the stage; the second lies over it, fitted. */
+.rv-layer { position: absolute; inset: 0; }
+.rv-layer:first-child { position: relative; }
+.rv-layer:not(:first-child) img { width: 100%; height: 100%; object-fit: contain; }
+.rv-swipe { touch-action: none; cursor: ew-resize; user-select: none; --x: 50%; }
+.rv-swipe .rv-after { clip-path: inset(0 0 0 var(--x)); }
+.rv-swipe .rv-handle { position: absolute; top: -10px; bottom: -10px; left: var(--x); width: 2px; margin-left: -1px; background: var(--rv-fg); }
+.rv-swipe .rv-grip { position: absolute; top: 50%; left: 50%; width: 30px; height: 30px; transform: translate(-50%, -50%); border-radius: 50%; background: var(--rv-bg); border: 1px solid var(--rv-border); box-shadow: 0 2px 6px var(--rv-shadow); display: grid; place-items: center; color: var(--rv-fg); }
+.rv-swipe .rv-handle:focus-visible { outline: none; }
+.rv-swipe .rv-handle:focus-visible .rv-grip { outline: 2px solid var(--rv-accent); outline-offset: 2px; }
+.rv-stage-tags { position: absolute; top: 8px; left: 8px; right: 8px; display: flex; justify-content: space-between; pointer-events: none; }
+.rv-tag { font: 600 11px/18px var(--rv-sans); padding: 0 6px; border-radius: 4px; color: var(--rv-on-accent); }
+.rv-tag.rv-tag-b { background: var(--rv-danger); }
+.rv-tag.rv-tag-a { background: var(--rv-success-emph); }
+.rv-onion .rv-after { opacity: var(--o, 0.5); }
+.rv-onion-ctl { display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 14px; font-size: 12px; color: var(--rv-fg-muted); }
+.rv-onion-ctl input { width: min(260px, 50vw); accent-color: var(--rv-accent); }
+.rv-img-meta { margin: 0; font: 12px/1.5 var(--rv-mono); color: var(--rv-fg-muted); text-align: center; font-variant-numeric: tabular-nums; }
+.rv-img-meta .rv-delta { margin-left: 6px; }
+.rv-img-meta .rv-delta.rv-smaller { color: var(--rv-success); }
+.rv-img-meta .rv-delta.rv-larger { color: var(--rv-danger); }
+.rv-img-card { display: grid; place-items: center; min-height: 120px; padding: 16px; color: var(--rv-danger); font-size: 13px; text-align: center; background: var(--rv-danger-subtle); }
+.rv-single { width: min(600px, 100%); margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.rv-single figcaption { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--rv-fg-muted); }
+.rv-single.rv-deleted img { opacity: 0.75; }
+
+/* ---------- Commits ---------- */
+.rv-commits { padding-block: 24px 64px; max-width: 980px; }
+.rv-commits h3 { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 400; color: var(--rv-fg-muted); margin: 0 0 8px; }
+.rv-commits h3:not(:first-child) { margin-top: 24px; }
+.rv-commits ol { list-style: none; margin: 0; padding: 0; border: 1px solid var(--rv-border); border-radius: 6px; }
+.rv-commits li { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+.rv-commits li + li { border-top: 1px solid var(--rv-border-muted); }
+.rv-commits li > div { min-width: 0; }
+.rv-commits .rv-msg { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
+.rv-commits .rv-cmeta { margin: 2px 0 0; font-size: 12px; color: var(--rv-fg-muted); }
+.rv-commits .rv-sha { margin-left: auto; font: 12px/1 var(--rv-mono); padding: 6px 8px; border: 1px solid var(--rv-border); border-radius: 6px; color: var(--rv-fg-muted); }
+.rv-commits .rv-none { margin: 0; color: var(--rv-fg-muted); }
+
+/* ---------- Menus, dialog, toast ---------- */
+.rv-menu { position: absolute; z-index: 40; min-width: 200px; padding: 6px; border: 1px solid var(--rv-border); border-radius: 10px; background: var(--rv-bg); box-shadow: 0 8px 24px var(--rv-shadow); }
+.rv-menu button { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border-radius: 6px; font-size: 13px; text-align: left; }
+.rv-menu button:hover, .rv-menu button:focus-visible { background: var(--rv-bg-hover); outline: none; }
+.rv-menu button .ic { color: var(--rv-fg-muted); }
+.rv-menu hr { border: 0; border-top: 1px solid var(--rv-border-muted); margin: 6px -6px; }
+.rv-modal-back { position: fixed; inset: 0; z-index: 60; background: var(--rv-backdrop); display: grid; place-items: center; padding: 16px; }
+.rv-modal { width: min(420px, 100%); border: 1px solid var(--rv-border); border-radius: 12px; background: var(--rv-bg); box-shadow: 0 16px 48px var(--rv-shadow); }
+.rv-modal-h { display: flex; align-items: center; justify-content: space-between; padding: 12px 12px 12px 16px; border-bottom: 1px solid var(--rv-border-muted); }
+.rv-modal-h h2 { margin: 0; font-size: 14px; }
+.rv-modal dl { margin: 0; padding: 8px 16px 16px; display: grid; grid-template-columns: auto 1fr; gap: 10px 16px; align-items: center; }
+.rv-modal dt { display: flex; gap: 4px; }
+.rv-modal dd { margin: 0; color: var(--rv-fg); }
+.rv-modal kbd { display: inline-block; min-width: 20px; padding: 0 5px; font-size: 11px; line-height: 18px; text-align: center; color: var(--rv-fg); background: var(--rv-bg); border: 1px solid var(--rv-border); border-bottom-width: 2px; border-radius: 4px; }
+.rv-toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 70; padding: 8px 14px; border-radius: 8px; background: var(--rv-fg); color: var(--rv-bg); font-size: 13px; box-shadow: 0 8px 24px var(--rv-shadow); max-width: calc(100vw - 32px); overflow-wrap: anywhere; }
+
+/* ---------- Narrow ---------- */
+@media (max-width: 900px) {
+  .rv-layout, .rv-layout.rv-no-tree { grid-template-columns: minmax(0, 1fr); }
+  .rv-sidebar { display: none; }
+  .rv-sidebar.rv-open { display: flex; align-self: stretch; position: fixed; z-index: 50; top: 0; left: 0; bottom: 0; width: min(320px, 86vw); max-height: none; padding: 12px; background: var(--rv-bg); border-right: 1px solid var(--rv-border); box-shadow: 0 0 32px var(--rv-shadow); }
+  .rv-sidebar.rv-open .rv-side-head { display: flex; }
+  .rv-drawer-back.rv-open { display: block; position: fixed; inset: 0; z-index: 45; background: var(--rv-backdrop); }
+  .rv-tree-btn { width: auto; padding: 0 10px; gap: 6px; display: inline-flex; border: 1px solid var(--rv-border); }
+  .rv-tree-btn .rv-lbl { display: inline; font-size: 13px; color: var(--rv-fg); }
+}
+@media (max-width: 700px) {
+  .rv-mode { display: none; }
+  .rv-tb-note { display: none; }
+  .rv-tabs .rv-total { display: none; }
+  .rv-head h1 { font-size: 22px; }
+  .rv-fh-stat .rv-blocks { display: none; }
+  .rv-seg.rv-sm button span { display: none; }
+  .rv-seg.rv-sm button { padding: 0 6px; }
+  .rv-viewed-btn { padding: 0 8px 0 6px; }
+  .rv-rich .markdown-body { padding: 16px 16px 24px 30px; font-size: 15px; }
+  .rv-rich.rv-all-add::before { left: 12px; top: 16px; bottom: 24px; }
+  .rv-two-up { flex-wrap: wrap; }
+  .rv-rich { --br-bar-x: -18px; }
+  .rv-rich-bar { padding: 8px 12px; }
+  .rv-fid { margin-left: 0; }
+  .rv-banner { margin: 12px 12px 0; }
+  .rv-img { padding: 12px; }
+  .rv-appbar .rv-local { display: none; }
+  .rv-theme button { width: 28px; }
+  .rv-appbar .rv-keys-btn { display: none; }
+  .rv-appbar-in { gap: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rv *, .rv *::before, .rv *::after { transition: none !important; animation: none !important; }
+}
+@media print {
+  .rv-toolbar, .rv-sidebar, .rv-fh-act, .rv-note, .rv-tabs { display: none; }
+  .rv-layout { display: block; }
+}

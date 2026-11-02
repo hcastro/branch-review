@@ -626,9 +626,10 @@ const DRAWN: Record<string, {kind: DifferenceKind; tag: string}> = {
 type StarryNight = Awaited<ReturnType<typeof import('@wooorm/starry-night')['createStarryNight']>>;
 let starryNight: Promise<StarryNight> | undefined;
 
-// Loaded on the first page that has a fenced language: the grammars are
-// most of the renderer's start-up cost.
-function loadStarryNight() {
+// Loaded on the first page that has a fenced language, or the first diff
+// the Review in browser page colors: the grammars are most of the
+// renderer's start-up cost.
+export function loadStarryNight() {
   starryNight ??= import('@wooorm/starry-night').then(({common, createStarryNight}) => createStarryNight(common));
   return starryNight;
 }

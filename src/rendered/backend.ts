@@ -5,6 +5,7 @@ import type {ChangeGroup} from './changes.js';
 import type {ImageFacts} from './image.js';
 import type {LinkAnswer, RenderedFragment} from './markdown.js';
 import type {PageBody, PageFile, PageInput, RailEntry} from './page.js';
+import type {ReviewPageCard, ReviewPageInput} from './review/page.js';
 import type {PageLayout} from './plan.js';
 import type {SourceSpec} from './source.js';
 import type {PageGeometry} from './tileGeometry.js';
@@ -71,6 +72,62 @@ export type PageRequest = {
   content: {fragment: FragmentRequest} | {body: PageBody};
 } & Pick<PageInput, 'brokenRefs' | 'appears' | 'report'>;
 
+/** A card's fragment as the page asks for it: the review's links and asset sides, which every fragment shares, ride once with the page. */
+export type ReviewFragmentRequest = Omit<FragmentRequest, 'links' | 'assets'>;
+
+/**
+ * One changed file's card on the Review in browser page, as the UI plans it
+ * from the review: its hunks as the review read them, where each side's
+ * text is (for colors across the file, and the context the page carries),
+ * and for a markdown file, an image or an SVG the fragment its rich view
+ * is rendered from, once the review has rendered it.
+ */
+export type ReviewCardRequest = {
+  path: string;
+  /** The file's stable page name, which links to it in other files' rich views name. */
+  alias?: string;
+  oldPath?: string;
+  status: FileStatus;
+  additions: number;
+  deletions: number;
+  kind: ReviewPageCard['kind'];
+  /** What the file is on each side apart from its hunks: the blob ids, a mode change and the old path. A file with no hunks changes here. */
+  identity: string;
+  blocks: Array<{rawDiff: string}>;
+  sides: {before?: SourceSpec; after?: SourceSpec};
+  /** Sent only once the review rendered the file: one that hasn't yet is drawn as on its way. */
+  fragment?: ReviewFragmentRequest;
+  /** Why the file's render failed, when it did: the card says so, and nothing renders it again. */
+  renderFailure?: string;
+  /** The rich view's links to a heading another file doesn't have, by their `ref` index, drawn broken. */
+  brokenRefs?: readonly number[];
+  /** In place of a diff, why there is none. */
+  notice?: string;
+  /** A file the review doesn't list whose text is the same, which shows the changed images named here. */
+  also?: string[];
+};
+
+/**
+ * The Review in browser page for the whole review. `refs` are the refs as
+ * git resolves them, which the commits and the branch's state are read
+ * with; `title` names them for people. `links` and `assets` are what each
+ * card's fragment shares; `findings` is the link and asset report.
+ */
+export type ReviewRequest = {
+  key: string;
+  cwd: string;
+  refs: {base: string; branch: string};
+  title: ReviewPageInput['title'];
+  reviewId: string;
+  cards: ReviewCardRequest[];
+  links: Record<string, LinkAnswer>;
+  assets: AssetSides | null;
+  findings: ReviewPageInput['findings'];
+};
+
+/** `partial`: something on the page wasn't ready (the commits, a card's colors or its rich view), so it is written again. */
+export type ReviewResult = {ok: true; html: string; partial?: true} | WorkerFailure;
+
 /** Markdown the review didn't change that may show one of its images (assets.embedders). */
 export type EmbeddersRequest = {cwd: string; assets: AssetSides; names: string[]; skip: string[]};
 
@@ -136,6 +193,8 @@ export interface RenderedBackend {
   // Moves a fragment still waiting for the worker, asked for with `signal`, to `priority`.
   prioritize(signal: AbortSignal, priority: number): void;
   page(request: PageRequest, signal: AbortSignal): Promise<PageResult>;
+  // The Review in browser page. A backend without it opens none.
+  review?(request: ReviewRequest, signal: AbortSignal): Promise<ReviewResult>;
   // The review's markdown candidates for "also looks different". A backend
   // without it finds none.
   embedders?(request: EmbeddersRequest, signal: AbortSignal): Promise<EmbeddersResult>;
@@ -152,10 +211,11 @@ export interface RenderedBackend {
 export type RenderedJobs = {
   fragment: {request: FragmentRequest; result: FragmentResult};
   page: {request: PageRequest; result: PageResult};
+  review: {request: ReviewRequest; result: ReviewResult};
   embedders: {request: EmbeddersRequest; result: EmbeddersResult};
   layout: {request: LayoutRequest; result: LayoutResult};
   tile: {request: TileRequest; result: TileResult};
 };
 
-export type RenderedWorkerRequest = ({type: 'fragment'} & FragmentRequest) | ({type: 'page'} & PageRequest) | ({type: 'embedders'} & EmbeddersRequest)
+export type RenderedWorkerRequest = ({type: 'fragment'} & FragmentRequest) | ({type: 'page'} & PageRequest) | ({type: 'review'} & ReviewRequest) | ({type: 'embedders'} & EmbeddersRequest)
   | ({type: 'layout'} & LayoutRequest) | ({type: 'tile'} & TileRequest);
