@@ -663,15 +663,7 @@ describe('the review builder\'s hidden characters, line ends and coloring allowa
 
   it('colors every card of the ordinary 100 KB files that the worst rate cut, on the first build, inside its time', async () => {
     await highlightLines('const warm = 1;\n', 'src/warm.ts');
-    // The build's clock moves as each coloring would at the slowest rate
-    // measured for ordinary code, a third of the worst rate, so the claim
-    // holds on a slow CI runner as on a fast laptop.
-    let clock = 0;
-    const highlight: typeof highlightLines = async (text, filePath) => {
-      const lines = await highlightLines(text, filePath);
-      clock += coloringCost(text) * COLOR_MS_PER_UNIT / 3;
-      return lines;
-    };
+    const {highlight, now, elapsed, restart} = ordinaryRateClock();
     // A line of 100 characters and its newline.
     const wide = `    const message = "${'a string literal that pads this line out'.padEnd(77, '.')}";\n`;
     expect(wide.length).toBe(101);
@@ -685,10 +677,10 @@ describe('the review builder\'s hidden characters, line ends and coloring allowa
       Array.from({length: 12}, (_, index) => tsCard(`src/many${index}.ts`, 100 * 1024)),
     ];
     for (const files of shapes) {
-      clock = 0;
-      const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, highlight, now: () => clock, branch: knownBranch});
+      restart();
+      const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, highlight, now, branch: knownBranch});
       const {html, partial} = await builder.page(request(files.map((each) => each.card)));
-      expect(clock).toBeLessThan(BUILD_BUDGET_MS);
+      expect(elapsed()).toBeLessThan(BUILD_BUDGET_MS);
       const contexts = dataOf(html).cards.map((card) => card.diff!.context);
       expect(contexts.map((context) => context !== null && context.some((each) => each.includes('<span class="pl-')))).toEqual(files.map(() => true));
       expect(partial).toBe(false);
@@ -697,14 +689,36 @@ describe('the review builder\'s hidden characters, line ends and coloring allowa
 
   it('colors every card of a few ordinary 100 KB files on the first build', async () => {
     await highlightLines('const warm = 1;\n', 'src/warm.ts');
+    const {highlight, now} = ordinaryRateClock();
     const files = Array.from({length: 7}, (_, index) => tsCard(`src/mid${index}.ts`, 100 * 1024));
-    const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, branch: knownBranch});
+    const builder = createReviewBuilder({sources: memorySides(files), fragment: noFragment, highlight, now, branch: knownBranch});
     const {html, partial} = await builder.page(request(files.map((each) => each.card)));
     const contexts = dataOf(html).cards.map((card) => card.diff!.context);
     expect(contexts.map((context) => context !== null && context.some((each) => each.includes('<span class="pl-')))).toEqual(Array.from({length: 7}, () => true));
     expect(partial).toBe(false);
   }, 120_000);
 });
+
+// A build clock that moves as each coloring would at the slowest rate
+// measured for ordinary code, a third of the worst rate, with the real
+// grammars doing the coloring. Tests of what a build colors in its time
+// then hold on a slow CI runner as on a fast laptop.
+function ordinaryRateClock() {
+  let clock = 0;
+  const highlight: typeof highlightLines = async (text, filePath) => {
+    const lines = await highlightLines(text, filePath);
+    clock += coloringCost(text) * COLOR_MS_PER_UNIT / 3;
+    return lines;
+  };
+  return {
+    highlight,
+    now: () => clock,
+    elapsed: () => clock,
+    restart: () => {
+      clock = 0;
+    },
+  };
+}
 
 function escapeHtmlText(text: string) {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
