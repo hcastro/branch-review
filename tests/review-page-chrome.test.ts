@@ -481,7 +481,7 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
     expect(await evaluate('document.querySelectorAll(".rv-flash").length')).toBe(0);
   });
 
-  it('hugs a small picture with its frame in 2-up, and gives the dark state pill white text at 4.5:1', async () => {
+  it('hugs a small picture with its frame in 2-up, and gives the dark state pill the brand teal', async () => {
     await evaluate('localStorage.clear()');
     await load('top&m=0&n=1');
     const hero = index('img/hero.png');
@@ -489,7 +489,7 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
     expect(sizes).toHaveLength(2);
     for (const {frame, picture} of sizes) expect(frame - picture).toBeLessThanOrEqual(2);
     await click('[data-theme-set="dark"]');
-    expect(await evaluate('getComputedStyle(document.querySelector(".rv-state")).backgroundColor')).toBe('rgb(35, 134, 54)');
+    expect(await evaluate('getComputedStyle(document.querySelector(".rv-state")).backgroundColor')).toBe('rgb(92, 209, 222)');
     await click('[data-theme-set="auto"]');
   });
 
@@ -906,7 +906,7 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
     expect(Math.abs((await topOf(file)) - before)).toBeLessThanOrEqual(2);
   });
 
-  it('colors the behind and diverged pills in each theme, each with its text at 4.5:1', async () => {
+  it('colors every state pill in each theme, each with its text at 4.5:1', async () => {
     await load('top&m=0&n=1', specialUrl);
     const pill = () => evaluate<{background: string; ratio: number}>(`(() => {
       const box = getComputedStyle(document.querySelector('.rv-state'));
@@ -916,13 +916,13 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
       return {background: box.backgroundColor, ratio: (light + 0.05) / (dark + 0.05)};
     })()`);
     const expected = {
-      light: {diverged: 'rgb(207, 34, 46)', behind: 'rgb(212, 167, 44)'},
-      dark: {diverged: 'rgb(218, 54, 51)', behind: 'rgb(187, 128, 9)'},
+      light: {unpushed: 'rgb(16, 124, 144)', even: 'rgb(124, 82, 219)', diverged: 'rgb(207, 34, 46)', behind: 'rgb(212, 167, 44)'},
+      dark: {unpushed: 'rgb(92, 209, 222)', even: 'rgb(204, 170, 253)', diverged: 'rgb(218, 54, 51)', behind: 'rgb(187, 128, 9)'},
     };
     try {
       for (const theme of ['light', 'dark'] as const) {
         await click(`[data-theme-set="${theme}"]`);
-        for (const kind of ['diverged', 'behind'] as const) {
+        for (const kind of ['unpushed', 'even', 'diverged', 'behind'] as const) {
           await evaluate(`document.querySelector('.rv-state').className = 'rv-state rv-state-${kind}'`);
           const {background, ratio} = await pill();
           expect(background).toBe(expected[theme][kind]);

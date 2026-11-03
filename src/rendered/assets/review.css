@@ -7,8 +7,12 @@
    page.css only; a rich markdown view inside a card keeps GitHub's
    article styles and the rich view's change marks (page.css).
 
-   The palette is GitHub's review palette, light and dark. Tokens carry an
-   `rv-` prefix so they can't meet GitHub's or page.css's own. */
+   The diffs, syntax colors and rich views keep GitHub's palette, since
+   showing the branch as GitHub will is the point. The chrome around them
+   (the wordmark, links, focus rings, the selected file, the state pill,
+   the viewed count) takes branch-review's own teal to violet, the banner's
+   colors. Tokens carry an `rv-` prefix so they can't meet GitHub's or
+   page.css's own. */
 
 :root.rv {
   --rv-bg: #ffffff;
@@ -20,14 +24,20 @@
   --rv-border-muted: #e3e8ee;
   --rv-fg: #1f2328;
   --rv-fg-muted: #59636e;
-  --rv-accent: #0969da;
-  --rv-accent-subtle: #ddf4ff;
-  --rv-accent-border: #9dd0fb;
+  /* branch-review's own colors, the banner's light gradient. White text
+     sits on either end at 4.5:1 or more. */
+  --rv-brand-a: #107c90;
+  --rv-brand-b: #7c52db;
+  --rv-on-brand: #ffffff;
+  --rv-accent: #0e6e80;
+  --rv-accent-subtle: #e3f4f7;
+  --rv-accent-border: #9fd6df;
+  /* White, for text on GitHub's green and red. */
   --rv-on-accent: #ffffff;
   --rv-success: #1a7f37;
   --rv-success-emph: #1f883d;
-  /* The state pill's green, which white text sits on at 4.5:1 or more. */
-  --rv-state-bg: #1f883d;
+  /* The state pill's solid color, under its gradient. */
+  --rv-state-bg: #107c90;
   /* The diverged pill's red, which white text sits on at 4.5:1 or more. */
   --rv-diverged-bg: #cf222e;
   --rv-success-subtle: #dafbe1;
@@ -41,7 +51,7 @@
   /* A hidden character's marker in a line or a path, as the TUI draws it. */
   --rv-hc-fg: #59636e;
   --rv-hc-bg: rgba(212, 167, 44, 0.18);
-  --rv-done: #8250df;
+  --rv-done: #7c52db;
   --rv-add-line: #e6ffec;
   --rv-add-num: #ccffd8;
   --rv-add-word: #abf2bc;
@@ -56,7 +66,7 @@
   --rv-checker-b: #ffffff;
   --rv-backdrop: rgba(31, 35, 40, 0.45);
   --rv-shadow: rgba(31, 35, 40, 0.14);
-  --rv-flash: rgba(9, 105, 218, 0.35);
+  --rv-flash: rgba(16, 124, 144, 0.35);
   --rv-syn-k: #cf222e;
   --rv-syn-s: #0a3069;
   --rv-syn-cm: #59636e;
@@ -86,13 +96,16 @@
     --rv-border-muted: #2a3038;
     --rv-fg: #e6edf3;
     --rv-fg-muted: #9198a1;
-    --rv-accent: #4493f8;
-    --rv-accent-subtle: #121d2f;
-    --rv-accent-border: #1f4a85;
+    --rv-brand-a: #5cd1de;
+    --rv-brand-b: #ccaafd;
+    --rv-on-brand: #0d1117;
+    --rv-accent: #5cd1de;
+    --rv-accent-subtle: #122a30;
+    --rv-accent-border: #1f5560;
     --rv-on-accent: #ffffff;
     --rv-success: #3fb950;
     --rv-success-emph: #2ea043;
-    --rv-state-bg: #238636;
+    --rv-state-bg: #5cd1de;
     --rv-diverged-bg: #da3633;
     --rv-success-subtle: #12261e;
     --rv-danger: #f85149;
@@ -104,7 +117,7 @@
     --rv-attention-border: #6b5014;
     --rv-hc-fg: #9198a1;
     --rv-hc-bg: rgba(187, 128, 9, 0.22);
-    --rv-done: #ab7df8;
+    --rv-done: #ccaafd;
     --rv-add-line: rgba(46, 160, 67, 0.15);
     --rv-add-num: rgba(63, 185, 80, 0.3);
     --rv-add-word: rgba(46, 160, 67, 0.42);
@@ -119,7 +132,7 @@
     --rv-checker-b: #11161d;
     --rv-backdrop: rgba(1, 4, 9, 0.7);
     --rv-shadow: rgba(1, 4, 9, 0.6);
-    --rv-flash: rgba(68, 147, 248, 0.45);
+    --rv-flash: rgba(92, 209, 222, 0.45);
     --rv-syn-k: #ff7b72;
     --rv-syn-s: #a5d6ff;
     --rv-syn-cm: #9198a1;
@@ -157,7 +170,7 @@
 .rv-appbar { background: var(--rv-bg-subtle); border-bottom: 1px solid var(--rv-border); }
 .rv-appbar-in { display: flex; align-items: center; gap: 12px; min-height: 56px; }
 .rv-wordmark { display: inline-flex; align-items: center; gap: 8px; font: 700 14px/1 var(--rv-mono); letter-spacing: -0.01em; color: var(--rv-fg); white-space: nowrap; }
-.rv-wordmark .rv-glyph { width: 26px; height: 26px; border-radius: 7px; background: var(--rv-fg); color: var(--rv-bg); display: grid; place-items: center; }
+.rv-wordmark .rv-glyph { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, var(--rv-brand-a), var(--rv-brand-b)); color: var(--rv-on-brand); display: grid; place-items: center; }
 .rv-crumb-sep { color: var(--rv-border); font-size: 20px; font-weight: 300; }
 .rv-repo { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; color: var(--rv-fg); }
 .rv-repo .ic { color: var(--rv-fg-muted); }
@@ -183,13 +196,13 @@
 .rv-head h1 { margin: 0; font-size: 26px; line-height: 1.25; font-weight: 600; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; text-wrap: balance; overflow-wrap: anywhere; }
 .rv-head h1 .rv-into { color: var(--rv-fg-muted); font-weight: 300; }
 .rv-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-top: 10px; color: var(--rv-fg-muted); }
-.rv-state { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; height: 30px; border-radius: 999px; background: var(--rv-state-bg); color: var(--rv-on-accent); font-weight: 500; white-space: nowrap; }
+.rv-state { display: inline-flex; align-items: center; gap: 6px; padding: 0 12px; height: 30px; border-radius: 999px; background: var(--rv-state-bg) linear-gradient(90deg, var(--rv-brand-a), var(--rv-brand-b)); color: var(--rv-on-brand); font-weight: 500; white-space: nowrap; }
 .rv-state.rv-state-ahead { background: var(--rv-attention-bar); color: #1f2328; }
 .rv-state.rv-state-even { background: var(--rv-done); }
 /* Commits to fetch: the attention color, as for commits to push, and red
    once both sides have their own. */
 .rv-state.rv-state-behind { background: var(--rv-attention-bar); color: #1f2328; }
-.rv-state.rv-state-diverged { background: var(--rv-diverged-bg); }
+.rv-state.rv-state-diverged { background: var(--rv-diverged-bg); color: var(--rv-on-accent); }
 /* git didn't say in time: a quiet pill in the same place, so the title
    keeps its shape from one page to the next. */
 .rv-state.rv-state-unknown { background: var(--rv-bg-inset); color: var(--rv-fg-muted); border: 1px solid var(--rv-border); }
@@ -197,7 +210,7 @@
 .rv-tabs { display: flex; align-items: flex-end; gap: 4px; margin-top: 16px; border-bottom: 1px solid var(--rv-border); overflow-x: auto; }
 .rv-tab { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px 9px; border-bottom: 2px solid transparent; color: var(--rv-fg-muted); white-space: nowrap; margin-bottom: -1px; }
 .rv-tab:hover { color: var(--rv-fg); }
-.rv-tab[aria-selected="true"] { color: var(--rv-fg); font-weight: 600; border-bottom-color: var(--rv-attention-bar); }
+.rv-tab[aria-selected="true"] { color: var(--rv-fg); font-weight: 600; border-bottom-color: var(--rv-brand-a); border-image: linear-gradient(90deg, var(--rv-brand-a), var(--rv-brand-b)) 1; }
 .rv-tab .rv-count { font-size: 12px; font-weight: 500; line-height: 18px; padding: 0 6px; border-radius: 999px; background: var(--rv-bg-inset); color: var(--rv-fg); }
 .rv-tabs .rv-total { margin-left: auto; padding: 8px 0 9px 12px; font: 12px/1 var(--rv-mono); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .rv .rv-a { color: var(--rv-success); font-weight: 600; }
@@ -217,7 +230,7 @@
 .rv-progress b { color: var(--rv-fg); font-weight: 600; }
 .rv-progress svg { width: 18px; height: 18px; transform: rotate(-90deg); }
 .rv-progress .rv-trk { stroke: var(--rv-border); }
-.rv-progress .rv-val { stroke: var(--rv-success-emph); transition: stroke-dashoffset 0.3s; }
+.rv-progress .rv-val { stroke: var(--rv-accent); transition: stroke-dashoffset 0.3s; }
 
 /* ---------- Layout ---------- */
 .rv-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 24px; padding-block: 16px 64px; }
@@ -241,7 +254,7 @@
 .rv-dir.rv-shut .ic.rv-chev { transform: rotate(-90deg); }
 .rv-dir.rv-shut > ul { display: none; }
 .rv-file.rv-on { background: var(--rv-bg-hover); font-weight: 600; }
-.rv-file.rv-on::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 4px; border-radius: 2px; background: var(--rv-accent); }
+.rv-file.rv-on::before { content: ""; position: absolute; left: 0; top: 6px; bottom: 6px; width: 4px; border-radius: 2px; background: linear-gradient(180deg, var(--rv-brand-a), var(--rv-brand-b)); }
 .rv-file.rv-is-viewed .rv-nm { color: var(--rv-fg-muted); }
 .rv-st { display: inline-grid; place-items: center; }
 .rv-row .rv-st .ic, .rv-row .rv-vchk .ic { color: inherit; }
@@ -337,7 +350,7 @@
 .rv .diff tr.hdr .hx-more { font: 12px var(--rv-sans); color: var(--rv-fg-muted); }
 .rv .diff tr.hdr .hx-more.hx-after { margin-left: 12px; }
 .rv .exbtn { display: grid; place-items: center; width: 100%; height: 32px; color: var(--rv-fg-muted); }
-.rv .exbtn:not(:disabled):hover { background: var(--rv-accent); color: var(--rv-on-accent); }
+.rv .exbtn:not(:disabled):hover { background: var(--rv-accent); color: var(--rv-on-brand); }
 .rv .exbtn:disabled { opacity: 0.45; }
 .rv .exbtn:focus-visible { outline-offset: -2px; }
 .rv tr.revealed td { animation: rv-reveal 0.6s ease-out; }
