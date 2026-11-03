@@ -310,13 +310,13 @@ When the terminal is narrower than 74 columns, the file tree collapses to a rail
 
 The repo ships an agent skill in [`skills/branch-review`](skills/branch-review). It teaches Claude Code, or any tool that reads `SKILL.md` files, to hand you a ready-to-run `branch-review` command.
 
-An agent can't drive a full-screen terminal UI, so the skill never runs `branch-review` itself. It finds the repo or worktree that holds the changes and picks the refs. Then it copies one line to your clipboard, such as the following:
+An agent can't drive a full-screen terminal UI, so the skill never opens the UI itself. It finds the repo or worktree that holds the changes and picks the refs. Then it copies one line to your clipboard, such as the following:
 
 ```sh
 cd '/Users/me/code/app' && branch-review
 ```
 
-To get the command, ask the agent with a phrase such as `let me review this`, `/branch-review`, or `let me check the diff before you continue`. Paste the command into your terminal. When you finish the review, press `q`. To get a frozen snapshot or another option, say so, and the skill puts the flag, such as `--no-watch`, in the copied command.
+To get the command, ask the agent with a phrase such as `let me review this`, `/branch-review`, or `let me check the diff before you continue`. Paste the command into your terminal. When you finish the review, press `q`. To get a frozen snapshot or another option, say so, and the skill puts the flag, such as `--no-watch`, in the copied command. To get the review as an HTML file instead, ask for it, such as `export the review as HTML`. The agent runs `branch-review --export-html` itself, since that run writes the page and exits, and replies with the page's path.
 
 The command is written for POSIX shells and zsh. The script refuses a repo path or ref name that holds control or invisible characters, because a pasted command can't carry them safely. Examples include a newline, an escape, and a bidi control, and the script's report shows them escaped, such as `\x1b` or `\u202e`.
 

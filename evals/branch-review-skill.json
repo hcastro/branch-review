@@ -49,5 +49,34 @@
       "Adds --no-watch after branch-review in the command the script printed",
       "Keeps the cd into the worktree"
     ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "Same as the first case.",
+    "query": "I'd rather review this in the browser",
+    "expected_behavior": [
+      "Runs the script with a path inside app.worktrees/feat-login and no refs, as for any review",
+      "Never runs the branch-review UI and never opens a browser itself",
+      "Replies with the command and the one summary line, then one line saying r in the review opens the page in the browser at the file in view and R opens it at its top"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "Same as the first case.",
+    "query": "export the review as an HTML page I can send to a teammate",
+    "expected_behavior": [
+      "Runs branch-review --export-html itself from the worktree's root, with a directory outside the repo",
+      "Does not run review-command.sh, so the clipboard is left alone",
+      "Replies with the full path of index.html and the file count from the summary"
+    ]
+  },
+  {
+    "skills": ["branch-review"],
+    "setup": "Same as the first case.",
+    "query": "the markdown preview in the review is drawing garbage in my terminal",
+    "expected_behavior": [
+      "Runs the script as usual and puts BRANCH_REVIEW_PREVIEW=off before branch-review in the command it replies with",
+      "Tells the user the clipboard holds the command without the variable"
+    ]
   }
 ]
