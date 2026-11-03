@@ -458,6 +458,30 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
     }
   });
 
+  it('plays the arrival scanline for a press with motion, again for a later press, and never for a refresh, motion off, a hand-opened page or reduced motion', async () => {
+    const arriving = () => evaluate<boolean>('document.documentElement.classList.contains("rv-arriving")');
+    await page('Emulation.setEmulatedMedia', {features: [{name: 'prefers-reduced-motion', value: 'no-preference'}, {name: 'prefers-color-scheme', value: 'light'}]});
+    try {
+      await load('top&m=1&n=1');
+      expect(await arriving()).toBe(true);
+      expect(await evaluate<string>('document.getAnimations().map((each) => each.animationName).sort().join(",")')).toBe('rv-curtain,rv-scan');
+      await evaluate('new Promise((resolve) => setTimeout(resolve, 1000))');
+      expect(await arriving()).toBe(false);
+      // A later press only changes the hash of the page already open.
+      await evaluate('location.hash = "top&m=1&n=2"');
+      await evaluate('new Promise((resolve) => setTimeout(resolve, 50))');
+      expect(await arriving()).toBe(true);
+      for (const hash of ['top&m=1&n=3&l=1', 'top&m=0&n=4', 'top&m=1']) {
+        await load(hash);
+        expect(await arriving(), hash).toBe(false);
+      }
+    } finally {
+      await page('Emulation.setEmulatedMedia', {features: [{name: 'prefers-reduced-motion', value: 'reduce'}, {name: 'prefers-color-scheme', value: 'light'}]});
+    }
+    await load('top&m=1&n=5');
+    expect(await arriving()).toBe(false);
+  });
+
   it('says the path it copied, or when the browser keeps the clipboard, the path itself', async () => {
     await load('top&m=0&n=1');
     const pkg = index('package.json');

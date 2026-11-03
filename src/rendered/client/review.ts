@@ -893,6 +893,25 @@ function resetPage() {
   }
 }
 
+// ---------- The scanline ----------
+// The head script arms the first arrival; this clears it once it has
+// played, and plays it again for a later press that only changes the hash
+// of a page already open. The curtain takes 700 ms with its delay.
+const ARRIVAL_MS = 900;
+let arrivalTimer: ReturnType<typeof setTimeout> | undefined;
+function scanIn(hash: ReturnType<typeof readReviewHash>, again: boolean) {
+  if (again) {
+    if (!hash.m || hash.n === undefined || hash.l || reduced.matches) return;
+    root.classList.remove('rv-arriving');
+    // A reflow between the two, so the animation starts over.
+    void root.offsetWidth;
+    root.classList.add('rv-arriving');
+  }
+  if (!root.classList.contains('rv-arriving')) return;
+  clearTimeout(arrivalTimer);
+  arrivalTimer = setTimeout(() => root.classList.remove('rv-arriving'), ARRIVAL_MS);
+}
+
 // ---------- Arrival ----------
 // A trip names the card to open at, which glows once; a trip with no card
 // opens the page at its top. A press on the same file again, to a split
@@ -901,6 +920,7 @@ function resetPage() {
 function arrive(first = false) {
   const hash = readReviewHash(location.hash);
   if (hash.m !== undefined) motion = hash.m;
+  scanIn(hash, !first);
   // A live refresh: back where the reader was, with the page and each card
   // as they left them, no glow and no motion but a pulse on what changed.
   if (hash.l && first) {

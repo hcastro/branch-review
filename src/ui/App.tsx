@@ -44,7 +44,7 @@ import {LEAVES_PANE} from '../rendered/marks.js';
 import type {RenderedPages, RenderedService, Trip} from '../rendered/service.js';
 import {anchorLine} from '../rendered/anchor.js';
 import {isMarkdownName} from '../rendered/classify.js';
-import {beamFrame, pressFrame} from '../rendered/beam.js';
+import {chip, chipLaunchLook, CHIP_HOVER, CHIP_REST, launchScreen, placeAt, pressFrame, shimmerAt, SHIMMER_MS, type LaunchDepth} from '../rendered/launch.js';
 import {addMediaRows as addMediaRowsTo} from './mediaRows.js';
 import {firstTip, keyHelpGroups, keyHelpLines} from './keyHelp.js';
 import {createCrossingClock, type CrossingClock} from './crossing.js';
@@ -1001,9 +1001,16 @@ function isFileActionCopied(actionId: string, copiedAction?: string) {
   return actionId === copiedAction || (actionId === 'copy.path' && copiedAction === ABSOLUTE_PATH_ACTION.id);
 }
 
+// Review in browser draws as a filled chip wherever there is color; the
+// other actions stay gray tabs, so it leads the eye.
+const chipDepth = (): LaunchDepth | null => (palette.depth > 0 ? palette.depth as LaunchDepth : null);
+
 function fileActions(actions: ReadonlyArray<FileAction>, hoveredAction?: string, copiedAction?: string) {
+  const depth = chipDepth();
   return actions
-    .map((action) => actionButton(action.label, action.id === hoveredAction, isFileActionCopied(action.id, copiedAction)))
+    .map((action) => (action.id === RENDERED_ACTION.id && depth !== null
+      ? chip(action.label, depth, action.id === hoveredAction ? CHIP_HOVER : CHIP_REST)
+      : actionButton(action.label, action.id === hoveredAction, isFileActionCopied(action.id, copiedAction))))
     .join(' ');
 }
 
@@ -1333,7 +1340,9 @@ function buildDiffHeader({
     for (const action of drawnActions) {
       const width = buttonWidth(action);
       const labelWidth = width - 4;
-      fileSpans.push({id: action.id, start: column + 2, end: column + 2 + labelWidth});
+      // The chip answers on its padding too, all but its half-block ends.
+      const chipped = action.id === RENDERED_ACTION.id && chipDepth() !== null;
+      fileSpans.push({id: action.id, start: column + (chipped ? 1 : 2), end: column + 2 + labelWidth + (chipped ? 1 : 0)});
       if (action.id === 'copy.path') pathButton = {start: column, width};
       column += width + 1;
     }
@@ -2170,6 +2179,7 @@ type DiffPaneBodyProps = {
   // The crossing toward a rendered page, and the Rendered button's label
   // columns on the file row, when it is drawn.
   crossing: CrossingClock;
+  shimmer: CrossingClock;
   renderedSpan: {start: number; end: number} | null;
   // The page in the pane, and its crossing's clock, while it is offered.
   pane?: RenderedPane;
@@ -2349,6 +2359,7 @@ function DiffPaneBody({
   selection,
   media,
   crossing,
+  shimmer,
   renderedSpan,
   pane,
   paneClock,
@@ -2358,9 +2369,28 @@ function DiffPaneBody({
   // Only this pane reads the crossing's clock, so its 40 ms ticks redraw
   // the pane alone. Diff text rows only: picture rows are never redrawn.
   const crossingFrame = useSyncExternalStore(crossing.subscribe, crossing.snapshot);
+  const shimmerFrame = useSyncExternalStore(shimmer.subscribe, shimmer.snapshot);
   const beamAccent = palette.beam();
-  const beam = (line: string, row: number) => (crossingFrame?.motion === 'full' ? beamFrame(line, row, crossingFrame.t, inner, beamAccent) ?? line : line);
-  const pressedRow = crossingFrame ? pressFrame(fileRow, renderedSpan, crossingFrame.t, crossingFrame.motion, beamAccent) : null;
+  const depth = chipDepth();
+  // The Review in browser chip, redrawn while it is pressed, lit or
+  // shimmering; at rest the header row has it already. Without color, the
+  // tab's label shows the press in inverse.
+  const chipHovered = hoveredAction?.kind === 'file-header' && hoveredAction.id === RENDERED_ACTION.id;
+  const chipRow = (() => {
+    if (!renderedSpan || (!crossingFrame && !shimmerFrame)) return null;
+    if (depth === null) return crossingFrame ? pressFrame(fileRow, renderedSpan, crossingFrame.t, crossingFrame.motion, beamAccent) : null;
+    const look = {...chipLaunchLook(crossingFrame?.t ?? -1, chipHovered), shimmer: shimmerFrame ? shimmerAt(shimmerFrame.t) : null};
+    return placeAt(fileRow, renderedSpan.start - 1, renderedSpan.end + 1, chip(RENDERED_ACTION.label, depth, look));
+  })();
+  // The launch: the diff's text rows only, as delta drew them. Specks fly
+  // to the chip's middle, two rows above the diff, or to the header's
+  // right end when the chip didn't fit.
+  const launchRows = crossingFrame?.motion === 'full' && depth !== null && !paneClock.snapshot()
+    ? launchScreen(crossingFrame.t, visibleDiffLines.map((line, index) => {
+      const row = allDiffRows[diffOffset + index];
+      return row && !row.pane && row.kind === 'body' && row.codeColumn !== undefined ? {line: line || ' ', from: row.codeColumn} : null;
+    }), {width: inner, depth, target: {row: -2, col: renderedSpan ? Math.round((renderedSpan.start + renderedSpan.end) / 2) : inner - 1}})
+    : null;
   // The in-pane crossing's frame, while `v` plays one.
   const paneFrame = useSyncExternalStore(paneClock.subscribe, paneClock.snapshot);
   const glow = paneFrame ? glowTone(paneFrame.t) : null;
@@ -2385,7 +2415,7 @@ function DiffPaneBody({
   };
   const rows: string[] = [
     frameTopBorder(paneWidth, borderAnsi),
-    frameLine(pressedRow ?? applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
+    frameLine(chipRow ?? applyArrivalWash(fileRow, fileArrival, arrivalNow), inner, borderAnsi),
     frameLine(metricsRow, inner, borderAnsi),
   ];
   if (!hasChanges) {
@@ -2443,10 +2473,10 @@ function DiffPaneBody({
 
     const selectedLine = highlightSelectedCode(visibleLine, row, absoluteLineIndex, selection);
     const arrivalLine = applyArrivalWash(selectedLine, blockArrival, arrivalNow);
-    // The band crosses diff text only: rows with delta's gutter. A block's
+    // The launch moves diff text only: rows with delta's gutter. A block's
     // framed header and the blank rows between files keep still.
     const holdsText = row?.kind === 'body' && row.codeColumn !== undefined;
-    const paneRow = frameLine(holdsText ? beam(arrivalLine, index) : arrivalLine, inner, borderAnsi);
+    const paneRow = frameLine(holdsText ? launchRows?.[index] ?? arrivalLine : arrivalLine, inner, borderAnsi);
     rows.push(marksFocus ? paneRow.replace('│', FOCUS_BAR) : paneRow);
   }
   // A diff shorter than the pane still draws the pane's full height, so the
@@ -2727,7 +2757,9 @@ function AppContent({
   // A renderable file is markdown, or an image or SVG whose media hints stay.
   const activeIsMarkdown = Boolean(activeFile && isMarkdownName(activeFile.path));
   const [crossing] = useState(createCrossingClock);
+  const [shimmer] = useState(() => createCrossingClock({timing: {full: SHIMMER_MS, reduced: 0}}));
   useEffect(() => () => crossing.dispose(), [crossing]);
+  useEffect(() => () => shimmer.dispose(), [shimmer]);
   // The in-pane crossing's clock. The footer reads only whether it is
   // developing, so its ticks redraw the diff pane alone.
   const [paneClock] = useState(createPaneClock);
@@ -3898,6 +3930,12 @@ function AppContent({
           return current;
         }
 
+        // The pointer coming onto the chip sends one stripe across it, with
+        // the same motion as the launch.
+        const onChip = (action: HoveredAction) => action?.kind === 'file-header' && action.id === RENDERED_ACTION.id;
+        if (onChip(nextHoveredAction) && !onChip(current)) {
+          void (pages?.crossingMotion ? pages.crossingMotion() : Promise.resolve(paneMotion)).then((motion) => shimmer.start(motion));
+        }
         return nextHoveredAction;
       });
     };
@@ -3919,8 +3957,10 @@ function AppContent({
     media,
     mouse,
     pages,
+    paneMotion,
     scheduleTreeTooltip,
     sections,
+    shimmer,
     terminalRows,
     treeCollapsed,
     visibleDiffRows,
@@ -4506,6 +4546,7 @@ function AppContent({
               selection={codeSelection?.lines === allDiffLines ? codeSelection : null}
               media={mediaOn ? media : undefined}
               crossing={crossing}
+              shimmer={shimmer}
               renderedSpan={renderedSpan}
               {...(pane ? {pane} : {})}
               paneClock={paneClock}

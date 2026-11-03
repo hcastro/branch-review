@@ -20,8 +20,8 @@ import {
 import {cleanupTempDirs} from './core-helpers.js';
 
 // The trip from the TUI to a page in the browser: the Review in browser button and its
-// hint, `r` and `R`, the footer's hints and toasts, and the beam the TUI
-// plays on the way. The surface is real, with cmux, the browser opener and
+// hint, `r` and `R`, the footer's hints and toasts, and the launch the
+// TUI plays on the way. The surface is real, with cmux, the browser opener and
 // tool lookup recorded, so these tests see the exact commands a press
 // sends, and nothing real ever runs.
 
@@ -29,6 +29,9 @@ afterEach(cleanupTempDirs);
 
 const SIZE = {columns: 120, rows: 30};
 const BAND = /[░▒▓]{3,}/;
+// A speck on its way to the button, and the scanline that lifts the rows.
+const SPECK = /[⣿⠿⠶⠖⠒]/;
+const SCANLINE = /▄{8,}/;
 const SPLIT_ARGS = (url: string) => ['--json', 'browser', 'open-split', url, '--workspace', 'workspace:1', '--focus', 'false'];
 
 function docs() {
@@ -54,7 +57,7 @@ describe('the Review in browser button', () => {
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
     const header = frameLines(instance.lastFrame())[4]!;
-    expect(header).toMatch(/docs\/guide\.md\s+╭─Review in browser ⇗─╮ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
+    expect(header).toMatch(/docs\/guide\.md\s+▐ ⇗ Review in browser ▌ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
 
     instance.stdin.write('\u001B[B');
     await flush(2);
@@ -69,14 +72,14 @@ describe('the Review in browser button', () => {
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/hero\.png\s+╭─Review in browser ⇗─╮/);
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/hero\.png\s+▐ ⇗ Review in browser ▌/);
     instance.stdin.write('r');
     await waitForFrame(instance, '⇗ hero.png opened in the browser split');
     expect(calls[0]!.args.slice(0, 3)).toEqual(['--json', 'browser', 'open-split']);
 
     instance.stdin.write('\u001B[B');
     await flush(2);
-    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/flow\.svg\s+╭─Review in browser ⇗─╮/);
+    expect(frameLines(instance.lastFrame())[4]!).toMatch(/docs\/flow\.svg\s+▐ ⇗ Review in browser ▌/);
     instance.stdin.write('r');
     await waitForFrame(instance, '⇗ flow.svg opened in the browser split');
     expect(calls[1]!.args.slice(0, 4)).toEqual(['browser', '--surface', 'surface:7', 'goto']);
@@ -86,11 +89,11 @@ describe('the Review in browser button', () => {
   it('is the last header action to drop when the pane narrows', async () => {
     const fixture = docs();
     const {service} = fakeRenderedService({review: fixture.review});
-    for (const [columns, shown] of [[96, ['Review in browser ⇗', 'Copy path']], [74, ['Review in browser ⇗']]] as const) {
+    for (const [columns, shown] of [[96, ['⇗ Review in browser', 'Copy path']], [74, ['⇗ Review in browser']]] as const) {
       const instance = renderFixture({...fixture, rendered: service}, {columns, rows: 30});
       await flush();
       const header = frameLines(instance.lastFrame())[4]!;
-      const actions = [...header.matchAll(/╭─([^─]+)─╮/g)].map((match) => match[1]);
+      const actions = [...header.matchAll(/╭─([^─]+)─╮|▐ ([^▌]+) ▌/g)].map((match) => match[1] ?? match[2]);
       expect(actions, `${columns} columns`).toEqual(shown);
       instance.unmount();
     }
@@ -101,7 +104,7 @@ describe('the Review in browser button', () => {
     const {service} = fakeRenderedService({review: fixture.review});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    const at = cellPosition(instance.lastFrame(), ['Review in browser ⇗'], 'Review');
+    const at = cellPosition(instance.lastFrame(), ['⇗ Review in browser'], 'Review');
     await emitMouseMoveAt(at.column + 2, at.row);
     await flush(2);
     expect(frameLines(instance.lastFrame())[1]).toContain("Open this file's changes in a browser split, as GitHub shows them");
@@ -113,7 +116,7 @@ describe('the Review in browser button', () => {
     const {service, calls} = fakeRenderedService({review: fixture.review, motion: 'off'});
     const instance = renderFixture({...fixture, rendered: service}, SIZE);
     await flush();
-    const at = cellPosition(instance.lastFrame(), ['Review in browser ⇗'], 'Review');
+    const at = cellPosition(instance.lastFrame(), ['⇗ Review in browser'], 'Review');
     await emitMousePressAt(at.column + 1, at.row);
     await waitForFrame(instance, '⇗ guide.md opened in the browser split');
     expect(calls).toHaveLength(1);
@@ -306,7 +309,7 @@ describe('r and R', () => {
   });
 });
 
-describe('the beam', () => {
+describe('the launch', () => {
   // A markdown file over a picture: the beam sweeps the text rows and
   // leaves the picture's placeholder rows as they are.
   function withPicture() {
@@ -333,8 +336,13 @@ describe('the beam', () => {
     const during = instance.frames.slice(from);
     const swept = during.filter((frame) => diffRows(frame).some((row) => BAND.test(row)));
     expect(swept.length).toBeGreaterThanOrEqual(2);
-    // The press shows on the button first, in inverse.
-    expect(during.some((frame) => frame.includes('\u001B[7mReview in browser ⇗'))).toBe(true);
+    // The press shows on the chip first, pressed in, in the same words.
+    const headerOf = (frame: string | undefined) => (frame ?? '').split('\n')[4]!;
+    const restingHeader = headerOf(instance.frames[from - 1]);
+    expect(during.some((frame) => headerOf(frame) !== restingHeader && stripAnsi(headerOf(frame)) === stripAnsi(restingHeader))).toBe(true);
+    // The scanline lifts the rows, and specks fly off them.
+    expect(during.some((frame) => diffRows(frame).some((row) => SCANLINE.test(stripAnsi(row))))).toBe(true);
+    expect(during.some((frame) => diffRows(frame).some((row) => SPECK.test(stripAnsi(row))))).toBe(true);
     for (const frame of during) expect(pictureRows(frame)).toEqual(resting);
     // The band never lands on the header rows, and is gone once the toast shows.
     for (const frame of during) expect(frameLines(frame).slice(0, 6).join('\n')).not.toMatch(BAND);
@@ -364,10 +372,20 @@ describe('the beam', () => {
         if (!code[index]) expect(row, `row ${index}`).toBe(resting[index]);
       }
     }
+    // On the rows that lift off, the gutter's line numbers stay put.
+    const gutterOf = (row: string) => {
+      const text = stripAnsi(row);
+      return text.slice(0, text.indexOf('│', text.indexOf('⋮')) + 1);
+    };
+    for (const rows of during) {
+      for (const [index, row] of rows.entries()) {
+        if (code[index]) expect(gutterOf(row), `gutter ${index}`).toBe(gutterOf(resting[index]!));
+      }
+    }
     instance.unmount();
   });
 
-  it('plays nothing with motion off, and one frame of ░ on the button with reduced motion', async () => {
+  it('plays nothing with motion off, and only presses the chip in with reduced motion', async () => {
     const fixture = docs();
     for (const motion of ['off', 'reduced'] as const) {
       const {service} = fakeRenderedService({review: fixture.review, motion});
@@ -378,7 +396,12 @@ describe('the beam', () => {
       await waitForFrame(instance, '⇗ guide.md opened in the browser split');
       const during = instance.frames.slice(from).map((frame) => stripAnsi(frame));
       for (const frame of during) expect(diffRows(frame).join('\n')).not.toMatch(BAND);
-      expect(during.some((frame) => frameLines(frame)[4]!.includes(`╭─${'░'.repeat('Review in browser ⇗'.length)}─╮`)), motion).toBe(motion === 'reduced');
+      // Reduced motion presses the chip in, in the same words, and nothing else moves.
+      const headerOf = (frame: string | undefined) => (frame ?? '').split('\n')[4]!;
+      const resting = headerOf(instance.frames[from - 1]);
+      const pressed = instance.frames.slice(from).some((frame) => headerOf(frame) !== resting && stripAnsi(headerOf(frame)) === stripAnsi(resting));
+      expect(pressed, motion).toBe(motion === 'reduced');
+      for (const frame of during) expect(diffRows(frame).join('\n')).not.toMatch(SPECK);
       instance.unmount();
     }
   });

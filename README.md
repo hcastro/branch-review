@@ -112,7 +112,7 @@ For more information about terminal support, tmux setup, compare modes, and open
 
 To read a changed markdown file the way GitHub shows it, press `v`, and **Preview** draws its page right in the review, with a bar in the margin beside each block the branch added or changed. To review the whole branch in a browser, press `r`, and **Review in browser** opens one page laid out like a pull request on GitHub, at the card of the file in view, in a browser split beside the review in cmux, or in your default browser in other terminals. To open that page at its top, press `R` for **All files in browser**. To list every key, press `?`.
 
-The first time a file can use them, the footer says so in one line, such as `Tip: press v to preview this file as GitHub shows it, or r to open its changes in the browser`. The file header has the same actions as buttons: **Preview**, which reads **Diff** while the Preview shows, and **Review in browser ⇗**.
+The first time a file can use them, the footer says so in one line, such as `Tip: press v to preview this file as GitHub shows it, or r to open its changes in the browser`. The file header has the same actions as buttons: **Preview**, which reads **Diff** while the Preview shows, and **⇗ Review in browser**, a teal to violet chip that sends the diff off to the page when you click it.
 
 Preview needs Ghostty, cmux, or Kitty, and a headless Chromium already on disk. Where either is missing, the footer leaves `v` out, and `r` still works. When Preview can't draw a page, the diff comes back where you were reading, and the footer says why. To turn Preview off, set `BRANCH_REVIEW_PREVIEW=off`.
 
@@ -282,7 +282,7 @@ You can also do most of this with the mouse:
 | Click a block header | Collapse or expand that diff block |
 | Click **Preview** in a file header | Show the file's Preview, like `v` |
 | Click **Diff** in a file header | Go back from the Preview to the diff, like `v` |
-| Click **Review in browser ⇗** in a file header | Open the branch's page in the browser at that file, like `r` |
+| Click **⇗ Review in browser** in a file header | Open the branch's page in the browser at that file, like `r` |
 | Click a link in a Preview | Scroll to a heading on the page, open another file of the review, or copy a web address |
 | Drag across code | Select lines and copy them |
 | Drag the tree's right border | Resize the file tree. Dragging it to its minimum width collapses it to a rail. |

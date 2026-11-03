@@ -142,11 +142,11 @@ describe('the header buttons, in words', () => {
   it('shows Preview and Review in browser on a markdown file, and Diff in place of Preview while the Preview shows', async () => {
     const {instance} = setup({tips: false});
     await settle();
-    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Preview─╮ ╭─Review in browser ⇗─╮ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
+    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Preview─╮ ▐ ⇗ Review in browser ▌ ╭─Copy path─╮ ╭─Copy diff─╮ ╭─Copy file─╮/);
     await press(instance, 'v');
-    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Diff─╮ ╭─Review in browser ⇗─╮ ╭─Copy path─╮/);
+    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Diff─╮ ▐ ⇗ Review in browser ▌ ╭─Copy path─╮/);
     await press(instance, 'v');
-    expect(header(instance.lastFrame())).toMatch(/╭─Preview─╮ ╭─Review in browser ⇗─╮/);
+    expect(header(instance.lastFrame())).toMatch(/╭─Preview─╮ ▐ ⇗ Review in browser ▌/);
     instance.unmount();
   });
 
@@ -172,7 +172,7 @@ describe('the header buttons, in words', () => {
     const {instance} = setup({files: [HERO, PAGE], tips: false});
     await settle();
     const row = header(instance.lastFrame());
-    expect(row).toMatch(/docs\/hero\.png +╭─Review in browser ⇗─╮ ╭─Copy path─╮/);
+    expect(row).toMatch(/docs\/hero\.png +▐ ⇗ Review in browser ▌ ╭─Copy path─╮/);
     expect(row).not.toContain('Preview');
     instance.unmount();
   });
@@ -180,16 +180,16 @@ describe('the header buttons, in words', () => {
   it('shows no Preview button where Preview is turned off, and keeps Review in browser', async () => {
     const {instance} = setup({preview: false, tips: false});
     await settle();
-    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +╭─Review in browser ⇗─╮ ╭─Copy path─╮/);
+    expect(header(instance.lastFrame())).toMatch(/docs\/page\.md +▐ ⇗ Review in browser ▌ ╭─Copy path─╮/);
     expect(header(instance.lastFrame())).not.toContain('Preview');
     instance.unmount();
   });
 
   it('keeps Preview and Review in browser the last buttons to drop when the header narrows', async () => {
-    for (const [columns, shown] of [[110, ['Preview', 'Review in browser ⇗', 'Copy path']], [84, ['Preview', 'Review in browser ⇗']], [70, ['Preview', 'Review in browser ⇗']]] as const) {
+    for (const [columns, shown] of [[110, ['Preview', '⇗ Review in browser', 'Copy path']], [84, ['Preview', '⇗ Review in browser']], [70, ['Preview', '⇗ Review in browser']]] as const) {
       const {instance} = setup({tips: false, size: {columns, rows: 32}});
       await settle();
-      const actions = [...header(instance.lastFrame()).matchAll(/╭─([^─]+)─╮/g)].map((match) => match[1]);
+      const actions = [...header(instance.lastFrame()).matchAll(/╭─([^─]+)─╮|▐ ([^▌]+) ▌/g)].map((match) => match[1] ?? match[2]);
       expect(actions, `${columns} columns`).toEqual(shown);
       instance.unmount();
     }
@@ -205,7 +205,7 @@ describe('the header buttons, in words', () => {
       return stripAnsi(frameLines(instance.lastFrame())[1] ?? '');
     };
     expect(await tipFor('Preview')).toContain('Show this file the way GitHub draws it, right here');
-    expect(await tipFor('Review in browser ⇗')).toContain("Open this file's changes in a browser split, as GitHub shows them");
+    expect(await tipFor('⇗ Review in browser')).toContain("Open this file's changes in a browser split, as GitHub shows them");
     await press(instance, 'v');
     expect(await tipFor('Diff')).toContain("Go back to this file's diff");
     instance.unmount();

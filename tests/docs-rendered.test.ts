@@ -97,6 +97,6 @@ describe('Preview and Review in browser in the docs', () => {
     expect(readme).toContain('| `BRANCH_REVIEW_PREVIEW_DPR` |');
     for (const key of ['`v`', '`r`', '`R`', '`?`']) expect(readme).toContain(`| ${key} |`);
     expect(readme).toContain('| Click **Preview** in a file header |');
-    expect(readme).toContain('| Click **Review in browser ⇗** in a file header |');
+    expect(readme).toContain('| Click **⇗ Review in browser** in a file header |');
   });
 });

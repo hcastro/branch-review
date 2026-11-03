@@ -4,7 +4,7 @@ This document describes the two ways `branch-review` shows the branch the way Gi
 
 ## Review the branch in the browser
 
-To open the branch's changes at the file in view, press `r`, or click **Review in browser ⇗** in the file header. The button comes first in the header of a markdown, image, or SVG file, after **Preview** on a markdown file, and the two are the last to go when the header is too narrow for every button. `r` works on any file, code included: the page opens at that file's card, which glows once unless you started `branch-review` with `--no-animations`. To open the page at its top, press `R` for **All files in browser**. Neither key changes what the review shows, and you can keep reading while the page opens.
+To open the branch's changes at the file in view, press `r`, or click **⇗ Review in browser** in the file header. With color on, the button is a filled teal to violet chip, and a stripe crosses it when the pointer comes onto it. It comes first in the header of a markdown, image, or SVG file, after **Preview** on a markdown file, and the two are the last to go when the header is too narrow for every button. `r` works on any file, code included: the page opens at that file's card, which glows once unless you started `branch-review` with `--no-animations`. To open the page at its top, press `R` for **All files in browser**. Neither key changes what the review shows, and you can keep reading while the page opens.
 
 Where the page opens depends on where you run `branch-review`:
 
@@ -39,18 +39,27 @@ In watch mode, an edit writes a new page in the background, and the split follow
 
 ### Motion on the way
 
-While the page opens, a shade band sweeps the diff toward the split, for about a third of a second. The band crosses only the rows that hold diff text. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
+While the page opens, the review sends the diff to it, for about 0.8 seconds:
 
-A new split narrows the review as it opens, so a press that opens one plays the band first and opens the split after it. A press that goes to an open split opens the page while the band plays.
+1. The button presses in, and the code in the diff dissolves into shade in its own colors, from the top down.
+2. A teal to violet scanline sweeps up from the bottom. Each row it passes lifts off as specks, which fly up into the button.
+3. The specks land about 0.6 seconds after the press, and the button flares.
+4. The code draws back in from the top.
+
+Only the rows that hold diff text move, and their line numbers stay put. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
+
+A new split narrows the review as it opens, so a press that opens one opens the split as the specks land. A press that goes to an open split opens the page while the launch plays.
+
+The page answers with its own arrival when it opens from a press: a teal to violet scanline sweeps down once and uncovers it. A live refresh, a page opened by hand, and the settings below show the page at once.
 
 A page that opens in a new tab or a new split starts at its card. A press that goes to a split that already shows the page scrolls it to the card.
 
 The following settings change the motion:
 
-- `--no-animations` turns the band off, along with the review's other motion. The page then scrolls to its card at once.
-- `NO_COLOR` turns the band off.
-- With **Reduce motion** on in macOS's accessibility settings, the band gives way to one short flash of the **Review in browser ⇗** button. `branch-review` reads the setting once per session, and not over SSH. The page follows the system's setting too, and scrolls with no motion.
-- `BRANCH_REVIEW_MOTION` overrides the macOS setting for the band: `full`, `reduce`, or `off`.
+- `--no-animations` turns the launch and the page's arrival off, along with the review's other motion. The page then scrolls to its card at once.
+- `NO_COLOR` turns the launch off, and the button is a plain tab, which shows a press in inverse.
+- With **Reduce motion** on in macOS's accessibility settings, the launch gives way to one short press of the button, and the hover stripe doesn't play. `branch-review` reads the setting once per session, and not over SSH. The page follows the system's setting too: it opens with no arrival and scrolls with no motion.
+- `BRANCH_REVIEW_MOTION` overrides the macOS setting for the launch: `full`, `reduce`, or `off`.
 
 ## Read the review page
 

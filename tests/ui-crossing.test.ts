@@ -2,7 +2,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {createCrossingClock} from '../src/ui/crossing.js';
 
 // The TUI's crossing clock: it ticks every 40 ms only while a crossing plays,
-// so the diff pane redraws for the beam and then goes quiet.
+// so the diff pane redraws for the launch and then goes quiet.
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -21,28 +21,33 @@ function listening() {
 }
 
 describe('createCrossingClock', () => {
-  it('plays a full crossing for 320 ms, then stops ticking', async () => {
+  it('plays a full launch for 840 ms that settles at 640, when the specks land, then stops ticking', async () => {
     const {clock, emits} = listening();
     let settled = false;
     void clock.start('full').then(() => {
       settled = true;
     });
     expect(clock.snapshot()).toEqual({motion: 'full', t: 0});
-    await vi.advanceTimersByTimeAsync(280);
-    expect(clock.snapshot()).toEqual({motion: 'full', t: 280});
+    await vi.advanceTimersByTimeAsync(600);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 600});
     expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(40);
+    // Settled, and still drawing: the diff draws back in after it.
     expect(settled).toBe(true);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 640});
+    await vi.advanceTimersByTimeAsync(160);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 800});
+    await vi.advanceTimersByTimeAsync(40);
     expect(clock.snapshot()).toBeNull();
-    // The press, seven ticks, and the frame clearing at the end.
+    // The press, twenty ticks, and the frame clearing at the end.
     const atEnd = emits();
-    expect(atEnd).toBe(9);
+    expect(atEnd).toBe(22);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(emits()).toBe(atEnd);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('starts over on a second press: the first settles, and the second plays its full 320 ms', async () => {
+  it('starts over on a second press: the first settles, and the second plays its whole launch', async () => {
     const {clock} = listening();
     let first = false;
     let second = false;
@@ -57,11 +62,42 @@ describe('createCrossingClock', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(first).toBe(true);
     expect(clock.snapshot()).toEqual({motion: 'full', t: 0});
-    await vi.advanceTimersByTimeAsync(280);
-    expect(clock.snapshot()).toEqual({motion: 'full', t: 280});
+    await vi.advanceTimersByTimeAsync(600);
     expect(second).toBe(false);
     await vi.advanceTimersByTimeAsync(40);
     expect(second).toBe(true);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(clock.snapshot()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('settles at once on a press that stops it before it lands', async () => {
+    const {clock} = listening();
+    let settled = false;
+    void clock.start('full').then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    clock.dispose();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(true);
+    expect(clock.snapshot()).toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('plays its own timing: the hover shimmer runs 400 ms at full motion, and nothing under reduced', async () => {
+    const clock = createCrossingClock({timing: {full: 400, reduced: 0}});
+    let settled = false;
+    void clock.start('full').then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(360);
+    expect(clock.snapshot()).toEqual({motion: 'full', t: 360});
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(40);
+    expect(settled).toBe(true);
+    expect(clock.snapshot()).toBeNull();
+    await clock.start('reduced');
     expect(clock.snapshot()).toBeNull();
     expect(vi.getTimerCount()).toBe(0);
   });

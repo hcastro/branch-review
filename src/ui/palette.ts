@@ -62,7 +62,8 @@ export type Palette = {
   // An Ink colour prop, or undefined (the terminal's default) without colour.
   ink: <T extends string>(color: T) => T | undefined;
   arrivalBackground: (kind: ArrivalKind, progress: number) => string | null;
-  // The rendered view's beam accent, or null with color off: no color, no beam.
+  // The rendered view's accent (the in-pane scanline, the press without a
+  // chip), or null with color off.
   beam: () => string | null;
 };
 

@@ -742,8 +742,10 @@ export function createRenderedService({backend, site, surface, motion, animation
   // One trip to the page: the TUI's crossing, played while the page is
   // written and placed on the surface, so the crossing covers the split
   // opening. A new split narrows the TUI as it opens, which would cut the
-  // beam off, so a press that opens one places the page once the crossing
-  // has ended; one that goes to an open split places it while it plays.
+  // launch's specks off, so a press that opens one places the page once
+  // the crossing lands, as the specks reach the button, and the diff draws
+  // back in at the new width; one that goes to an open split places it
+  // while it plays.
   // `name` is how the footer names what opened. Nothing crosses toward a
   // surface that refuses. A page still unwritten after the crossing is
   // said to be on its way, until the deadline gives up on it, and then it
