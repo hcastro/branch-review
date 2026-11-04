@@ -209,6 +209,39 @@ describe('drag-select copies exact bytes', () => {
   });
 });
 
+describe('a line longer than delta draws', () => {
+  // 5,000 characters: delta draws the first 3,000 and a →. Short enough that
+  // a delta with no line limit stays under a gigabyte if this ever regresses.
+  const long = `begin${'x'.repeat(4990)}close`;
+  const rawDiff = `@@ -0,0 +1,2 @@\n+${long}\n+after\n`;
+  const patch = `diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n${rawDiff}`;
+
+  it('is cut by delta at its line limit with the truncation symbol', () => {
+    const rendered = renderDiffForDisplay(process.cwd(), patch, 120).split('\n').filter(Boolean);
+    const row = rendered.map((line) => line.replace(/\u001B\[[0-9;]*[A-Za-z]/g, '')).find((line) => line.includes('begin'));
+    expect(row).toBeDefined();
+    expect(row!.trimEnd().endsWith(`${'x'.repeat(10)}→`)).toBe(true);
+    expect(row).not.toContain('close');
+    expect(row!.length).toBeLessThan(3100);
+  });
+
+  it('copies the whole raw line when the whole cut line is dragged over', async () => {
+    const rendered = renderDiffForDisplay(process.cwd(), patch, 120).split('\n').filter(Boolean);
+    const writes: string[] = [];
+    const instance = renderFixture(buildFixture([{path: 'src/x.ts', rawDiff, rendered}]), {columns: 150, rows: 60}, writes);
+    await flush();
+
+    const frame = instance.lastFrame();
+    const from = cellPosition(frame, ['begin'], 'begin');
+    const to = cellPosition(frame, ['x→'], '→');
+    await dragCopy(instance, from, to);
+
+    expect(writes).toEqual([long]);
+
+    instance.unmount();
+  });
+});
+
 describe('drag-select over real delta output', () => {
   it('copies CRLF and tab lines as their raw bytes', async () => {
     const lines = ['crlf line\r', '\tindented();', 'plain'];

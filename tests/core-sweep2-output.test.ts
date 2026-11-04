@@ -105,7 +105,9 @@ describe('type changes keep each hunk inside its own section', () => {
 });
 
 describe('delta layout', () => {
-  it('renders a line longer than 3000 characters in full', () => {
+  // With no limit, delta's memory grows with the square of a line's length:
+  // one 105,000-character generated line took a delta past 30 GB.
+  it('cuts a line longer than 3000 characters with the truncation symbol', () => {
     const cwd = initRepo({'a.txt': 'one\n'});
     const long = `${'x'.repeat(5000)}TAILMARKER`;
     writeFiles(cwd, {'a.txt': `one\n${long}\n`});
@@ -113,8 +115,10 @@ describe('delta layout', () => {
 
     withEnv(COLOR_ENV, () => {
       const rendered = plain(getColoredFileDiff(cwd, range, 'a.txt', 100));
-      expect(rendered).toContain('TAILMARKER');
-      expect(rendered).toContain('x'.repeat(5000));
+      expect(rendered).not.toContain('TAILMARKER');
+      // delta counts the diff's +/- marker and its own padding in the limit.
+      expect(rendered).toContain(`${'x'.repeat(2990)}→`);
+      expect(rendered).not.toContain('x'.repeat(3001));
     });
   });
 

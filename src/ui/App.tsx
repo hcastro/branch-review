@@ -31,7 +31,7 @@ import {palette, plainDiffMode} from './palette.js';
 import {DiffErrorBoundary, renderFailureText} from './DiffErrorBoundary.js';
 import {blockSourceLines, mapDrawnToRaw} from './rawText.js';
 import {useSettledValue} from './useSettledValue.js';
-import {fileKey, type FileStatus} from '../git.js';
+import {DELTA_MAX_LINE_LENGTH, DELTA_TRUNCATION_SYMBOL, fileKey, type FileStatus} from '../git.js';
 import {executeCopyCommand} from '../commands/execute.js';
 import type {ClipboardWriter} from '../commands/execute.js';
 import type {ReviewFile, ReviewBlock, ReviewModel} from '../review/model.js';
@@ -1218,6 +1218,11 @@ function selectedSourceLineText(
   if (!hasCode) return null;
 
   const raw = rows[first]?.source;
+  // delta draws only the start of a very long line; the whole drawn line
+  // still copies as the whole raw line.
+  if (whole && raw !== undefined && raw.length > DELTA_MAX_LINE_LENGTH && drawn.trimEnd().endsWith(DELTA_TRUNCATION_SYMBOL)) {
+    return raw;
+  }
   const map = raw === undefined ? null : mapDrawnToRaw(raw, drawn);
   if (raw === undefined || !map) return drawnSelected;
   if (whole) return raw;
