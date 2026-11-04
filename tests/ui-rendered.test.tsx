@@ -340,9 +340,11 @@ describe('the launch', () => {
     const headerOf = (frame: string | undefined) => (frame ?? '').split('\n')[4]!;
     const restingHeader = headerOf(instance.frames[from - 1]);
     expect(during.some((frame) => headerOf(frame) !== restingHeader && stripAnsi(headerOf(frame)) === stripAnsi(restingHeader))).toBe(true);
-    // The scanline lifts the rows, and specks fly off them.
-    expect(during.some((frame) => diffRows(frame).some((row) => SCANLINE.test(stripAnsi(row))))).toBe(true);
-    expect(during.some((frame) => diffRows(frame).some((row) => SPECK.test(stripAnsi(row))))).toBe(true);
+    // The scanline lifts the rows, and specks fly off them. These frames are
+    // real 40 ms ticks, which a slow runner can skip past the scanline's
+    // 320 ms, so either one counts here; rendered-launch.test.ts checks each
+    // at its own time.
+    expect(during.some((frame) => diffRows(frame).some((row) => SCANLINE.test(stripAnsi(row)) || SPECK.test(stripAnsi(row))))).toBe(true);
     for (const frame of during) expect(pictureRows(frame)).toEqual(resting);
     // The band never lands on the header rows, and is gone once the toast shows.
     for (const frame of during) expect(frameLines(frame).slice(0, 6).join('\n')).not.toMatch(BAND);
