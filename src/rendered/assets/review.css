@@ -569,12 +569,16 @@
 }
 /* The arrival from a press in the TUI: a curtain in the page's own
    background lifts from the top, behind a teal to violet scanline with a
-   glow, as the TUI's specks land. The head script arms it before the first
-   frame (rv-arriving), and the page script clears it once it has played. */
+   glow, once the TUI's launch has ended. The head script arms it before
+   the first frame (rv-arriving), and the page script clears it once it has
+   played. */
 :root.rv.rv-arriving::after { content: ""; position: fixed; inset: 0; z-index: 2147483000; pointer-events: none; background: var(--rv-bg); animation: rv-curtain 620ms cubic-bezier(0.65, 0, 0.35, 1) 80ms both; }
 :root.rv.rv-arriving::before { content: ""; position: fixed; left: 0; right: 0; top: 0; height: 3px; z-index: 2147483001; pointer-events: none; background: linear-gradient(90deg, var(--rv-brand-a), var(--rv-brand-b)); box-shadow: 0 0 18px 4px var(--rv-flash); animation: rv-scan 620ms cubic-bezier(0.65, 0, 0.35, 1) 80ms both; }
 @keyframes rv-curtain { from { clip-path: inset(0 0 0 0); } to { clip-path: inset(100% 0 0 0); } }
 @keyframes rv-scan { from { transform: translateY(0); opacity: 1; } 85% { opacity: 1; } to { transform: translateY(100vh); opacity: 0; } }
+/* The page script's decode draws the arrival on a canvas from its first
+   frame; the curtain only covers the page until then. */
+:root.rv.rv-arriving.rv-decoding::before, :root.rv.rv-arriving.rv-decoding::after { content: none; }
 @media (prefers-reduced-motion: reduce) {
   :root.rv.rv-arriving::before, :root.rv.rv-arriving::after { content: none; }
 }

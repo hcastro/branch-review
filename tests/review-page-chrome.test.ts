@@ -458,19 +458,30 @@ describe.skipIf(!CHROME)('the Review in browser page in a real Chromium', () => 
     }
   });
 
-  it('plays the arrival scanline for a press with motion, again for a later press, and never for a refresh, motion off, a hand-opened page or reduced motion', async () => {
+  it('plays the decode arrival for a press with motion, again for a later press, and never for a refresh, motion off, a hand-opened page or reduced motion', async () => {
     const arriving = () => evaluate<boolean>('document.documentElement.classList.contains("rv-arriving")');
+    const decoding = () => evaluate<string>('[document.documentElement.classList.contains("rv-decoding"), !!document.getElementById("rv-decode")].join(",")');
     await page('Emulation.setEmulatedMedia', {features: [{name: 'prefers-reduced-motion', value: 'no-preference'}, {name: 'prefers-color-scheme', value: 'light'}]});
     try {
       await load('top&m=1&n=1');
       expect(await arriving()).toBe(true);
-      expect(await evaluate<string>('document.getAnimations().map((each) => each.animationName).sort().join(",")')).toBe('rv-curtain,rv-scan');
-      await evaluate('new Promise((resolve) => setTimeout(resolve, 1000))');
+      const text = await evaluate<string>('document.body.innerText');
+      await frames();
+      // The canvas covers the page in place of the CSS curtain, and draws the
+      // scrambled lines over the page's own, which it never changes.
+      expect(await decoding()).toBe('true,true');
+      expect(await evaluate<string>('document.getAnimations().map((each) => each.animationName).join(",")')).toBe('');
+      expect(await evaluate<string>('document.body.innerText.replace(/\\s+$/, "")')).toBe(text.replace(/\s+$/, ''));
+      await evaluate('new Promise((resolve) => setTimeout(resolve, 1100))');
       expect(await arriving()).toBe(false);
+      expect(await decoding()).toBe('false,false');
       // A later press only changes the hash of the page already open.
       await evaluate('location.hash = "top&m=1&n=2"');
       await evaluate('new Promise((resolve) => setTimeout(resolve, 50))');
       expect(await arriving()).toBe(true);
+      expect(await decoding()).toBe('true,true');
+      await evaluate('new Promise((resolve) => setTimeout(resolve, 1100))');
+      expect(await decoding()).toBe('false,false');
       for (const hash of ['top&m=1&n=3&l=1', 'top&m=0&n=4', 'top&m=1']) {
         await load(hash);
         expect(await arriving(), hash).toBe(false);

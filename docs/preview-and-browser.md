@@ -48,7 +48,7 @@ When you press `r`, the review sends the diff to the page, for about 0.8 seconds
 
 Only the rows that hold diff text move, and their line numbers stay put. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
 
-The page opens once the code has drawn back in, in a new split or one that's already open. Then it plays its own arrival: a teal to violet scanline sweeps down once and uncovers it. A live refresh, a page opened by hand, and the settings below show the page at once.
+The page opens once the code has drawn back in, in a new split or one that's already open. Then it plays its own arrival. Its text shows first as scrambled characters, among them the specks from the launch, and a teal to violet scanline sweeps down once. Each line it passes decodes left to right into the real text, in about a second in all. A live refresh, a page opened by hand, and the settings below show the page at once.
 
 A page that opens in a new tab or a new split starts at its card. A press that goes to a split that already shows the page scrolls it to the card.
 

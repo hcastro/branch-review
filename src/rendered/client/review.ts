@@ -1,4 +1,5 @@
 import {readReviewHash} from '../hash.js';
+import {DECODE_MS, decodeIn} from './decode.js';
 import {unpackDiff, wordRange, type CardDiff, type DrawnLine, type LineKind, type PackedDiff} from '../review/diff.js';
 import {readSession, readStore, STORE_KEYS, writeSession, writeStore} from '../review/store.js';
 import {expandGap, keptShown, tableHtml} from '../review/table.js';
@@ -894,22 +895,37 @@ function resetPage() {
 }
 
 // ---------- The scanline ----------
-// The head script arms the first arrival; this clears it once it has
-// played, and plays it again for a later press that only changes the hash
-// of a page already open. The curtain takes 700 ms with its delay.
-const ARRIVAL_MS = 900;
+// The head script arms the first arrival with the CSS curtain, so the page
+// never shows before it. Once arrive() has put the page in place, the
+// decode takes over on a canvas (rv-decoding takes the curtain away) and
+// clears both when it ends. A later press that only changes the hash of a
+// page already open plays it again. Without a canvas the curtain plays on
+// its own, and the timer clears it, as it does a page that gets no frame.
+const ARRIVAL_MS = DECODE_MS + 300;
 let arrivalTimer: ReturnType<typeof setTimeout> | undefined;
+let stopDecode: (() => void) | null = null;
+function finishArrival() {
+  clearTimeout(arrivalTimer);
+  stopDecode = null;
+  root.classList.remove('rv-arriving', 'rv-decoding');
+}
 function scanIn(hash: ReturnType<typeof readReviewHash>, again: boolean) {
   if (again) {
     if (!hash.m || hash.n === undefined || hash.l || reduced.matches) return;
-    root.classList.remove('rv-arriving');
-    // A reflow between the two, so the animation starts over.
+    stopDecode?.();
+    root.classList.remove('rv-arriving', 'rv-decoding');
+    // A reflow between the two, so the curtain starts over.
     void root.offsetWidth;
     root.classList.add('rv-arriving');
   }
   if (!root.classList.contains('rv-arriving')) return;
   clearTimeout(arrivalTimer);
-  arrivalTimer = setTimeout(() => root.classList.remove('rv-arriving'), ARRIVAL_MS);
+  arrivalTimer = setTimeout(() => (stopDecode ? stopDecode() : finishArrival()), ARRIVAL_MS);
+  requestAnimationFrame(() => {
+    if (!root.classList.contains('rv-arriving') || root.classList.contains('rv-decoding')) return;
+    stopDecode = decodeIn(finishArrival);
+    if (stopDecode) root.classList.add('rv-decoding');
+  });
 }
 
 // ---------- Arrival ----------
