@@ -739,13 +739,11 @@ export function createRenderedService({backend, site, surface, motion, animation
     });
   }
 
-  // One trip to the page: the TUI's crossing, played while the page is
-  // written and placed on the surface, so the crossing covers the split
-  // opening. A new split narrows the TUI as it opens, which would cut the
-  // launch's specks off, so a press that opens one places the page once
-  // the crossing lands, as the specks reach the button, and the diff draws
-  // back in at the new width; one that goes to an open split places it
-  // while it plays.
+  // One trip to the page: the TUI's crossing plays while the page is
+  // written, and the page is placed on the surface once the crossing ends,
+  // so the browser's arrival follows the launch instead of playing over it.
+  // A new split also narrows the TUI as it opens, which would cut the
+  // launch's specks off mid-flight.
   // `name` is how the footer names what opened. Nothing crosses toward a
   // surface that refuses. A page still unwritten after the crossing is
   // said to be on its way, until the deadline gives up on it, and then it
@@ -785,7 +783,7 @@ export function createRenderedService({backend, site, surface, motion, animation
         if ('where' in result) setSplit(result.where === 'browser' ? null : {key: written.key, ...(file === undefined ? {} : {file}), seq: (seqs += 1)});
         return result;
       }));
-      return place.opensSplit?.() ? crossing.then(show) : show();
+      return crossing.then(show);
     });
     void shownOn.catch(() => null).then(() => {
       traveling -= 1;

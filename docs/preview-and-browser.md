@@ -39,7 +39,7 @@ In watch mode, an edit writes a new page in the background, and the split follow
 
 ### Motion on the way
 
-While the page opens, the review sends the diff to it, for about 0.8 seconds:
+When you press `r`, the review sends the diff to the page, for about 0.8 seconds:
 
 1. The button presses in, and the code in the diff dissolves into shade in its own colors, from the top down.
 2. A teal to violet scanline sweeps up from the bottom. Each row it passes lifts off as specks, which fly up into the button.
@@ -48,9 +48,7 @@ While the page opens, the review sends the diff to it, for about 0.8 seconds:
 
 Only the rows that hold diff text move, and their line numbers stay put. Block headers, the blank rows under the last file, and pictures in the diff stay as they are.
 
-A new split narrows the review as it opens, so a press that opens one opens the split as the specks land. A press that goes to an open split opens the page while the launch plays.
-
-The page answers with its own arrival when it opens from a press: a teal to violet scanline sweeps down once and uncovers it. A live refresh, a page opened by hand, and the settings below show the page at once.
+The page opens once the code has drawn back in, in a new split or one that's already open. Then it plays its own arrival: a teal to violet scanline sweeps down once and uncovers it. A live refresh, a page opened by hand, and the settings below show the page at once.
 
 A page that opens in a new tab or a new split starts at its card. A press that goes to a split that already shows the page scrolls it to the card.
 

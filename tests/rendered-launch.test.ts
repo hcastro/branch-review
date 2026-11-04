@@ -9,7 +9,6 @@ import {
   CHIP_HOVER,
   CHIP_REST,
   color,
-  LAUNCH_LANDS_MS,
   LAUNCH_MS,
   launchScanRow,
   launchScreen,
@@ -46,7 +45,7 @@ const plain = (row: string | null) => (row === null ? null : stripAnsi(row));
 
 describe('launchScreen', () => {
   it('runs 840 ms and lands at 640, and draws nothing before the press or after it', () => {
-    expect([LAUNCH_MS, LAUNCH_LANDS_MS, PRESS_MS]).toEqual([840, 640, 120]);
+    expect([LAUNCH_MS, PRESS_MS]).toEqual([840, 120]);
     for (const t of [-1, LAUNCH_MS, 5_000]) expect(screen(6, t)).toEqual(Array(6).fill(null));
     expect(launchScreen(100, [], style(0))).toEqual([]);
   });

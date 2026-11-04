@@ -6,8 +6,9 @@ import type {Motion} from './motion.js';
 // diff's code dissolves in its own colors (0 to 160 ms), a teal to violet
 // scanline sweeps up from the bottom (160 to 480 ms), and each row it
 // passes lifts off as specks that fly up into the Review in browser
-// button. They land at 640 ms, when a split opens and the button flares,
-// and the code draws back in from the top (640 to 840 ms). The gutter's
+// button. They land at 640 ms, when the button flares, and the code draws
+// back in from the top (640 to 840 ms). The page opens once it has: the
+// browser's own arrival plays after this one, never over it. The gutter's
 // line numbers stay put throughout. Pure frames of the visible rows from
 // the time since the press, 40 ms a frame: text cells only, so it runs in
 // any terminal with color and never touches a picture's placeholder rows.
@@ -16,8 +17,6 @@ import type {Motion} from './motion.js';
 
 /** The whole trip, from the press to the diff drawn back. */
 export const LAUNCH_MS = 840;
-/** When the specks reach the button: a split opens with the page here. */
-export const LAUNCH_LANDS_MS = 640;
 /** How long the button shows it was pressed. */
 export const PRESS_MS = 120;
 /** The stripe that crosses the button once when the pointer comes onto it. */

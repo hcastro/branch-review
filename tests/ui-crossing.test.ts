@@ -21,23 +21,23 @@ function listening() {
 }
 
 describe('createCrossingClock', () => {
-  it('plays a full launch for 840 ms that settles at 640, when the specks land, then stops ticking', async () => {
+  it('plays a full launch for 840 ms and settles only once it ends, then stops ticking', async () => {
     const {clock, emits} = listening();
     let settled = false;
     void clock.start('full').then(() => {
       settled = true;
     });
     expect(clock.snapshot()).toEqual({motion: 'full', t: 0});
-    await vi.advanceTimersByTimeAsync(600);
-    expect(clock.snapshot()).toEqual({motion: 'full', t: 600});
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(40);
-    // Settled, and still drawing: the diff draws back in after it.
-    expect(settled).toBe(true);
+    await vi.advanceTimersByTimeAsync(640);
+    // The specks have landed and the diff is still drawing back in: the
+    // page waits for the end, so its arrival never plays over this.
     expect(clock.snapshot()).toEqual({motion: 'full', t: 640});
+    expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(160);
     expect(clock.snapshot()).toEqual({motion: 'full', t: 800});
+    expect(settled).toBe(false);
     await vi.advanceTimersByTimeAsync(40);
+    expect(settled).toBe(true);
     expect(clock.snapshot()).toBeNull();
     // The press, twenty ticks, and the frame clearing at the end.
     const atEnd = emits();
@@ -62,16 +62,15 @@ describe('createCrossingClock', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(first).toBe(true);
     expect(clock.snapshot()).toEqual({motion: 'full', t: 0});
-    await vi.advanceTimersByTimeAsync(600);
+    await vi.advanceTimersByTimeAsync(800);
     expect(second).toBe(false);
     await vi.advanceTimersByTimeAsync(40);
     expect(second).toBe(true);
-    await vi.advanceTimersByTimeAsync(200);
     expect(clock.snapshot()).toBeNull();
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('settles at once on a press that stops it before it lands', async () => {
+  it('settles at once on a dispose that stops it before it ends', async () => {
     const {clock} = listening();
     let settled = false;
     void clock.start('full').then(() => {

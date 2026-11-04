@@ -1019,7 +1019,7 @@ describe('opening the page', () => {
     expect(outcome!.message).not.toContain('‮');
   });
 
-  it('places the page on the surface while the crossing plays, and toasts once it ends', async () => {
+  it('places the page on the surface once the crossing ends, and toasts then', async () => {
     const {backend} = scriptedBackend();
     const {service, clock, surface} = openingService(backend);
     service.setReview(review([edited('docs/guide.md')]), CTX);
@@ -1040,12 +1040,13 @@ describe('opening the page', () => {
       return outcome;
     });
     await clock.advance(0);
-    // The split opens under the beam: cmux is asked before the crossing ends.
-    expect(surface.shown).toHaveLength(1);
+    // The page waits for the launch, so the browser's arrival follows it.
+    expect(surface.shown).toHaveLength(0);
     expect(toast).toBeNull();
     crossing.resolve();
     expect(await opening).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ guide\.md opened in the browser split/)});
-    expect(events).toEqual(['cross starts', 'cross ends, shown 1']);
+    expect(surface.shown).toHaveLength(1);
+    expect(events).toEqual(['cross starts', 'cross ends, shown 0']);
   });
 
   it('never shows an older press\'s card over a newer one, however late the page lands', async () => {
@@ -1936,8 +1937,8 @@ describe('the order of the beam and the split', () => {
     expect(await pressWith(true)).toEqual({duringBeam: 0, after: 1});
   });
 
-  it('sends an open split to the page while the beam plays', async () => {
-    expect(await pressWith(false)).toEqual({duringBeam: 1, after: 1});
+  it('sends an open split to the page once the beam has ended, so its arrival follows the launch', async () => {
+    expect(await pressWith(false)).toEqual({duringBeam: 0, after: 1});
   });
 
   it('opens a new split once the beam has ended on the press after a live refresh found the split closed', async () => {
