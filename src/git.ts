@@ -1933,11 +1933,21 @@ export function makeControlCharsVisible(text: string) {
   return escapeHiddenCharactersInLines(text);
 }
 
+/**
+ * delta draws at most this many characters of a line and ends a longer one
+ * with DELTA_TRUNCATION_SYMBOL. Its memory grows with the square of a line's
+ * length (delta 0.19.2 held 257 MB for a 4,000-character line and 935 MB
+ * for 8,000), so with no limit one 105,000-character generated line drove a
+ * single delta past 30 GB. Both values are delta's defaults; delta 0.19 has
+ * no flag that sets the symbol.
+ */
+export const DELTA_MAX_LINE_LENGTH = 3000;
+export const DELTA_TRUNCATION_SYMBOL = '→';
+
 const DELTA_LAYOUT_ARGS = [
   '--no-gitconfig',
   '--paging=never',
-  // delta cuts lines past 3000 characters by default; the app wraps rows itself.
-  '--max-line-length=0',
+  `--max-line-length=${DELTA_MAX_LINE_LENGTH}`,
   '--line-numbers',
   '--navigate',
   '--line-fill-method=spaces',
