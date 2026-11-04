@@ -1,0 +1,14 @@
+{
+  "name": "animate-terminal-flow-scripts",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Capture scripts for the animate-terminal-flow skill: record a TUI to asciicast, replay it into styled frames and Kitty images.",
+  "type": "module",
+  "scripts": {
+    "selftest": "node scripts/selftest.mjs"
+  },
+  "dependencies": {
+    "@xterm/addon-unicode11": "^0.8.0",
+    "@xterm/headless": "^5.5.0"
+  }
+}
