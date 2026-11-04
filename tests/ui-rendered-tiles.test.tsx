@@ -65,6 +65,10 @@ function layoutOf(rows: number): PageLayout {
   };
 }
 
+// Full motion, as BRANCH_REVIEW_MOTION=full sets it. By default Preview is
+// quiet, and its crossings don't play.
+const FULL = async () => 'full' as const;
+
 function setup({files = [PAGE, CODE, OTHER], env = {BRANCH_REVIEW_PREVIEW: 'on'} as NodeJS.ProcessEnv, caps = CAPS as typeof CAPS | typeof BLOCKS_CAPS, rows = 150, layout, layoutFor, layoutDelay = 0, layoutError, layoutOf: answerFor, disabled = null, chrome = true, tile, animations = false, size = SIZE, readFile, mediaSides, crossingMotion}: {
   // How much the crossing moves, as the service asks the OS for it.
   crossingMotion?: () => Promise<'full' | 'reduced' | 'off'>;
@@ -292,6 +296,7 @@ describe('the page in the pane', () => {
     let answer: (() => void) | null = null;
     const {instance} = setup({
       animations: true,
+      crossingMotion: FULL,
       tile: (request) => new Promise((resolve) => {
         answer = () => resolve({ok: true, png: pngHeaderOnly(request.source.geometry.sheetCols * 10, request.source.geometry.tileRows * 20)});
       }),
@@ -311,7 +316,7 @@ describe('the page in the pane', () => {
   });
 
   it('holds the crossing on a cold Chromium start, while the page is still laying out, and develops only once its tiles are in', async () => {
-    const {instance, tiles} = setup({animations: true, layoutDelay: 2_000});
+    const {instance, tiles} = setup({animations: true, crossingMotion: FULL, layoutDelay: 2_000});
     await settle();
     await press(instance, 'v');
     await new Promise((resolve) => setTimeout(resolve, 1_200));
@@ -1072,7 +1077,7 @@ describe('when the page in the pane fails', () => {
     // The tile fails once the crossing holds for it.
     let failTile: () => void = () => undefined;
     // No other page whose rows would wait in shade.
-    const {instance} = setup({files: [PAGE, CODE], animations: true, tile: () => new Promise((resolve) => {
+    const {instance} = setup({files: [PAGE, CODE], animations: true, crossingMotion: FULL, tile: () => new Promise((resolve) => {
       failTile = () => resolve({ok: false, state: 'error', reason: 'the browser exited (code 3)'});
     })});
     await settle();

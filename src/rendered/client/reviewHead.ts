@@ -9,10 +9,10 @@ import {readStore, STORE_KEYS} from '../review/store.js';
 const theme = readStore(STORE_KEYS.theme);
 if (theme === 'light' || theme === 'dark') document.documentElement.setAttribute('data-theme', theme);
 
-// A press in the TUI arrives here under a teal to violet scanline that
-// sweeps down once, the other half of its launch. It is armed before the
-// first frame, so the page never shows before its arrival; the page script
-// clears it once it has played. A live refresh, motion off (`m=0`), a page
-// opened by hand (no `n`) and reduced motion all show the page at once.
+// A full-motion press in the TUI (`a=1`) arrives here as a decode, the
+// other half of its launch. It is armed before the first frame, so the
+// page never shows before its arrival; the page script clears it once it
+// has played. A usual quiet press, a live refresh, motion off (`m=0`), a
+// page opened by hand (no `n`) and reduced motion all show the page at once.
 const arrival = readReviewHash(location.hash);
-if (arrival.m === true && arrival.n !== undefined && !arrival.l && !matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentElement.classList.add('rv-arriving');
+if (arrival.a && arrival.m === true && arrival.n !== undefined && !arrival.l && !matchMedia('(prefers-reduced-motion: reduce)').matches) document.documentElement.classList.add('rv-arriving');

@@ -15,7 +15,7 @@ import {failedMarkdownPage, renderableKind, type RenderableKind} from './classif
 import {formatReviewHash} from './hash.js';
 import {fileAlias, pageKey, railSignature} from './keys.js';
 import type {LinkAnswer} from './markdown.js';
-import {resolveMotion, type Motion} from './motion.js';
+import {resolveMotion, type Motion, type MotionLevels} from './motion.js';
 import {linkReport, type ReportSource} from './report.js';
 import {reviewCardRequest, type CardRender} from './review/request.js';
 import {runTool} from './run.js';
@@ -99,8 +99,10 @@ export type OpenOutcome = {message: string; kind: 'info' | 'error'};
 /**
  * The TUI's part in a trip: `cross` plays the crossing for `motion` and
  * settles when it ends; `waiting` says the page is still being made.
+ * `loud`: a press of `!`, which plays the session's loud motion (the full
+ * launch, and the page's decode) in place of its usual one.
  */
-export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void};
+export type Trip = {cross: (motion: Motion) => Promise<void>; waiting: (message: string) => void; loud?: boolean};
 
 export type PageSurface = Pick<Surface, 'kind' | 'refusal' | 'destination' | 'show'> & Partial<Pick<Surface, 'dispose' | 'refresh' | 'opensSplit' | 'refusalFor'>>;
 
@@ -162,8 +164,8 @@ export function createRenderedService({backend, site, surface, motion, animation
   site: RenderedSite;
   /** Where pages open. Without one, the service only renders. */
   surface?: PageSurface;
-  /** How much the TUI moves, asked once, at the first trip. */
-  motion?: () => Promise<Motion>;
+  /** How much the TUI moves on a usual trip and on `!`, asked once, at the first trip. */
+  motion?: () => Promise<MotionLevels>;
   /** False with `--no-animations`: pages arrive with no motion at all. */
   animations?: boolean;
   now?: () => number;
@@ -235,7 +237,8 @@ export function createRenderedService({backend, site, surface, motion, animation
   let wideAt = -1;
   // The files the newest pass left out by the prerender limit, by file key.
   let capped = new Set<string>();
-  let motionAsked: Promise<Motion> | null = null;
+  let motionAsked: Promise<MotionLevels> | null = null;
+  const askMotion = () => (motionAsked ??= motion ? motion() : Promise.resolve<MotionLevels>({usual: 'off', loud: 'off'}));
   // Counts `r` and `R` presses: only the newest one's page is shown.
   let presses = 0;
   // Counts the URLs sent to the surface, so each one differs and a split
@@ -760,8 +763,13 @@ export function createRenderedService({backend, site, surface, motion, animation
     const press = (presses += 1);
     const tripNumber = (trips += 1);
     traveling += 1;
-    motionAsked ??= motion ? motion() : Promise.resolve('off');
-    const crossing = motionAsked.then((kind) => trip?.cross(kind));
+    // Only a full trip has the page decode in; any other opens it at once.
+    let full = false;
+    const crossing = askMotion().then((levels) => {
+      const kind = trip?.loud ? levels.loud : levels.usual;
+      full = animations && kind === 'full';
+      return trip?.cross(kind);
+    });
     let ready = false;
     let gaveUp = false;
     let cancelDeadline = () => {};
@@ -778,8 +786,7 @@ export function createRenderedService({backend, site, surface, motion, animation
       if (gaveUp || disposed || press !== presses) return null;
       if (!written.ok) return {error: written.reason};
       const at = file === undefined ? -1 : written.files.indexOf(file);
-      const hash = formatReviewHash({...(at >= 0 ? {file: at} : {}), m: animations, n: tripNumber});
-      const show = () => (gaveUp || disposed || press !== presses ? null : place.show(`${site.url(written.key)}#${hash}`).then((result) => {
+      const show = () => (gaveUp || disposed || press !== presses ? null : place.show(`${site.url(written.key)}#${formatReviewHash({...(at >= 0 ? {file: at} : {}), m: animations, n: tripNumber, ...(full ? {a: true} : {})})}`).then((result) => {
         if ('where' in result) setSplit(result.where === 'browser' ? null : {key: written.key, ...(file === undefined ? {} : {file}), seq: (seqs += 1)});
         return result;
       }));
@@ -943,10 +950,9 @@ export function createRenderedService({backend, site, surface, motion, animation
       return travel(null, 'all files', undefined, trip);
     },
 
-    /** How much the TUI moves on a trip, asked once for the session. */
+    /** How much the TUI moves on a usual trip, asked once for the session. */
     crossingMotion(): Promise<Motion> {
-      motionAsked ??= motion ? motion() : Promise.resolve('off');
-      return motionAsked;
+      return askMotion().then((levels) => levels.usual);
     },
 
     /** The Review in browser button's hover tip: what it opens and where, or why it can't. */

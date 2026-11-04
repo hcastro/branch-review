@@ -14,9 +14,10 @@ const counter = (value: number | undefined) => (value !== undefined && Number.is
  * file's place in the review), or `top`, then motion and the trip counter,
  * which makes every trip's URL differ, so an open split hears a press on
  * the same file again. `l`: a live refresh in watch mode, which lands at
- * the card the reader was on, with no glow.
+ * the card the reader was on, with no glow. `a`: a trip with full motion,
+ * whose page decodes in; without it the page shows at once.
  */
-export type ReviewHash = {file?: number; m?: boolean; n?: number; l?: true};
+export type ReviewHash = {file?: number; m?: boolean; n?: number; l?: true; a?: true};
 
 const CARD = /^file-(\d{1,6})$/;
 
@@ -27,6 +28,7 @@ export function formatReviewHash(hash: ReviewHash): string {
   const n = counter(hash.n);
   if (n !== undefined) parts.push(`n=${n}`);
   if (hash.l) parts.push('l=1');
+  if (hash.a) parts.push('a=1');
   return parts.join('&');
 }
 
@@ -40,6 +42,7 @@ export function readReviewHash(text: string): ReviewHash {
     else if (key === 'm' && (value === '0' || value === '1')) hash.m = value === '1';
     else if (key === 'n' && /^\d{1,15}$/.test(value)) hash.n = Number(value);
     else if (key === 'l' && value === '1') hash.l = true;
+    else if (key === 'a' && value === '1') hash.a = true;
   }
   return hash;
 }

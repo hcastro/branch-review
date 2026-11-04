@@ -911,7 +911,7 @@ function finishArrival() {
 }
 function scanIn(hash: ReturnType<typeof readReviewHash>, again: boolean) {
   if (again) {
-    if (!hash.m || hash.n === undefined || hash.l || reduced.matches) return;
+    if (!hash.a || !hash.m || hash.n === undefined || hash.l || reduced.matches) return;
     stopDecode?.();
     root.classList.remove('rv-arriving', 'rv-decoding');
     // A reflow between the two, so the curtain starts over.

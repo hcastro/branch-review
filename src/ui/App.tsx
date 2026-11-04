@@ -2774,7 +2774,7 @@ function AppContent({
   // trip to a split asks; full until the answer is in. Only in a review
   // with a page for `v` to draw: asking can run a program, and a review
   // without one starts as it would with the pane turned off.
-  const [paneMotion, setPaneMotion] = useState<'full' | 'reduced' | 'off'>(animations ? 'full' : 'off');
+  const [paneMotion, setPaneMotion] = useState<'full' | 'reduced' | 'off'>(animations ? 'reduced' : 'off');
   const panePages = useMemo(() => Boolean(pane && review?.files.some((file) => pane.covers(reviewFileKey(file)))), [pane, review]);
   useEffect(() => {
     if (!panePages || !animations || !rendered?.crossingMotion) return;
@@ -3317,12 +3317,13 @@ function AppContent({
 
   // r opens the page at the active file's card; R opens it at the top. The
   // crossing plays on the way, and the footer says where the page went
-  // once it ends.
-  const openRendered = useCallback((target: 'file' | 'overview') => {
+  // once it ends. `loud`: `!`, which plays the full launch for that press.
+  const openRendered = useCallback((target: 'file' | 'overview', loud = false) => {
     if (!pages) return;
     const trip: Trip = {
       cross: (motion) => crossing.start(motion),
       waiting: (message) => showToast(message, undefined, 'info'),
+      ...(loud ? {loud} : {}),
     };
     const opening = target === 'overview' ? pages.openOverview(trip) : pages.open({fileKey: activeFileKey}, trip);
     void opening.then((outcome) => {
@@ -4303,8 +4304,10 @@ function AppContent({
 
     // The rendered page of the active file, and the overview of them all,
     // whatever the terminal can draw.
-    if (input === 'r' || input === 'R') {
-      openRendered(input === 'R' ? 'overview' : 'file');
+    // `!` is `r` with the full launch and the page's decode, for that one
+    // press. It's left out of the help on purpose.
+    if (input === 'r' || input === 'R' || input === '!') {
+      openRendered(input === 'R' ? 'overview' : 'file', input === '!');
       return;
     }
 

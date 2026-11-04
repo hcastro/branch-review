@@ -1,3 +1,4 @@
+import type {Motion, MotionLevels} from '../src/rendered/motion.js';
 import {spawnSync} from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -450,12 +451,12 @@ const CRASHING_WORKER = fileURLToPath(new URL('./fixtures/crashing-rendered-work
 // `tips`: the refs the commits are read from, as git would say them.
 function openingService(backend: RenderedBackend, {
   surface = recordingSurface(),
-  motion = 'full' as const,
+  motion = 'full' as Motion | MotionLevels,
   site,
   animations,
   live = true,
   tips,
-}: {surface?: ReturnType<typeof recordingSurface>; motion?: 'full' | 'reduced' | 'off'; site?: ReturnType<typeof createRenderedSite>; animations?: boolean; live?: boolean; tips?: () => string | null | Promise<string | null>} = {}) {
+}: {surface?: ReturnType<typeof recordingSurface>; motion?: Motion | MotionLevels; site?: ReturnType<typeof createRenderedSite>; animations?: boolean; live?: boolean; tips?: () => string | null | Promise<string | null>} = {}) {
   const clock = fakeTimers();
   const session = makeTempDir('branch-review-open-');
   const usedSite = site ?? createRenderedSite({tempDir: () => session, now: clock.now});
@@ -466,9 +467,10 @@ function openingService(backend: RenderedBackend, {
     now: clock.now,
     setTimer: clock.setTimer,
     surface,
+    // One level stands for both: a usual trip and `!` move the same.
     motion: async () => {
       motionAsked += 1;
-      return motion;
+      return typeof motion === 'string' ? {usual: motion, loud: motion} : motion;
     },
     ...(animations !== undefined ? {animations} : {}),
     live,
@@ -533,11 +535,11 @@ describe('opening the page', () => {
     const shown = new URL(surface.shown[0]!).pathname;
     expect(fs.realpathSync(path.dirname(shown))).toBe(fs.realpathSync(dir));
     expect(fs.readFileSync(shown, 'utf8')).toMatch(/^<p>[0-9a-f]{20}<\/p>$/);
-    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1');
+    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1&a=1');
 
     expect(await service.open({fileKey: 'docs/guide.md'}, trip)).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
     // The same page, at the same card, with a new count, so an open split hears it.
-    expect(surface.shown[1]).toBe(`${surface.shown[0]!.split('#')[0]}#file-1&m=1&n=2`);
+    expect(surface.shown[1]).toBe(`${surface.shown[0]!.split('#')[0]}#file-1&m=1&n=2&a=1`);
   });
 
   it('opens a code file at its card too, writing the page when no prerender ran', async () => {
@@ -546,7 +548,7 @@ describe('opening the page', () => {
     service.setReview(review([diffFile('a\n', 'b\n', 'src/app.ts'), diffFile('c\n', 'd\n', 'src/lib.ts')]), CTX);
     expect(await service.open({fileKey: 'src/lib.ts'}, trip)).toEqual({kind: 'info', message: '⇗ lib.ts opened in the browser split'});
     expect(reviews).toHaveLength(1);
-    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1');
+    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1&a=1');
   });
 
   it('opens at the top for R, and sends m=0 with --no-animations', async () => {
@@ -559,6 +561,33 @@ describe('opening the page', () => {
     expect(surface.shown.map(hashOf)).toEqual(['top&m=0&n=1', 'file-0&m=0&n=2']);
     // One page for both: R and r differ only in where it opens.
     expect(new Set(surface.shown.map((url) => url.split('#')[0])).size).toBe(1);
+  });
+
+  it('opens quietly by default, with no decode, and plays the full launch and the decode for `!` alone', async () => {
+    const {backend} = scriptedBackend();
+    const {service, clock, surface, trip, events} = openingService(backend, {motion: {usual: 'reduced', loud: 'full'}});
+    service.setReview(review([edited('README.md'), edited('docs/guide.md')]), CTX);
+    await clock.advance(2_000);
+    await service.open({fileKey: 'docs/guide.md'}, trip);
+    await service.open({fileKey: 'docs/guide.md'}, {...trip, loud: true});
+    await service.openOverview(trip);
+    expect(events).toEqual(['cross reduced', 'cross full', 'cross reduced']);
+    // Only the loud trip's page decodes in (`a=1`); every page keeps its own motion (`m=1`).
+    expect(surface.shown.map(hashOf)).toEqual(['file-1&m=1&n=1', 'file-1&m=1&n=2&a=1', 'top&m=1&n=3']);
+    // The pane's crossings follow the usual level.
+    expect(await service.crossingMotion()).toBe('reduced');
+  });
+
+  it('holds `!` to the session\'s motion when it is reduced or off', async () => {
+    const {backend} = scriptedBackend();
+    for (const motion of ['reduced', 'off'] as const) {
+      const {service, clock, surface, trip, events} = openingService(backend, {motion});
+      service.setReview(review([edited('README.md')]), CTX);
+      await clock.advance(2_000);
+      await service.open({fileKey: 'README.md'}, {...trip, loud: true});
+      expect(events, motion).toEqual([`cross ${motion}`]);
+      expect(surface.shown.map(hashOf), motion).toEqual(['file-0&m=1&n=1']);
+    }
   });
 
   it('throws nothing toward a page that will not open', async () => {
@@ -951,7 +980,7 @@ describe('opening the page', () => {
     });
     for (let at = 0; at < OPEN_DEADLINE_MS - 500 && outcome === undefined; at += 100) await clock.advance(100);
     expect(outcome).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
-    expect(hashOf(surface.shown[0]!)).toBe('file-2&m=1&n=1');
+    expect(hashOf(surface.shown[0]!)).toBe('file-2&m=1&n=1&a=1');
   });
 
   it('names the card by its place on the page the press wrote, though a file came into the review while the crossing played', async () => {
@@ -970,7 +999,7 @@ describe('opening the page', () => {
     expect(await opening).toEqual({kind: 'info', message: '⇗ guide.md opened in the browser split'});
     // The page shown is the press's own, where the guide is the second card.
     expect(surface.shown[0]!.split('#')[0]).toContain(reviews[0]!.key);
-    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1');
+    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1&a=1');
   });
 
   it('says why a page could not be written, and why the surface refused it', async () => {
@@ -1060,7 +1089,7 @@ describe('opening the page', () => {
     held.resolve({ok: true, html: '<p>both</p>'});
     expect(await newer).toMatchObject({kind: 'info', message: expect.stringMatching(/^⇗ fast\.md opened in the browser split/)});
     expect(await older).toBeNull();
-    expect(surface.shown.map(hashOf)).toEqual(['file-1&m=1&n=2']);
+    expect(surface.shown.map(hashOf)).toEqual(['file-1&m=1&n=2&a=1']);
     // Nor does the older press say it is still on its way once a newer one took its place.
     expect(events.filter((event) => event.startsWith('waiting'))).toEqual(['waiting preparing fast.md…']);
   });
@@ -1540,7 +1569,7 @@ describe('live refreshes of the split', () => {
     service.setReview(review([edited('README.md'), edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
     await clock.advance(2_000);
     await service.open({fileKey: 'docs/guide.md'}, trip);
-    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1');
+    expect(hashOf(surface.shown[0]!)).toBe('file-1&m=1&n=1&a=1');
     service.setReview(review([edited('CHANGELOG.md'), edited('README.md'), edited('docs/guide.md', 'One.\n', 'One, edited.\n')]), CTX);
     await clock.advance(250);
     expect(surface.refreshed.map(hashOf)).toEqual(['file-2&m=1&n=2&l=1']);

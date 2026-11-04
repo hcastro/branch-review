@@ -180,6 +180,20 @@ describe('r and R', () => {
     instance.unmount();
   });
 
+  it('plays the full trip for `!` alone: its page decodes in, and the next `r` is quiet again', async () => {
+    const fixture = docs();
+    const {service, calls} = fakeRenderedService({review: fixture.review, motion: {usual: 'off', loud: 'full'}});
+    const instance = renderFixture({...fixture, rendered: service}, SIZE);
+    await flush();
+    instance.stdin.write('!');
+    await waitForFrame(instance, '⇗ guide.md opened in the browser split');
+    expect(new URL(calls[0]!.args[3]!).hash).toBe('#file-0&m=1&n=1&a=1');
+    instance.stdin.write('r');
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    expect(new URL(calls[1]!.args[4]!).hash).toBe('#file-0&m=1&n=2');
+    instance.unmount();
+  });
+
   it('opens the page at the active file\'s card, wherever the pane is scrolled', async () => {
     const lines = Array.from({length: 60}, (_, index) => `Line ${index + 1} of a long page.`);
     const fixture = buildFixture([markdownFile('docs/long.md', lines)]);

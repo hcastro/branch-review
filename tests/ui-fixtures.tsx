@@ -18,7 +18,7 @@ import type {FragmentSummary, RenderedBackend, ReviewRequest} from '../src/rende
 import {createRenderedSite} from '../src/rendered/site.js';
 import {createSurface} from '../src/rendered/surface.js';
 import type {RunResult} from '../src/rendered/run.js';
-import type {Motion} from '../src/rendered/motion.js';
+import type {Motion, MotionLevels} from '../src/rendered/motion.js';
 import {makeTempDir} from './core-helpers.js';
 import type {ExportRequest, ExportResult, InspectRequest, InspectResult, MediaBackend, RenderRequest, RenderResult, VideoRequest, VideoResult} from '../src/media/backend.js';
 import type {SideInfo, VideoMeta} from '../src/media/types.js';
@@ -628,7 +628,7 @@ export function fakeRenderedService({
   review,
   env = {CMUX_WORKSPACE_ID: 'workspace:1'},
   cmux = [{ok: true, stdout: '{"created_split":true,"surface_ref":"surface:7"}'}, {ok: true, stdout: ''}],
-  motion = 'full',
+  motion = 'full' as Motion | MotionLevels,
   platform = 'darwin',
   summary = {},
   offAfterFirst,
@@ -636,7 +636,7 @@ export function fakeRenderedService({
   review?: ReviewModel;
   env?: NodeJS.ProcessEnv;
   cmux?: RunResult[];
-  motion?: Motion;
+  motion?: Motion | MotionLevels;
   platform?: NodeJS.Platform;
   summary?: Partial<FragmentSummary>;
   /** The worker gives up, with this reason, after its first fragment. */
@@ -678,7 +678,7 @@ export function fakeRenderedService({
     opener: (command, args) => opened.push([command, args]),
     platform,
   });
-  const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => dir}), surface, motion: async () => motion});
+  const service = createRenderedService({backend, site: createRenderedSite({tempDir: () => dir}), surface, motion: async () => (typeof motion === 'string' ? {usual: motion, loud: motion} : motion)});
   if (review) service.setReview(review, {cwd: '/repo/project', range: {base: 'development', branch: 'HEAD', diffArg: 'development...HEAD', includeWorktree: false}});
   onTestFinished(() => service.dispose());
   return {service, calls, opened, dir};

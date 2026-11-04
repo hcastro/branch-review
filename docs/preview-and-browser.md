@@ -39,7 +39,9 @@ In watch mode, an edit writes a new page in the background, and the split follow
 
 ### Motion on the way
 
-When you press `r`, the review sends the diff to the page, for about 0.8 seconds:
+By default a trip is quiet. When you press `r`, `R`, or the button, the button presses in for a moment and the page opens as it is.
+
+Press `!` in place of `r` for the full trip, for that one press. The review sends the diff to the page, for about 0.8 seconds:
 
 1. The button presses in, and the code in the diff dissolves into shade in its own colors, from the top down.
 2. A teal to violet scanline sweeps up from the bottom. Each row it passes lifts off as specks, which fly up into the button.
@@ -56,8 +58,8 @@ The following settings change the motion:
 
 - `--no-animations` turns the launch and the page's arrival off, along with the review's other motion. The page then scrolls to its card at once.
 - `NO_COLOR` turns the launch off, and the button is a plain tab, which shows a press in inverse.
-- With **Reduce motion** on in macOS's accessibility settings, the launch gives way to one short press of the button, and the hover stripe doesn't play. `branch-review` reads the setting once per session, and not over SSH. The page follows the system's setting too: it opens with no arrival and scrolls with no motion.
-- `BRANCH_REVIEW_MOTION` overrides the macOS setting for the launch: `full`, `reduce`, or `off`.
+- With **Reduce motion** on in macOS's accessibility settings, `!` gives only the quiet press too. `branch-review` reads the setting once per session, and not over SSH. The page follows the system's setting too: it opens with no arrival and scrolls with no motion.
+- `BRANCH_REVIEW_MOTION` overrides the macOS setting and the quiet default for every trip, `!` included: `full`, `reduce`, or `off`. With `full`, every `r` plays the launch, the button's hover stripe plays, and Preview dissolves the diff into its page.
 
 ## Read the review page
 
@@ -206,7 +208,7 @@ The file keeps its diff until you press `v` again, which tries the page once mor
 
 The following settings change Preview:
 
-- `--no-animations`, **Reduce motion** in macOS, and `BRANCH_REVIEW_MOTION` turn its motion off. The page then replaces the diff at once.
+- Preview's motion is off by default, as it is with `--no-animations` or **Reduce motion** in macOS. The page then replaces the diff at once. `BRANCH_REVIEW_MOTION=full` turns it on.
 - Over SSH and inside tmux, Preview sends fewer frames, skips the page's colors, and sends tiles ahead only one below the screen.
 - `BRANCH_REVIEW_PREVIEW_DPR` draws the page at a fixed scale, such as `2`, in place of the one that makes its text as tall as the terminal's. It's there to compare the two by eye.
 

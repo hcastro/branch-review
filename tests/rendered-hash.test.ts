@@ -13,10 +13,13 @@ describe('the Review in browser page hash', () => {
     // No card: the page opens at its top.
     expect(formatReviewHash({m: true, n: 1})).toBe('top&m=1&n=1');
     expect(readReviewHash('#top&m=1&n=1')).toEqual({m: true, n: 1});
+    // A full-motion trip, whose page decodes in.
+    expect(formatReviewHash({file: 0, m: true, n: 2, a: true})).toBe('file-0&m=1&n=2&a=1');
+    expect(readReviewHash('#file-0&m=1&n=2&a=1')).toEqual({file: 0, m: true, n: 2, a: true});
   });
 
   it('drops anything that isn\'t one of our values', () => {
-    expect(readReviewHash('#file-x&file--1&m=2&n=<b>')).toEqual({});
+    expect(readReviewHash('#file-x&file--1&m=2&n=<b>&a=0&a=yes')).toEqual({});
     expect(readReviewHash('#user-content-install')).toEqual({});
     expect(formatReviewHash({file: -1, n: Number.NaN})).toBe('top');
   });

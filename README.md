@@ -234,7 +234,7 @@ For `--animations` and `--images`, the last flag of each pair wins.
 | `FORCE_COLOR` | `0` or `false` turns off color and image previews. |
 | `TERM` | `dumb` turns off color and image previews. `linux`, and `screen*` outside tmux, turn off image previews. |
 | `BRANCH_REVIEW_IMAGES` | `auto`, the default, detects what the terminal can draw. `kitty` forces pictures in a terminal that supports them but isn't recognized. `blocks` forces the block preview. `off`, `none`, `0`, or `false` turns previews off. |
-| `BRANCH_REVIEW_MOTION` | `full`, `reduce`, or `off` sets the motion of Preview and on the way to a page in the browser, in place of the macOS **Reduce motion** setting. |
+| `BRANCH_REVIEW_MOTION` | `full`, `reduce`, or `off` sets the motion of Preview and on the way to a page in the browser, in place of the quiet default and the macOS **Reduce motion** setting. |
 | `BRANCH_REVIEW_PREVIEW` | `off`, `0`, `false`, or `none` turns Preview off, the page a markdown file shows in the review on `v`, in a terminal that draws Kitty images. `on`, like any other value, leaves it on. |
 | `BRANCH_REVIEW_CHROME` | The absolute path of the headless Chromium or Chrome that Preview draws pages with, in place of the one `branch-review` finds on disk. |
 | `BRANCH_REVIEW_PREVIEW_DPR` | A fixed scale for Preview's pages, such as `2`, in place of the one that makes their text as tall as the terminal's. For comparing the two. |
