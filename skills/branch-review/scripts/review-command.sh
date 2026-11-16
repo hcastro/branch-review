@@ -74,18 +74,22 @@ note() { printf '%s\n' "$(escape_hidden "$1")" >&2; }
 
 # The flags branch-review takes. They go into the command as they are, so only
 # these fixed words are let through.
-cli_flags="--watch --no-watch --watch-poll --animations --no-animations --images --no-images"
+cli_flags="--browser --watch --no-watch --watch-poll --animations --no-animations --images --no-images"
 flags=""
 positional=()
 for arg in "$@"; do
   case $arg in
-    --watch | --no-watch | --watch-poll | --animations | --no-animations | --images | --no-images)
+    --browser | --watch | --no-watch | --watch-poll | --animations | --no-animations | --images | --no-images)
       flags+=" $arg"; continue ;;
   esac
   [[ $arg == -* ]] \
     && die "unknown flag: $arg (branch-review takes $cli_flags; write a path that starts with - as ./$arg)"
   positional+=("$arg")
 done
+# --browser opens one snapshot and exits, so branch-review refuses it beside a
+# watch flag. Refused here too, so a command that would fail is never copied.
+[[ " $flags " == *" --browser "* && ( " $flags " == *" --watch "* || " $flags " == *" --watch-poll "* ) ]] \
+  && die "--browser opens one snapshot of the review, so it can't take --watch or --watch-poll"
 (( ${#positional[@]} <= 3 )) \
   || die "too many arguments: expected PATH, BRANCH and BASE, got ${#positional[@]} (quote a path that holds spaces)"
 

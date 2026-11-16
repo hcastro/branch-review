@@ -1,11 +1,11 @@
 ---
 name: branch-review
-description: Builds a ready-to-run `branch-review` command for the right repo or git worktree and copies it to the clipboard, so the user can open a local PR-style review of a diff in their own terminal or in the browser. Also writes the review as an HTML page without the UI. Use when the user wants to look over code that was just written ("let me review this", "/branch-review", "I want to look at these changes", "open the review UI", "review it in the browser", "give me the branch-review command", "let me check the diff before you continue"), after finishing a task, feature or fix the user should inspect before a commit or push, for a specific comparison such as "review my-feature against main" or "just show me the uncommitted changes", or for the review page as a file ("export the review as HTML"). Not for a teammate's pull request.
+description: Builds a ready-to-run `branch-review` command for the right repo or git worktree and copies it to the clipboard, so the user can open a local PR-style review of a diff in their own terminal or in the browser. Also writes the review as an HTML page without the UI. Use when the user wants to look over code that was just written ("let me review this", "/branch-review", "I want to look at these changes", "open the review UI", "review it in the browser", "give me the command to review the code in the browser", "open the diff in the browser", "give me the branch-review command", "let me check the diff before you continue"), after finishing a task, feature or fix the user should inspect before a commit or push, for a specific comparison such as "review my-feature against main" or "just show me the uncommitted changes", or for the review page as a file ("export the review as HTML"). Not for a teammate's pull request.
 ---
 
 # branch-review
 
-`branch-review` is a full-screen terminal UI for reviewing a diff before it reaches GitHub. From the UI, the user can also open the review as one page in the browser. This skill hands the user one command to run in their own terminal.
+`branch-review` is a full-screen terminal UI for reviewing a diff before it reaches GitHub. From the UI, the user can also open the review as one page in the browser, and `--browser` opens that page directly, with no UI. This skill hands the user one command to run in their own terminal.
 
 **Never run the `branch-review` UI from a tool call.** It takes over the screen, reads keys and the mouse, and exits only when the user presses `q`, `Esc` or Ctrl-C, so a tool call hangs. The deliverable is the command text. To look at a diff yourself, use `git diff`. The one run you make yourself is `--export-html`, which writes a page and exits. See [A page without the UI](#a-page-without-the-ui).
 
@@ -45,6 +45,8 @@ If the script reports "not inside a git repository" and you have no edited file 
 | A named branch against its detected base | `BRANCH` |
 | A named branch against a chosen base | `BRANCH BASE` |
 
+When the user wants to read the review in the browser ("review the code in the browser", "open the diff in the browser"), also pass `--browser`, whatever the comparison. See [Flags](#flags).
+
 With no arguments, the review covers `HEAD` plus the working tree against the detected base. Commits made during the task and edits not yet committed show together, the way a pull request would show them. Narrow it only when the user asks.
 
 A ref resolves locally first and then as `origin/<ref>`, so a base the user never checked out still works. When the user describes a branch instead of naming it ("that login branch"), find its exact name with `git -C REPO_DIR branch --all --list '*login*'` and pass that name. `REPO_DIR` is the repo path, or the folder that holds it when the repo path is a file, since `git -C` needs a directory.
@@ -73,6 +75,7 @@ For example:
 "<skill-dir>/scripts/review-command.sh" ~/code/app HEAD HEAD          # uncommitted edits only
 "<skill-dir>/scripts/review-command.sh" ~/code/app feat/login main    # a branch against a base
 "<skill-dir>/scripts/review-command.sh" ~/code/app --no-watch         # a frozen snapshot
+"<skill-dir>/scripts/review-command.sh" ~/code/app --browser          # the review page in the browser, no UI
 ```
 
 The script prints the command on stdout and a state report on stderr. The report names the repo, the branch, the base and the counts of commits and changed files. It warns when the range is empty or when `branch-review` or `git-delta` is missing from `PATH`. A hint that `ffmpeg` or `ffprobe` is missing needs no action. The command runs in POSIX shells and zsh.
@@ -101,7 +104,9 @@ Take the file count from the report's `in review` line, and the commits and unco
 - When the report says a count is unknown, say that instead of giving a number.
 - Say "Copied to your clipboard" only when the report says the copy worked.
 
-Add nothing else, such as a key list or a feature tour. The UI explains itself. When the user asked to review in the browser, add one line: in the review, `r` opens the branch as one page in the browser at the file in view, and `R` opens that page at its top.
+Add nothing else, such as a key list or a feature tour. The UI explains itself.
+
+For a `--browser` command, say what it does in place of "Reviews": "Copied to your clipboard. Opens the 3 uncommitted files on `main` as one page in your browser, then exits." Add that the page is a snapshot, so the user runs the command again after more edits.
 
 ## Changes in several repos
 
@@ -127,6 +132,7 @@ The directory gets `index.html` and `links.json`. A later run replaces the two f
 
 The default command fits nearly every review. Pass a flag to the script only when the user describes the problem it solves. The script refuses any other flag.
 
+- `--browser`: open the review page straight in the browser, where `r` would open it (a cmux split, or the default browser), then exit with no UI. Pass it when the user wants to review in the browser. The script refuses it beside `--watch` or `--watch-poll`, since the page is one snapshot.
 - `--no-watch`: a frozen snapshot, for when an agent is still writing files and the live view would churn. Watch mode is on by default in an interactive terminal.
 - `--watch-poll`: poll for changes, for network mounts and container bind mounts where file events never arrive.
 - `--no-animations`: no transitions, for slow or remote terminals.

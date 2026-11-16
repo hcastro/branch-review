@@ -149,6 +149,24 @@ function startMedia({caps: detected, cwd, env, proc, session, tempDir, watching,
 
 type SessionDir = ReturnType<typeof createMediaTempDir>;
 
+/** Exits 1 after one line on stderr. Repo text in `message`, such as a path or ref name, is escaped. */
+function exitWithError(stderr: CliIo['stderr'], proc: CliProcess, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  stderr.write(`branch-review: ${escapeHiddenCharacters(message.split('\n')[0] || 'unknown error')}\n`);
+  proc.exit(1);
+}
+
+/**
+ * Exits 0 once `text` is out. A pipe on macOS takes a large write in
+ * pieces, after the call returns, and exiting sooner would cut it short.
+ */
+async function exitWithOutput(stdout: CliIo['stdout'], proc: CliProcess, text: string) {
+  await new Promise<void>((resolve) => {
+    stdout.write(text, () => resolve());
+  });
+  proc.exit(0);
+}
+
 async function writeRenderedPages({cwd, startDir, range, review, outLabel, json, stdout, stderr, proc}: {
   cwd: string;
   startDir: string;
@@ -167,17 +185,32 @@ async function writeRenderedPages({cwd, startDir, range, review, outLabel, json,
     // startup.
     const {formatRenderOutJson, formatRenderOutSummary, renderToDirectory} = await import('./rendered/renderOut.js');
     const report = await renderToDirectory({cwd, range, review, outDir, outLabel, now: Date.now});
-    const text = json ? formatRenderOutJson(report) : formatRenderOutSummary(report, outLabel);
-    // A pipe on macOS takes a large write in pieces, after the call returns;
-    // exiting before the last piece is out would cut the report short.
-    await new Promise<void>((resolve) => {
-      stdout.write(text, () => resolve());
-    });
-    proc.exit(0);
+    await exitWithOutput(stdout, proc, json ? formatRenderOutJson(report) : formatRenderOutSummary(report, outLabel));
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    stderr.write(`branch-review: ${escapeHiddenCharacters(message.split('\n')[0] || 'unknown error')}\n`);
-    proc.exit(1);
+    exitWithError(stderr, proc, error);
+  }
+}
+
+async function openInBrowser({cwd, range, review, env, opener, stdout, stderr, proc}: {
+  cwd: string;
+  range: Awaited<ReturnType<typeof prepareStartup>>['range'];
+  review: Awaited<ReturnType<typeof prepareStartup>>['review'];
+  env: NodeJS.ProcessEnv;
+  opener: Opener;
+  stdout: CliIo['stdout'];
+  stderr: CliIo['stderr'];
+  proc: CliProcess;
+}) {
+  try {
+    // Loaded only here, as for the export, so the renderer stays out of the UI's startup.
+    const [{openReviewInBrowser}, {runTool}, {findTool}] = await Promise.all([import('./rendered/browserOut.js'), import('./rendered/run.js'), import('./media/worker/tools.js')]);
+    const exiting = new AbortController();
+    proc.on('exit', () => exiting.abort());
+    const outcome = await openReviewInBrowser({cwd, range, review, env, platform: process.platform, opener, run: runTool, findTool: (name) => findTool(name, env, cwd), signal: exiting.signal});
+    if (outcome.ok) await exitWithOutput(stdout, proc, `${outcome.message}\n  ${escapeHiddenCharacters(outcome.page)}\n`);
+    else exitWithError(stderr, proc, outcome.message);
+  } catch (error) {
+    exitWithError(stderr, proc, error);
   }
 }
 
@@ -232,6 +265,13 @@ export async function runCli(io: CliIo) {
   // asked anything and never drawn on, so stdout carries only the report.
   if (options.renderOut !== undefined) {
     await writeRenderedPages({cwd, startDir, range, review, outLabel: options.renderOut, json: options.json ?? false, stdout, stderr, proc});
+    return;
+  }
+
+  // --browser: the page `r` opens, opened at once, then exit. Like the
+  // export, the terminal is never asked anything and never drawn on.
+  if (options.browser && review.files.length > 0) {
+    await openInBrowser({cwd, range, review, env, opener, stdout, stderr, proc});
     return;
   }
 

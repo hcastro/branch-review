@@ -11,6 +11,9 @@ export type CliOptions = {
   // and exit, with no UI. Set only when given, as is --json, which prints the report as JSON.
   renderOut?: string;
   json?: boolean;
+  // --browser: build the Review in browser page, open it where `r` would,
+  // and exit, with no UI. Set only when given.
+  browser?: true;
 };
 
 const RENDER_OUT = '--export-html';
@@ -29,6 +32,7 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
   let images: CliOptions['images'];
   let renderOut: string | undefined;
   let json = false;
+  let browser = false;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
@@ -36,6 +40,11 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
       const value = arg === RENDER_OUT ? argv[++index] : arg.slice(RENDER_OUT.length + 1);
       if (!value || value.startsWith('--')) throw new Error(NEEDS_DIRECTORY);
       renderOut = value;
+      continue;
+    }
+
+    if (arg === '--browser') {
+      browser = true;
       continue;
     }
 
@@ -84,16 +93,19 @@ export function parseCliArgs(argv: string[], {interactive}: {interactive: boolea
   }
 
   if (json && renderOut === undefined) throw new Error('--json works only with --export-html');
+  if (browser && renderOut !== undefined) throw new Error('--browser opens the page and --export-html writes it to a directory · pick one');
+  if (browser && (watchFlag || watchPoll)) throw new Error('--browser opens one snapshot of the review · --watch works only in the terminal UI');
 
   return {
     requestedBranch: positional[0] ?? 'HEAD',
     requestedBase: positional[1],
     // Headless output is one snapshot.
-    watch: noWatch || renderOut !== undefined ? false : watchFlag || interactive,
+    watch: noWatch || browser || renderOut !== undefined ? false : watchFlag || interactive,
     watchPoll,
     animations,
     ...(images ? {images} : {}),
     ...(renderOut === undefined ? {} : {renderOut}),
     ...(json ? {json} : {}),
+    ...(browser ? {browser: true as const} : {}),
   };
 }

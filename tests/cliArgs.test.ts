@@ -76,6 +76,15 @@ describe('parseCliArgs', () => {
     expect(() => parseCliArgs(['--json'], {interactive: true})).toThrow('--json works only with --export-html');
   });
 
+  it('reads --browser, which never watches, and refuses it beside --export-html or --watch', () => {
+    expect(parseCliArgs(['--browser', 'feature', 'main'], {interactive: true})).toMatchObject({browser: true, watch: false, requestedBranch: 'feature', requestedBase: 'main'});
+    expect(parseCliArgs([], {interactive: true})).not.toHaveProperty('browser');
+    expect(() => parseCliArgs(['--browser', '--export-html', 'out'], {interactive: true})).toThrow('--browser opens the page and --export-html writes it to a directory · pick one');
+    expect(() => parseCliArgs(['--browser', '--watch'], {interactive: true})).toThrow('--browser opens one snapshot of the review · --watch works only in the terminal UI');
+    expect(() => parseCliArgs(['--watch-poll', '--browser'], {interactive: true})).toThrow('--watch works only in the terminal UI');
+    expect(() => parseCliArgs(['--browser', '--json'], {interactive: true})).toThrow('--json works only with --export-html');
+  });
+
   it('has no --render-out: the flag is --export-html, with no alias', () => {
     expect(parseCliArgs(['--render-out', 'out'], {interactive: true})).not.toHaveProperty('renderOut');
     expect(parseCliArgs(['--render-out=out'], {interactive: true})).not.toHaveProperty('renderOut');

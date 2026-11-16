@@ -15,6 +15,8 @@ Where the page opens depends on where you run `branch-review`:
 | In another terminal on macOS or Linux | A new tab in your default browser, on each press. On Linux, `xdg-open` on your `PATH` opens it. |
 | Over SSH | Nothing opens. On a markdown file that Preview can draw, press `v` to read the page in the review. |
 
+To open the page without the review, run `branch-review --browser`. It opens the page where `r` would, at its top, prints where it went, such as `⇗ 3 files opened in your browser` and the page's path, and exits. The page is a snapshot: it lives in a folder of its own under the temp directory, so it outlasts the run, and running the same review again replaces it. Over SSH it opens nothing and names `--export-html`, as `r` does.
+
 After each press the footer says where the page went, such as `⇗ setup.md opened in the browser split` or `⇗ all files opened in your browser`.
 
 In a review with a markdown, image, or SVG file, the page is made in the background while you read, so it's usually ready before you press `r`. A review that changed only code makes its page the first time you press `r` or `R`. If the page isn't ready, the footer reads `preparing setup.md…` until it opens. After 10 seconds it gives up with `setup.md took too long to prepare`.

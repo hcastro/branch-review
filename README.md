@@ -118,6 +118,14 @@ Preview needs Ghostty, cmux, or Kitty, and a headless Chromium already on disk. 
 
 The page has a card for every changed file, in the review's order, with a file tree and a filter beside them. A code file's card shows its diff with GitHub's syntax colors and word highlights, unified or split, and expands the unchanged lines around each hunk. A markdown file's card switches between its diff and its rich view, the file as GitHub draws it with each added or changed block marked. An image's card compares its versions in 2-up, swipe, and onion skin. A binary file, a submodule, a Git LFS file, or a rename with no changes gets one line in its card, as on GitHub, and a diff over 3,000 lines waits behind **Load diff**. Mark a file **Viewed** to fold it, and the browser remembers it for this review. The **Commits** tab lists the branch's commits, and the title says whether the branch is pushed, ahead, or behind. A list at the top names each link that won't resolve on GitHub, such as one to a missing file or heading. In watch mode, an open split follows your edits, keeps your place and your viewed marks, and pulses the cards that changed. The page fits a phone's width, with the file tree behind its **Files** button.
 
+To skip the terminal UI and go straight to the page, pass `--browser`:
+
+```sh
+branch-review --browser
+```
+
+It opens the page where `r` would, prints where it went, and exits. The page stays in a folder under the temp directory, and running the same review again replaces it. It's a snapshot: to see later edits, run it again.
+
 To write the page for the whole branch to a directory without opening the UI, pass `--export-html`:
 
 ```sh
@@ -219,6 +227,7 @@ branch-review my-feature release/2026.04
 | `--animations` | Turn animations back on after an earlier `--no-animations`. |
 | `--no-images` | Show image, SVG, and video files as plain diffs. |
 | `--images` | Turn previews back on after an earlier `--no-images`. `BRANCH_REVIEW_IMAGES=off` and `NO_COLOR` still turn them off. |
+| `--browser` | Open the review page for the whole branch where `r` would, in a cmux split or your default browser, then exit without opening the UI. It can't be combined with `--watch` or `--export-html`. |
 | `--export-html DIR` | Write the review page for the whole branch to `DIR` as `index.html`, with `links.json`. Then print a summary and exit without opening the UI. |
 | `--json` | With `--export-html`, print the report as JSON. |
 
@@ -316,7 +325,7 @@ An agent can't drive a full-screen terminal UI, so the skill never opens the UI 
 cd '/Users/me/code/app' && branch-review
 ```
 
-To get the command, ask the agent with a phrase such as `let me review this`, `/branch-review`, or `let me check the diff before you continue`. Paste the command into your terminal. When you finish the review, press `q`. To get a frozen snapshot or another option, say so, and the skill puts the flag, such as `--no-watch`, in the copied command. To get the review as an HTML file instead, ask for it, such as `export the review as HTML`. The agent runs `branch-review --export-html` itself, since that run writes the page and exits, and replies with the page's path.
+To get the command, ask the agent with a phrase such as `let me review this`, `/branch-review`, or `let me check the diff before you continue`. Paste the command into your terminal. When you finish the review, press `q`. To get a frozen snapshot or another option, say so, and the skill puts the flag, such as `--no-watch`, in the copied command. To review in the browser without the terminal UI, ask for that, such as `review the code in the browser`, and the copied command ends in `--browser`. To get the review as an HTML file instead, ask for it, such as `export the review as HTML`. The agent runs `branch-review --export-html` itself, since that run writes the page and exits, and replies with the page's path.
 
 The command is written for POSIX shells and zsh. The script refuses a repo path or ref name that holds control or invisible characters, because a pasted command can't carry them safely. Examples include a newline, an escape, and a bidi control, and the script's report shows them escaped, such as `\x1b` or `\u202e`.
 

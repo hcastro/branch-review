@@ -1000,6 +1000,25 @@ describe.each(scriptShells)('flags in the printed command under %s', (shell) => 
     }
   });
 
+  it('puts --browser in the copied command, and refuses it beside a watch flag', () => {
+    const sandbox = createSandbox();
+    const repo = createRepo(sandbox);
+
+    const run = runScript(sandbox, shell, [repo, '--browser']);
+    expect(run.status, run.stderr).toBe(0);
+    expect(run.command.endsWith('branch-review --browser')).toBe(true);
+    for (const pasteShell of pasteShells(shell)) expect(paste(sandbox, pasteShell, run.command)).toEqual({cwd: repo, argv: ['--browser']});
+    fs.rmSync(sandbox.clipOut);
+
+    for (const watch of ['--watch', '--watch-poll']) {
+      const refused = runScript(sandbox, shell, [repo, '--browser', watch]);
+      expect(refused.status).toBe(1);
+      expect(refused.stdout).toBe('');
+      expect(refused.stderr).toContain("--browser opens one snapshot of the review, so it can't take --watch or --watch-poll");
+      expect(fs.existsSync(sandbox.clipOut)).toBe(false);
+    }
+  });
+
   it('refuses a fourth positional argument', () => {
     const sandbox = createSandbox();
     const repo = createRepo(sandbox);
