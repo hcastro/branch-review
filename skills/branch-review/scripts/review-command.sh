@@ -301,7 +301,7 @@ note "uncommitted: $uncommitted"
 note "in review:   $in_review"
 
 command -v branch-review >/dev/null 2>&1 \
-  || note "warning: branch-review is not on PATH — install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review"
+  || note "warning: branch-review is not on PATH — install with: npm install -g branch-review"
 command -v delta >/dev/null 2>&1 \
   || note "warning: git-delta is not on PATH — diffs need it: brew install git-delta"
 command -v ffprobe >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 \

@@ -26,14 +26,12 @@ There's no AI in `branch-review`. It puts the whole change in front of you, and 
 
 ## Install
 
-`branch-review` needs Node.js 22 or later, Git, and [delta](https://dandavison.github.io/delta/installation.html) on your `PATH`. On macOS, install delta with Homebrew, and then install `branch-review` from GitHub:
+`branch-review` needs Node.js 22 or later, Git, and [delta](https://dandavison.github.io/delta/installation.html) on your `PATH`. On macOS, install delta with Homebrew, and then install `branch-review` from npm:
 
 ```sh
 brew install git-delta
-pnpm add -g --allow-build=branch-review github:hcastro/branch-review
+npm install -g branch-review
 ```
-
-The package builds when it installs, so the `--allow-build` flag lets pnpm run that build.
 
 Run it from any folder inside a Git repo:
 
@@ -139,7 +137,7 @@ mkdir -p ~/.claude/skills
 ln -s "$PWD/skills/branch-review" ~/.claude/skills/branch-review
 ```
 
-If you installed with `pnpm add -g`, link `"$(pnpm root -g)/branch-review/skills/branch-review"` in its place.
+If you installed with `npm install -g`, link `"$(npm root -g)/branch-review/skills/branch-review"` in its place.
 
 ## Documentation
 

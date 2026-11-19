@@ -686,16 +686,13 @@ describe.each(scriptShells)('review-command.sh under %s', (shell) => {
       expect(report(run.stderr, 'in review')).toBe('3 files (2 tracked, 1 untracked)');
     });
 
-    it('points at the GitHub install when branch-review is missing', () => {
+    it('points at the npm install when branch-review is missing', () => {
       const sandbox = createSandbox({cli: false});
       const repo = createRepo(sandbox);
 
       const run = runScript(sandbox, shell, [repo]);
       expect(run.status, run.stderr).toBe(0);
-      expect(run.stderr).toContain(
-        'install with: pnpm add -g --allow-build=branch-review github:hcastro/branch-review',
-      );
-      expect(run.stderr).not.toMatch(/pnpm add -g branch-review/);
+      expect(run.stderr).toContain('install with: npm install -g branch-review');
     });
 
     it('refuses a named-branch review with no merge base', () => {
