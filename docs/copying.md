@@ -1,6 +1,6 @@
 # Clipboard copies in branch-review
 
-This document describes what each copy in `branch-review` puts on the clipboard, which clipboard tool it uses, and when a copy refuses. For the list of copy buttons and keys, see the [Copy context back to the agent](../README.md#copy-context-back-to-the-agent) section of the README.
+This document describes what each copy in `branch-review` puts on the clipboard, which clipboard tool it uses, and when a copy refuses. For the list of copy buttons and keys, see the [Copy buttons and keys](reference.md#copy-buttons-and-keys) section of the reference.
 
 ## Clipboard tools
 

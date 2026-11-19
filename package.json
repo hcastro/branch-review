@@ -1,7 +1,7 @@
 {
   "name": "branch-review",
   "version": "0.1.0",
-  "description": "A PR-style review UI in your terminal for checking what you or a coding agent changed before it reaches GitHub.",
+  "description": "See your branch as the pull request it will become, in your terminal or your browser, before it leaves your machine.",
   "keywords": [
     "cli",
     "git",

@@ -1,6 +1,6 @@
 # Image and video previews
 
-This document describes how `branch-review` shows changed images, SVG files, and videos in the diff pane, which terminals draw them, and how to set up tmux. For the keys that work on a preview, see the [Keys and mouse](../README.md#keys-and-mouse) section of the README.
+This document describes how `branch-review` shows changed images, SVG files, and videos in the diff pane, which terminals draw them, and how to set up tmux. For the keys that work on a preview, see the [Keys and mouse](reference.md#keys-and-mouse) section of the reference.
 
 ## Images
 
@@ -102,7 +102,7 @@ Previews are off in the following cases:
 - When the input or the output isn't a terminal.
 - When `TERM` is `linux`, or `screen*` outside tmux. Those terminals might print graphics codes as text.
 
-The app then shows media files as plain diffs. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognized, and `BRANCH_REVIEW_IMAGES=blocks` forces the block preview. For all the environment variables, see the [Environment variables](../README.md#environment-variables) section of the README.
+The app then shows media files as plain diffs. `BRANCH_REVIEW_IMAGES=kitty` forces pictures in a terminal that supports them but isn't recognized, and `BRANCH_REVIEW_IMAGES=blocks` forces the block preview. For all the environment variables, see the [Environment variables](reference.md#environment-variables) section of the reference.
 
 ## How previews work
 

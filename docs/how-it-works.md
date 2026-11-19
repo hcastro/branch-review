@@ -1,6 +1,6 @@
 # How branch-review works
 
-This document describes how `branch-review` builds a review, how watch mode decides when to refresh, how the app treats your terminal, and what it touches on disk. For more information about image and video previews, see [Image and video previews](media-previews.md).
+This document describes how `branch-review` builds a review, how watch mode decides when to refresh, how the app treats your terminal, how it shows hidden characters, and what it touches on disk. For more information about image and video previews, see [Image and video previews](media-previews.md).
 
 ## Diffs and files
 
@@ -17,9 +17,11 @@ Git runs with fixed settings, so repo config can't change what you read or copy.
 
 A symlink shows as its link text, and a symlink to a FIFO never blocks the app. A file that's too large, or isn't a regular file, is refused before it's read.
 
+A change with no text to diff still shows up in the review. A pure rename, a mode change, a new empty file, or a binary file gets a one-line summary, such as `renamed from a.txt` or `mode 100644 → 100755`.
+
 A submodule shows as its old and new `Subproject commit` lines, marked `-dirty` when it has local edits. A `chmod +x` shows the new mode, counting only the owner's execute bit, the way Git records it.
 
-One bad file never stops the review. Some files can't load: a file that can't be read, one deleted between the listing and the diff, or a blob that a partial clone can't fetch. Each becomes an error row with the reason, and the rest of the review loads.
+One bad file never stops the review. Some files can't load: a file that can't be read, one deleted between the listing and the diff, or a blob that a partial clone can't fetch. Each shows `✗ Could not load diff` and the reason under its header, and the rest of the review loads.
 
 If a file fails while it's being drawn, the pane shows `✗ could not render PATH`, where `PATH` is the file's path, with the reason. The next scroll or refresh tries again.
 
@@ -53,6 +55,10 @@ After a refresh, a new file or block is tinted green and an edited one teal, and
 
 A checkout that touches hundreds of files highlights at most 120 entries.
 
+The review keeps your place through every refresh: the text at the top of the pane stays in place when lines or files appear above it. Blocks that you collapsed stay collapsed, and a block that you focused with `[` or `]` keeps its focus as long as its header doesn't move. If the lines you're selecting change mid-drag, `branch-review` drops the selection and says why, so the copy never holds text that you didn't pick.
+
+While a refresh runs, the footer shows `refreshing...` and then `updated now`.
+
 Resizing the terminal lays out the frame for the new size right away. The review wraps again after the width stays the same for 120 ms, and delta's output is rebuilt for the new pane width without restarting the watcher.
 
 ## Terminal handling
@@ -66,6 +72,10 @@ A run with watch mode off and no changes prints `No file changes between BASE an
 On `q`, `Esc`, `Control+C`, `SIGTERM`, a closed window, or a crash, `branch-review` turns off every mouse mode, shows the cursor, and leaves the alternate screen. Signals exit with code 130 for `SIGINT`, 143 for `SIGTERM`, and 129 for `SIGHUP`. A crash prints one `branch-review: REASON` line, where `REASON` is the error message. `Alt+q` and `Control+q` don't quit.
 
 `branch-review` holds the app's console output until the session ends. After the terminal is restored, it writes that output to stderr with hidden characters escaped.
+
+## Hidden characters
+
+Hidden characters, such as control characters and bidirectional (bidi) overrides, show on screen as markers, for example `^M` or `<U+202E>`, in diffs, paths, ref names, and tooltips. A line that uses bidi characters to disguise its code, the attack known as Trojan Source, stands out on screen, and so does a look-alike file name. Copies keep the original bytes.
 
 ## What branch-review touches
 

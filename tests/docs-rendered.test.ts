@@ -48,11 +48,11 @@ describe('Preview and Review in browser in the docs', () => {
 
   it('says Preview is on where it can draw, and every BRANCH_REVIEW_PREVIEW value that turns it off', () => {
     const doc = read('docs/preview-and-browser.md');
-    const readme = read('README.md');
+    const reference = read('docs/reference.md');
     expect(doc).toContain('set `BRANCH_REVIEW_PREVIEW` to `off`, `0`, `false`, or `none`');
     expect(doc).toContain('`BRANCH_REVIEW_PREVIEW=on` is accepted and changes nothing.');
-    expect(readme).toContain('| `BRANCH_REVIEW_PREVIEW` | `off`, `0`, `false`, or `none` turns Preview off');
-    for (const text of [doc, readme]) expect(text).not.toContain('turned off by default');
+    expect(reference).toContain('| `BRANCH_REVIEW_PREVIEW` | `off`, `0`, `false`, or `none` turns Preview off');
+    for (const text of [doc, reference, read('README.md')]) expect(text).not.toContain('turned off by default');
     expect(doc).toContain('the diff comes back in one frame, at the line the page showed at the top');
   });
 
@@ -67,7 +67,7 @@ describe('Preview and Review in browser in the docs', () => {
   });
 
   it('calls the modes Preview, Review in browser, and All files in browser, in every heading and with no old name', () => {
-    for (const name of ['README.md', 'docs/preview-and-browser.md', 'docs/how-it-works.md', 'docs/media-previews.md', 'docs/copying.md']) {
+    for (const name of ['README.md', 'docs/reference.md', 'docs/preview-and-browser.md', 'docs/how-it-works.md', 'docs/media-previews.md', 'docs/copying.md']) {
       const text = raw(name);
       for (const old of ['--render-out', 'BRANCH_REVIEW_PANE', 'in-pane view', 'Rendered ⇗', 'rendered page', 'rendered view', '`v here`']) expect(text, `${name}: ${old}`).not.toContain(old);
       for (const heading of headings(name)) expect(heading, name).not.toMatch(/render|\bpane\b/i);
@@ -76,22 +76,23 @@ describe('Preview and Review in browser in the docs', () => {
     for (const name of ['Preview', 'Review in browser', 'All files in browser']) expect(doc).toContain(`**${name}**`);
   });
 
-  it('tells a new user in one sentence each what v, r, and R do, in the README section after the images one', () => {
+  it('tells a new user in one sentence each what v, r, and R do, in the README section on the browser', () => {
     const readme = raw('README.md');
-    const section = readme.slice(readme.indexOf('## Preview markdown and review it in the browser'), readme.indexOf('\n## ', readme.indexOf('## Preview markdown and review it in the browser') + 1));
-    expect(readme.indexOf('## See images and video in the diff')).toBeLessThan(readme.indexOf('## Preview markdown and review it in the browser'));
+    const start = readme.indexOf('## Review it in the browser');
+    expect(start).toBeGreaterThan(0);
+    const section = readme.slice(start, readme.indexOf('\n## ', start + 1));
     for (const key of ['`v`', '`r`', '`R`', '`?`']) expect(section).toContain(`press ${key}`);
     expect(section).toContain('--export-html');
   });
 
   it('says what --no-animations turns off on the review page now, which has no develop', () => {
-    const row = raw('README.md').split('\n').find((line) => line.startsWith('| `--no-animations` |'))!;
+    const row = raw('docs/reference.md').split('\n').find((line) => line.startsWith('| `--no-animations` |'))!;
     expect(row).not.toContain('develop');
     expect(row).toContain('its pulse on a live refresh');
   });
 
-  it('lists the keys, the flag and the env var in the README tables', () => {
-    const readme = read('README.md');
+  it('lists the keys, the flag and the env var in the reference tables', () => {
+    const readme = read('docs/reference.md');
     expect(readme).toContain('| `--export-html DIR` |');
     expect(readme).toContain('| `--json` | With `--export-html`, print the report as JSON. |');
     expect(readme).toContain('| `BRANCH_REVIEW_PREVIEW_DPR` |');
