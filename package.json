@@ -33,7 +33,7 @@
   },
   "files": [
     "dist",
-    "skills",
+    "skills/branch-review",
     "docs",
     "src/rendered/assets/LICENSE-github-markdown-css",
     "src/rendered/assets/LICENSE-octicons",
